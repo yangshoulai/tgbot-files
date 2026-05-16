@@ -1,11 +1,16 @@
 import { AppError } from "./http";
 
-export interface TelegramDocument {
+export interface TelegramStoredFile {
   file_id: string;
   file_unique_id?: string;
   file_name?: string;
   mime_type?: string;
   file_size?: number;
+}
+
+interface TelegramPhotoSize extends TelegramStoredFile {
+  width?: number;
+  height?: number;
 }
 
 interface TelegramApiResponse<T> {
@@ -16,7 +21,14 @@ interface TelegramApiResponse<T> {
 }
 
 interface TelegramMessage {
-  document?: TelegramDocument;
+  document?: TelegramStoredFile;
+  sticker?: TelegramStoredFile;
+  animation?: TelegramStoredFile;
+  video?: TelegramStoredFile;
+  audio?: TelegramStoredFile;
+  voice?: TelegramStoredFile;
+  video_note?: TelegramStoredFile;
+  photo?: TelegramPhotoSize[];
 }
 
 interface TelegramFileInfo {
@@ -31,7 +43,7 @@ export async function uploadDocumentToTelegram(params: {
   chatId: string;
   file: File;
   fileName: string;
-}): Promise<TelegramDocument> {
+}): Promise<TelegramStoredFile> {
   const formData = new FormData();
   formData.set("chat_id", params.chatId);
   formData.set("document", params.file, params.fileName);
@@ -47,11 +59,13 @@ export async function uploadDocumentToTelegram(params: {
     throw telegramError("TelegramUploadFailed", "Telegram sendDocument failed", response.status, body);
   }
 
-  if (!body.result?.document?.file_id) {
-    throw new AppError(502, "TelegramUploadFailed", "Telegram response did not include document.file_id");
+  const uploadedFile = extractUploadedFile(body.result);
+
+  if (!uploadedFile) {
+    throw new AppError(502, "TelegramUploadFailed", "Telegram response did not include a supported file_id");
   }
 
-  return body.result.document;
+  return uploadedFile;
 }
 
 export async function getTelegramFileUrl(params: {
@@ -105,6 +119,54 @@ function telegramApiUrl(botToken: string, method: string): string {
 function telegramFileUrl(botToken: string, filePath: string): string {
   const encodedPath = filePath.split("/").map(encodeURIComponent).join("/");
   return `https://api.telegram.org/file/bot${botToken}/${encodedPath}`;
+}
+
+function extractUploadedFile(message: TelegramMessage | undefined): TelegramStoredFile | undefined {
+  if (!message) {
+    return undefined;
+  }
+
+  const directCandidates = [
+    message.document,
+    message.sticker,
+    message.animation,
+    message.video,
+    message.audio,
+    message.voice,
+    message.video_note
+  ];
+
+  for (const candidate of directCandidates) {
+    if (isTelegramStoredFile(candidate)) {
+      return candidate;
+    }
+  }
+
+  const photo = chooseLargestPhoto(message.photo);
+
+  if (photo) {
+    return photo;
+  }
+
+  return undefined;
+}
+
+function chooseLargestPhoto(photo: TelegramPhotoSize[] | undefined): TelegramPhotoSize | undefined {
+  if (!photo?.length) {
+    return undefined;
+  }
+
+  return photo
+    .filter(isTelegramStoredFile)
+    .sort((left, right) => photoScore(right) - photoScore(left))[0];
+}
+
+function photoScore(photo: TelegramPhotoSize): number {
+  return photo.file_size ?? (photo.width ?? 0) * (photo.height ?? 0);
+}
+
+function isTelegramStoredFile(value: TelegramStoredFile | undefined): value is TelegramStoredFile {
+  return typeof value?.file_id === "string" && value.file_id.length > 0;
 }
 
 async function readTelegramJson<T>(response: Response): Promise<TelegramApiResponse<T>> {

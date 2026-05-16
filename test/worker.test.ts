@@ -156,6 +156,41 @@ describe("worker upload endpoint", () => {
     expect(fetchCalls[0]).toBe("https://api.telegram.org/bot123456:test-token/sendDocument");
   });
 
+  it("accepts small webp files when Telegram returns them as stickers", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({
+        ok: true,
+        result: {
+          sticker: {
+            file_id: "tg-sticker-file-id",
+            file_unique_id: "tg-sticker-unique-id",
+            file_size: 4
+          }
+        }
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await worker.fetch(
+      uploadRequest({ file: new File(["webp"], "tiny.webp", { type: "image/webp" }) }),
+      env
+    );
+    const body = await response.json() as {
+      ok: boolean;
+      url: string;
+      name: string;
+      size: number;
+      mime_type: string;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.url).toMatch(/^https:\/\/files\.example\.com\/f\//);
+    expect(body.name).toBe("tiny.webp");
+    expect(body.size).toBe(4);
+    expect(body.mime_type).toBe("image/webp");
+  });
+
   it("surfaces Telegram upload errors", async () => {
     vi.stubGlobal(
       "fetch",
