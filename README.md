@@ -1,6 +1,6 @@
 # tgbot-files
 
-基于 **Cloudflare Worker** 和 **Telegram Bot API** 的无数据库小文件存储服务。
+基于 **Cloudflare Worker** 和 **Telegram Bot API** 的文件存储服务。
 
 核心思路：上传接口把文件发送到指定 Telegram 私有频道/群/聊天，Worker 只把 Telegram 返回的 `file_id` 写入签名链接。访问文件时，Worker 校验签名链接，再通过 Telegram `getFile` 获取真实文件地址并代理返回文件内容。
 
