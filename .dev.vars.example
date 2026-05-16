@@ -1,0 +1,6 @@
+TELEGRAM_BOT_TOKEN="123456789:replace-with-your-bot-token"
+TELEGRAM_STORAGE_CHAT_ID="-1001234567890"
+UPLOAD_API_KEY="replace-with-a-long-random-upload-api-key"
+LINK_SIGNING_SECRET="replace-with-a-long-random-link-signing-secret"
+PUBLIC_BASE_URL="http://localhost:8787"
+MAX_FILE_BYTES="20971520"

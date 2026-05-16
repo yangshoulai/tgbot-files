@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tgbot-files",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-16",
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "MAX_FILE_BYTES": "20971520",
+    "PUBLIC_BASE_URL": "https://files.yangshoulai.xyz"
+  }
+}
