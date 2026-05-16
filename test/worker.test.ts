@@ -48,6 +48,24 @@ function jsonResponse(body: unknown, init?: ResponseInit): Response {
   });
 }
 
+function createMemoryCache(): Pick<Cache, "match" | "put"> {
+  const store = new Map<string, Response>();
+
+  return {
+    async match(input: RequestInfo | URL): Promise<Response | undefined> {
+      const cachedResponse = store.get(cacheKeyUrl(input));
+      return cachedResponse?.clone();
+    },
+    async put(input: RequestInfo | URL, response: Response): Promise<void> {
+      store.set(cacheKeyUrl(input), response.clone());
+    }
+  };
+}
+
+function cacheKeyUrl(input: RequestInfo | URL): string {
+  return input instanceof Request ? input.url : String(input);
+}
+
 describe("worker upload endpoint", () => {
   beforeEach(() => {
     vi.unstubAllGlobals();
@@ -156,6 +174,7 @@ describe("worker upload endpoint", () => {
 describe("worker file access endpoint", () => {
   beforeEach(() => {
     vi.unstubAllGlobals();
+    vi.stubGlobal("caches", { default: createMemoryCache() });
   });
 
   it("proxies a signed file link through Telegram getFile", async () => {
@@ -203,11 +222,117 @@ describe("worker file access endpoint", () => {
     expect(response.headers.get("Content-Type")).toBe("text/plain");
     expect(response.headers.get("Content-Disposition")).toContain("hello.txt");
     expect(response.headers.get("Content-Length")).toBe("5");
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=31536000");
+    expect(response.headers.get("X-TGBOT-Cache")).toBe("MISS");
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(fetchCalls).toEqual([
       "https://api.telegram.org/bot123456:test-token/getFile?file_id=tg-file-id",
       "https://api.telegram.org/file/bot123456:test-token/documents/file_1.txt"
     ]);
+  });
+
+  it("serves repeated signed file access from Cloudflare cache without Telegram fetch", async () => {
+    const token = await createSignedToken(
+      {
+        v: 1,
+        file_id: "tg-file-id",
+        name: "hello.txt",
+        mime_type: "text/plain",
+        size: 5,
+        iat: 1_768_566_400
+      },
+      env.LINK_SIGNING_SECRET
+    );
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          ok: true,
+          result: {
+            file_id: "tg-file-id",
+            file_size: 5,
+            file_path: "documents/file_1.txt"
+          }
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response("hello", {
+          status: 200,
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": "5"
+          }
+        })
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const fileUrl = `https://files.example.com/f/${token}/hello.txt`;
+    const firstResponse = await worker.fetch(new Request(fileUrl), env);
+    expect(await firstResponse.text()).toBe("hello");
+    expect(firstResponse.headers.get("X-TGBOT-Cache")).toBe("MISS");
+
+    const secondResponse = await worker.fetch(new Request(fileUrl), env);
+    expect(await secondResponse.text()).toBe("hello");
+    expect(secondResponse.headers.get("X-TGBOT-Cache")).toBe("HIT");
+    expect(secondResponse.headers.get("Cache-Control")).toBe("public, max-age=31536000");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("bypasses cache for range requests to avoid storing partial responses", async () => {
+    const token = await createSignedToken(
+      {
+        v: 1,
+        file_id: "tg-file-id",
+        name: "hello.txt",
+        mime_type: "text/plain",
+        size: 5,
+        iat: 1_768_566_400
+      },
+      env.LINK_SIGNING_SECRET
+    );
+    const fetchCalls: Array<{ input: string; range: string | undefined }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      fetchCalls.push({
+        input: String(input),
+        range: new Headers(init?.headers).get("Range") ?? undefined
+      });
+
+      if (fetchCalls.length === 1) {
+        return jsonResponse({
+          ok: true,
+          result: {
+            file_id: "tg-file-id",
+            file_size: 5,
+            file_path: "documents/file_1.txt"
+          }
+        });
+      }
+
+      return new Response("he", {
+        status: 206,
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "Content-Length": "2",
+          "Content-Range": "bytes 0-1/5"
+        }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await worker.fetch(
+      new Request(`https://files.example.com/f/${token}/hello.txt`, {
+        headers: { Range: "bytes=0-1" }
+      }),
+      env
+    );
+
+    expect(response.status).toBe(206);
+    expect(response.headers.get("X-TGBOT-Cache")).toBe("BYPASS");
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(fetchCalls[1]).toEqual({
+      input: "https://api.telegram.org/file/bot123456:test-token/documents/file_1.txt",
+      range: "bytes=0-1"
+    });
   });
 
   it("rejects tampered file links", async () => {

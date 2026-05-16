@@ -8,6 +8,8 @@
   },
   "vars": {
     "MAX_FILE_BYTES": "20971520",
+    "FILE_CACHE_ENABLED": "true",
+    "FILE_CACHE_TTL_SECONDS": "31536000",
     "PUBLIC_BASE_URL": "https://files.yangshoulai.xyz"
   }
 }

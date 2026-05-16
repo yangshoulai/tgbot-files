@@ -11,6 +11,7 @@
 - 上传接口使用 `Authorization: Bearer <UPLOAD_API_KEY>`。
 - 不使用数据库、R2、KV、Durable Object 或其他持久化存储。
 - 默认限制文件大小为 `20MB`，匹配 Telegram 官方 Bot API `getFile` 的稳定下载边界。
+- 文件访问默认启用 Cloudflare Workers Cache API，缓存 TTL 为 `31536000` 秒，重复访问同一链接可减少 Telegram 回源。
 
 ## API 示例
 
@@ -39,6 +40,12 @@ curl -X POST "https://<your-worker-domain>/api/v1/files" \
 ```bash
 curl -L "https://<your-worker-domain>/f/<signed-token>/example.txt" -o example.txt
 ```
+
+响应头中的 `X-TGBOT-Cache` 可用于观察缓存状态：
+
+- `MISS`：本次未命中 Cloudflare 缓存，已从 Telegram 回源并写入缓存。
+- `HIT`：本次命中 Cloudflare 缓存，没有再请求 Telegram。
+- `BYPASS`：本次绕过缓存，例如 Range 分片请求。
 
 ## 本地开发
 
