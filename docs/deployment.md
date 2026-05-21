@@ -105,8 +105,6 @@ openssl rand -base64 32
 | `LINK_SIGNING_SECRET` | 是 | 文件访问链接 HMAC 签名密钥 |
 | `PUBLIC_BASE_URL` | 否 | 自定义公开访问域名，例如 `https://files.example.com` |
 | `MAX_FILE_BYTES` | 否 | 最大文件大小，默认 `20971520` |
-| `FILE_CACHE_ENABLED` | 否 | 是否启用 Cloudflare Workers Cache API，默认 `true` |
-| `FILE_CACHE_TTL_SECONDS` | 否 | 文件缓存 TTL，默认最大值 `31536000` 秒 |
 
 `MAX_FILE_BYTES` 默认已经写在 `wrangler.jsonc` 的 `vars` 中。如需自定义生产域名，可以在 `wrangler.jsonc` 中加入：
 
@@ -114,8 +112,6 @@ openssl rand -base64 32
 {
   "vars": {
     "MAX_FILE_BYTES": "20971520",
-    "FILE_CACHE_ENABLED": "true",
-    "FILE_CACHE_TTL_SECONDS": "31536000",
     "PUBLIC_BASE_URL": "https://files.example.com"
   }
 }
@@ -138,8 +134,6 @@ UPLOAD_API_KEY="replace-with-a-long-random-upload-api-key"
 LINK_SIGNING_SECRET="replace-with-a-long-random-link-signing-secret"
 PUBLIC_BASE_URL="http://localhost:8787"
 MAX_FILE_BYTES="20971520"
-FILE_CACHE_ENABLED="true"
-FILE_CACHE_TTL_SECONDS="31536000"
 ```
 
 启动本地 Worker：
@@ -202,8 +196,6 @@ curl -X POST "https://tgbot-files.<your-subdomain>.workers.dev/api/v1/files" \
 {
   "vars": {
     "MAX_FILE_BYTES": "20971520",
-    "FILE_CACHE_ENABLED": "true",
-    "FILE_CACHE_TTL_SECONDS": "31536000",
     "PUBLIC_BASE_URL": "https://files.example.com"
   }
 }
@@ -233,32 +225,13 @@ Authorization: Bearer <UPLOAD_API_KEY>
 - 不要把 `TELEGRAM_BOT_TOKEN`、`UPLOAD_API_KEY`、`LINK_SIGNING_SECRET` 提交到 Git。
 - 建议使用私有频道/群保存文件，避免人工误删消息。
 
-## 10. 文件缓存说明
-
-文件访问默认启用 Cloudflare Workers Cache API：
+## 10. 文件访问流程说明
 
 ```txt
-FILE_CACHE_ENABLED=true
-FILE_CACHE_TTL_SECONDS=31536000
+校验签名 token -> 调用 Telegram getFile -> 代理下载 Telegram 文件内容
 ```
 
-访问流程是：
-
-```txt
-校验签名 token -> 查 Cloudflare 边缘缓存 -> 未命中才回源 Telegram -> 写入缓存
-```
-
-响应头 `X-TGBOT-Cache` 可用于判断缓存状态：
-
-- `MISS`：未命中 Cloudflare 缓存，已从 Telegram 回源并写入缓存。
-- `HIT`：命中 Cloudflare 缓存，没有再请求 Telegram。
-- `BYPASS`：绕过缓存，例如 Range 分片请求。
-
-缓存注意事项：
-
-- `31536000` 秒约等于 1 年，是本项目允许的最大 TTL。
-- Cache API 是边缘节点本地缓存，不是全局永久存储；不同地区首次访问仍可能回源 Telegram。
-- Worker 会先校验签名 token 再查缓存，因此轮换 `LINK_SIGNING_SECRET` 后旧链接无法继续命中缓存。
+文件访问接口不再使用 Cloudflare Workers Cache API，也不再输出 `X-TGBOT-Cache` 观测头。重复访问同一个链接时，Worker 会重新向 Telegram 查询并代理返回。
 
 ## 11. 常见问题排查
 
@@ -310,23 +283,6 @@ curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/sendMessage" \
 - Telegram 文件超过官方 `getFile` 可下载限制。
 - bot token 被轮换或失效。
 - Telegram 侧文件不可用。
-
-### 如何确认文件是否命中 Cloudflare 缓存
-
-连续请求同一个文件链接：
-
-```bash
-curl -sD - -o /dev/null "<文件访问链接>"
-curl -sD - -o /dev/null "<文件访问链接>"
-```
-
-如果第二次返回：
-
-```http
-X-TGBOT-Cache: HIT
-```
-
-说明本次命中了 Cloudflare Worker Cache，没有再从 Telegram 下载文件。
 
 ## 12. 设计边界
 

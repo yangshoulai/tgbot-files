@@ -19,16 +19,12 @@ export interface Env {
   LINK_SIGNING_SECRET: string;
   PUBLIC_BASE_URL?: string;
   MAX_FILE_BYTES?: string;
-  FILE_CACHE_ENABLED?: string;
-  FILE_CACHE_TTL_SECONDS?: string;
 }
 
-const MAX_FILE_CACHE_TTL_SECONDS = 31_536_000;
-
 const worker = {
-  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     try {
-      return await routeRequest(request, env, ctx);
+      return await routeRequest(request, env);
     } catch (error) {
       if (error instanceof AppError) {
         return errorResponse(error);
@@ -46,7 +42,7 @@ const worker = {
 
 export default worker;
 
-async function routeRequest(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+async function routeRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
 
   if (request.method === "OPTIONS") {
@@ -69,7 +65,7 @@ async function routeRequest(request: Request, env: Env, ctx?: ExecutionContext):
   }
 
   if (request.method === "GET" && url.pathname.startsWith("/f/")) {
-    return handleFileAccess(request, env, ctx);
+    return handleFileAccess(request, env);
   }
 
   return errorResponse(new AppError(404, "NotFound", "Route not found"));
@@ -140,29 +136,11 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   });
 }
 
-async function handleFileAccess(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+async function handleFileAccess(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const token = extractFileToken(url.pathname);
   const payload = await verifySignedToken(token, requireEnv(env, "LINK_SIGNING_SECRET"));
-  const cacheOptions = parseFileCacheOptions(env);
   const rangeHeader = request.headers.get("Range");
-  const canUseCache = cacheOptions.enabled && !rangeHeader;
-  const cacheKey = createFileCacheKey(url, token);
-
-  if (canUseCache) {
-    const cachedResponse = await getDefaultCache().match(cacheKey);
-
-    if (cachedResponse) {
-      const headers = new Headers(cachedResponse.headers);
-      headers.set("X-TGBOT-Cache", "HIT");
-
-      return new Response(cachedResponse.body, {
-        status: cachedResponse.status,
-        statusText: cachedResponse.statusText,
-        headers
-      });
-    }
-  }
 
   const botToken = requireEnv(env, "TELEGRAM_BOT_TOKEN");
   const telegramFileUrl = await getTelegramFileUrl({ botToken, fileId: payload.file_id });
@@ -174,32 +152,16 @@ async function handleFileAccess(request: Request, env: Env, ctx?: ExecutionConte
 
   headers.set("Content-Type", payload.mime_type || telegramResponse.headers.get("Content-Type") || "application/octet-stream");
   headers.set("Content-Disposition", contentDispositionInline(payload.name));
-  headers.set("Cache-Control", canUseCache ? `public, max-age=${cacheOptions.ttlSeconds}` : "no-store");
-  headers.set("X-TGBOT-Cache", canUseCache ? "MISS" : "BYPASS");
 
   copyHeader(telegramResponse.headers, headers, "Content-Length");
   copyHeader(telegramResponse.headers, headers, "Content-Range");
   copyHeader(telegramResponse.headers, headers, "Accept-Ranges");
-  copyHeader(telegramResponse.headers, headers, "ETag");
-  copyHeader(telegramResponse.headers, headers, "Last-Modified");
 
-  const response = new Response(telegramResponse.body, {
+  return new Response(telegramResponse.body, {
     status: telegramResponse.status,
     statusText: telegramResponse.statusText,
     headers
   });
-
-  if (canUseCache && response.ok) {
-    const cachePut = getDefaultCache().put(cacheKey, response.clone());
-
-    if (ctx) {
-      ctx.waitUntil(cachePut);
-    } else {
-      await cachePut;
-    }
-  }
-
-  return response;
 }
 
 function requireBearerAuth(request: Request, expectedApiKey: string): void {
@@ -227,59 +189,4 @@ function copyHeader(source: Headers, target: Headers, name: string): void {
   if (value) {
     target.set(name, value);
   }
-}
-
-function createFileCacheKey(url: URL, token: string): Request {
-  return new Request(`${url.origin}/__tgbot-file-cache/${token}`, { method: "GET" });
-}
-
-function getDefaultCache(): Cache {
-  return (caches as CacheStorage & { default: Cache }).default;
-}
-
-function parseFileCacheOptions(env: Env): { enabled: boolean; ttlSeconds: number } {
-  return {
-    enabled: parseBooleanEnv(env.FILE_CACHE_ENABLED, true),
-    ttlSeconds: parseFileCacheTtlSeconds(env.FILE_CACHE_TTL_SECONDS)
-  };
-}
-
-function parseBooleanEnv(value: string | undefined, defaultValue: boolean): boolean {
-  if (value === undefined || value.trim() === "") {
-    return defaultValue;
-  }
-
-  const normalized = value.trim().toLowerCase();
-
-  if (["1", "true", "yes", "on"].includes(normalized)) {
-    return true;
-  }
-
-  if (["0", "false", "no", "off"].includes(normalized)) {
-    return false;
-  }
-
-  throw new AppError(500, "ServerMisconfigured", "FILE_CACHE_ENABLED must be a boolean value");
-}
-
-function parseFileCacheTtlSeconds(value: string | undefined): number {
-  if (value === undefined || value.trim() === "") {
-    return MAX_FILE_CACHE_TTL_SECONDS;
-  }
-
-  const parsed = Number(value);
-
-  if (
-    !Number.isSafeInteger(parsed) ||
-    parsed <= 0 ||
-    parsed > MAX_FILE_CACHE_TTL_SECONDS
-  ) {
-    throw new AppError(
-      500,
-      "ServerMisconfigured",
-      `FILE_CACHE_TTL_SECONDS must be an integer between 1 and ${MAX_FILE_CACHE_TTL_SECONDS}`
-    );
-  }
-
-  return parsed;
 }
