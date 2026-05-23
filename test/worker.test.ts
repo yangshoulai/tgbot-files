@@ -237,6 +237,7 @@ describe("worker file access endpoint", () => {
     expect(await response.text()).toBe("hello");
     expect(response.headers.get("Content-Type")).toBe("text/plain");
     expect(response.headers.get("Content-Disposition")).toContain("hello.txt");
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=31536000, immutable");
     expect(response.headers.get("Content-Length")).toBe("5");
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(fetchCalls).toEqual([

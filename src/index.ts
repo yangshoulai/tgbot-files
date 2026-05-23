@@ -152,6 +152,7 @@ async function handleFileAccess(request: Request, env: Env): Promise<Response> {
 
   headers.set("Content-Type", payload.mime_type || telegramResponse.headers.get("Content-Type") || "application/octet-stream");
   headers.set("Content-Disposition", contentDispositionInline(payload.name));
+  headers.set("Cache-Control", "public, max-age=31536000, immutable");
 
   copyHeader(telegramResponse.headers, headers, "Content-Length");
   copyHeader(telegramResponse.headers, headers, "Content-Range");
