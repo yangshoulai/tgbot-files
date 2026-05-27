@@ -6,6 +6,13 @@
   "observability": {
     "enabled": true
   },
+  "d1_databases": [
+    {
+      "binding": "FILES_DB",
+      "database_name": "tgbot-files",
+      "database_id": "e7252d64-2d36-4876-b3bd-f60352bab6c6"
+    }
+  ],
   "vars": {
     "MAX_FILE_BYTES": "20971520",
     "PUBLIC_BASE_URL": "https://files.yangshoulai.xyz"

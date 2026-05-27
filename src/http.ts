@@ -24,6 +24,26 @@ export function jsonResponse(
   });
 }
 
+export function htmlResponse(body: string, status = 200, extraHeaders?: HeadersInit): Response {
+  return new Response(body, {
+    status,
+    headers: withSecurityHeaders({
+      "Content-Type": "text/html; charset=utf-8",
+      ...headersInitToObject(extraHeaders)
+    })
+  });
+}
+
+export function redirectResponse(location: string, status = 303, extraHeaders?: HeadersInit): Response {
+  return new Response(null, {
+    status,
+    headers: withSecurityHeaders({
+      Location: location,
+      ...headersInitToObject(extraHeaders)
+    })
+  });
+}
+
 export function errorResponse(error: AppError): Response {
   return jsonResponse(
     {
@@ -81,13 +101,21 @@ export function sanitizeFileName(input: string | undefined): string {
 }
 
 export function contentDispositionInline(fileName: string): string {
+  return contentDisposition("inline", fileName);
+}
+
+export function contentDispositionAttachment(fileName: string): string {
+  return contentDisposition("attachment", fileName);
+}
+
+function contentDisposition(disposition: "attachment" | "inline", fileName: string): string {
   const asciiFallback = fileName
     .replace(/["\\\r\n]/g, "_")
     .replace(/[^\x20-\x7E]/g, "_")
     .slice(0, 120) || "file";
   const encoded = encodeRFC5987ValueChars(fileName);
 
-  return `inline; filename="${asciiFallback}"; filename*=UTF-8''${encoded}`;
+  return `${disposition}; filename="${asciiFallback}"; filename*=UTF-8''${encoded}`;
 }
 
 export function normalizeBaseUrl(value: string): string {

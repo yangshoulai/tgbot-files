@@ -21,6 +21,17 @@ export async function createSignedToken(
   payload: FileTokenPayload,
   secret: string
 ): Promise<string> {
+  return createSignedPayload(payload, secret);
+}
+
+export async function verifySignedToken(
+  token: string,
+  secret: string
+): Promise<FileTokenPayload> {
+  return parsePayload(await verifySignedPayload(token, secret));
+}
+
+export async function createSignedPayload(payload: unknown, secret: string): Promise<string> {
   const payloadJson = JSON.stringify(payload);
   const payloadBytes = textEncoder.encode(payloadJson);
   const signature = await hmacSha256(secret, payloadBytes);
@@ -28,10 +39,7 @@ export async function createSignedToken(
   return `${base64UrlEncode(payloadBytes)}.${base64UrlEncode(signature)}`;
 }
 
-export async function verifySignedToken(
-  token: string,
-  secret: string
-): Promise<FileTokenPayload> {
+export async function verifySignedPayload(token: string, secret: string): Promise<unknown> {
   const [payloadPart, signaturePart, extraPart] = token.split(".");
 
   if (!payloadPart || !signaturePart || extraPart !== undefined) {
@@ -46,8 +54,11 @@ export async function verifySignedToken(
     throw new TokenError("Invalid token signature");
   }
 
-  const payload = parsePayload(payloadJson);
-  return payload;
+  try {
+    return JSON.parse(payloadJson) as unknown;
+  } catch {
+    throw new TokenError("Invalid token payload JSON");
+  }
 }
 
 export function constantTimeEqual(left: string, right: string): boolean {
@@ -113,15 +124,7 @@ export function base64UrlDecode(value: string): Uint8Array {
   return bytes;
 }
 
-function parsePayload(payloadJson: string): FileTokenPayload {
-  let parsed: unknown;
-
-  try {
-    parsed = JSON.parse(payloadJson);
-  } catch {
-    throw new TokenError("Invalid token payload JSON");
-  }
-
+function parsePayload(parsed: unknown): FileTokenPayload {
   if (!isRecord(parsed)) {
     throw new TokenError("Invalid token payload");
   }
