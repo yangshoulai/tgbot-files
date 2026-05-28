@@ -3,6 +3,14 @@
   "name": "tgbot-files",
   "main": "src/index.ts",
   "compatibility_date": "2026-05-16",
+  "assets": {
+    "directory": "../frontend/dist",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": [
+      "/api/*",
+      "/f/*"
+    ]
+  },
   "observability": {
     "enabled": true
   },

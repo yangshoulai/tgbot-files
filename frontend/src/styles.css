@@ -1,0 +1,161 @@
+@import "tailwindcss";
+
+@theme {
+  --color-background: oklch(99% 0.003 145);
+  --color-surface: oklch(100% 0 0);
+  --color-foreground: oklch(20% 0.014 230);
+  --color-muted: oklch(56% 0.012 230);
+  --color-subtle: oklch(72% 0.01 230);
+  --color-border: oklch(92% 0.006 230);
+  --color-border-strong: oklch(85% 0.01 230);
+
+  --color-primary: oklch(67% 0.16 158);
+  --color-primary-strong: oklch(59% 0.18 158);
+  --color-primary-soft: oklch(95.5% 0.04 158);
+  --color-primary-ring: oklch(67% 0.16 158 / 0.22);
+
+  --color-success: oklch(63% 0.15 158);
+  --color-success-soft: oklch(95.5% 0.04 158);
+  --color-danger: oklch(60% 0.21 25);
+  --color-danger-strong: oklch(53% 0.22 25);
+  --color-danger-soft: oklch(96% 0.04 25);
+  --color-warning: oklch(75% 0.14 75);
+  --color-warning-soft: oklch(96% 0.05 75);
+  --color-info: oklch(63% 0.14 255);
+  --color-info-soft: oklch(96% 0.03 255);
+
+  --shadow-card: 0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow-card-hover: 0 6px 18px rgba(15, 23, 42, 0.06);
+  --shadow-dialog: 0 24px 64px rgba(15, 23, 42, 0.12);
+
+  --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text",
+    "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "SF Mono", ui-monospace, Menlo, Monaco, Consolas, monospace;
+}
+
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+  }
+
+  html,
+  body {
+    @apply m-0 min-h-dvh bg-background font-sans text-[15px] leading-[1.55] text-foreground antialiased;
+  }
+
+  body {
+    min-width: 320px;
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+    color: inherit;
+  }
+
+  button {
+    @apply cursor-pointer;
+  }
+
+  button:disabled {
+    @apply pointer-events-none opacity-50;
+  }
+
+  a {
+    @apply text-inherit no-underline;
+  }
+
+  img,
+  svg {
+    @apply block max-w-full;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  p,
+  figure {
+    @apply m-0;
+  }
+
+  ::selection {
+    @apply bg-primary/20 text-foreground;
+  }
+
+  /* Hide default scrollbars for a cleaner look on overlay scrollers */
+  .scroll-thin::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  .scroll-thin::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-border-strong;
+  }
+
+  .scroll-thin::-webkit-scrollbar-thumb:hover {
+    @apply bg-subtle;
+  }
+}
+
+@utility overflow-anywhere {
+  overflow-wrap: anywhere;
+}
+
+@utility focus-ring {
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px var(--color-primary-ring);
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes dialog-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@utility animate-fade-in {
+  animation: fade-in 160ms ease-out both;
+}
+
+@utility animate-dialog-in {
+  animation: dialog-in 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@utility animate-toast-in {
+  animation: toast-in 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}

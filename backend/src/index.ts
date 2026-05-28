@@ -5,21 +5,29 @@ import {
   requireAdminSession,
   validateAdminCredentials
 } from "./admin-auth";
-import { renderAdminPage, renderLoginPage } from "./admin-ui";
-import { constantTimeEqual, createSignedToken, TokenError, verifySignedToken } from "./crypto";
+import { createSignedToken, TokenError, verifySignedToken } from "./crypto";
 import {
+  findActiveApiKeyRecord,
+  getApiKeyRecord,
+  insertApiKeyRecord,
   insertFileRecord,
+  listApiKeyRecords,
   listFileRecords,
   requireDb,
+  softDeleteApiKeyRecord,
   softDeleteFileRecord,
-  type FileRecord
+  touchApiKeyRecord,
+  updateApiKeyRecord,
+  type ApiKeyRecord,
+  type ApiKeyStatus,
+  type FileRecord,
+  type FileTypeFilter
 } from "./database";
 import {
   AppError,
   contentDispositionAttachment,
   contentDispositionInline,
   errorResponse,
-  htmlResponse,
   jsonResponse,
   normalizeBaseUrl,
   parseMaxFileBytes,
@@ -34,7 +42,6 @@ import { fetchTelegramFile, getTelegramFileUrl, uploadDocumentToTelegram } from 
 export interface Env {
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_STORAGE_CHAT_ID: string;
-  UPLOAD_API_KEY: string;
   LINK_SIGNING_SECRET: string;
   FILES_DB?: D1Database;
   ADMIN_USERNAME?: string;
@@ -54,6 +61,7 @@ interface UploadResult {
   publicUrl: string;
   telegramFileId: string;
   telegramFileUniqueId?: string;
+  remark?: string;
   createdAt: string;
 }
 
@@ -97,24 +105,6 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
     });
   }
 
-  if (request.method === "GET" && url.pathname === "/login") {
-    const username = await getAdminSession(request, env);
-    if (username) {
-      return redirectResponse("/admin", 302);
-    }
-
-    return htmlResponse(renderLoginPage({ hasError: url.searchParams.has("error") }));
-  }
-
-  if (request.method === "GET" && url.pathname === "/admin") {
-    const username = await getAdminSession(request, env);
-    if (!username) {
-      return redirectResponse("/login", 302);
-    }
-
-    return htmlResponse(renderAdminPage({ maxFileBytes: parseMaxFileBytes(env.MAX_FILE_BYTES), username }));
-  }
-
   if (request.method === "POST" && url.pathname === "/api/admin/login") {
     return handleAdminLogin(request, env);
   }
@@ -123,8 +113,16 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
     return handleAdminLogout(request, env);
   }
 
+  if (request.method === "GET" && url.pathname === "/api/admin/session") {
+    return handleAdminSession(request, env);
+  }
+
   if (url.pathname === "/api/admin/files" || url.pathname.startsWith("/api/admin/files/")) {
     return handleAdminFiles(request, env);
+  }
+
+  if (url.pathname === "/api/admin/api-keys" || url.pathname.startsWith("/api/admin/api-keys/")) {
+    return handleAdminApiKeys(request, env);
   }
 
   if (request.method === "POST" && url.pathname === "/api/v1/files") {
@@ -139,14 +137,15 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
 }
 
 async function handleUpload(request: Request, env: Env): Promise<Response> {
-  requireBearerAuth(request, requireEnv(env, "UPLOAD_API_KEY"));
+  const db = requireDb(env);
+  await requireUploadApiKey(request, db);
 
-  const formFile = await readUploadFile(request, env);
+  const { file } = await readUploadForm(request, env);
   const result = await uploadAndRecordFile({
     request,
     env,
-    file: formFile,
-    ...(env.FILES_DB ? { db: env.FILES_DB } : {})
+    file,
+    db
   });
 
   return jsonResponse({
@@ -193,6 +192,41 @@ async function handleAdminLogout(request: Request, env: Env): Promise<Response> 
   );
 }
 
+async function handleAdminSession(request: Request, env: Env): Promise<Response> {
+  const username = await requireAdminSession(request, env);
+  const maxFileBytes = parseMaxFileBytes(env.MAX_FILE_BYTES);
+  const baseUrl = getPublicBaseUrl(request, env);
+
+  return jsonResponse({
+    ok: true,
+    username,
+    max_file_bytes: maxFileBytes,
+    base_url: baseUrl,
+    config: {
+      files_db: Boolean(env.FILES_DB),
+      telegram_bot_token: hasEnvValue(env.TELEGRAM_BOT_TOKEN),
+      telegram_storage_chat_id: hasEnvValue(env.TELEGRAM_STORAGE_CHAT_ID),
+      link_signing_secret: hasEnvValue(env.LINK_SIGNING_SECRET),
+      admin_username: hasEnvValue(env.ADMIN_USERNAME),
+      admin_password: hasEnvValue(env.ADMIN_PASSWORD),
+      admin_session_secret: hasEnvValue(env.ADMIN_SESSION_SECRET)
+    },
+    config_values: {
+      files_db: env.FILES_DB ? "已绑定" : "未绑定",
+      telegram_bot_token: maskSecret(env.TELEGRAM_BOT_TOKEN),
+      telegram_storage_chat_id: env.TELEGRAM_STORAGE_CHAT_ID?.trim() || "未配置",
+      link_signing_secret: maskSecret(env.LINK_SIGNING_SECRET),
+      admin_username: env.ADMIN_USERNAME?.trim() || "未配置",
+      admin_password: maskSecret(env.ADMIN_PASSWORD),
+      admin_session_secret: env.ADMIN_SESSION_SECRET?.trim()
+        ? maskSecret(env.ADMIN_SESSION_SECRET)
+        : "未单独配置，使用签名密钥",
+      public_base_url: baseUrl,
+      max_file_bytes: String(maxFileBytes)
+    }
+  });
+}
+
 async function handleAdminFiles(request: Request, env: Env): Promise<Response> {
   const username = await requireAdminSession(request, env);
   const db = requireDb(env);
@@ -201,9 +235,15 @@ async function handleAdminFiles(request: Request, env: Env): Promise<Response> {
   if (request.method === "GET" && url.pathname === "/api/admin/files") {
     const page = parsePositiveInteger(url.searchParams.get("page"), 1, 1, 100000);
     const limit = parsePositiveInteger(url.searchParams.get("limit"), 24, 1, 100);
+    const type = normalizeFileTypeFilter(url.searchParams.get("type"));
+    const createdFrom = normalizeDateTimeParam(url.searchParams.get("created_from"), "created_from");
+    const createdTo = normalizeDateTimeParam(url.searchParams.get("created_to"), "created_to");
     const result = await listFileRecords({
       db,
       query: url.searchParams.get("q") || "",
+      ...(type ? { type } : {}),
+      ...(createdFrom ? { createdFrom } : {}),
+      ...(createdTo ? { createdTo } : {}),
       page,
       limit
     });
@@ -224,13 +264,14 @@ async function handleAdminFiles(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === "POST" && url.pathname === "/api/admin/files") {
-    const formFile = await readUploadFile(request, env);
+    const { file: formFile, remark } = await readUploadForm(request, env);
     const result = await uploadAndRecordFile({
       request,
       env,
       file: formFile,
       db,
-      uploadedBy: username
+      uploadedBy: username,
+      ...(remark ? { remark } : {})
     });
 
     return jsonResponse({
@@ -244,6 +285,7 @@ async function handleAdminFiles(request: Request, env: Env): Promise<Response> {
         telegram_file_id: result.telegramFileId,
         telegram_file_unique_id: result.telegramFileUniqueId ?? null,
         file_path: result.filePath,
+        remark: result.remark ?? null,
         url: result.publicUrl,
         download_url: appendDownloadParam(result.publicUrl),
         uploaded_by: username,
@@ -266,7 +308,84 @@ async function handleAdminFiles(request: Request, env: Env): Promise<Response> {
   return errorResponse(new AppError(404, "NotFound", "Admin file route not found"));
 }
 
-async function readUploadFile(request: Request, env: Env): Promise<File> {
+async function handleAdminApiKeys(request: Request, env: Env): Promise<Response> {
+  await requireAdminSession(request, env);
+  const db = requireDb(env);
+  const url = new URL(request.url);
+
+  if (request.method === "GET" && url.pathname === "/api/admin/api-keys") {
+    const records = await listApiKeyRecords(db);
+
+    return jsonResponse({
+      ok: true,
+      api_keys: records.map((record) => serializeApiKeyRecord(record, false))
+    });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/admin/api-keys") {
+    const body = await readJsonObject(request);
+    const name = normalizeName(body.name, "API key name");
+    const createdAt = new Date().toISOString();
+    const record = await insertApiKeyRecord(db, {
+      id: crypto.randomUUID(),
+      name,
+      key: generateApiKey(),
+      createdAt
+    });
+
+    return jsonResponse({ ok: true, api_key: serializeApiKeyRecord(record, true) }, 201);
+  }
+
+  const match = /^\/api\/admin\/api-keys\/([^/]+)$/.exec(url.pathname);
+  const id = match?.[1] ? decodeURIComponent(match[1]) : "";
+
+  if (!id) {
+    return errorResponse(new AppError(404, "NotFound", "Admin API key route not found"));
+  }
+
+  if (request.method === "GET") {
+    const record = await getApiKeyRecord(db, id);
+
+    if (!record) {
+      throw new AppError(404, "NotFound", "API key not found");
+    }
+
+    return jsonResponse({ ok: true, api_key: serializeApiKeyRecord(record, true) });
+  }
+
+  if (request.method === "PATCH") {
+    const body = await readJsonObject(request);
+    const name = body.name === undefined ? undefined : normalizeName(body.name, "API key name");
+    const status = body.status === undefined ? undefined : normalizeApiKeyStatus(body.status);
+    const record = await updateApiKeyRecord({
+      db,
+      id,
+      updatedAt: new Date().toISOString(),
+      ...(name ? { name } : {}),
+      ...(status ? { status } : {})
+    });
+
+    if (!record) {
+      throw new AppError(404, "NotFound", "API key not found");
+    }
+
+    return jsonResponse({ ok: true, api_key: serializeApiKeyRecord(record, false) });
+  }
+
+  if (request.method === "DELETE") {
+    const deleted = await softDeleteApiKeyRecord(db, id, new Date().toISOString());
+
+    if (!deleted) {
+      throw new AppError(404, "NotFound", "API key not found");
+    }
+
+    return jsonResponse({ ok: true });
+  }
+
+  return errorResponse(new AppError(405, "MethodNotAllowed", "Unsupported API key method"));
+}
+
+async function readUploadForm(request: Request, env: Env): Promise<{ file: File; remark?: string }> {
   const contentType = request.headers.get("Content-Type") || "";
   if (!contentType.toLowerCase().includes("multipart/form-data")) {
     throw new AppError(400, "InvalidContentType", "Upload request must use multipart/form-data");
@@ -291,7 +410,12 @@ async function readUploadFile(request: Request, env: Env): Promise<File> {
     });
   }
 
-  return formFile;
+  const remark = normalizeRemark(formData.get("remark"));
+
+  return {
+    file: formFile,
+    ...(remark ? { remark } : {})
+  };
 }
 
 async function uploadAndRecordFile(params: {
@@ -300,6 +424,7 @@ async function uploadAndRecordFile(params: {
   file: File;
   db?: D1Database;
   uploadedBy?: string;
+  remark?: string;
 }): Promise<UploadResult> {
   const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
   const chatId = requireEnv(params.env, "TELEGRAM_STORAGE_CHAT_ID");
@@ -345,6 +470,7 @@ async function uploadAndRecordFile(params: {
       telegramFileId: telegramDocument.file_id,
       filePath,
       createdAt,
+      ...(params.remark ? { remark: params.remark } : {}),
       ...(telegramDocument.file_unique_id ? { telegramFileUniqueId: telegramDocument.file_unique_id } : {}),
       ...(params.uploadedBy ? { uploadedBy: params.uploadedBy } : {})
     });
@@ -360,6 +486,7 @@ async function uploadAndRecordFile(params: {
     publicUrl,
     telegramFileId: telegramDocument.file_id,
     ...(telegramDocument.file_unique_id ? { telegramFileUniqueId: telegramDocument.file_unique_id } : {}),
+    ...(params.remark ? { remark: params.remark } : {}),
     createdAt
   };
 }
@@ -397,13 +524,21 @@ async function handleFileAccess(request: Request, env: Env): Promise<Response> {
   });
 }
 
-function requireBearerAuth(request: Request, expectedApiKey: string): void {
+async function requireUploadApiKey(request: Request, db: D1Database): Promise<void> {
   const authorization = request.headers.get("Authorization") || "";
   const [scheme, token, extra] = authorization.split(/\s+/);
 
-  if (scheme !== "Bearer" || !token || extra !== undefined || !constantTimeEqual(token, expectedApiKey)) {
+  if (scheme !== "Bearer" || !token || extra !== undefined) {
     throw new AppError(401, "Unauthorized", "Missing or invalid bearer token");
   }
+
+  const apiKey = await findActiveApiKeyRecord(db, token);
+
+  if (!apiKey) {
+    throw new AppError(401, "Unauthorized", "Missing or invalid bearer token");
+  }
+
+  await touchApiKeyRecord(db, apiKey.id, new Date().toISOString());
 }
 
 async function readLoginCredentials(request: Request): Promise<{ username: string; password: string }> {
@@ -448,12 +583,142 @@ function serializeFileRecord(file: FileRecord, baseUrl: string): Record<string, 
   };
 }
 
+function serializeApiKeyRecord(record: ApiKeyRecord, includeKey: boolean): Record<string, unknown> {
+  return {
+    id: record.id,
+    name: record.name,
+    status: record.status,
+    masked_key: maskApiKey(record.key),
+    ...(includeKey ? { key: record.key } : {}),
+    created_at: record.created_at,
+    updated_at: record.updated_at,
+    last_used_at: record.last_used_at
+  };
+}
+
+function maskApiKey(key: string): string {
+  if (key.length <= 12) {
+    return `${key.slice(0, 3)}••••${key.slice(-2)}`;
+  }
+
+  return `${key.slice(0, 8)}••••••••${key.slice(-4)}`;
+}
+
+function generateApiKey(): string {
+  const left = crypto.randomUUID().replace(/-/g, "");
+  const right = crypto.randomUUID().replace(/-/g, "");
+
+  return `tgf_${left}${right.slice(0, 16)}`;
+}
+
+async function readJsonObject(request: Request): Promise<Record<string, unknown>> {
+  const contentType = request.headers.get("Content-Type") || "";
+
+  if (!contentType.toLowerCase().includes("application/json")) {
+    throw new AppError(400, "InvalidContentType", "Request must use application/json");
+  }
+
+  const body = await request.json();
+
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new AppError(400, "InvalidBody", "Request body must be a JSON object");
+  }
+
+  return body as Record<string, unknown>;
+}
+
+function normalizeName(value: unknown, fieldName: string): string {
+  if (typeof value !== "string") {
+    throw new AppError(400, "InvalidBody", `${fieldName} is required`);
+  }
+
+  const normalized = value.trim();
+
+  if (normalized.length === 0 || normalized.length > 80) {
+    throw new AppError(400, "InvalidBody", `${fieldName} must be 1-80 characters`);
+  }
+
+  return normalized;
+}
+
+function normalizeApiKeyStatus(value: unknown): ApiKeyStatus {
+  if (value === "active" || value === "disabled") {
+    return value;
+  }
+
+  throw new AppError(400, "InvalidBody", "API key status must be active or disabled");
+}
+
+function normalizeRemark(value: FormDataEntryValue | null): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const normalized = value.trim();
+
+  if (!normalized) {
+    return undefined;
+  }
+
+  return normalized.slice(0, 1000);
+}
+
 function appendDownloadParam(url: string): string {
   return `${url}${url.includes("?") ? "&" : "?"}download=1`;
 }
 
 function getPublicBaseUrl(request: Request, env: Env): string {
   return normalizeBaseUrl(env.PUBLIC_BASE_URL || new URL(request.url).origin);
+}
+
+function hasEnvValue(value: string | undefined): boolean {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function normalizeFileTypeFilter(value: string | null): FileTypeFilter | undefined {
+  if (!value || value === "all") {
+    return undefined;
+  }
+
+  if (
+    value === "image" ||
+    value === "text" ||
+    value === "pdf" ||
+    value === "archive" ||
+    value === "other"
+  ) {
+    return value;
+  }
+
+  throw new AppError(400, "InvalidQuery", "File type filter is invalid");
+}
+
+function normalizeDateTimeParam(value: string | null, fieldName: string): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    throw new AppError(400, "InvalidQuery", `${fieldName} must be a valid date time`);
+  }
+
+  return date.toISOString();
+}
+
+function maskSecret(value: string | undefined): string {
+  const normalized = value?.trim();
+
+  if (!normalized) {
+    return "未配置";
+  }
+
+  if (normalized.length <= 8) {
+    return "••••";
+  }
+
+  return `${normalized.slice(0, 4)}••••${normalized.slice(-4)}`;
 }
 
 function parsePositiveInteger(value: string | null, fallback: number, min: number, max: number): number {

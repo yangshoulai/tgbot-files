@@ -1,6 +1,5 @@
 TELEGRAM_BOT_TOKEN="123456789:replace-with-your-bot-token"
 TELEGRAM_STORAGE_CHAT_ID="-1001234567890"
-UPLOAD_API_KEY="replace-with-a-long-random-upload-api-key"
 LINK_SIGNING_SECRET="replace-with-a-long-random-link-signing-secret"
 ADMIN_USERNAME="admin"
 ADMIN_PASSWORD="replace-with-a-long-random-admin-password"

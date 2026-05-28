@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS files (
   telegram_file_id TEXT NOT NULL,
   telegram_file_unique_id TEXT,
   file_path TEXT NOT NULL,
+  remark TEXT,
   uploaded_by TEXT,
   created_at TEXT NOT NULL,
   deleted_at TEXT

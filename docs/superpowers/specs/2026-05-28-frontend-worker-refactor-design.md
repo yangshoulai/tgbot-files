@@ -6,8 +6,8 @@
 
 当前项目是单个 Cloudflare Worker：
 
-- `src/index.ts` 同时承载 API 路由、文件代理和管理员页面路由。
-- `src/admin-ui.ts` 以内嵌 HTML/CSS/JS 的方式输出登录页和文件管理页。
+- `backend/src/index.ts` 承载 API 路由和文件代理。
+- 原 `src/admin-ui.ts` 以内嵌 HTML/CSS/JS 的方式输出登录页和文件管理页，重构后删除。
 - `POST /api/v1/files` 已在生产使用，用于上传文件到 Telegram 并写入 D1 元数据。
 - `GET /f/:token/:filename?` 已在生产使用，用于通过签名链接代理下载文件。
 - 生产数据库的 `files` 表已有 `remark TEXT NULL` 字段，用于保存文件备注。
@@ -58,7 +58,7 @@
 - 管理员上传文件时可提交 `remark`。
 - 文件列表和详情返回 `remark`。
 - 搜索支持匹配 `remark`。
-- 初始建表脚本 `migrations/0001_create_files.sql` 补全 `remark TEXT`，用于新环境初始化。
+- 初始建表脚本 `backend/migrations/0001_create_files.sql` 补全 `remark TEXT`，用于新环境初始化。
 - 生产环境不依赖重新执行 `0001`。
 
 ## 范围
@@ -101,21 +101,22 @@ tgbot-files/
     package.json
     tsconfig.json
     vite.config.ts
-  src/
-    index.ts
-    admin-auth.ts
-    database.ts
-    telegram.ts
-    http.ts
-    crypto.ts
-    md5.ts
-  migrations/
-    0001_create_files.sql
-    0002_create_api_keys.sql
-  test/
+  backend/
+    src/
+      index.ts
+      admin-auth.ts
+      database.ts
+      telegram.ts
+      http.ts
+      crypto.ts
+      md5.ts
+    migrations/
+      0001_create_files.sql
+      0002_create_api_keys.sql
+    test/
 ```
 
-根目录继续作为主 pnpm workspace，可根据实现需要增加 `pnpm-workspace.yaml`，使根项目和 `frontend/` 能统一安装、构建和测试。
+根目录继续作为 pnpm workspace，`backend/` 和 `frontend/` 分别是独立包，根目录只负责统一安装、构建和测试编排。
 
 ### 路由边界
 
