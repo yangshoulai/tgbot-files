@@ -3,6 +3,9 @@
   "name": "tgbot-files",
   "main": "backend/src/index.ts",
   "compatibility_date": "2026-05-16",
+  "build": {
+    "command": "pnpm build:frontend"
+  },
   "assets": {
     "directory": "frontend/dist",
     "not_found_handling": "single-page-application",
