@@ -474,6 +474,47 @@ describe("worker upload endpoint", () => {
     expect(body.mime_type).toBe("image/webp");
   });
 
+  it("sniffs WebP MIME type from file bytes when upload headers are octet-stream", async () => {
+    const db = new FakeD1();
+    addApiKey(db);
+    const webpBytes = new Uint8Array([
+      0x52, 0x49, 0x46, 0x46,
+      0x02, 0x00, 0x00, 0x00,
+      0x57, 0x45, 0x42, 0x50
+    ]);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse({
+          ok: true,
+          result: {
+            document: {
+              file_id: "tg-webp-file-id",
+              file_unique_id: "tg-webp-unique-id",
+              file_name: "tiny.webp",
+              mime_type: "application/octet-stream",
+              file_size: webpBytes.byteLength
+            }
+          }
+        })
+      )
+    );
+
+    const response = await worker.fetch(
+      uploadRequest({ file: new File([webpBytes], "tiny.webp", { type: "application/octet-stream" }) }),
+      envWithDb(db)
+    );
+    const body = await response.json() as {
+      ok: boolean;
+      mime_type: string;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.mime_type).toBe("image/webp");
+    expect(db.files[0]?.mime_type).toBe("image/webp");
+  });
+
   it("surfaces Telegram upload errors", async () => {
     const db = new FakeD1();
     addApiKey(db);

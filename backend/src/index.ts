@@ -37,6 +37,7 @@ import {
   withSecurityHeaders
 } from "./http";
 import { md5Hex } from "./md5";
+import { resolveStoredMimeType } from "./mime";
 import { fetchTelegramFile, getTelegramFileUrl, uploadDocumentToTelegram } from "./telegram";
 
 export interface Env {
@@ -430,16 +431,28 @@ async function uploadAndRecordFile(params: {
   const chatId = requireEnv(params.env, "TELEGRAM_STORAGE_CHAT_ID");
   const signingSecret = requireEnv(params.env, "LINK_SIGNING_SECRET");
   const fileName = sanitizeFileName(params.file.name);
-  const md5 = md5Hex(await params.file.arrayBuffer());
+  const fileBytes = await params.file.arrayBuffer();
+  const md5 = md5Hex(fileBytes);
+  const uploadMimeType = resolveStoredMimeType({
+    bytes: fileBytes,
+    fileType: params.file.type
+  });
+  const uploadFile = uploadMimeType === params.file.type
+    ? params.file
+    : new File([fileBytes], fileName, { type: uploadMimeType });
 
   const telegramDocument = await uploadDocumentToTelegram({
     botToken,
     chatId,
-    file: params.file,
+    file: uploadFile,
     fileName
   });
   const storedName = telegramDocument.file_name ? sanitizeFileName(telegramDocument.file_name) : fileName;
-  const mimeType = telegramDocument.mime_type || params.file.type || "application/octet-stream";
+  const mimeType = resolveStoredMimeType({
+    bytes: fileBytes,
+    fileType: params.file.type,
+    telegramMimeType: telegramDocument.mime_type
+  });
   const fileSize = telegramDocument.file_size ?? params.file.size;
   const createdAt = new Date().toISOString();
   const token = await createSignedToken(
