@@ -107,7 +107,7 @@ export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
       <div
         className={
           fullscreen
-            ? "grid min-h-0 w-full flex-1 place-items-center overflow-hidden rounded-xl border border-border bg-surface"
+            ? "flex min-h-0 w-full flex-1 items-center justify-center overflow-hidden rounded-xl border border-border bg-surface"
             : "grid min-h-72 place-items-center overflow-hidden rounded-xl border border-border bg-surface"
         }
       >
@@ -115,7 +115,7 @@ export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
           <img
             src={file.file_path}
             alt={file.file_name}
-            className={fullscreen ? "h-full max-h-full w-full max-w-full object-contain" : "h-[60vh] w-full object-contain"}
+            className={fullscreen ? "block h-auto max-h-full w-auto max-w-full object-contain" : "h-[60vh] w-full object-contain"}
             loading="lazy"
           />
         ) : preview === "text" ? (
