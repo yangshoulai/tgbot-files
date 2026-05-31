@@ -2,6 +2,7 @@ import {
   createAdminSessionCookie,
   createExpiredAdminSessionCookie,
   requireAdminSession,
+  requireAdminSessionInfo,
   validateAdminCredentials
 } from "./admin-auth";
 import { createSignedToken, TokenError, verifySignedToken } from "./crypto";
@@ -176,7 +177,8 @@ async function handleAdminLogin(request: Request, env: Env): Promise<Response> {
   const cookie = await createAdminSessionCookie({
     env,
     requestUrl: request.url,
-    username: credentials.username
+    username: credentials.username,
+    persistent: credentials.rememberMe
   });
 
   if (isFormRequest) {
@@ -201,8 +203,8 @@ async function handleAuthenticatedAdminRequest(
   env: Env,
   handler: (username: string) => Promise<Response>
 ): Promise<Response> {
-  const username = await requireAdminSession(request, env);
-  const response = await handler(username);
+  const session = await requireAdminSessionInfo(request, env);
+  const response = await handler(session.username);
 
   if (!response.ok) {
     return response;
@@ -211,7 +213,8 @@ async function handleAuthenticatedAdminRequest(
   const cookie = await createAdminSessionCookie({
     env,
     requestUrl: request.url,
-    username
+    username: session.username,
+    persistent: session.persistent
   });
   const headers = new Headers(response.headers);
   headers.set("Set-Cookie", cookie);
@@ -581,15 +584,16 @@ async function requireUploadApiKey(request: Request, db: D1Database): Promise<vo
   await touchApiKeyRecord(db, apiKey.id, new Date().toISOString());
 }
 
-async function readLoginCredentials(request: Request): Promise<{ username: string; password: string }> {
+async function readLoginCredentials(request: Request): Promise<{ username: string; password: string; rememberMe: boolean }> {
   const contentType = request.headers.get("Content-Type") || "";
 
   if (contentType.toLowerCase().includes("application/json")) {
-    const body = await request.json() as Partial<{ username: unknown; password: unknown }>;
+    const body = await request.json() as Partial<{ username: unknown; password: unknown; remember_me: unknown }>;
 
     return {
       username: typeof body.username === "string" ? body.username : "",
-      password: typeof body.password === "string" ? body.password : ""
+      password: typeof body.password === "string" ? body.password : "",
+      rememberMe: body.remember_me !== false
     };
   }
 
@@ -597,10 +601,12 @@ async function readLoginCredentials(request: Request): Promise<{ username: strin
     const formData = await request.formData();
     const username = formData.get("username");
     const password = formData.get("password");
+    const rememberMe = formData.get("remember_me");
 
     return {
       username: typeof username === "string" ? username : "",
-      password: typeof password === "string" ? password : ""
+      password: typeof password === "string" ? password : "",
+      rememberMe: rememberMe !== "0" && rememberMe !== "false"
     };
   }
 

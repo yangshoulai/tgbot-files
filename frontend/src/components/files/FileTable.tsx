@@ -52,7 +52,6 @@ export function FileTable({
               </th>
               <th className="px-4 py-3 text-left font-medium text-muted">文件</th>
               <th className="hidden px-4 py-3 text-left font-medium text-muted lg:table-cell">大小</th>
-              <th className="hidden px-4 py-3 text-left font-medium text-muted xl:table-cell">备注</th>
               <th className="hidden px-4 py-3 text-left font-medium text-muted md:table-cell">上传时间</th>
               <th className="px-4 py-3 text-right font-medium text-muted">操作</th>
             </tr>
@@ -88,9 +87,6 @@ export function FileTable({
                 </td>
                 <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-foreground lg:table-cell">
                   {formatBytes(file.size)}
-                </td>
-                <td className="hidden max-w-[260px] truncate px-4 py-3 align-middle text-sm text-muted xl:table-cell">
-                  {file.remark || <span className="text-subtle">—</span>}
                 </td>
                 <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted md:table-cell">
                   {formatDateTime(file.created_at)}

@@ -9,12 +9,19 @@ interface AdminSessionPayload {
   username: string;
   iat: number;
   exp: number;
+  persistent?: boolean;
+}
+
+export interface AdminSession {
+  username: string;
+  persistent: boolean;
 }
 
 export async function createAdminSessionCookie(params: {
   env: AdminEnv;
   requestUrl: string;
   username: string;
+  persistent: boolean;
 }): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   const token = await createSignedPayload(
@@ -22,13 +29,15 @@ export async function createAdminSessionCookie(params: {
       v: 1,
       username: params.username,
       iat: now,
-      exp: now + sessionMaxAgeSeconds
+      exp: now + sessionMaxAgeSeconds,
+      persistent: params.persistent
     } satisfies AdminSessionPayload,
     getAdminSessionSecret(params.env)
   );
   const secure = new URL(params.requestUrl).protocol === "https:" ? "; Secure" : "";
+  const maxAge = params.persistent ? `; Max-Age=${sessionMaxAgeSeconds}` : "";
 
-  return `${sessionCookieName}=${token}; Path=/; Max-Age=${sessionMaxAgeSeconds}; HttpOnly; SameSite=Strict${secure}`;
+  return `${sessionCookieName}=${token}; Path=/${maxAge}; HttpOnly; SameSite=Strict${secure}`;
 }
 
 export function createExpiredAdminSessionCookie(requestUrl: string): string {
@@ -38,16 +47,30 @@ export function createExpiredAdminSessionCookie(requestUrl: string): string {
 }
 
 export async function requireAdminSession(request: Request, env: AdminEnv): Promise<string> {
-  const username = await getAdminSession(request, env);
+  const session = await getAdminSessionInfo(request, env);
 
-  if (!username) {
+  if (!session) {
     throw new AppError(401, "Unauthorized", "Missing or invalid admin session");
   }
 
-  return username;
+  return session.username;
+}
+
+export async function requireAdminSessionInfo(request: Request, env: AdminEnv): Promise<AdminSession> {
+  const session = await getAdminSessionInfo(request, env);
+
+  if (!session) {
+    throw new AppError(401, "Unauthorized", "Missing or invalid admin session");
+  }
+
+  return session;
 }
 
 export async function getAdminSession(request: Request, env: AdminEnv): Promise<string | null> {
+  return (await getAdminSessionInfo(request, env))?.username ?? null;
+}
+
+async function getAdminSessionInfo(request: Request, env: AdminEnv): Promise<AdminSession | null> {
   const token = readCookie(request.headers.get("Cookie"), sessionCookieName);
 
   if (!token) {
@@ -70,7 +93,10 @@ export async function getAdminSession(request: Request, env: AdminEnv): Promise<
       return null;
     }
 
-    return payload.username;
+    return {
+      username: payload.username,
+      persistent: payload.persistent ?? true
+    };
   } catch (error) {
     if (error instanceof TokenError) {
       return null;
@@ -128,7 +154,8 @@ function isAdminSessionPayload(value: unknown): value is AdminSessionPayload {
     payload.iat > 0 &&
     typeof payload.exp === "number" &&
     Number.isSafeInteger(payload.exp) &&
-    payload.exp > payload.iat
+    payload.exp > payload.iat &&
+    (payload.persistent === undefined || typeof payload.persistent === "boolean")
   );
 }
 

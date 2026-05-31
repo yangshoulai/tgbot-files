@@ -806,6 +806,42 @@ describe("admin file manager", () => {
     expect(response.headers.get("Set-Cookie")).toContain("Max-Age=2592000");
   });
 
+  it("sets a browser session cookie when remember me is disabled", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "admin", password: "secret", remember_me: false })
+      }),
+      adminEnv
+    );
+    const cookie = response.headers.get("Set-Cookie");
+
+    expect(response.status).toBe(200);
+    expect(cookie).toContain("tgbot_admin=");
+    expect(cookie).not.toContain("Max-Age");
+
+    const sessionResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/session", {
+        headers: { Cookie: cookie || "" }
+      }),
+      adminEnv
+    );
+    const refreshedCookie = sessionResponse.headers.get("Set-Cookie");
+
+    expect(sessionResponse.status).toBe(200);
+    expect(refreshedCookie).toContain("tgbot_admin=");
+    expect(refreshedCookie).not.toContain("Max-Age");
+  });
+
   it("refreshes an admin session cookie after a valid protected request", async () => {
     const db = new FakeD1();
     const adminEnv: Env = {

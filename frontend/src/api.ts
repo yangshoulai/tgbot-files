@@ -134,13 +134,13 @@ export function getSession() {
   return requestJson<SessionResponse>("/api/admin/session");
 }
 
-export function login(username: string, password: string) {
+export function login(username: string, password: string, rememberMe: boolean) {
   return requestJson<LoginResponse>("/api/admin/login", {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
     },
-    body: JSON.stringify({ username, password })
+    body: JSON.stringify({ username, password, remember_me: rememberMe })
   });
 }
 

@@ -17,6 +17,7 @@ function errorMessage(error: unknown): string {
 export function LoginPage({ onLoggedIn }: LoginPageProps) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [rememberMe, setRememberMe] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const toast = useToast();
 
@@ -28,7 +29,7 @@ export function LoginPage({ onLoggedIn }: LoginPageProps) {
     }
     setSubmitting(true);
     try {
-      await login(username, password);
+      await login(username, password, rememberMe);
       onLoggedIn();
     } catch (error) {
       toast.danger(errorMessage(error));
@@ -84,12 +85,25 @@ export function LoginPage({ onLoggedIn }: LoginPageProps) {
             />
           </div>
 
+          <label className="flex items-start gap-2 text-sm text-muted">
+            <input
+              type="checkbox"
+              checked={rememberMe}
+              onChange={(event) => setRememberMe(event.target.checked)}
+              className="mt-0.5 size-4 rounded border-border text-primary accent-primary focus-visible:outline-none focus-visible:focus-ring"
+            />
+            <span>
+              记住我
+              <span className="block text-[11px] text-subtle">勾选后保留 30 天；取消勾选则关闭浏览器后失效。</span>
+            </span>
+          </label>
+
           <Button type="submit" variant="primary" size="lg" block loading={submitting} leadingIcon={<LogIn size={16} />}>
             进入控制台
           </Button>
 
           <p className="text-center text-[11px] text-subtle">
-            登录后会话保持 30 天；有效访问会自动续期。
+            有效访问会按当前选择自动续期。
           </p>
         </form>
       </div>
