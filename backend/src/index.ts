@@ -329,7 +329,6 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
       db,
       query: normalizedQuery,
       directoryPath,
-      recursive: normalizedQuery.trim().length > 0,
       ...(type ? { type } : {}),
       ...(createdFrom ? { createdFrom } : {}),
       ...(createdTo ? { createdTo } : {}),
@@ -344,7 +343,7 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
       ok: true,
       current_directory: serializeCurrentDirectory(currentDirectory, directoryPath),
       directories: directories.map(serializeDirectoryRecord),
-      search_scope: normalizedQuery.trim() ? "subtree" : "current",
+      search_scope: "current",
       files,
       pagination: {
         page,

@@ -421,7 +421,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
           ))}
           {query.trim() ? (
             <span className="ml-auto rounded-full bg-primary-soft px-2 py-1 text-xs font-medium text-primary-strong">
-              当前目录及子目录内搜索
+              当前目录内搜索
             </span>
           ) : null}
         </div>

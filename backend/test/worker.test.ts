@@ -1751,7 +1751,7 @@ describe("admin file manager", () => {
     expect(dateBody.files[0]?.id).toBe("file-text");
   });
 
-  it("creates virtual directories, moves files, searches subtrees, and recursive deletes", async () => {
+  it("creates virtual directories, moves files, searches current directory, and recursive deletes", async () => {
     const db = new FakeD1();
     const adminEnv: Env = {
       ...env,
@@ -1834,18 +1834,31 @@ describe("admin file manager", () => {
     expect(rootListBody.files.map((item) => item.id)).toEqual(["file-root"]);
     expect(rootListBody.pagination.total).toBe(1);
 
-    const subtreeSearchResponse = await worker.fetch(
+    const rootSearchResponse = await worker.fetch(
       new Request("https://files.example.com/api/admin/files?dir=/&q=%E6%97%85%E8%A1%8C", {
         headers: { Cookie: cookie }
       }),
       adminEnv
     );
-    const subtreeSearchBody = await subtreeSearchResponse.json() as {
+    const rootSearchBody = await rootSearchResponse.json() as {
       files: Array<{ id: string; directory_path: string }>;
       pagination: { total: number };
     };
-    expect(subtreeSearchBody.pagination.total).toBe(1);
-    expect(subtreeSearchBody.files[0]).toMatchObject({ id: "file-trip", directory_path: "/photos/2026" });
+    expect(rootSearchBody.pagination.total).toBe(0);
+    expect(rootSearchBody.files).toHaveLength(0);
+
+    const childSearchResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/files?dir=/photos/2026&q=%E6%97%85%E8%A1%8C", {
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const childSearchBody = await childSearchResponse.json() as {
+      files: Array<{ id: string; directory_path: string }>;
+      pagination: { total: number };
+    };
+    expect(childSearchBody.pagination.total).toBe(1);
+    expect(childSearchBody.files[0]).toMatchObject({ id: "file-trip", directory_path: "/photos/2026" });
 
     const moveResponse = await worker.fetch(
       new Request("https://files.example.com/api/admin/files/move", {

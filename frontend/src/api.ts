@@ -79,7 +79,7 @@ export interface FileListResponse {
   ok: boolean;
   current_directory: CurrentDirectory;
   directories: DirectoryItem[];
-  search_scope: "current" | "subtree";
+  search_scope: "current";
   files: FileItem[];
   pagination: Pagination;
   max_file_bytes: number;

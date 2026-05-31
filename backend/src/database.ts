@@ -190,7 +190,6 @@ export async function listFileRecords(params: {
   createdFrom?: string;
   createdTo?: string;
   directoryPath?: string;
-  recursive?: boolean;
   page: number;
   limit: number;
 }): Promise<FileListResult> {
@@ -199,15 +198,8 @@ export async function listFileRecords(params: {
   const normalizedQuery = params.query.trim().toLowerCase();
   const directoryPath = params.directoryPath ?? "/";
 
-  if (params.recursive) {
-    if (directoryPath !== "/") {
-      whereParts.push("(COALESCE(directory_path, '/') = ? OR COALESCE(directory_path, '/') LIKE ? ESCAPE '\\')");
-      bindings.push(directoryPath, `${escapeLikePattern(directoryPath)}/%`);
-    }
-  } else {
-    whereParts.push("COALESCE(directory_path, '/') = ?");
-    bindings.push(directoryPath);
-  }
+  whereParts.push("COALESCE(directory_path, '/') = ?");
+  bindings.push(directoryPath);
 
   if (normalizedQuery) {
     const pattern = `%${escapeLikePattern(normalizedQuery)}%`;
