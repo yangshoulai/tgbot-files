@@ -32,7 +32,8 @@ export function ConfigPanel({ session }: ConfigPanelProps) {
 
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
         <RuntimeValue label="BASE_URL" value={session.config_values.public_base_url || session.base_url} />
-        <RuntimeValue label="最大上传大小" value={formatBytes(session.max_file_bytes)} />
+        <RuntimeValue label="直传上限" value={formatBytes(session.max_file_bytes)} />
+        <RuntimeValue label="分片上限" value={formatBytes(session.max_multipart_file_bytes)} />
       </div>
 
       <ul className="flex flex-col gap-2">

@@ -7,10 +7,14 @@ import {
 } from "./admin-auth";
 import { createSignedToken, TokenError, verifySignedToken } from "./crypto";
 import {
+  completeMultipartUploadRecord,
   findActiveApiKeyRecord,
   getApiKeyRecord,
+  getMultipartUploadRecord,
   insertApiKeyRecord,
   insertFileRecord,
+  insertMultipartUploadRecord,
+  listFileChunkRecords,
   listApiKeyRecords,
   listFileRecords,
   requireDb,
@@ -18,10 +22,13 @@ import {
   softDeleteFileRecord,
   touchApiKeyRecord,
   updateApiKeyRecord,
+  upsertFileChunkRecord,
   type ApiKeyRecord,
   type ApiKeyStatus,
+  type FileChunkRecord,
   type FileRecord,
-  type FileTypeFilter
+  type FileTypeFilter,
+  type MultipartUploadRecord
 } from "./database";
 import {
   AppError,
@@ -65,6 +72,25 @@ interface UploadResult {
   remark?: string;
   createdAt: string;
 }
+
+interface MultipartInitResult {
+  id: string;
+  fileName: string;
+  mimeType: string;
+  size: number;
+  chunkSize: number;
+  chunkCount: number;
+}
+
+interface ParsedByteRange {
+  start: number;
+  end: number;
+  partial: boolean;
+}
+
+const TELEGRAM_CHUNK_SIZE_BYTES = 18 * 1024 * 1024;
+const MAX_TELEGRAM_MULTIPART_CHUNKS = 24;
+const MAX_TELEGRAM_MULTIPART_BYTES = TELEGRAM_CHUNK_SIZE_BYTES * MAX_TELEGRAM_MULTIPART_CHUNKS;
 
 const worker = {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -117,6 +143,12 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
   if (request.method === "GET" && url.pathname === "/api/admin/session") {
     return handleAuthenticatedAdminRequest(request, env, (username) =>
       handleAdminSession(request, env, username)
+    );
+  }
+
+  if (url.pathname === "/api/admin/uploads" || url.pathname.startsWith("/api/admin/uploads/")) {
+    return handleAuthenticatedAdminRequest(request, env, (username) =>
+      handleAdminMultipartUploads(request, env, username)
     );
   }
 
@@ -234,6 +266,8 @@ async function handleAdminSession(request: Request, env: Env, username: string):
     ok: true,
     username,
     max_file_bytes: maxFileBytes,
+    multipart_chunk_bytes: TELEGRAM_CHUNK_SIZE_BYTES,
+    max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
     base_url: baseUrl,
     config: {
       files_db: Boolean(env.FILES_DB),
@@ -255,7 +289,8 @@ async function handleAdminSession(request: Request, env: Env, username: string):
         ? maskSecret(env.ADMIN_SESSION_SECRET)
         : "未单独配置，使用签名密钥",
       public_base_url: baseUrl,
-      max_file_bytes: String(maxFileBytes)
+      max_file_bytes: String(maxFileBytes),
+      max_multipart_file_bytes: String(MAX_TELEGRAM_MULTIPART_BYTES)
     }
   });
 }
@@ -291,7 +326,9 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
         total: result.total,
         total_pages: Math.max(1, Math.ceil(result.total / limit))
       },
-      max_file_bytes: parseMaxFileBytes(env.MAX_FILE_BYTES)
+      max_file_bytes: parseMaxFileBytes(env.MAX_FILE_BYTES),
+      multipart_chunk_bytes: TELEGRAM_CHUNK_SIZE_BYTES,
+      max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES
     });
   }
 
@@ -308,21 +345,7 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
 
     return jsonResponse({
       ok: true,
-      file: {
-        id: result.id,
-        file_name: result.name,
-        mime_type: result.mimeType,
-        size: result.size,
-        md5: result.md5,
-        telegram_file_id: result.telegramFileId,
-        telegram_file_unique_id: result.telegramFileUniqueId ?? null,
-        file_path: result.filePath,
-        remark: result.remark ?? null,
-        url: result.publicUrl,
-        download_url: appendDownloadParam(result.publicUrl),
-        uploaded_by: username,
-        created_at: result.createdAt
-      }
+      file: serializeUploadedFileResult(result, username)
     });
   }
 
@@ -338,6 +361,138 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
   }
 
   return errorResponse(new AppError(404, "NotFound", "Admin file route not found"));
+}
+
+async function handleAdminMultipartUploads(request: Request, env: Env, username: string): Promise<Response> {
+  const db = requireDb(env);
+  const url = new URL(request.url);
+
+  if (request.method === "POST" && url.pathname === "/api/admin/uploads/init") {
+    const body = await readJsonObject(request);
+    const fileName = sanitizeFileName(stringField(body.file_name, "file_name"));
+    const mimeType = normalizeMimeTypeField(body.mime_type);
+    const size = positiveIntegerField(body.size, "size");
+    const remark = normalizeRemark(body.remark);
+    const result = await createMultipartUpload({
+      db,
+      sourceKind: "local",
+      fileName,
+      mimeType,
+      size,
+      uploadedBy: username,
+      ...(remark ? { remark } : {})
+    });
+
+    return jsonResponse({
+      ok: true,
+      upload: serializeMultipartInit(result)
+    }, 201);
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/admin/uploads/url/init") {
+    const body = await readJsonObject(request);
+    const sourceUrl = normalizeSourceUrl(body.url);
+    const remark = normalizeRemark(body.remark);
+
+    if (!sourceUrl) {
+      throw new AppError(400, "MissingUrl", "JSON field 'url' is required");
+    }
+
+    const probe = await probeRemoteSourceForMultipart(sourceUrl, parseMaxFileBytes(env.MAX_FILE_BYTES));
+
+    if (probe.mode === "single") {
+      return jsonResponse({
+        ok: true,
+        mode: "single",
+        max_file_bytes: parseMaxFileBytes(env.MAX_FILE_BYTES),
+        max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
+        multipart_chunk_bytes: TELEGRAM_CHUNK_SIZE_BYTES
+      });
+    }
+
+    const result = await createMultipartUpload({
+      db,
+      sourceKind: "url",
+      sourceUrl: sourceUrl.toString(),
+      fileName: probe.fileName,
+      mimeType: probe.mimeType,
+      size: probe.size,
+      uploadedBy: username,
+      ...(remark ? { remark } : {})
+    });
+
+    return jsonResponse({
+      ok: true,
+      mode: "multipart",
+      upload: serializeMultipartInit(result)
+    }, 201);
+  }
+
+  const chunkMatch = /^\/api\/admin\/uploads\/([^/]+)\/chunks\/(\d+)$/.exec(url.pathname);
+  if (request.method === "POST" && chunkMatch?.[1] && chunkMatch?.[2]) {
+    const upload = await requireMultipartUpload(db, decodeURIComponent(chunkMatch[1]), "local");
+    const chunkIndex = normalizeChunkIndex(chunkMatch[2], upload);
+    const formData = await request.formData();
+    const chunk = formData.get("chunk");
+
+    if (!(chunk instanceof File)) {
+      throw new AppError(400, "MissingChunk", "Multipart field 'chunk' is required");
+    }
+
+    const expectedSize = expectedChunkSize(upload, chunkIndex);
+    validateChunkFile(chunk, expectedSize);
+    const record = await uploadChunkToTelegram({
+      env,
+      upload,
+      chunk,
+      chunkIndex
+    });
+
+    await upsertFileChunkRecord(db, record);
+    return jsonResponse({
+      ok: true,
+      chunk: serializeChunk(record),
+      uploaded_chunks: (await listFileChunkRecords(db, upload.id)).length
+    });
+  }
+
+  const urlChunkMatch = /^\/api\/admin\/uploads\/([^/]+)\/url-chunks\/(\d+)$/.exec(url.pathname);
+  if (request.method === "POST" && urlChunkMatch?.[1] && urlChunkMatch?.[2]) {
+    const upload = await requireMultipartUpload(db, decodeURIComponent(urlChunkMatch[1]), "url");
+    const chunkIndex = normalizeChunkIndex(urlChunkMatch[2], upload);
+    const chunk = await downloadRemoteChunk(upload, chunkIndex);
+    const record = await uploadChunkToTelegram({
+      env,
+      upload,
+      chunk,
+      chunkIndex
+    });
+
+    await upsertFileChunkRecord(db, record);
+    return jsonResponse({
+      ok: true,
+      chunk: serializeChunk(record),
+      uploaded_chunks: (await listFileChunkRecords(db, upload.id)).length
+    });
+  }
+
+  const completeMatch = /^\/api\/admin\/uploads\/([^/]+)\/complete$/.exec(url.pathname);
+  if (request.method === "POST" && completeMatch?.[1]) {
+    const upload = await requireMultipartUpload(db, decodeURIComponent(completeMatch[1]));
+    const result = await completeMultipartUpload({
+      request,
+      env,
+      db,
+      upload
+    });
+
+    return jsonResponse({
+      ok: true,
+      file: serializeUploadedFileResult(result, username)
+    });
+  }
+
+  return errorResponse(new AppError(404, "NotFound", "Admin multipart upload route not found"));
 }
 
 async function handleAdminApiKeys(request: Request, env: Env): Promise<Response> {
@@ -613,6 +768,10 @@ async function downloadSignedFileUrl(params: {
     });
   }
 
+  if (payload.v !== 1) {
+    return undefined;
+  }
+
   const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
   const telegramFileUrl = await getTelegramFileUrl({ botToken, fileId: payload.file_id });
   const telegramResponse = await fetchTelegramFile({
@@ -724,6 +883,354 @@ function ensureFileExtension(fileName: string, mimeType: string): string {
   return extension ? `${fileName}.${extension}` : fileName;
 }
 
+async function createMultipartUpload(params: {
+  db: D1Database;
+  sourceKind: "local" | "url";
+  sourceUrl?: string;
+  fileName: string;
+  mimeType: string;
+  size: number;
+  uploadedBy: string;
+  remark?: string;
+}): Promise<MultipartInitResult> {
+  validateMultipartFileSize(params.size);
+  const chunkCount = Math.ceil(params.size / TELEGRAM_CHUNK_SIZE_BYTES);
+  const createdAt = new Date().toISOString();
+  const record = await insertMultipartUploadRecord(params.db, {
+    id: crypto.randomUUID(),
+    sourceKind: params.sourceKind,
+    ...(params.sourceUrl ? { sourceUrl: params.sourceUrl } : {}),
+    fileName: params.fileName,
+    mimeType: params.mimeType,
+    size: params.size,
+    chunkSize: TELEGRAM_CHUNK_SIZE_BYTES,
+    chunkCount,
+    uploadedBy: params.uploadedBy,
+    ...(params.remark ? { remark: params.remark } : {}),
+    createdAt
+  });
+
+  return {
+    id: record.id,
+    fileName: record.file_name,
+    mimeType: record.mime_type,
+    size: record.size,
+    chunkSize: record.chunk_size,
+    chunkCount: record.chunk_count
+  };
+}
+
+function validateMultipartFileSize(size: number): void {
+  if (!Number.isSafeInteger(size) || size <= 0) {
+    throw new AppError(400, "EmptyFile", "File must not be empty");
+  }
+
+  if (size > MAX_TELEGRAM_MULTIPART_BYTES) {
+    throw new AppError(413, "FileTooLarge", `File size must be <= ${MAX_TELEGRAM_MULTIPART_BYTES} bytes`, {
+      max_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
+      actual_file_bytes: size,
+      chunk_size_bytes: TELEGRAM_CHUNK_SIZE_BYTES,
+      max_chunks: MAX_TELEGRAM_MULTIPART_CHUNKS
+    });
+  }
+}
+
+async function probeRemoteSourceForMultipart(
+  sourceUrl: URL,
+  singleMaxFileBytes: number
+): Promise<
+  | { mode: "single" }
+  | { mode: "multipart"; fileName: string; mimeType: string; size: number }
+> {
+  const head = await fetchRemoteHead(sourceUrl);
+  let size = parseContentLength(head?.headers.get("Content-Length") ?? null);
+  const initialFileName = inferRemoteFileName(sourceUrl, head?.headers ?? new Headers());
+  const remoteMimeHint = pickRemoteMimeHint(head?.headers.get("Content-Type") ?? null, initialFileName);
+
+  if (size !== undefined && size <= singleMaxFileBytes) {
+    return { mode: "single" };
+  }
+
+  if (size !== undefined && size > MAX_TELEGRAM_MULTIPART_BYTES) {
+    throw new AppError(413, "FileTooLarge", `File size must be <= ${MAX_TELEGRAM_MULTIPART_BYTES} bytes`, {
+      max_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
+      actual_file_bytes: size
+    });
+  }
+
+  const rangeProbe = await fetchRemoteRange(sourceUrl, 0, 0);
+  if (rangeProbe.status !== 206) {
+    throw new AppError(400, "RangeNotSupported", "Source URL must support Range requests for large URL uploads");
+  }
+
+  const contentRange = parseContentRange(rangeProbe.headers.get("Content-Range"));
+  size = contentRange?.size ?? size;
+
+  if (size === undefined) {
+    throw new AppError(400, "UnknownFileSize", "Source URL must expose Content-Length or Content-Range");
+  }
+
+  if (size <= singleMaxFileBytes) {
+    return { mode: "single" };
+  }
+
+  if (size > MAX_TELEGRAM_MULTIPART_BYTES) {
+    throw new AppError(413, "FileTooLarge", `File size must be <= ${MAX_TELEGRAM_MULTIPART_BYTES} bytes`, {
+      max_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
+      actual_file_bytes: size
+    });
+  }
+
+  const detectedMimeType = resolveStoredMimeType({
+    bytes: new ArrayBuffer(0),
+    fileType: remoteMimeHint
+  });
+  const fileName = ensureFileExtension(sanitizeFileName(initialFileName), detectedMimeType);
+
+  return {
+    mode: "multipart",
+    fileName,
+    mimeType: detectedMimeType,
+    size
+  };
+}
+
+async function fetchRemoteHead(sourceUrl: URL): Promise<Response | undefined> {
+  try {
+    const response = await fetch(sourceUrl.toString(), {
+      method: "HEAD",
+      redirect: "follow",
+      headers: { Accept: "*/*" }
+    });
+
+    return response.ok ? response : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function fetchRemoteRange(sourceUrl: URL, start: number, end: number): Promise<Response> {
+  try {
+    const response = await fetch(sourceUrl.toString(), {
+      redirect: "follow",
+      headers: {
+        Accept: "*/*",
+        Range: `bytes=${start}-${end}`
+      }
+    });
+
+    if (!response.ok && response.status !== 206) {
+      throw new AppError(
+        response.status >= 500 ? 502 : 400,
+        "UrlFetchFailed",
+        `Source URL returned ${response.status}`,
+        { source_status: response.status }
+      );
+    }
+
+    return response;
+  } catch (error) {
+    if (error instanceof AppError) {
+      throw error;
+    }
+
+    throw new AppError(502, "UrlFetchFailed", "Failed to fetch source URL");
+  }
+}
+
+async function requireMultipartUpload(
+  db: D1Database,
+  id: string,
+  sourceKind?: "local" | "url"
+): Promise<MultipartUploadRecord> {
+  const upload = await getMultipartUploadRecord(db, id);
+
+  if (!upload) {
+    throw new AppError(404, "UploadNotFound", "Multipart upload session not found");
+  }
+
+  if (sourceKind && upload.source_kind !== sourceKind) {
+    throw new AppError(400, "InvalidUploadSource", `Upload session expects ${upload.source_kind} chunks`);
+  }
+
+  return upload;
+}
+
+function normalizeChunkIndex(value: string, upload: MultipartUploadRecord): number {
+  const index = Number(value);
+
+  if (!Number.isSafeInteger(index) || index < 0 || index >= upload.chunk_count) {
+    throw new AppError(400, "InvalidChunkIndex", "Chunk index is out of range");
+  }
+
+  return index;
+}
+
+function expectedChunkSize(upload: MultipartUploadRecord, chunkIndex: number): number {
+  if (chunkIndex === upload.chunk_count - 1) {
+    return upload.size - upload.chunk_size * chunkIndex;
+  }
+
+  return upload.chunk_size;
+}
+
+function validateChunkFile(chunk: File, expectedSize: number): void {
+  if (chunk.size !== expectedSize) {
+    throw new AppError(400, "InvalidChunkSize", `Chunk size must be ${expectedSize} bytes`, {
+      expected_chunk_bytes: expectedSize,
+      actual_chunk_bytes: chunk.size
+    });
+  }
+}
+
+async function downloadRemoteChunk(upload: MultipartUploadRecord, chunkIndex: number): Promise<File> {
+  if (!upload.source_url) {
+    throw new AppError(400, "InvalidUploadSource", "URL upload session is missing source URL");
+  }
+
+  const sourceUrl = new URL(upload.source_url);
+  const start = chunkIndex * upload.chunk_size;
+  const end = start + expectedChunkSize(upload, chunkIndex) - 1;
+  const response = await fetchRemoteRange(sourceUrl, start, end);
+
+  if (response.status !== 206) {
+    throw new AppError(400, "RangeNotSupported", "Source URL must return 206 for chunk Range requests");
+  }
+
+  let bytes: ArrayBuffer;
+  try {
+    bytes = await response.arrayBuffer();
+  } catch {
+    throw new AppError(502, "UrlFetchFailed", "Failed to read source URL response");
+  }
+
+  const chunk = new File([bytes], chunkFileName(upload, chunkIndex), { type: upload.mime_type });
+  validateChunkFile(chunk, expectedChunkSize(upload, chunkIndex));
+  return chunk;
+}
+
+async function uploadChunkToTelegram(params: {
+  env: Env;
+  upload: MultipartUploadRecord;
+  chunk: File;
+  chunkIndex: number;
+}) {
+  const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
+  const chatId = requireEnv(params.env, "TELEGRAM_STORAGE_CHAT_ID");
+  const bytes = await params.chunk.arrayBuffer();
+  const md5 = md5Hex(bytes);
+  const uploadFile = new File([bytes], chunkFileName(params.upload, params.chunkIndex), {
+    type: "application/octet-stream"
+  });
+  const telegramDocument = await uploadDocumentToTelegram({
+    botToken,
+    chatId,
+    file: uploadFile,
+    fileName: uploadFile.name
+  });
+
+  return {
+    fileId: params.upload.id,
+    chunkIndex: params.chunkIndex,
+    size: telegramDocument.file_size ?? params.chunk.size,
+    md5,
+    telegramFileId: telegramDocument.file_id,
+    ...(telegramDocument.file_unique_id ? { telegramFileUniqueId: telegramDocument.file_unique_id } : {}),
+    createdAt: new Date().toISOString()
+  };
+}
+
+function chunkFileName(upload: MultipartUploadRecord, chunkIndex: number): string {
+  const padded = String(chunkIndex + 1).padStart(String(upload.chunk_count).length, "0");
+  return `${upload.file_name}.part-${padded}-of-${upload.chunk_count}`;
+}
+
+async function completeMultipartUpload(params: {
+  request: Request;
+  env: Env;
+  db: D1Database;
+  upload: MultipartUploadRecord;
+}): Promise<UploadResult> {
+  const chunks = await listFileChunkRecords(params.db, params.upload.id);
+  validateCompleteChunks(params.upload, chunks);
+
+  const signingSecret = requireEnv(params.env, "LINK_SIGNING_SECRET");
+  const createdAt = new Date().toISOString();
+  const token = await createSignedToken(
+    {
+      v: 2,
+      file_record_id: params.upload.id,
+      name: params.upload.file_name,
+      mime_type: params.upload.mime_type,
+      size: params.upload.size,
+      chunk_size: params.upload.chunk_size,
+      chunk_count: params.upload.chunk_count,
+      iat: Math.floor(Date.now() / 1000)
+    },
+    signingSecret
+  );
+  const baseUrl = getPublicBaseUrl(params.request, params.env);
+  const publicName = encodeURIComponent(params.upload.file_name);
+  const filePath = `/f/${token}/${publicName}`;
+  const publicUrl = `${baseUrl}${filePath}`;
+  const md5 = multipartDigest(chunks);
+
+  await insertFileRecord(params.db, {
+    id: params.upload.id,
+    fileName: params.upload.file_name,
+    mimeType: params.upload.mime_type,
+    size: params.upload.size,
+    md5,
+    telegramFileId: `multipart:${params.upload.id}`,
+    filePath,
+    createdAt,
+    storageBackend: "telegram_multipart",
+    chunkSize: params.upload.chunk_size,
+    chunkCount: params.upload.chunk_count,
+    ...(params.upload.remark ? { remark: params.upload.remark } : {}),
+    ...(params.upload.uploaded_by ? { uploadedBy: params.upload.uploaded_by } : {})
+  });
+  await completeMultipartUploadRecord(params.db, params.upload.id, createdAt);
+
+  return {
+    id: params.upload.id,
+    name: params.upload.file_name,
+    size: params.upload.size,
+    mimeType: params.upload.mime_type,
+    md5,
+    filePath,
+    publicUrl,
+    telegramFileId: `multipart:${params.upload.id}`,
+    ...(params.upload.remark ? { remark: params.upload.remark } : {}),
+    createdAt
+  };
+}
+
+function validateCompleteChunks(upload: MultipartUploadRecord, chunks: FileChunkRecord[]): void {
+  if (chunks.length !== upload.chunk_count) {
+    throw new AppError(409, "UploadIncomplete", "Not all chunks have been uploaded", {
+      expected_chunks: upload.chunk_count,
+      actual_chunks: chunks.length
+    });
+  }
+
+  for (let index = 0; index < upload.chunk_count; index += 1) {
+    const chunk = chunks[index];
+    const expectedSize = expectedChunkSize(upload, index);
+    if (!chunk || chunk.chunk_index !== index || chunk.size !== expectedSize) {
+      throw new AppError(409, "UploadIncomplete", "Uploaded chunks are incomplete or inconsistent", {
+        chunk_index: index,
+        expected_chunk_bytes: expectedSize,
+        actual_chunk_bytes: chunk?.size
+      });
+    }
+  }
+}
+
+function multipartDigest(chunks: FileChunkRecord[]): string {
+  return `multipart:${chunks.map((chunk) => chunk.md5).join(":")}`;
+}
+
 async function uploadAndRecordFile(params: {
   request: Request;
   env: Env;
@@ -816,6 +1323,15 @@ async function handleFileAccess(request: Request, env: Env): Promise<Response> {
   const rangeHeader = request.headers.get("Range");
   const forceDownload = url.searchParams.get("download") === "1" || url.searchParams.get("download") === "true";
 
+  if (payload.v === 2) {
+    return handleMultipartFileAccess({
+      env,
+      payload,
+      rangeHeader,
+      forceDownload
+    });
+  }
+
   const botToken = requireEnv(env, "TELEGRAM_BOT_TOKEN");
   const telegramFileUrl = await getTelegramFileUrl({ botToken, fileId: payload.file_id });
   const telegramResponse = await fetchTelegramFile({
@@ -840,6 +1356,168 @@ async function handleFileAccess(request: Request, env: Env): Promise<Response> {
     statusText: telegramResponse.statusText,
     headers
   });
+}
+
+async function handleMultipartFileAccess(params: {
+  env: Env;
+  payload: Extract<Awaited<ReturnType<typeof verifySignedToken>>, { v: 2 }>;
+  rangeHeader: string | null;
+  forceDownload: boolean;
+}): Promise<Response> {
+  const db = requireDb(params.env);
+  const chunks = await listFileChunkRecords(db, params.payload.file_record_id);
+
+  validateTokenChunks(params.payload, chunks);
+  const range = parseByteRange(params.rangeHeader, params.payload.size);
+  if (!range) {
+    return rangeNotSatisfiableResponse(params.payload.size);
+  }
+
+  const headers = withSecurityHeaders();
+  headers.set("Content-Type", params.payload.mime_type);
+  headers.set(
+    "Content-Disposition",
+    params.forceDownload
+      ? contentDispositionAttachment(params.payload.name)
+      : contentDispositionInline(params.payload.name)
+  );
+  headers.set("Cache-Control", "public, max-age=31536000, immutable");
+  headers.set("Accept-Ranges", "bytes");
+  headers.set("Content-Length", String(range.end - range.start + 1));
+
+  if (range.partial) {
+    headers.set("Content-Range", `bytes ${range.start}-${range.end}/${params.payload.size}`);
+  }
+
+  return new Response(streamMultipartFile({
+    env: params.env,
+    payload: params.payload,
+    chunks,
+    range
+  }), {
+    status: range.partial ? 206 : 200,
+    headers
+  });
+}
+
+function validateTokenChunks(
+  payload: Extract<Awaited<ReturnType<typeof verifySignedToken>>, { v: 2 }>,
+  chunks: FileChunkRecord[]
+): void {
+  if (chunks.length !== payload.chunk_count) {
+    throw new AppError(404, "FileChunksNotFound", "Multipart file chunks are incomplete");
+  }
+
+  for (let index = 0; index < payload.chunk_count; index += 1) {
+    const chunk = chunks[index];
+    const expectedSize = index === payload.chunk_count - 1
+      ? payload.size - payload.chunk_size * index
+      : payload.chunk_size;
+
+    if (!chunk || chunk.chunk_index !== index || chunk.size !== expectedSize) {
+      throw new AppError(404, "FileChunksNotFound", "Multipart file chunks are incomplete");
+    }
+  }
+}
+
+function streamMultipartFile(params: {
+  env: Env;
+  payload: Extract<Awaited<ReturnType<typeof verifySignedToken>>, { v: 2 }>;
+  chunks: FileChunkRecord[];
+  range: ParsedByteRange;
+}): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
+
+        for (const chunk of params.chunks) {
+          const chunkStart = chunk.chunk_index * params.payload.chunk_size;
+          const chunkEnd = chunkStart + chunk.size - 1;
+          const overlapStart = Math.max(params.range.start, chunkStart);
+          const overlapEnd = Math.min(params.range.end, chunkEnd);
+
+          if (overlapStart > overlapEnd) {
+            continue;
+          }
+
+          const telegramFileUrl = await getTelegramFileUrl({ botToken, fileId: chunk.telegram_file_id });
+          const telegramResponse = await fetchTelegramFile({
+            fileUrl: telegramFileUrl,
+            rangeHeader: `bytes=${overlapStart - chunkStart}-${overlapEnd - chunkStart}`
+          });
+
+          if (telegramResponse.status !== 206 && (overlapStart !== chunkStart || overlapEnd !== chunkEnd)) {
+            throw new AppError(502, "TelegramFileDownloadFailed", "Telegram file server ignored a partial Range request");
+          }
+
+          if (!telegramResponse.body) {
+            throw new AppError(502, "TelegramFileDownloadFailed", "Telegram file response did not include a body");
+          }
+
+          const reader = telegramResponse.body.getReader();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+              break;
+            }
+            if (value) {
+              controller.enqueue(value);
+            }
+          }
+        }
+
+        controller.close();
+      } catch (error) {
+        controller.error(error);
+      }
+    }
+  });
+}
+
+function parseByteRange(rangeHeader: string | null, size: number): ParsedByteRange | null {
+  if (!rangeHeader) {
+    return { start: 0, end: size - 1, partial: false };
+  }
+
+  const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+  if (!match || (match[1] === "" && match[2] === "")) {
+    return null;
+  }
+
+  let start: number;
+  let end: number;
+
+  if (match[1] === "") {
+    const suffixLength = Number(match[2]);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) {
+      return null;
+    }
+    start = Math.max(0, size - suffixLength);
+    end = size - 1;
+  } else {
+    start = Number(match[1]);
+    end = match[2] === "" ? size - 1 : Number(match[2]);
+
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end) {
+      return null;
+    }
+
+    if (start >= size) {
+      return null;
+    }
+
+    end = Math.min(end, size - 1);
+  }
+
+  return { start, end, partial: true };
+}
+
+function rangeNotSatisfiableResponse(size: number): Response {
+  const headers = withSecurityHeaders();
+  headers.set("Accept-Ranges", "bytes");
+  headers.set("Content-Range", `bytes */${size}`);
+  return new Response(null, { status: 416, headers });
 }
 
 async function requireUploadApiKey(request: Request, db: D1Database): Promise<void> {
@@ -904,6 +1582,46 @@ function serializeFileRecord(file: FileRecord, baseUrl: string): Record<string, 
   };
 }
 
+function serializeMultipartInit(result: MultipartInitResult): Record<string, unknown> {
+  return {
+    id: result.id,
+    file_name: result.fileName,
+    mime_type: result.mimeType,
+    size: result.size,
+    chunk_size: result.chunkSize,
+    chunk_count: result.chunkCount,
+    max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES
+  };
+}
+
+function serializeChunk(record: Awaited<ReturnType<typeof uploadChunkToTelegram>>): Record<string, unknown> {
+  return {
+    chunk_index: record.chunkIndex,
+    size: record.size,
+    md5: record.md5,
+    telegram_file_id: record.telegramFileId
+  };
+}
+
+function serializeUploadedFileResult(result: UploadResult, username: string): Record<string, unknown> {
+  return {
+    id: result.id,
+    file_name: result.name,
+    mime_type: result.mimeType,
+    size: result.size,
+    md5: result.md5,
+    telegram_file_id: result.telegramFileId,
+    telegram_file_unique_id: result.telegramFileUniqueId ?? null,
+    file_path: result.filePath,
+    remark: result.remark ?? null,
+    url: result.publicUrl,
+    download_url: appendDownloadParam(result.publicUrl),
+    uploaded_by: username,
+    created_at: result.createdAt,
+    storage_backend: result.telegramFileId.startsWith("multipart:") ? "telegram_multipart" : "telegram_single"
+  };
+}
+
 function serializeApiKeyRecord(record: ApiKeyRecord, includeKey: boolean): Record<string, unknown> {
   return {
     id: record.id,
@@ -930,6 +1648,61 @@ function generateApiKey(): string {
   const right = crypto.randomUUID().replace(/-/g, "");
 
   return `tgf_${left}${right.slice(0, 16)}`;
+}
+
+function stringField(value: unknown, fieldName: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new AppError(400, "InvalidBody", `${fieldName} is required`);
+  }
+
+  return value.trim();
+}
+
+function positiveIntegerField(value: unknown, fieldName: string): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new AppError(400, "InvalidBody", `${fieldName} must be a positive integer`);
+  }
+
+  return parsed;
+}
+
+function normalizeMimeTypeField(value: unknown): string {
+  if (typeof value !== "string") {
+    return "application/octet-stream";
+  }
+
+  const normalized = value.split(";")[0]?.trim().toLowerCase();
+  return normalized || "application/octet-stream";
+}
+
+function parseContentRange(value: string | null): { start: number; end: number; size: number } | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const match = /^bytes\s+(\d+)-(\d+)\/(\d+)$/i.exec(value.trim());
+  if (!match) {
+    return undefined;
+  }
+
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  const size = Number(match[3]);
+
+  if (
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(end) ||
+    !Number.isSafeInteger(size) ||
+    start < 0 ||
+    end < start ||
+    size <= 0
+  ) {
+    return undefined;
+  }
+
+  return { start, end, size };
 }
 
 async function readJsonObject(request: Request): Promise<Record<string, unknown>> {

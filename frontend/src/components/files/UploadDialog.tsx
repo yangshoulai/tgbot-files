@@ -1,6 +1,15 @@
 import { ChangeEvent, FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { CheckCircle2, ClipboardPaste, FilePlus2, Link2, Trash2, UploadCloud, X } from "lucide-react";
-import { ApiError, uploadFile, uploadFileFromUrl } from "../../api";
+import { CheckCircle2, ClipboardPaste, FilePlus2, Layers3, Link2, Trash2, UploadCloud, X } from "lucide-react";
+import {
+  ApiError,
+  completeMultipartUpload,
+  initMultipartUpload,
+  initUrlMultipartUpload,
+  uploadFile,
+  uploadFileFromUrl,
+  uploadMultipartChunk,
+  uploadUrlMultipartChunk
+} from "../../api";
 import { formatBytes } from "../../utils";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
@@ -15,6 +24,8 @@ interface UploadDialogProps {
   open: boolean;
   initialFiles: File[];
   maxBytes: number;
+  multipartChunkBytes: number;
+  maxMultipartBytes: number;
   onClose: () => void;
   onUploaded: (uploadedCount: number) => void;
   onError: (message: string) => void;
@@ -23,16 +34,24 @@ interface UploadDialogProps {
 type ItemStatus = "pending" | "uploading" | "done" | "error" | "skipped";
 type UploadMode = "file" | "url";
 
+interface ChunkProgress {
+  completed: number;
+  total: number;
+  label: string;
+}
+
 interface QueueItem {
   id: string;
   file: File;
   status: ItemStatus;
   message?: string;
+  progress?: ChunkProgress;
 }
 
 interface UrlUploadState {
   status: ItemStatus;
   message?: string;
+  progress?: ChunkProgress;
 }
 
 let counter = 0;
@@ -42,7 +61,16 @@ function makeItem(file: File): QueueItem {
   return { id: `${Date.now()}-${counter}`, file, status: "pending" };
 }
 
-export function UploadDialog({ open, initialFiles, maxBytes, onClose, onUploaded, onError }: UploadDialogProps) {
+export function UploadDialog({
+  open,
+  initialFiles,
+  maxBytes,
+  multipartChunkBytes,
+  maxMultipartBytes,
+  onClose,
+  onUploaded,
+  onError
+}: UploadDialogProps) {
   const [mode, setMode] = useState<UploadMode>("file");
   const [items, setItems] = useState<QueueItem[]>([]);
   const [sourceUrl, setSourceUrl] = useState("");
@@ -147,11 +175,11 @@ export function UploadDialog({ open, initialFiles, maxBytes, onClose, onUploaded
     let successCount = 0;
 
     for (const target of targets) {
-      if (target.file.size > maxBytes) {
+      if (target.file.size > maxMultipartBytes) {
         setItems((current) =>
           current.map((item) =>
             item.id === target.id
-              ? { ...item, status: "error", message: `超过 ${formatBytes(maxBytes)} 上限` }
+              ? { ...item, status: "error", message: `超过 ${formatBytes(maxMultipartBytes)} 分片上限` }
               : item
           )
         );
@@ -159,22 +187,30 @@ export function UploadDialog({ open, initialFiles, maxBytes, onClose, onUploaded
       }
 
       setItems((current) =>
-        current.map((item) => (item.id === target.id ? { ...item, status: "uploading", message: undefined } : item))
+        current.map((item) =>
+          item.id === target.id ? { ...item, status: "uploading", message: undefined, progress: undefined } : item
+        )
       );
 
       try {
-        const form = new FormData();
-        form.set("file", target.file);
-        if (remark.trim()) form.set("remark", remark.trim());
-        await uploadFile(form);
+        if (target.file.size > maxBytes) {
+          await uploadLocalMultipart(target);
+        } else {
+          const form = new FormData();
+          form.set("file", target.file);
+          if (remark.trim()) form.set("remark", remark.trim());
+          await uploadFile(form);
+        }
         successCount += 1;
         setItems((current) =>
-          current.map((item) => (item.id === target.id ? { ...item, status: "done", message: undefined } : item))
+          current.map((item) =>
+            item.id === target.id ? { ...item, status: "done", message: undefined, progress: undefined } : item
+          )
         );
       } catch (error) {
         const message = error instanceof ApiError ? error.message : error instanceof Error ? error.message : "上传失败";
         setItems((current) =>
-          current.map((item) => (item.id === target.id ? { ...item, status: "error", message } : item))
+          current.map((item) => (item.id === target.id ? { ...item, status: "error", message, progress: undefined } : item))
         );
         onError(message);
       }
@@ -186,6 +222,43 @@ export function UploadDialog({ open, initialFiles, maxBytes, onClose, onUploaded
     }
   }
 
+  async function uploadLocalMultipart(target: QueueItem) {
+    const init = await initMultipartUpload({
+      file_name: target.file.name,
+      mime_type: target.file.type || "application/octet-stream",
+      size: target.file.size,
+      ...(remark.trim() ? { remark: remark.trim() } : {})
+    });
+    const upload = init.upload;
+
+    for (let index = 0; index < upload.chunk_count; index += 1) {
+      updateItemProgress(target.id, {
+        completed: index,
+        total: upload.chunk_count,
+        label: `上传分片 ${index + 1}/${upload.chunk_count}`
+      });
+      const start = index * upload.chunk_size;
+      const end = Math.min(target.file.size, start + upload.chunk_size);
+      await uploadMultipartChunk(upload.id, index, target.file.slice(start, end));
+      updateItemProgress(target.id, {
+        completed: index + 1,
+        total: upload.chunk_count,
+        label: `已上传 ${index + 1}/${upload.chunk_count}`
+      });
+    }
+
+    updateItemProgress(target.id, {
+      completed: upload.chunk_count,
+      total: upload.chunk_count,
+      label: "正在生成访问链接"
+    });
+    await completeMultipartUpload(upload.id);
+  }
+
+  function updateItemProgress(id: string, progress: ChunkProgress) {
+    setItems((current) => current.map((item) => (item.id === id ? { ...item, progress } : item)));
+  }
+
   async function submitUrlUpload() {
     const error = validateSourceUrl(sourceUrl);
     if (error) {
@@ -195,10 +268,44 @@ export function UploadDialog({ open, initialFiles, maxBytes, onClose, onUploaded
     }
 
     setSubmitting(true);
-    setUrlUpload({ status: "uploading" });
+    setUrlUpload({ status: "uploading", progress: { completed: 0, total: 1, label: "探测远程文件" } });
 
     try {
-      await uploadFileFromUrl(normalizedSourceUrl, remark.trim() || undefined);
+      const init = await initUrlMultipartUpload(normalizedSourceUrl, remark.trim() || undefined);
+      if (init.mode === "multipart" && init.upload) {
+        const upload = init.upload;
+        for (let index = 0; index < upload.chunk_count; index += 1) {
+          setUrlUpload({
+            status: "uploading",
+            progress: {
+              completed: index,
+              total: upload.chunk_count,
+              label: `导入分片 ${index + 1}/${upload.chunk_count}`
+            }
+          });
+          await uploadUrlMultipartChunk(upload.id, index);
+          setUrlUpload({
+            status: "uploading",
+            progress: {
+              completed: index + 1,
+              total: upload.chunk_count,
+              label: `已导入 ${index + 1}/${upload.chunk_count}`
+            }
+          });
+        }
+        setUrlUpload({
+          status: "uploading",
+          progress: {
+            completed: upload.chunk_count,
+            total: upload.chunk_count,
+            label: "正在生成访问链接"
+          }
+        });
+        await completeMultipartUpload(upload.id);
+      } else {
+        setUrlUpload({ status: "uploading", progress: { completed: 0, total: 1, label: "拉取远程文件" } });
+        await uploadFileFromUrl(normalizedSourceUrl, remark.trim() || undefined);
+      }
       setUrlUpload({ status: "done", message: "已从 URL 上传" });
       onUploaded(1);
     } catch (uploadError) {
@@ -227,7 +334,7 @@ export function UploadDialog({ open, initialFiles, maxBytes, onClose, onUploaded
       open={open}
       onClose={onClose}
       title="上传文件"
-      description={`单文件上限 ${formatBytes(maxBytes)}`}
+      description={`单文件 ${formatBytes(maxBytes)} 内直传；大文件分片上限 ${formatBytes(maxMultipartBytes)}`}
       size="lg"
       closeOnBackdrop={!submitting}
       closeOnEscape={!submitting}
@@ -245,7 +352,7 @@ export function UploadDialog({ open, initialFiles, maxBytes, onClose, onUploaded
             disabled={pendingCount === 0}
           >
             {submitting
-              ? mode === "url" ? "拉取中" : "上传中"
+              ? mode === "url" ? "导入中" : "上传中"
               : pendingCount > 0
                 ? mode === "url" ? "上传 URL" : `开始上传 ${pendingCount} 个`
                 : "无待传文件"}
@@ -264,7 +371,7 @@ export function UploadDialog({ open, initialFiles, maxBytes, onClose, onUploaded
               { value: "url", label: "URL 链接", icon: <Link2 size={15} /> }
             ]}
           />
-          <span className="hidden text-xs text-muted sm:inline">单文件上限 {formatBytes(maxBytes)}</span>
+          <span className="hidden text-xs text-muted sm:inline">分片上限 {formatBytes(maxMultipartBytes)}</span>
         </div>
 
         {mode === "file" ? (
@@ -291,7 +398,9 @@ export function UploadDialog({ open, initialFiles, maxBytes, onClose, onUploaded
                 <UploadCloud size={22} />
               </span>
               <p className="text-sm font-medium text-foreground">点击选择文件，或拖拽到这里</p>
-              <p className="text-xs text-muted">可同时选择多个文件 · 上限 {formatBytes(maxBytes)}</p>
+              <p className="text-xs text-muted">
+                {formatBytes(maxBytes)} 内直传；超过后按 {formatBytes(multipartChunkBytes)} 分片
+              </p>
               <input
                 ref={fileInput}
                 type="file"
@@ -304,7 +413,13 @@ export function UploadDialog({ open, initialFiles, maxBytes, onClose, onUploaded
             {items.length > 0 ? (
               <div className="flex max-h-64 flex-col gap-2 overflow-auto scroll-thin">
                 {items.map((item) => (
-                  <QueueRow key={item.id} item={item} onRemove={() => removeItem(item.id)} disabled={submitting} />
+                  <QueueRow
+                    key={item.id}
+                    item={item}
+                    directMaxBytes={maxBytes}
+                    onRemove={() => removeItem(item.id)}
+                    disabled={submitting}
+                  />
                 ))}
               </div>
             ) : null}
@@ -334,8 +449,8 @@ export function UploadDialog({ open, initialFiles, maxBytes, onClose, onUploaded
                 }}
               />
               <p className="text-xs leading-5 text-muted">
-                后端会拉取该 URL，并优先根据文件内容、响应头和扩展名识别类型；远端文件同样受
-                {" "}{formatBytes(maxBytes)} 上限约束。
+                小文件直接拉取；超过 {formatBytes(maxBytes)} 时要求远端支持 Range，并按
+                {" "}{formatBytes(multipartChunkBytes)} 分片导入。
               </p>
             </div>
 
@@ -344,6 +459,7 @@ export function UploadDialog({ open, initialFiles, maxBytes, onClose, onUploaded
                 url={normalizedSourceUrl}
                 status={urlUpload.status}
                 message={urlUpload.message}
+                progress={urlUpload.progress}
                 onClear={() => handleSourceUrlChange("")}
                 disabled={submitting}
               />
@@ -370,11 +486,12 @@ export function UploadDialog({ open, initialFiles, maxBytes, onClose, onUploaded
 
 interface QueueRowProps {
   item: QueueItem;
+  directMaxBytes: number;
   onRemove: () => void;
   disabled: boolean;
 }
 
-function QueueRow({ item, onRemove, disabled }: QueueRowProps) {
+function QueueRow({ item, directMaxBytes, onRemove, disabled }: QueueRowProps) {
   const status = item.status;
   return (
     <div className="flex items-center gap-3 rounded-xl border border-border bg-surface px-3 py-2.5">
@@ -385,10 +502,12 @@ function QueueRow({ item, onRemove, disabled }: QueueRowProps) {
         </p>
         <p className="truncate text-xs text-muted">
           {formatBytes(item.file.size)}
+          {item.file.size > directMaxBytes ? <span> · 分片上传</span> : null}
           {item.message ? <span className="text-danger"> · {item.message}</span> : null}
         </p>
+        {item.progress ? <ProgressBar progress={item.progress} /> : null}
       </div>
-      <StatusBadge status={status} />
+      <StatusBadge status={status} multipart={Boolean(item.progress)} />
       <button
         type="button"
         aria-label="移除"
@@ -406,11 +525,12 @@ interface UrlUploadRowProps {
   url: string;
   status: ItemStatus;
   message?: string;
+  progress?: ChunkProgress;
   onClear: () => void;
   disabled: boolean;
 }
 
-function UrlUploadRow({ url, status, message, onClear, disabled }: UrlUploadRowProps) {
+function UrlUploadRow({ url, status, message, progress, onClear, disabled }: UrlUploadRowProps) {
   return (
     <div className="flex items-center gap-3 rounded-xl border border-border bg-surface px-3 py-2.5">
       <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-primary-soft text-primary-strong">
@@ -424,8 +544,9 @@ function UrlUploadRow({ url, status, message, onClear, disabled }: UrlUploadRowP
           {url}
           {message ? <span className={status === "error" ? "text-danger" : "text-success"}> · {message}</span> : null}
         </p>
+        {progress ? <ProgressBar progress={progress} /> : null}
       </div>
-      <StatusBadge status={status} />
+      <StatusBadge status={status} multipart={Boolean(progress)} />
       <button
         type="button"
         aria-label="清空 URL"
@@ -435,6 +556,24 @@ function UrlUploadRow({ url, status, message, onClear, disabled }: UrlUploadRowP
       >
         {status === "done" ? <CheckCircle2 size={14} className="text-success" /> : <X size={14} />}
       </button>
+    </div>
+  );
+}
+
+function ProgressBar({ progress }: { progress: ChunkProgress }) {
+  const percent = progress.total > 0 ? Math.round((progress.completed / progress.total) * 100) : 0;
+  return (
+    <div className="mt-2 flex flex-col gap-1">
+      <div className="h-1.5 overflow-hidden rounded-full bg-border">
+        <div
+          className="h-full rounded-full bg-primary transition-all duration-300 ease-out"
+          style={{ width: `${Math.min(100, Math.max(0, percent))}%` }}
+        />
+      </div>
+      <div className="flex items-center justify-between text-[11px] text-muted">
+        <span>{progress.label}</span>
+        <span>{percent}%</span>
+      </div>
     </div>
   );
 }
@@ -449,10 +588,10 @@ function remoteFileLabel(value: string): string {
   }
 }
 
-function StatusBadge({ status }: { status: ItemStatus }) {
+function StatusBadge({ status, multipart }: { status: ItemStatus; multipart?: boolean }) {
   switch (status) {
     case "uploading":
-      return <Spinner size={14} className="text-primary-strong" />;
+      return multipart ? <Layers3 size={15} className="text-primary-strong" /> : <Spinner size={14} className="text-primary-strong" />;
     case "done":
       return <CheckCircle2 size={16} className="text-success" />;
     case "error":

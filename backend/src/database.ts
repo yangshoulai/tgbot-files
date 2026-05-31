@@ -1,5 +1,8 @@
 import { AppError } from "./http";
 
+export type StorageBackend = "telegram_single" | "telegram_multipart";
+export type MultipartSourceKind = "local" | "url";
+
 export interface FileRecord {
   id: string;
   file_name: string;
@@ -13,6 +16,9 @@ export interface FileRecord {
   uploaded_by: string | null;
   created_at: string;
   deleted_at: string | null;
+  storage_backend?: StorageBackend;
+  chunk_size?: number | null;
+  chunk_count?: number | null;
 }
 
 export interface NewFileRecord {
@@ -27,6 +33,9 @@ export interface NewFileRecord {
   remark?: string;
   uploadedBy?: string;
   createdAt: string;
+  storageBackend?: StorageBackend;
+  chunkSize?: number;
+  chunkCount?: number;
 }
 
 export interface FileListResult {
@@ -56,6 +65,55 @@ export interface NewApiKeyRecord {
   createdAt: string;
 }
 
+export interface MultipartUploadRecord {
+  id: string;
+  source_kind: MultipartSourceKind;
+  source_url: string | null;
+  file_name: string;
+  mime_type: string;
+  size: number;
+  chunk_size: number;
+  chunk_count: number;
+  remark: string | null;
+  uploaded_by: string | null;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface NewMultipartUploadRecord {
+  id: string;
+  sourceKind: MultipartSourceKind;
+  sourceUrl?: string;
+  fileName: string;
+  mimeType: string;
+  size: number;
+  chunkSize: number;
+  chunkCount: number;
+  remark?: string;
+  uploadedBy?: string;
+  createdAt: string;
+}
+
+export interface FileChunkRecord {
+  file_id: string;
+  chunk_index: number;
+  size: number;
+  md5: string;
+  telegram_file_id: string;
+  telegram_file_unique_id: string | null;
+  created_at: string;
+}
+
+export interface NewFileChunkRecord {
+  fileId: string;
+  chunkIndex: number;
+  size: number;
+  md5: string;
+  telegramFileId: string;
+  telegramFileUniqueId?: string;
+  createdAt: string;
+}
+
 export function requireDb(env: { FILES_DB?: D1Database }): D1Database {
   if (!env.FILES_DB) {
     throw new AppError(500, "ServerMisconfigured", "Missing required D1 binding: FILES_DB");
@@ -79,8 +137,11 @@ export async function insertFileRecord(db: D1Database, record: NewFileRecord): P
         remark,
         uploaded_by,
         created_at,
-        deleted_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+        deleted_at,
+        storage_backend,
+        chunk_size,
+        chunk_count
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
     )
     .bind(
       record.id,
@@ -93,7 +154,10 @@ export async function insertFileRecord(db: D1Database, record: NewFileRecord): P
       record.filePath,
       record.remark ?? null,
       record.uploadedBy ?? null,
-      record.createdAt
+      record.createdAt,
+      record.storageBackend ?? "telegram_single",
+      record.chunkSize ?? null,
+      record.chunkCount ?? null
     )
     .run();
 }
@@ -153,7 +217,10 @@ export async function listFileRecords(params: {
         remark,
         uploaded_by,
         created_at,
-        deleted_at
+        deleted_at,
+        COALESCE(storage_backend, 'telegram_single') AS storage_backend,
+        chunk_size,
+        chunk_count
       FROM files
       WHERE ${whereClause}
       ORDER BY created_at DESC
@@ -168,6 +235,32 @@ export async function listFileRecords(params: {
   };
 }
 
+export async function getFileRecord(db: D1Database, id: string): Promise<FileRecord | null> {
+  return await db
+    .prepare(
+      `SELECT
+        id,
+        file_name,
+        mime_type,
+        size,
+        md5,
+        telegram_file_id,
+        telegram_file_unique_id,
+        file_path,
+        remark,
+        uploaded_by,
+        created_at,
+        deleted_at,
+        COALESCE(storage_backend, 'telegram_single') AS storage_backend,
+        chunk_size,
+        chunk_count
+      FROM files
+      WHERE id = ? AND deleted_at IS NULL`
+    )
+    .bind(id)
+    .first<FileRecord>();
+}
+
 export async function softDeleteFileRecord(db: D1Database, id: string, deletedAt: string): Promise<boolean> {
   const existing = await db
     .prepare("SELECT id FROM files WHERE id = ? AND deleted_at IS NULL")
@@ -180,6 +273,138 @@ export async function softDeleteFileRecord(db: D1Database, id: string, deletedAt
 
   await db.prepare("UPDATE files SET deleted_at = ? WHERE id = ?").bind(deletedAt, id).run();
   return true;
+}
+
+export async function insertMultipartUploadRecord(
+  db: D1Database,
+  record: NewMultipartUploadRecord
+): Promise<MultipartUploadRecord> {
+  await db
+    .prepare(
+      `INSERT INTO multipart_uploads (
+        id,
+        source_kind,
+        source_url,
+        file_name,
+        mime_type,
+        size,
+        chunk_size,
+        chunk_count,
+        remark,
+        uploaded_by,
+        created_at,
+        completed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+    )
+    .bind(
+      record.id,
+      record.sourceKind,
+      record.sourceUrl ?? null,
+      record.fileName,
+      record.mimeType,
+      record.size,
+      record.chunkSize,
+      record.chunkCount,
+      record.remark ?? null,
+      record.uploadedBy ?? null,
+      record.createdAt
+    )
+    .run();
+
+  return {
+    id: record.id,
+    source_kind: record.sourceKind,
+    source_url: record.sourceUrl ?? null,
+    file_name: record.fileName,
+    mime_type: record.mimeType,
+    size: record.size,
+    chunk_size: record.chunkSize,
+    chunk_count: record.chunkCount,
+    remark: record.remark ?? null,
+    uploaded_by: record.uploadedBy ?? null,
+    created_at: record.createdAt,
+    completed_at: null
+  };
+}
+
+export async function getMultipartUploadRecord(db: D1Database, id: string): Promise<MultipartUploadRecord | null> {
+  return await db
+    .prepare(
+      `SELECT
+        id,
+        source_kind,
+        source_url,
+        file_name,
+        mime_type,
+        size,
+        chunk_size,
+        chunk_count,
+        remark,
+        uploaded_by,
+        created_at,
+        completed_at
+      FROM multipart_uploads
+      WHERE id = ? AND completed_at IS NULL`
+    )
+    .bind(id)
+    .first<MultipartUploadRecord>();
+}
+
+export async function completeMultipartUploadRecord(
+  db: D1Database,
+  id: string,
+  completedAt: string
+): Promise<void> {
+  await db
+    .prepare("UPDATE multipart_uploads SET completed_at = ? WHERE id = ? AND completed_at IS NULL")
+    .bind(completedAt, id)
+    .run();
+}
+
+export async function upsertFileChunkRecord(db: D1Database, record: NewFileChunkRecord): Promise<void> {
+  await db
+    .prepare(
+      `INSERT OR REPLACE INTO file_chunks (
+        file_id,
+        chunk_index,
+        size,
+        md5,
+        telegram_file_id,
+        telegram_file_unique_id,
+        created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      record.fileId,
+      record.chunkIndex,
+      record.size,
+      record.md5,
+      record.telegramFileId,
+      record.telegramFileUniqueId ?? null,
+      record.createdAt
+    )
+    .run();
+}
+
+export async function listFileChunkRecords(db: D1Database, fileId: string): Promise<FileChunkRecord[]> {
+  const result = await db
+    .prepare(
+      `SELECT
+        file_id,
+        chunk_index,
+        size,
+        md5,
+        telegram_file_id,
+        telegram_file_unique_id,
+        created_at
+      FROM file_chunks
+      WHERE file_id = ?
+      ORDER BY chunk_index ASC`
+    )
+    .bind(fileId)
+    .all<FileChunkRecord>();
+
+  return result.results ?? [];
 }
 
 export async function insertApiKeyRecord(db: D1Database, record: NewApiKeyRecord): Promise<ApiKeyRecord> {

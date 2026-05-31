@@ -2,6 +2,8 @@ export interface SessionResponse {
   ok: boolean;
   username: string;
   max_file_bytes: number;
+  multipart_chunk_bytes: number;
+  max_multipart_file_bytes: number;
   base_url: string;
   config: {
     files_db: boolean;
@@ -22,6 +24,7 @@ export interface SessionResponse {
     admin_session_secret: string;
     public_base_url: string;
     max_file_bytes: string;
+    max_multipart_file_bytes: string;
   };
 }
 
@@ -47,6 +50,9 @@ export interface FileItem {
   deleted_at: string | null;
   url: string;
   download_url: string;
+  storage_backend?: "telegram_single" | "telegram_multipart";
+  chunk_size?: number | null;
+  chunk_count?: number | null;
 }
 
 export interface FileListResponse {
@@ -54,11 +60,48 @@ export interface FileListResponse {
   files: FileItem[];
   pagination: Pagination;
   max_file_bytes: number;
+  multipart_chunk_bytes: number;
+  max_multipart_file_bytes: number;
 }
 
 export interface AdminUploadResponse {
   ok: boolean;
   file: FileItem;
+}
+
+export interface MultipartUpload {
+  id: string;
+  file_name: string;
+  mime_type: string;
+  size: number;
+  chunk_size: number;
+  chunk_count: number;
+  max_multipart_file_bytes: number;
+}
+
+export interface MultipartInitResponse {
+  ok: boolean;
+  upload: MultipartUpload;
+}
+
+export interface UrlMultipartInitResponse {
+  ok: boolean;
+  mode: "single" | "multipart";
+  upload?: MultipartUpload;
+  max_file_bytes?: number;
+  multipart_chunk_bytes?: number;
+  max_multipart_file_bytes?: number;
+}
+
+export interface MultipartChunkResponse {
+  ok: boolean;
+  chunk: {
+    chunk_index: number;
+    size: number;
+    md5: string;
+    telegram_file_id: string;
+  };
+  uploaded_chunks: number;
 }
 
 export interface ApiKeyItem {
@@ -196,6 +239,56 @@ export function uploadFileFromUrl(url: string, remark?: string) {
       url,
       ...(remark ? { remark } : {})
     })
+  });
+}
+
+export function initMultipartUpload(params: {
+  file_name: string;
+  mime_type: string;
+  size: number;
+  remark?: string;
+}) {
+  return requestJson<MultipartInitResponse>("/api/admin/uploads/init", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(params)
+  });
+}
+
+export function uploadMultipartChunk(uploadId: string, chunkIndex: number, chunk: Blob) {
+  const form = new FormData();
+  form.set("chunk", chunk);
+  return requestJson<MultipartChunkResponse>(`/api/admin/uploads/${encodeURIComponent(uploadId)}/chunks/${chunkIndex}`, {
+    method: "POST",
+    body: form
+  });
+}
+
+export function initUrlMultipartUpload(url: string, remark?: string) {
+  return requestJson<UrlMultipartInitResponse>("/api/admin/uploads/url/init", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      url,
+      ...(remark ? { remark } : {})
+    })
+  });
+}
+
+export function uploadUrlMultipartChunk(uploadId: string, chunkIndex: number) {
+  return requestJson<MultipartChunkResponse>(
+    `/api/admin/uploads/${encodeURIComponent(uploadId)}/url-chunks/${chunkIndex}`,
+    { method: "POST" }
+  );
+}
+
+export function completeMultipartUpload(uploadId: string) {
+  return requestJson<AdminUploadResponse>(`/api/admin/uploads/${encodeURIComponent(uploadId)}/complete`, {
+    method: "POST"
   });
 }
 

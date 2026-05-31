@@ -1,7 +1,7 @@
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
-export interface FileTokenPayload {
+export interface SingleFileTokenPayload {
   v: 1;
   file_id: string;
   name: string;
@@ -9,6 +9,19 @@ export interface FileTokenPayload {
   size: number;
   iat: number;
 }
+
+export interface MultipartFileTokenPayload {
+  v: 2;
+  file_record_id: string;
+  name: string;
+  mime_type: string;
+  size: number;
+  chunk_size: number;
+  chunk_count: number;
+  iat: number;
+}
+
+export type FileTokenPayload = SingleFileTokenPayload | MultipartFileTokenPayload;
 
 export class TokenError extends Error {
   constructor(message: string) {
@@ -130,6 +143,42 @@ function parsePayload(parsed: unknown): FileTokenPayload {
   }
 
   const payload = parsed as Partial<FileTokenPayload>;
+
+  if (payload.v === 2) {
+    if (
+      typeof payload.file_record_id !== "string" ||
+      payload.file_record_id.length === 0 ||
+      typeof payload.name !== "string" ||
+      payload.name.length === 0 ||
+      typeof payload.mime_type !== "string" ||
+      payload.mime_type.length === 0 ||
+      typeof payload.size !== "number" ||
+      !Number.isSafeInteger(payload.size) ||
+      payload.size < 0 ||
+      typeof payload.chunk_size !== "number" ||
+      !Number.isSafeInteger(payload.chunk_size) ||
+      payload.chunk_size <= 0 ||
+      typeof payload.chunk_count !== "number" ||
+      !Number.isSafeInteger(payload.chunk_count) ||
+      payload.chunk_count <= 0 ||
+      typeof payload.iat !== "number" ||
+      !Number.isSafeInteger(payload.iat) ||
+      payload.iat <= 0
+    ) {
+      throw new TokenError("Invalid token payload fields");
+    }
+
+    return {
+      v: 2,
+      file_record_id: payload.file_record_id,
+      name: payload.name,
+      mime_type: payload.mime_type,
+      size: payload.size,
+      chunk_size: payload.chunk_size,
+      chunk_count: payload.chunk_count,
+      iat: payload.iat
+    };
+  }
 
   if (
     payload.v !== 1 ||

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import worker, { type Env } from "../src/index";
 import { createSignedToken } from "../src/crypto";
-import type { ApiKeyRecord, ApiKeyStatus, FileRecord } from "../src/database";
+import type { ApiKeyRecord, ApiKeyStatus, FileChunkRecord, FileRecord, MultipartUploadRecord } from "../src/database";
 
 const uploadApiKey = "upload-secret";
 const env: Env = {
@@ -14,6 +14,8 @@ const env: Env = {
 class FakeD1 {
   readonly files: FileRecord[] = [];
   readonly apiKeys: ApiKeyRecord[] = [];
+  readonly multipartUploads: MultipartUploadRecord[] = [];
+  readonly fileChunks: FileChunkRecord[] = [];
 
   prepare(sql: string): D1PreparedStatement {
     return new FakeD1Statement(this, sql) as unknown as D1PreparedStatement;
@@ -63,8 +65,64 @@ class FakeD1Statement {
         remark: remark === null ? null : String(remark),
         uploaded_by: uploadedBy === null ? null : String(uploadedBy),
         created_at: String(createdAt),
-        deleted_at: null
+        deleted_at: null,
+        storage_backend: this.bindings[11] === "telegram_multipart" ? "telegram_multipart" : "telegram_single",
+        chunk_size: this.bindings[12] === null ? null : Number(this.bindings[12]),
+        chunk_count: this.bindings[13] === null ? null : Number(this.bindings[13])
       });
+    }
+
+    if (normalizedSql.startsWith("INSERT INTO MULTIPART_UPLOADS")) {
+      const [
+        id,
+        sourceKind,
+        sourceUrl,
+        fileName,
+        mimeType,
+        size,
+        chunkSize,
+        chunkCount,
+        remark,
+        uploadedBy,
+        createdAt
+      ] = this.bindings;
+
+      this.db.multipartUploads.push({
+        id: String(id),
+        source_kind: sourceKind as MultipartUploadRecord["source_kind"],
+        source_url: sourceUrl === null ? null : String(sourceUrl),
+        file_name: String(fileName),
+        mime_type: String(mimeType),
+        size: Number(size),
+        chunk_size: Number(chunkSize),
+        chunk_count: Number(chunkCount),
+        remark: remark === null ? null : String(remark),
+        uploaded_by: uploadedBy === null ? null : String(uploadedBy),
+        created_at: String(createdAt),
+        completed_at: null
+      });
+    }
+
+    if (normalizedSql.startsWith("INSERT OR REPLACE INTO FILE_CHUNKS")) {
+      const [fileId, chunkIndex, size, md5, telegramFileId, telegramFileUniqueId, createdAt] = this.bindings;
+      const existingIndex = this.db.fileChunks.findIndex((item) =>
+        item.file_id === fileId && item.chunk_index === chunkIndex
+      );
+      const chunk: FileChunkRecord = {
+        file_id: String(fileId),
+        chunk_index: Number(chunkIndex),
+        size: Number(size),
+        md5: String(md5),
+        telegram_file_id: String(telegramFileId),
+        telegram_file_unique_id: telegramFileUniqueId === null ? null : String(telegramFileUniqueId),
+        created_at: String(createdAt)
+      };
+
+      if (existingIndex >= 0) {
+        this.db.fileChunks[existingIndex] = chunk;
+      } else {
+        this.db.fileChunks.push(chunk);
+      }
     }
 
     if (normalizedSql.startsWith("INSERT INTO API_KEYS")) {
@@ -118,6 +176,14 @@ class FakeD1Statement {
       }
     }
 
+    if (normalizedSql.startsWith("UPDATE MULTIPART_UPLOADS SET COMPLETED_AT")) {
+      const [completedAt, id] = this.bindings;
+      const upload = this.db.multipartUploads.find((item) => item.id === id && item.completed_at === null);
+      if (upload) {
+        upload.completed_at = String(completedAt);
+      }
+    }
+
     return { success: true, meta: fakeD1Meta(), results: [] };
   }
 
@@ -132,6 +198,12 @@ class FakeD1Statement {
       const id = this.bindings[0];
       const file = this.db.files.find((item) => item.id === id && item.deleted_at === null);
       return (file ? { id: file.id } : null) as T | null;
+    }
+
+    if (normalizedSql.includes("FROM MULTIPART_UPLOADS")) {
+      const id = this.bindings[0];
+      const upload = this.db.multipartUploads.find((item) => item.id === id && item.completed_at === null);
+      return (upload ?? null) as T | null;
     }
 
     if (normalizedSql.includes("FROM API_KEYS")) {
@@ -149,6 +221,17 @@ class FakeD1Statement {
         success: true,
         meta: fakeD1Meta(),
         results: this.db.apiKeys.filter((item) => item.deleted_at === null) as T[]
+      };
+    }
+
+    if (normalizedSql.includes("FROM FILE_CHUNKS")) {
+      const fileId = this.bindings[0];
+      return {
+        success: true,
+        meta: fakeD1Meta(),
+        results: this.db.fileChunks
+          .filter((item) => item.file_id === fileId)
+          .sort((left, right) => left.chunk_index - right.chunk_index) as T[]
       };
     }
 
@@ -729,6 +812,82 @@ describe("worker file access endpoint", () => {
     expect(response.headers.get("Content-Disposition")).toContain("attachment");
   });
 
+  it("streams range requests across multipart Telegram chunks", async () => {
+    const db = new FakeD1();
+    db.fileChunks.push(
+      {
+        file_id: "file-multipart",
+        chunk_index: 0,
+        size: 3,
+        md5: "chunk-a",
+        telegram_file_id: "tg-chunk-0",
+        telegram_file_unique_id: null,
+        created_at: "2026-05-31T00:00:00.000Z"
+      },
+      {
+        file_id: "file-multipart",
+        chunk_index: 1,
+        size: 3,
+        md5: "chunk-b",
+        telegram_file_id: "tg-chunk-1",
+        telegram_file_unique_id: null,
+        created_at: "2026-05-31T00:00:01.000Z"
+      }
+    );
+    const token = await createSignedToken(
+      {
+        v: 2,
+        file_record_id: "file-multipart",
+        name: "letters.txt",
+        mime_type: "text/plain",
+        size: 6,
+        chunk_size: 3,
+        chunk_count: 2,
+        iat: 1_768_566_400
+      },
+      env.LINK_SIGNING_SECRET
+    );
+    const fetchCalls: Array<{ input: string; range: string | null }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const inputUrl = String(input);
+        const range = new Headers(init?.headers).get("Range");
+        fetchCalls.push({ input: inputUrl, range });
+
+        if (inputUrl.includes("file_id=tg-chunk-0")) {
+          return jsonResponse({ ok: true, result: { file_id: "tg-chunk-0", file_path: "documents/chunk0" } });
+        }
+        if (inputUrl.includes("file_id=tg-chunk-1")) {
+          return jsonResponse({ ok: true, result: { file_id: "tg-chunk-1", file_path: "documents/chunk1" } });
+        }
+        if (inputUrl.endsWith("/documents/chunk0")) {
+          expect(range).toBe("bytes=2-2");
+          return new Response("c", { status: 206, headers: { "Content-Length": "1" } });
+        }
+        if (inputUrl.endsWith("/documents/chunk1")) {
+          expect(range).toBe("bytes=0-1");
+          return new Response("de", { status: 206, headers: { "Content-Length": "2" } });
+        }
+
+        throw new Error(`Unexpected fetch ${inputUrl}`);
+      })
+    );
+
+    const response = await worker.fetch(
+      new Request(`https://files.example.com/f/${token}/letters.txt`, {
+        headers: { Range: "bytes=2-4" }
+      }),
+      envWithDb(db)
+    );
+
+    expect(response.status).toBe(206);
+    expect(response.headers.get("Content-Range")).toBe("bytes 2-4/6");
+    expect(response.headers.get("Content-Length")).toBe("3");
+    expect(await response.text()).toBe("cde");
+    expect(fetchCalls).toHaveLength(4);
+  });
+
   it("rejects tampered file links", async () => {
     const token = await createSignedToken(
       {
@@ -1110,6 +1269,69 @@ describe("admin file manager", () => {
     expect(db.files[0]?.mime_type).toBe("image/png");
     expect(db.files[0]?.uploaded_by).toBe("admin");
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("initializes a range-based URL multipart upload", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const cookie = await loginAndGetCookie(adminEnv);
+    const sourceUrl = "https://source.example.com/big-video.mp4";
+    const fileSize = 25 * 1024 * 1024;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+
+      if (String(input) === sourceUrl && init?.method === "HEAD") {
+        return new Response(null, {
+          headers: {
+            "Content-Length": String(fileSize),
+            "Content-Type": "video/mp4",
+            "Accept-Ranges": "bytes"
+          }
+        });
+      }
+
+      if (String(input) === sourceUrl && headers.get("Range") === "bytes=0-0") {
+        return new Response(new Uint8Array([0]), {
+          status: 206,
+          headers: {
+            "Content-Range": `bytes 0-0/${fileSize}`,
+            "Content-Length": "1"
+          }
+        });
+      }
+
+      throw new Error(`Unexpected fetch ${String(input)}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/uploads/url/init", {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ url: sourceUrl, remark: "大文件 URL" })
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      mode: string;
+      upload: { id: string; file_name: string; size: number; chunk_count: number };
+    };
+
+    expect(response.status).toBe(201);
+    expect(body.mode).toBe("multipart");
+    expect(body.upload.file_name).toBe("big-video.mp4");
+    expect(body.upload.size).toBe(fileSize);
+    expect(body.upload.chunk_count).toBe(2);
+    expect(db.multipartUploads[0]?.source_url).toBe(sourceUrl);
+    expect(db.multipartUploads[0]?.remark).toBe("大文件 URL");
   });
 
   it("uploads an existing signed file URL without fetching the public source URL", async () => {

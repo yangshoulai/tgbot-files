@@ -86,6 +86,7 @@ pnpm --filter backend exec wrangler d1 migrations apply tgbot-files --remote
 
 - `0001_create_files.sql`：文件元数据表，包含 `remark TEXT` 备注字段。
 - `0002_create_api_keys.sql`：上传 API key 表，明文保存 key。
+- `0003_add_multipart_files.sql`：分片上传会话、分片索引和文件存储类型字段。
 
 ## 6. 设置 Secrets 和变量
 
@@ -111,7 +112,7 @@ pnpm --filter backend exec wrangler secret put ADMIN_SESSION_SECRET
 | `ADMIN_PASSWORD` | 是 | 管理员后台密码 |
 | `ADMIN_SESSION_SECRET` | 建议 | 管理员登录 Cookie 签名密钥；未设置时回退使用 `LINK_SIGNING_SECRET` |
 | `PUBLIC_BASE_URL` | 否 | 自定义公开访问域名，例如 `https://files.example.com` |
-| `MAX_FILE_BYTES` | 否 | 最大文件大小，默认 `20971520` |
+| `MAX_FILE_BYTES` | 否 | 单文件直传大小，默认 `20971520`；后台分片上传固定使用 18MiB 分片和 432MiB 上限 |
 
 `UPLOAD_API_KEY` 已废弃，不再作为上传鉴权来源。上传 API key 需要在后台 `/settings` 创建，并写入 D1 的 `api_keys` 表。
 
@@ -249,7 +250,9 @@ Authorization: Bearer your-upload-api-key
 
 ### 上传返回 `413 FileTooLarge`
 
-文件超过当前 `MAX_FILE_BYTES`。默认是 `20971520` 字节，即 20MB。
+小文件直传超过当前 `MAX_FILE_BYTES` 时会返回该错误。默认直传上限是 `20971520` 字节，即 20MiB。
+
+后台上传页会对更大的本地文件启用 Telegram 分片上传：每片 18MiB，最多 24 片，最大 432MiB。URL 大文件也可分片导入，但远端必须支持 HTTP Range；否则会返回 `RangeNotSupported`。
 
 ### 上传返回 `TelegramUploadFailed`
 

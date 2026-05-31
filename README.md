@@ -9,11 +9,11 @@
 - `POST /api/v1/files`：上传本地文件或 URL 文件，返回可直接访问的 HTTPS 链接。
 - `GET /f/:token/:filename?`：访问文件，链接自带 HMAC 签名鉴权。
 - `GET /f/:token/:filename?download=1`：强制以附件方式下载文件。
-- `/admin`：管理员后台，支持登录、本地上传、粘贴 URL 上传、备注、搜索、分页、预览、复制链接、下载和删除索引。
+- `/admin`：管理员后台，支持登录、本地上传、粘贴 URL 上传、分片大文件上传、备注、搜索、分页、预览、复制链接、下载和删除索引。
 - `/settings`：上传 API key 管理，支持新增、查看、启用、禁用和删除。
 - 上传接口继续使用 `Authorization: Bearer <API_KEY>`，API key 明文保存在 D1 的 `api_keys` 表。
 - D1 保存文件元数据、备注 `remark` 和相对访问路径 `file_path`。
-- 默认限制文件大小为 `20MB`，匹配 Telegram 官方 Bot API `getFile` 的稳定下载边界。
+- 默认直传限制为 `20MiB`；后台大文件使用 `18MiB` Telegram 分片，Cloudflare Free 下限制为 `432MiB`，并支持 `/f/*` Range 访问。
 
 ## API 示例
 
