@@ -1039,6 +1039,109 @@ describe("admin file manager", () => {
     expect(db.files[0]?.remark).toBe("季度报告归档");
   });
 
+  it("uploads from admin UI by source URL and infers remote file type", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      PUBLIC_BASE_URL: "https://cdn.example.com",
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const cookie = await loginAndGetCookie(adminEnv);
+    const sourceUrl = "https://source.example.com/download?id=42";
+    const pngBytes = new Uint8Array([
+      0x89, 0x50, 0x4e, 0x47,
+      0x0d, 0x0a, 0x1a, 0x0a
+    ]);
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const inputUrl = String(input);
+
+      if (inputUrl === sourceUrl) {
+        return new Response(pngBytes, {
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "Content-Disposition": "attachment; filename*=UTF-8''remote%20image"
+          }
+        });
+      }
+
+      return jsonResponse({
+        ok: true,
+        result: {
+          document: {
+            file_id: "tg-url-file-id",
+            file_unique_id: "tg-url-unique-id",
+            file_name: "remote image.png",
+            mime_type: "application/octet-stream",
+            file_size: pngBytes.byteLength
+          }
+        }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/files", {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          url: sourceUrl,
+          remark: "从 URL 导入"
+        })
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      ok: boolean;
+      file: { file_name: string; mime_type: string; size: number; remark: string | null; url: string };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.file.file_name).toBe("remote image.png");
+    expect(body.file.mime_type).toBe("image/png");
+    expect(body.file.size).toBe(pngBytes.byteLength);
+    expect(body.file.remark).toBe("从 URL 导入");
+    expect(body.file.url).toMatch(/^https:\/\/cdn\.example\.com\/f\//);
+    expect(db.files[0]?.mime_type).toBe("image/png");
+    expect(db.files[0]?.uploaded_by).toBe("admin");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects unsupported source URL protocols before fetching", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const cookie = await loginAndGetCookie(adminEnv);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/files", {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ url: "file:///etc/passwd" })
+      }),
+      adminEnv
+    );
+    const body = await response.json() as { error: string };
+
+    expect(response.status).toBe(400);
+    expect(body.error).toBe("InvalidUrl");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("lists and soft-deletes D1 file records", async () => {
     const db = new FakeD1();
     const adminEnv: Env = {

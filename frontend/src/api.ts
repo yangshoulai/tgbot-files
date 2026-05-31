@@ -186,6 +186,19 @@ export function uploadFile(formData: FormData) {
   });
 }
 
+export function uploadFileFromUrl(url: string, remark?: string) {
+  return requestJson<AdminUploadResponse>("/api/admin/files", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      url,
+      ...(remark ? { remark } : {})
+    })
+  });
+}
+
 export function deleteFile(id: string) {
   return requestJson<{ ok: boolean }>(`/api/admin/files/${encodeURIComponent(id)}`, {
     method: "DELETE"

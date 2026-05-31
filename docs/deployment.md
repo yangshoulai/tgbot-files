@@ -155,6 +155,15 @@ curl -X POST "http://localhost:8787/api/v1/files" \
   -F "file=@./README.md"
 ```
 
+URL 上传测试：
+
+```bash
+curl -X POST "http://localhost:8787/api/v1/files" \
+  -H "Authorization: Bearer <API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com/report.pdf"}'
+```
+
 ## 8. 部署
 
 部署前检查：

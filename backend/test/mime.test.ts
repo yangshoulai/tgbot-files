@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { detectMimeTypeFromBytes, resolveStoredMimeType } from "../src/mime";
+import {
+  detectMimeTypeFromBytes,
+  extensionForMimeType,
+  mimeTypeForFileName,
+  resolveStoredMimeType
+} from "../src/mime";
 
 describe("MIME type detection", () => {
   it("detects WebP from RIFF WEBP bytes even when callers send octet-stream", () => {
@@ -48,5 +53,12 @@ describe("MIME type detection", () => {
       fileType: "text/plain",
       telegramMimeType: "application/octet-stream"
     })).toBe("text/plain");
+  });
+
+  it("maps common URL file names and MIME types for remote uploads", () => {
+    expect(mimeTypeForFileName("report.PDF")).toBe("application/pdf");
+    expect(mimeTypeForFileName("photo.webp")).toBe("image/webp");
+    expect(extensionForMimeType("image/png; charset=utf-8")).toBe("png");
+    expect(extensionForMimeType("application/octet-stream")).toBeUndefined();
   });
 });

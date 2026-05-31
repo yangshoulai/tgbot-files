@@ -37,7 +37,7 @@ import {
   withSecurityHeaders
 } from "./http";
 import { md5Hex } from "./md5";
-import { resolveStoredMimeType } from "./mime";
+import { extensionForMimeType, mimeTypeForFileName, resolveStoredMimeType } from "./mime";
 import { fetchTelegramFile, getTelegramFileUrl, uploadDocumentToTelegram } from "./telegram";
 
 export interface Env {
@@ -145,7 +145,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const db = requireDb(env);
   await requireUploadApiKey(request, db);
 
-  const { file } = await readUploadForm(request, env);
+  const { file } = await readUploadInput(request, env);
   const result = await uploadAndRecordFile({
     request,
     env,
@@ -296,7 +296,7 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
   }
 
   if (request.method === "POST" && url.pathname === "/api/admin/files") {
-    const { file: formFile, remark } = await readUploadForm(request, env);
+    const { file: formFile, remark } = await readUploadInput(request, env);
     const result = await uploadAndRecordFile({
       request,
       env,
@@ -416,37 +416,249 @@ async function handleAdminApiKeys(request: Request, env: Env): Promise<Response>
   return errorResponse(new AppError(405, "MethodNotAllowed", "Unsupported API key method"));
 }
 
-async function readUploadForm(request: Request, env: Env): Promise<{ file: File; remark?: string }> {
+async function readUploadInput(request: Request, env: Env): Promise<{ file: File; remark?: string }> {
   const contentType = request.headers.get("Content-Type") || "";
-  if (!contentType.toLowerCase().includes("multipart/form-data")) {
-    throw new AppError(400, "InvalidContentType", "Upload request must use multipart/form-data");
+  const normalizedContentType = contentType.toLowerCase();
+
+  if (normalizedContentType.includes("application/json")) {
+    return readUrlUploadJson(request, env);
+  }
+
+  if (!normalizedContentType.includes("multipart/form-data")) {
+    throw new AppError(400, "InvalidContentType", "Upload request must use multipart/form-data or application/json");
   }
 
   const maxFileBytes = parseMaxFileBytes(env.MAX_FILE_BYTES);
   const formData = await request.formData();
   const formFile = formData.get("file");
+  const remark = normalizeRemark(formData.get("remark"));
 
-  if (!(formFile instanceof File)) {
-    throw new AppError(400, "MissingFile", "Multipart field 'file' is required");
+  if (formFile instanceof File) {
+    validateUploadFileSize(formFile, maxFileBytes);
+
+    return {
+      file: formFile,
+      ...(remark ? { remark } : {})
+    };
   }
 
-  if (formFile.size <= 0) {
+  const sourceUrl = normalizeSourceUrl(formData.get("url"));
+  if (sourceUrl) {
+    const file = await downloadFileFromUrl({
+      sourceUrl,
+      maxFileBytes
+    });
+
+    return {
+      file,
+      ...(remark ? { remark } : {})
+    };
+  }
+
+  throw new AppError(400, "MissingFile", "Multipart field 'file' is required");
+}
+
+async function readUrlUploadJson(request: Request, env: Env): Promise<{ file: File; remark?: string }> {
+  const maxFileBytes = parseMaxFileBytes(env.MAX_FILE_BYTES);
+  const body = await readJsonObject(request);
+  const sourceUrl = normalizeSourceUrl(body.url);
+
+  if (!sourceUrl) {
+    throw new AppError(400, "MissingUrl", "JSON field 'url' is required");
+  }
+
+  const file = await downloadFileFromUrl({
+    sourceUrl,
+    maxFileBytes
+  });
+  const remark = normalizeRemark(body.remark);
+
+  return {
+    file,
+    ...(remark ? { remark } : {})
+  };
+}
+
+function validateUploadFileSize(file: File, maxFileBytes: number): void {
+  if (file.size <= 0) {
     throw new AppError(400, "EmptyFile", "File must not be empty");
   }
 
-  if (formFile.size > maxFileBytes) {
+  if (file.size > maxFileBytes) {
     throw new AppError(413, "FileTooLarge", `File size must be <= ${maxFileBytes} bytes`, {
       max_file_bytes: maxFileBytes,
-      actual_file_bytes: formFile.size
+      actual_file_bytes: file.size
+    });
+  }
+}
+
+function normalizeSourceUrl(value: unknown): URL | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const normalized = value.trim();
+
+  if (!normalized) {
+    return undefined;
+  }
+
+  if (normalized.length > 4096) {
+    throw new AppError(400, "InvalidUrl", "URL is too long");
+  }
+
+  let url: URL;
+  try {
+    url = new URL(normalized);
+  } catch {
+    throw new AppError(400, "InvalidUrl", "URL must be absolute");
+  }
+
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new AppError(400, "InvalidUrl", "URL protocol must be http or https");
+  }
+
+  return url;
+}
+
+async function downloadFileFromUrl(params: {
+  sourceUrl: URL;
+  maxFileBytes: number;
+}): Promise<File> {
+  let response: Response;
+
+  try {
+    response = await fetch(params.sourceUrl.toString(), {
+      redirect: "follow",
+      headers: {
+        Accept: "*/*"
+      }
+    });
+  } catch {
+    throw new AppError(502, "UrlFetchFailed", "Failed to fetch source URL");
+  }
+
+  if (!response.ok) {
+    throw new AppError(
+      response.status >= 500 ? 502 : 400,
+      "UrlFetchFailed",
+      `Source URL returned ${response.status}`,
+      { source_status: response.status }
+    );
+  }
+
+  const contentLength = parseContentLength(response.headers.get("Content-Length"));
+  if (contentLength !== undefined && contentLength > params.maxFileBytes) {
+    throw new AppError(413, "FileTooLarge", `File size must be <= ${params.maxFileBytes} bytes`, {
+      max_file_bytes: params.maxFileBytes,
+      actual_file_bytes: contentLength
     });
   }
 
-  const remark = normalizeRemark(formData.get("remark"));
+  let bytes: ArrayBuffer;
+  try {
+    bytes = await response.arrayBuffer();
+  } catch {
+    throw new AppError(502, "UrlFetchFailed", "Failed to read source URL response");
+  }
 
-  return {
-    file: formFile,
-    ...(remark ? { remark } : {})
-  };
+  const initialFileName = inferRemoteFileName(params.sourceUrl, response.headers);
+  const remoteMimeHint = pickRemoteMimeHint(response.headers.get("Content-Type"), initialFileName);
+  const detectedMimeType = resolveStoredMimeType({
+    bytes,
+    fileType: remoteMimeHint
+  });
+  const fileName = ensureFileExtension(sanitizeFileName(initialFileName), detectedMimeType);
+  const file = new File([bytes], fileName, { type: detectedMimeType });
+
+  validateUploadFileSize(file, params.maxFileBytes);
+
+  return file;
+}
+
+function parseContentLength(value: string | null): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    return undefined;
+  }
+
+  return parsed;
+}
+
+function pickRemoteMimeHint(contentType: string | null, fileName: string): string | undefined {
+  const normalizedContentType = contentType?.split(";")[0]?.trim().toLowerCase();
+  const nameMimeType = mimeTypeForFileName(fileName);
+
+  if (normalizedContentType && normalizedContentType !== "application/octet-stream") {
+    return normalizedContentType;
+  }
+
+  return nameMimeType ?? normalizedContentType;
+}
+
+function inferRemoteFileName(sourceUrl: URL, headers: Headers): string {
+  const contentDispositionName = parseContentDispositionFileName(headers.get("Content-Disposition"));
+  if (contentDispositionName) {
+    return contentDispositionName;
+  }
+
+  const rawSegment = sourceUrl.pathname.split("/").filter(Boolean).at(-1);
+  if (!rawSegment) {
+    return "download";
+  }
+
+  try {
+    return decodeURIComponent(rawSegment);
+  } catch {
+    return rawSegment;
+  }
+}
+
+function parseContentDispositionFileName(value: string | null): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const encodedMatch = /(?:^|;)\s*filename\*\s*=\s*([^;]+)/i.exec(value);
+  const encodedValue = encodedMatch?.[1]?.trim();
+  if (encodedValue) {
+    const decoded = decodeContentDispositionFileName(encodedValue);
+    if (decoded) {
+      return decoded;
+    }
+  }
+
+  const plainMatch = /(?:^|;)\s*filename\s*=\s*("([^"]*)"|[^;]+)/i.exec(value);
+  const plainValue = plainMatch?.[2] ?? plainMatch?.[1];
+  const normalized = plainValue?.trim().replace(/^"|"$/g, "");
+
+  return normalized || undefined;
+}
+
+function decodeContentDispositionFileName(value: string): string | undefined {
+  const normalized = value.replace(/^"|"$/g, "");
+  const encodedPart = normalized.includes("''") ? normalized.split("''").slice(1).join("''") : normalized;
+
+  try {
+    return decodeURIComponent(encodedPart);
+  } catch {
+    return encodedPart || undefined;
+  }
+}
+
+function ensureFileExtension(fileName: string, mimeType: string): string {
+  if (/\.[a-z0-9]{1,12}$/i.test(fileName)) {
+    return fileName;
+  }
+
+  const extension = extensionForMimeType(mimeType);
+
+  return extension ? `${fileName}.${extension}` : fileName;
 }
 
 async function uploadAndRecordFile(params: {
@@ -695,7 +907,7 @@ function normalizeApiKeyStatus(value: unknown): ApiKeyStatus {
   throw new AppError(400, "InvalidBody", "API key status must be active or disabled");
 }
 
-function normalizeRemark(value: FormDataEntryValue | null): string | undefined {
+function normalizeRemark(value: unknown): string | undefined {
   if (typeof value !== "string") {
     return undefined;
   }

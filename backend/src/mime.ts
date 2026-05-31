@@ -1,5 +1,80 @@
 const OCTET_STREAM = "application/octet-stream";
 
+const EXTENSION_TO_MIME: Record<string, string> = {
+  "7z": "application/x-7z-compressed",
+  avif: "image/avif",
+  bin: OCTET_STREAM,
+  bmp: "image/bmp",
+  css: "text/css",
+  csv: "text/csv",
+  gif: "image/gif",
+  gz: "application/gzip",
+  gzip: "application/gzip",
+  htm: "text/html",
+  html: "text/html",
+  jpeg: "image/jpeg",
+  jpg: "image/jpeg",
+  js: "text/javascript",
+  json: "application/json",
+  log: "text/plain",
+  m4v: "video/mp4",
+  markdown: "text/markdown",
+  md: "text/markdown",
+  mov: "video/quicktime",
+  mp3: "audio/mpeg",
+  mp4: "video/mp4",
+  ogg: "audio/ogg",
+  pdf: "application/pdf",
+  png: "image/png",
+  rar: "application/x-rar-compressed",
+  svg: "image/svg+xml",
+  tar: "application/x-tar",
+  toml: "application/toml",
+  ts: "text/typescript",
+  tsx: "text/typescript",
+  txt: "text/plain",
+  wav: "audio/wav",
+  webm: "video/webm",
+  webp: "image/webp",
+  xml: "application/xml",
+  yaml: "application/yaml",
+  yml: "application/yaml",
+  zip: "application/zip"
+};
+
+const MIME_TO_EXTENSION: Record<string, string> = {
+  "application/gzip": "gz",
+  "application/json": "json",
+  "application/pdf": "pdf",
+  "application/toml": "toml",
+  "application/x-7z-compressed": "7z",
+  "application/x-rar-compressed": "rar",
+  "application/x-tar": "tar",
+  "application/xml": "xml",
+  "application/yaml": "yaml",
+  "application/zip": "zip",
+  "audio/mpeg": "mp3",
+  "audio/ogg": "ogg",
+  "audio/wav": "wav",
+  "image/avif": "avif",
+  "image/bmp": "bmp",
+  "image/gif": "gif",
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/svg+xml": "svg",
+  "image/webp": "webp",
+  "text/css": "css",
+  "text/csv": "csv",
+  "text/html": "html",
+  "text/javascript": "js",
+  "text/markdown": "md",
+  "text/plain": "txt",
+  "text/typescript": "ts",
+  "video/mp4": "mp4",
+  "video/quicktime": "mov",
+  "video/webm": "webm"
+};
+
 interface MimeSource {
   bytes: ArrayBuffer;
   fileType?: string | undefined;
@@ -84,6 +159,26 @@ export function detectMimeTypeFromBytes(buffer: ArrayBuffer): string | undefined
   }
 
   return undefined;
+}
+
+export function mimeTypeForFileName(fileName: string): string | undefined {
+  const extension = fileName.split(".").at(-1)?.trim().toLowerCase();
+
+  if (!extension || extension === fileName.toLowerCase()) {
+    return undefined;
+  }
+
+  return EXTENSION_TO_MIME[extension];
+}
+
+export function extensionForMimeType(mimeType: string | undefined): string | undefined {
+  const normalized = normalizeMimeType(mimeType);
+
+  if (!normalized || normalized === OCTET_STREAM) {
+    return undefined;
+  }
+
+  return MIME_TO_EXTENSION[normalized];
 }
 
 function normalizeMimeType(value: string | undefined): string | undefined {
