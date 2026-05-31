@@ -89,7 +89,7 @@ export function LoginPage({ onLoggedIn }: LoginPageProps) {
           </Button>
 
           <p className="text-center text-[11px] text-subtle">
-            登录成功后将记住会话；空闲后自动登出。
+            登录后会话保持 30 天；有效访问会自动续期。
           </p>
         </form>
       </div>

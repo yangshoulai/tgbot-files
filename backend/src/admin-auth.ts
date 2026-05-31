@@ -2,7 +2,7 @@ import { constantTimeEqual, createSignedPayload, TokenError, verifySignedPayload
 import { AppError, requireEnv } from "./http";
 
 const sessionCookieName = "tgbot_admin";
-const sessionMaxAgeSeconds = 7 * 24 * 60 * 60;
+const sessionMaxAgeSeconds = 30 * 24 * 60 * 60;
 
 interface AdminSessionPayload {
   v: 1;

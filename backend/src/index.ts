@@ -1,7 +1,6 @@
 import {
   createAdminSessionCookie,
   createExpiredAdminSessionCookie,
-  getAdminSession,
   requireAdminSession,
   validateAdminCredentials
 } from "./admin-auth";
@@ -115,15 +114,19 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === "GET" && url.pathname === "/api/admin/session") {
-    return handleAdminSession(request, env);
+    return handleAuthenticatedAdminRequest(request, env, (username) =>
+      handleAdminSession(request, env, username)
+    );
   }
 
   if (url.pathname === "/api/admin/files" || url.pathname.startsWith("/api/admin/files/")) {
-    return handleAdminFiles(request, env);
+    return handleAuthenticatedAdminRequest(request, env, (username) =>
+      handleAdminFiles(request, env, username)
+    );
   }
 
   if (url.pathname === "/api/admin/api-keys" || url.pathname.startsWith("/api/admin/api-keys/")) {
-    return handleAdminApiKeys(request, env);
+    return handleAuthenticatedAdminRequest(request, env, () => handleAdminApiKeys(request, env));
   }
 
   if (request.method === "POST" && url.pathname === "/api/v1/files") {
@@ -193,8 +196,34 @@ async function handleAdminLogout(request: Request, env: Env): Promise<Response> 
   );
 }
 
-async function handleAdminSession(request: Request, env: Env): Promise<Response> {
+async function handleAuthenticatedAdminRequest(
+  request: Request,
+  env: Env,
+  handler: (username: string) => Promise<Response>
+): Promise<Response> {
   const username = await requireAdminSession(request, env);
+  const response = await handler(username);
+
+  if (!response.ok) {
+    return response;
+  }
+
+  const cookie = await createAdminSessionCookie({
+    env,
+    requestUrl: request.url,
+    username
+  });
+  const headers = new Headers(response.headers);
+  headers.set("Set-Cookie", cookie);
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
+
+async function handleAdminSession(request: Request, env: Env, username: string): Promise<Response> {
   const maxFileBytes = parseMaxFileBytes(env.MAX_FILE_BYTES);
   const baseUrl = getPublicBaseUrl(request, env);
 
@@ -228,8 +257,7 @@ async function handleAdminSession(request: Request, env: Env): Promise<Response>
   });
 }
 
-async function handleAdminFiles(request: Request, env: Env): Promise<Response> {
-  const username = await requireAdminSession(request, env);
+async function handleAdminFiles(request: Request, env: Env, username: string): Promise<Response> {
   const db = requireDb(env);
   const url = new URL(request.url);
 
@@ -310,7 +338,6 @@ async function handleAdminFiles(request: Request, env: Env): Promise<Response> {
 }
 
 async function handleAdminApiKeys(request: Request, env: Env): Promise<Response> {
-  await requireAdminSession(request, env);
   const db = requireDb(env);
   const url = new URL(request.url);
 

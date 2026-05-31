@@ -803,6 +803,71 @@ describe("admin file manager", () => {
     expect(response.status).toBe(303);
     expect(response.headers.get("Location")).toBe("/admin");
     expect(response.headers.get("Set-Cookie")).toContain("tgbot_admin=");
+    expect(response.headers.get("Set-Cookie")).toContain("Max-Age=2592000");
+  });
+
+  it("refreshes an admin session cookie after a valid protected request", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const now = vi.spyOn(Date, "now");
+
+    try {
+      now.mockReturnValue(Date.parse("2026-01-01T00:00:00.000Z"));
+      const cookie = await loginAndGetCookie(adminEnv);
+
+      now.mockReturnValue(Date.parse("2026-01-02T00:00:00.000Z"));
+      const response = await worker.fetch(
+        new Request("https://files.example.com/api/admin/session", {
+          headers: { Cookie: cookie }
+        }),
+        adminEnv
+      );
+      const refreshedCookie = response.headers.get("Set-Cookie");
+
+      expect(response.status).toBe(200);
+      expect(refreshedCookie).toContain("tgbot_admin=");
+      expect(refreshedCookie).toContain("Max-Age=2592000");
+      expect(refreshedCookie).not.toBe(cookie);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("expires the admin session cookie on manual logout", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/logout", {
+        method: "POST",
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const expiredCookie = response.headers.get("Set-Cookie");
+
+    expect(response.status).toBe(200);
+    expect(expiredCookie).toContain("tgbot_admin=");
+    expect(expiredCookie).toContain("Max-Age=0");
+
+    const sessionResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/session", {
+        headers: { Cookie: expiredCookie || "" }
+      }),
+      adminEnv
+    );
+    expect(sessionResponse.status).toBe(401);
   });
 
   it("creates, lists, reveals, disables, and deletes upload API keys", async () => {

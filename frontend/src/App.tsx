@@ -88,10 +88,6 @@ function AppShell() {
   }, []);
 
   useEffect(() => {
-    if (path === "/login") {
-      setSessionLoading(false);
-      return;
-    }
     void refreshSession();
   }, [path, refreshSession]);
 
@@ -123,7 +119,7 @@ function AppShell() {
   );
 
   if (path === "/login" || !session) {
-    if (sessionLoading && path !== "/login") {
+    if (sessionLoading) {
       return <Splash />;
     }
     return (
