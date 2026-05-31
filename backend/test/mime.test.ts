@@ -23,6 +23,23 @@ describe("MIME type detection", () => {
     })).toBe("image/jpeg");
   });
 
+  it("detects MP4 and WebM video bytes for browser preview", () => {
+    const mp4 = new Uint8Array([
+      0x00, 0x00, 0x00, 0x18,
+      0x66, 0x74, 0x79, 0x70,
+      0x69, 0x73, 0x6f, 0x6d,
+      0x00, 0x00, 0x02, 0x00,
+      0x6d, 0x70, 0x34, 0x32
+    ]);
+    const webm = new Uint8Array([
+      0x1a, 0x45, 0xdf, 0xa3,
+      ...new TextEncoder().encode("webm")
+    ]);
+
+    expect(detectMimeTypeFromBytes(mp4.buffer)).toBe("video/mp4");
+    expect(detectMimeTypeFromBytes(webm.buffer)).toBe("video/webm");
+  });
+
   it("uses non-octet fallback MIME types when content is unknown", () => {
     const bytes = new TextEncoder().encode("hello");
 

@@ -33,7 +33,7 @@ export function formatDateTime(value: string | null | undefined): string {
 
 export function fileKind(file: Pick<FileItem, "mime_type" | "file_name">): {
   label: string;
-  tone: "image" | "text" | "pdf" | "archive" | "file";
+  tone: "image" | "video" | "text" | "pdf" | "archive" | "file";
 } {
   const mime = file.mime_type.toLowerCase();
   const name = file.file_name.toLowerCase();
@@ -42,11 +42,15 @@ export function fileKind(file: Pick<FileItem, "mime_type" | "file_name">): {
     return { label: "图片", tone: "image" };
   }
 
+  if (mime.startsWith("video/") || /\.(mp4|m4v|mov|webm|ogv)$/i.test(name)) {
+    return { label: "视频", tone: "video" };
+  }
+
   if (mime === "application/pdf" || name.endsWith(".pdf")) {
     return { label: "PDF", tone: "pdf" };
   }
 
-  if (mime.startsWith("text/") || /\.(md|txt|json|csv|log)$/i.test(name)) {
+  if (mime.startsWith("text/") || /\.(md|markdown|txt|json|csv|log|js|jsx|ts|tsx|css|html|htm|yaml|yml|toml)$/i.test(name)) {
     return { label: "文本", tone: "text" };
   }
 
@@ -57,7 +61,7 @@ export function fileKind(file: Pick<FileItem, "mime_type" | "file_name">): {
   return { label: "文件", tone: "file" };
 }
 
-export type PreviewKind = "image" | "text" | "markdown";
+export type PreviewKind = "image" | "video" | "text" | "markdown";
 
 export function previewKind(file: Pick<FileItem, "mime_type" | "file_name">): PreviewKind | null {
   const mime = file.mime_type.toLowerCase();
@@ -67,14 +71,18 @@ export function previewKind(file: Pick<FileItem, "mime_type" | "file_name">): Pr
     return "image";
   }
 
+  if (mime.startsWith("video/") || /\.(mp4|m4v|mov|webm|ogv)$/i.test(name)) {
+    return "video";
+  }
+
   if (mime === "text/markdown" || name.endsWith(".md") || name.endsWith(".markdown")) {
     return "markdown";
   }
 
   if (
     mime.startsWith("text/") ||
-    ["application/json", "application/xml", "application/yaml", "application/x-yaml"].includes(mime) ||
-    /\.(txt|log|csv|json|xml|yaml|yml)$/i.test(name)
+    ["application/json", "application/xml", "application/yaml", "application/x-yaml", "application/toml"].includes(mime) ||
+    /\.(txt|log|csv|json|xml|yaml|yml|toml|js|jsx|ts|tsx|css|html|htm)$/i.test(name)
   ) {
     return "text";
   }

@@ -69,8 +69,18 @@ export function detectMimeTypeFromBytes(buffer: ArrayBuffer): string | undefined
   }
 
   const isoBrand = asciiAt(bytes, 4, "ftyp") ? readAscii(bytes, 8, 16) : "";
-  if (isoBrand.includes("avif") || isoBrand.includes("avis")) {
-    return "image/avif";
+  if (isoBrand) {
+    if (isoBrand.includes("avif") || isoBrand.includes("avis")) {
+      return "image/avif";
+    }
+
+    if (/(isom|iso2|mp41|mp42|avc1|m4v|qt  )/i.test(isoBrand)) {
+      return isoBrand.toLowerCase().includes("qt  ") ? "video/quicktime" : "video/mp4";
+    }
+  }
+
+  if (matches(bytes, [0x1a, 0x45, 0xdf, 0xa3]) && readAscii(bytes, 0, 4096).includes("webm")) {
+    return "video/webm";
   }
 
   return undefined;

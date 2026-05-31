@@ -114,6 +114,8 @@ function badgeTone(tone: ReturnType<typeof fileKind>["tone"]): "success" | "dang
   switch (tone) {
     case "image":
       return "success";
+    case "video":
+      return "success";
     case "pdf":
       return "danger";
     case "text":

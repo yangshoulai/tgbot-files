@@ -1,8 +1,8 @@
-import { Archive, File as FileIcon, FileText, Image as ImageIcon, FileCode } from "lucide-react";
+import { Archive, File as FileIcon, FileText, Film, Image as ImageIcon, FileCode } from "lucide-react";
 import { fileKind } from "../../utils";
 import { cn } from "../../lib/cn";
 
-type Tone = "image" | "pdf" | "text" | "archive" | "file";
+type Tone = "image" | "video" | "pdf" | "text" | "archive" | "file";
 type Size = "sm" | "md" | "lg";
 
 interface FileTypeIconProps {
@@ -14,6 +14,7 @@ interface FileTypeIconProps {
 
 const palette: Record<Tone, { bg: string; fg: string; ring: string }> = {
   image: { bg: "bg-success-soft", fg: "text-success", ring: "ring-success/15" },
+  video: { bg: "bg-primary-soft", fg: "text-primary-strong", ring: "ring-primary/15" },
   pdf: { bg: "bg-danger-soft", fg: "text-danger", ring: "ring-danger/15" },
   text: { bg: "bg-info-soft", fg: "text-info", ring: "ring-info/15" },
   archive: { bg: "bg-warning-soft", fg: "text-warning", ring: "ring-warning/15" },
@@ -35,6 +36,8 @@ export function FileTypeIcon({ mimeType, fileName, size = "md", className }: Fil
   const Icon =
     tone === "image"
       ? ImageIcon
+      : tone === "video"
+        ? Film
       : tone === "pdf"
         ? FileText
         : tone === "text"

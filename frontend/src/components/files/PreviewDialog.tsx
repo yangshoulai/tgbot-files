@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Copy, Download, Maximize2, Minimize2 } from "lucide-react";
@@ -118,8 +118,10 @@ export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
             className={fullscreen ? "block h-auto max-h-full w-auto max-w-full object-contain" : "h-[60vh] w-full object-contain"}
             loading="lazy"
           />
+        ) : preview === "video" ? (
+          <VideoPreview file={file} fullscreen={fullscreen} />
         ) : preview === "text" ? (
-          <TextPreview state={textState} fullscreen={fullscreen} />
+          <TextPreview file={file} state={textState} fullscreen={fullscreen} />
         ) : preview === "markdown" ? (
           <MarkdownPreview state={textState} fullscreen={fullscreen} />
         ) : (
@@ -132,17 +134,37 @@ export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
   );
 }
 
+function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolean }) {
+  return (
+    <div className={(fullscreen ? "h-full" : "h-[60vh]") + " grid w-full place-items-center bg-foreground p-3"}>
+      <video
+        src={file.file_path}
+        controls
+        preload="metadata"
+        className="max-h-full w-full max-w-full rounded-lg bg-black"
+      >
+        当前浏览器不支持该视频预览。
+      </video>
+    </div>
+  );
+}
+
 function appendDownloadParam(url: string): string {
   return `${url}${url.includes("?") ? "&" : "?"}download=1`;
 }
 
 function TextPreview({
+  file,
   state,
   fullscreen
 }: {
+  file: FileItem;
   state: { status: "idle" | "loading" | "ready" | "error"; content: string; message?: string };
   fullscreen: boolean;
 }) {
+  const language = detectTextLanguage(file);
+  const prepared = useMemo(() => prepareTextContent(state.content, language), [state.content, language]);
+
   if (state.status === "loading" || state.status === "idle") {
     return <PreviewLoading />;
   }
@@ -152,9 +174,12 @@ function TextPreview({
   }
 
   return (
-    <pre className={(fullscreen ? "h-full" : "h-[60vh]") + " w-full overflow-auto whitespace-pre-wrap break-words bg-background p-4 font-mono text-xs leading-6 text-foreground scroll-thin"}>
-      {state.content || "空文本文件"}
-    </pre>
+    <CodePreview
+      content={prepared}
+      fullscreen={fullscreen}
+      language={language}
+      originalContent={state.content}
+    />
   );
 }
 
@@ -186,8 +211,8 @@ function MarkdownPreview({
           ul: (props) => <ul {...props} className="mb-3 list-disc pl-5" />,
           ol: (props) => <ol {...props} className="mb-3 list-decimal pl-5" />,
           blockquote: (props) => <blockquote {...props} className="mb-3 border-l-4 border-border pl-3 text-muted" />,
-          code: (props) => <code {...props} className="rounded bg-surface px-1.5 py-0.5 font-mono text-xs" />,
-          pre: (props) => <pre {...props} className="mb-3 overflow-auto rounded-xl border border-border bg-surface p-3 font-mono text-xs leading-6 scroll-thin" />,
+          code: (props) => <code {...props} className="rounded bg-primary-soft px-1.5 py-0.5 font-mono text-xs text-primary-strong" />,
+          pre: (props) => <pre {...props} className="mb-3 overflow-auto rounded-xl border border-border bg-foreground p-3 font-mono text-xs leading-6 text-white scroll-thin" />,
           table: (props) => <table {...props} className="mb-3 w-full border-collapse text-sm" />,
           th: (props) => <th {...props} className="border border-border bg-surface px-2 py-1 text-left font-semibold" />,
           td: (props) => <td {...props} className="border border-border px-2 py-1" />
@@ -197,6 +222,211 @@ function MarkdownPreview({
       </ReactMarkdown>
     </div>
   );
+}
+
+type TextLanguage = "javascript" | "json" | "yaml" | "toml" | "html" | "css" | "xml" | "text";
+
+function detectTextLanguage(file: Pick<FileItem, "mime_type" | "file_name">): TextLanguage {
+  const mime = file.mime_type.toLowerCase();
+  const name = file.file_name.toLowerCase();
+  const extension = name.split(".").pop() || "";
+
+  if (["js", "jsx", "ts", "tsx", "mjs", "cjs"].includes(extension) || mime.includes("javascript") || mime.includes("typescript")) {
+    return "javascript";
+  }
+
+  if (extension === "json" || mime === "application/json") {
+    return "json";
+  }
+
+  if (["yaml", "yml"].includes(extension) || mime.includes("yaml")) {
+    return "yaml";
+  }
+
+  if (extension === "toml" || mime.includes("toml")) {
+    return "toml";
+  }
+
+  if (["html", "htm"].includes(extension) || mime === "text/html") {
+    return "html";
+  }
+
+  if (extension === "css" || mime === "text/css") {
+    return "css";
+  }
+
+  if (extension === "xml" || mime.includes("xml")) {
+    return "xml";
+  }
+
+  return "text";
+}
+
+function prepareTextContent(content: string, language: TextLanguage): string {
+  if (!content) {
+    return "空文本文件";
+  }
+
+  if (language !== "json") {
+    return content;
+  }
+
+  try {
+    return JSON.stringify(JSON.parse(content), null, 2);
+  } catch {
+    return content;
+  }
+}
+
+function CodePreview({
+  content,
+  fullscreen,
+  language,
+  originalContent
+}: {
+  content: string;
+  fullscreen: boolean;
+  language: TextLanguage;
+  originalContent: string;
+}) {
+  const lines = content.split("\n");
+  const lineCountLabel = `${lines.length} 行`;
+  const formattedLabel = language === "json" && content !== originalContent ? "已格式化" : "原文";
+
+  return (
+    <div className={(fullscreen ? "h-full" : "h-[60vh]") + " flex w-full flex-col overflow-hidden bg-foreground text-white"}>
+      <div className="flex shrink-0 items-center justify-between gap-3 border-b border-white/10 bg-white/[0.04] px-4 py-2 text-xs text-white/70">
+        <span className="font-medium text-white">{languageLabel(language)}</span>
+        <span className="flex items-center gap-2">
+          <span>{formattedLabel}</span>
+          <span className="h-1 w-1 rounded-full bg-white/30" />
+          <span>{lineCountLabel}</span>
+        </span>
+      </div>
+      <div className="min-h-0 flex-1 overflow-auto scroll-thin">
+        <div className="min-w-max py-2 font-mono text-xs leading-6">
+          {lines.map((line, index) => (
+            <div key={`${index}-${line}`} className="grid grid-cols-[3.75rem_1fr] hover:bg-white/[0.04]">
+              <span className="select-none border-r border-white/10 px-3 text-right text-white/35">
+                {index + 1}
+              </span>
+              <code className="whitespace-pre px-4 text-white/88">
+                {highlightLine(line, language)}
+              </code>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function languageLabel(language: TextLanguage): string {
+  switch (language) {
+    case "javascript":
+      return "JavaScript / TypeScript";
+    case "json":
+      return "JSON";
+    case "yaml":
+      return "YAML";
+    case "toml":
+      return "TOML";
+    case "html":
+      return "HTML";
+    case "css":
+      return "CSS";
+    case "xml":
+      return "XML";
+    default:
+      return "Text";
+  }
+}
+
+const tokenPattern =
+  /(\/\/.*$|#.*$|<!--.*?-->|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b(?:async|await|break|case|catch|class|const|continue|default|delete|do|else|enum|export|extends|false|finally|for|from|function|if|implements|import|interface|let|new|null|private|protected|public|return|static|switch|this|throw|true|try|type|undefined|var|while|yield)\b|\b\d+(?:\.\d+)?\b|<\/?[A-Za-z][^>]*>|&[A-Za-z0-9#]+;|[{}[\]():,.;=<>+\-*\/])/g;
+
+function highlightLine(line: string, language: TextLanguage): ReactNode[] {
+  if (!line) {
+    return [""];
+  }
+
+  const nodes: ReactNode[] = [];
+  const keyMatch =
+    language === "json" || language === "yaml" || language === "toml"
+      ? /^(\s*)("?[\w.-]+"?)(\s*[:=])/.exec(line)
+      : null;
+
+  if (keyMatch) {
+    const [, indent, key, separator] = keyMatch;
+    const consumed = `${indent}${key}${separator}`;
+    nodes.push(indent);
+    nodes.push(<span key="key" className="text-sky-300">{key}</span>);
+    nodes.push(<span key="separator" className="text-white/45">{separator}</span>);
+    nodes.push(...highlightTokens(line.slice(consumed.length), language, consumed.length));
+    return nodes;
+  }
+
+  return highlightTokens(line, language, 0);
+}
+
+function highlightTokens(value: string, language: TextLanguage, offset: number): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  let lastIndex = 0;
+
+  for (const match of value.matchAll(tokenPattern)) {
+    const index = match.index ?? 0;
+    const token = match[0];
+
+    if (index > lastIndex) {
+      nodes.push(value.slice(lastIndex, index));
+    }
+
+    nodes.push(
+      <span key={`${offset + index}-${token}`} className={tokenClass(token, language)}>
+        {token}
+      </span>
+    );
+    lastIndex = index + token.length;
+  }
+
+  if (lastIndex < value.length) {
+    nodes.push(value.slice(lastIndex));
+  }
+
+  return nodes.length > 0 ? nodes : [value];
+}
+
+function tokenClass(token: string, language: TextLanguage): string {
+  if (token.startsWith("//") || token.startsWith("#") || token.startsWith("<!--")) {
+    return "text-white/38";
+  }
+
+  if (
+    token.startsWith("\"") ||
+    token.startsWith("'") ||
+    token.startsWith("`") ||
+    (language === "html" && token.startsWith("&"))
+  ) {
+    return "text-emerald-300";
+  }
+
+  if (token.startsWith("<") && token.endsWith(">")) {
+    return "text-primary-soft";
+  }
+
+  if (/^\d/.test(token)) {
+    return "text-amber-200";
+  }
+
+  if (/^(true|false|null|undefined)$/.test(token)) {
+    return "text-amber-200";
+  }
+
+  if (/^[A-Za-z_$][\w$]*$/.test(token)) {
+    return "text-violet-200";
+  }
+
+  return "text-white/45";
 }
 
 function PreviewLoading() {
