@@ -1074,7 +1074,7 @@ function expectedChunkSize(upload: MultipartUploadRecord, chunkIndex: number): n
   return upload.chunk_size;
 }
 
-function validateChunkFile(chunk: File, expectedSize: number): void {
+function validateChunkFile(chunk: Blob, expectedSize: number): void {
   if (chunk.size !== expectedSize) {
     throw new AppError(400, "InvalidChunkSize", `Chunk size must be ${expectedSize} bytes`, {
       expected_chunk_bytes: expectedSize,
@@ -1083,7 +1083,7 @@ function validateChunkFile(chunk: File, expectedSize: number): void {
   }
 }
 
-async function downloadRemoteChunk(upload: MultipartUploadRecord, chunkIndex: number): Promise<File> {
+async function downloadRemoteChunk(upload: MultipartUploadRecord, chunkIndex: number): Promise<Blob> {
   if (!upload.source_url) {
     throw new AppError(400, "InvalidUploadSource", "URL upload session is missing source URL");
   }
@@ -1097,14 +1097,13 @@ async function downloadRemoteChunk(upload: MultipartUploadRecord, chunkIndex: nu
     throw new AppError(400, "RangeNotSupported", "Source URL must return 206 for chunk Range requests");
   }
 
-  let bytes: ArrayBuffer;
+  let chunk: Blob;
   try {
-    bytes = await response.arrayBuffer();
+    chunk = await response.blob();
   } catch {
     throw new AppError(502, "UrlFetchFailed", "Failed to read source URL response");
   }
 
-  const chunk = new File([bytes], chunkFileName(upload, chunkIndex), { type: upload.mime_type });
   validateChunkFile(chunk, expectedChunkSize(upload, chunkIndex));
   return chunk;
 }
@@ -1112,28 +1111,24 @@ async function downloadRemoteChunk(upload: MultipartUploadRecord, chunkIndex: nu
 async function uploadChunkToTelegram(params: {
   env: Env;
   upload: MultipartUploadRecord;
-  chunk: File;
+  chunk: Blob;
   chunkIndex: number;
 }) {
   const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
   const chatId = requireEnv(params.env, "TELEGRAM_STORAGE_CHAT_ID");
-  const bytes = await params.chunk.arrayBuffer();
-  const md5 = md5Hex(bytes);
-  const uploadFile = new File([bytes], chunkFileName(params.upload, params.chunkIndex), {
-    type: "application/octet-stream"
-  });
+  const fileName = chunkFileName(params.upload, params.chunkIndex);
   const telegramDocument = await uploadDocumentToTelegram({
     botToken,
     chatId,
-    file: uploadFile,
-    fileName: uploadFile.name
+    file: params.chunk,
+    fileName
   });
 
   return {
     fileId: params.upload.id,
     chunkIndex: params.chunkIndex,
     size: telegramDocument.file_size ?? params.chunk.size,
-    md5,
+    md5: chunkDigest(params.upload, params.chunkIndex, telegramDocument.file_unique_id),
     telegramFileId: telegramDocument.file_id,
     ...(telegramDocument.file_unique_id ? { telegramFileUniqueId: telegramDocument.file_unique_id } : {}),
     createdAt: new Date().toISOString()
@@ -1143,6 +1138,12 @@ async function uploadChunkToTelegram(params: {
 function chunkFileName(upload: MultipartUploadRecord, chunkIndex: number): string {
   const padded = String(chunkIndex + 1).padStart(String(upload.chunk_count).length, "0");
   return `${upload.file_name}.part-${padded}-of-${upload.chunk_count}`;
+}
+
+function chunkDigest(upload: MultipartUploadRecord, chunkIndex: number, telegramFileUniqueId: string | undefined): string {
+  return telegramFileUniqueId
+    ? `tg:${telegramFileUniqueId}`
+    : `chunk:${chunkIndex}:${expectedChunkSize(upload, chunkIndex)}`;
 }
 
 async function completeMultipartUpload(params: {

@@ -41,7 +41,7 @@ interface TelegramFileInfo {
 export async function uploadDocumentToTelegram(params: {
   botToken: string;
   chatId: string;
-  file: File;
+  file: Blob;
   fileName: string;
 }): Promise<TelegramStoredFile> {
   const formData = new FormData();
