@@ -139,8 +139,8 @@ export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
 function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolean }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const playerRef = useRef<Plyr | null>(null);
-  const [ratio, setRatio] = useState(16 / 9);
-  const heightLimit = fullscreen ? "calc(100dvh - 12rem)" : "60vh";
+  const [ratio, setRatio] = useState({ label: "16:9", value: 16 / 9 });
+  const heightLimit = fullscreen ? "calc(100dvh - 11rem)" : "min(64dvh, 760px)";
 
   useEffect(() => {
     const node = videoRef.current;
@@ -153,15 +153,13 @@ function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolea
         "progress",
         "current-time",
         "mute",
-        "volume",
-        "settings",
-        "pip",
-        "fullscreen"
+        "settings"
       ],
       settings: ["speed"],
       speed: { selected: 1, options: [0.5, 0.75, 1, 1.25, 1.5, 2] },
       tooltips: { controls: true, seek: true },
-      ratio: "16:9"
+      fullscreen: { enabled: false },
+      ratio: ratio.label
     });
     playerRef.current = player;
 
@@ -173,17 +171,17 @@ function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolea
 
   useEffect(() => {
     if (playerRef.current) {
-      playerRef.current.ratio = `${ratio}`;
+      playerRef.current.ratio = ratio.label;
     }
-  }, [ratio]);
+  }, [ratio.label]);
 
   return (
-    <div className={(fullscreen ? "h-full min-h-0" : "h-[60vh]") + " flex w-full items-center justify-center bg-foreground p-3"}>
+    <div className={(fullscreen ? "h-full min-h-0" : "h-[min(64dvh,760px)]") + " flex w-full items-center justify-center bg-foreground p-3 sm:p-4"}>
       <div
-        className="max-h-full max-w-full overflow-hidden rounded-xl bg-black shadow-dialog"
+        className="max-h-full max-w-full overflow-hidden rounded-xl bg-black shadow-dialog [&_.plyr]:h-full [&_.plyr]:w-full [&_.plyr]:min-w-0 [&_.plyr]:rounded-xl [&_.plyr]:[aspect-ratio:inherit] [&_.plyr__controls]:rounded-b-xl [&_.plyr__video-wrapper]:h-full [&_.plyr__video-wrapper]:w-full [&_.plyr__video-wrapper]:rounded-xl [&_.plyr__video-wrapper]:[aspect-ratio:inherit] [&_.plyr__video-wrapper--fixed-ratio]:[aspect-ratio:inherit]"
         style={{
-          aspectRatio: String(ratio),
-          width: `min(100%, calc(${heightLimit} * ${ratio}))`
+          aspectRatio: ratio.label.replace(":", " / "),
+          width: `min(100%, calc(${heightLimit} * ${ratio.value}))`
         }}
       >
         <video
@@ -195,7 +193,7 @@ function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolea
           onLoadedMetadata={(event) => {
             const target = event.currentTarget;
             if (target.videoWidth > 0 && target.videoHeight > 0) {
-              setRatio(target.videoWidth / target.videoHeight);
+              setRatio(toAspectRatio(target.videoWidth, target.videoHeight));
             }
           }}
         >
@@ -204,6 +202,30 @@ function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolea
       </div>
     </div>
   );
+}
+
+function toAspectRatio(width: number, height: number): { label: string; value: number } {
+  const gcd = greatestCommonDivisor(width, height);
+  const normalizedWidth = Math.max(1, Math.round(width / gcd));
+  const normalizedHeight = Math.max(1, Math.round(height / gcd));
+
+  return {
+    label: `${normalizedWidth}:${normalizedHeight}`,
+    value: width / height
+  };
+}
+
+function greatestCommonDivisor(left: number, right: number): number {
+  let a = Math.abs(Math.round(left));
+  let b = Math.abs(Math.round(right));
+
+  while (b > 0) {
+    const next = a % b;
+    a = b;
+    b = next;
+  }
+
+  return a || 1;
 }
 
 function appendDownloadParam(url: string): string {
