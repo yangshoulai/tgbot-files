@@ -446,6 +446,7 @@ async function readUploadInput(request: Request, env: Env): Promise<{ file: File
   if (sourceUrl) {
     const file = await downloadFileFromUrl({
       sourceUrl,
+      env,
       maxFileBytes
     });
 
@@ -469,6 +470,7 @@ async function readUrlUploadJson(request: Request, env: Env): Promise<{ file: Fi
 
   const file = await downloadFileFromUrl({
     sourceUrl,
+    env,
     maxFileBytes
   });
   const remark = normalizeRemark(body.remark);
@@ -523,8 +525,14 @@ function normalizeSourceUrl(value: unknown): URL | undefined {
 
 async function downloadFileFromUrl(params: {
   sourceUrl: URL;
+  env: Env;
   maxFileBytes: number;
 }): Promise<File> {
+  const signedFile = await downloadSignedFileUrl(params);
+  if (signedFile) {
+    return signedFile;
+  }
+
   let response: Response;
 
   try {
@@ -570,6 +578,61 @@ async function downloadFileFromUrl(params: {
   });
   const fileName = ensureFileExtension(sanitizeFileName(initialFileName), detectedMimeType);
   const file = new File([bytes], fileName, { type: detectedMimeType });
+
+  validateUploadFileSize(file, params.maxFileBytes);
+
+  return file;
+}
+
+async function downloadSignedFileUrl(params: {
+  sourceUrl: URL;
+  env: Env;
+  maxFileBytes: number;
+}): Promise<File | undefined> {
+  const token = extractOptionalFileToken(params.sourceUrl.pathname);
+
+  if (!token) {
+    return undefined;
+  }
+
+  let payload: Awaited<ReturnType<typeof verifySignedToken>>;
+  try {
+    payload = await verifySignedToken(token, requireEnv(params.env, "LINK_SIGNING_SECRET"));
+  } catch (error) {
+    if (error instanceof TokenError) {
+      return undefined;
+    }
+
+    throw error;
+  }
+
+  if (payload.size > params.maxFileBytes) {
+    throw new AppError(413, "FileTooLarge", `File size must be <= ${params.maxFileBytes} bytes`, {
+      max_file_bytes: params.maxFileBytes,
+      actual_file_bytes: payload.size
+    });
+  }
+
+  const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
+  const telegramFileUrl = await getTelegramFileUrl({ botToken, fileId: payload.file_id });
+  const telegramResponse = await fetchTelegramFile({
+    fileUrl: telegramFileUrl,
+    rangeHeader: null
+  });
+
+  let bytes: ArrayBuffer;
+  try {
+    bytes = await telegramResponse.arrayBuffer();
+  } catch {
+    throw new AppError(502, "TelegramFileDownloadFailed", "Failed to read Telegram file response");
+  }
+
+  const fileName = sanitizeFileName(payload.name);
+  const detectedMimeType = resolveStoredMimeType({
+    bytes,
+    fileType: payload.mime_type || pickRemoteMimeHint(telegramResponse.headers.get("Content-Type"), fileName)
+  });
+  const file = new File([bytes], ensureFileExtension(fileName, detectedMimeType), { type: detectedMimeType });
 
   validateUploadFileSize(file, params.maxFileBytes);
 
@@ -994,13 +1057,19 @@ function parsePositiveInteger(value: string | null, fallback: number, min: numbe
 }
 
 function extractFileToken(pathname: string): string {
-  const match = /^\/f\/([^/]+)(?:\/.*)?$/.exec(pathname);
+  const token = extractOptionalFileToken(pathname);
 
-  if (!match?.[1]) {
+  if (!token) {
     throw new AppError(404, "NotFound", "File route not found");
   }
 
-  return match[1];
+  return token;
+}
+
+function extractOptionalFileToken(pathname: string): string | undefined {
+  const match = /^\/f\/([^/]+)(?:\/.*)?$/.exec(pathname);
+
+  return match?.[1];
 }
 
 function copyHeader(source: Headers, target: Headers, name: string): void {

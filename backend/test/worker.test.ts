@@ -1112,6 +1112,102 @@ describe("admin file manager", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("uploads an existing signed file URL without fetching the public source URL", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const cookie = await loginAndGetCookie(adminEnv);
+    const mp4Bytes = new Uint8Array([
+      0x00, 0x00, 0x00, 0x18,
+      0x66, 0x74, 0x79, 0x70,
+      0x69, 0x73, 0x6f, 0x6d,
+      0x00, 0x00, 0x02, 0x00,
+      0x6d, 0x70, 0x34, 0x32
+    ]);
+    const token = await createSignedToken(
+      {
+        v: 1,
+        file_id: "original-tg-file-id",
+        name: "movie.mp4",
+        mime_type: "video/mp4",
+        size: mp4Bytes.byteLength,
+        iat: 1_768_566_400
+      },
+      env.LINK_SIGNING_SECRET
+    );
+    const sourceUrl = `https://files.example.com/f/${token}/movie.mp4`;
+    const fetchCalls: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const inputUrl = String(input);
+      fetchCalls.push(inputUrl);
+
+      if (inputUrl.includes("/getFile?")) {
+        return jsonResponse({
+          ok: true,
+          result: {
+            file_id: "original-tg-file-id",
+            file_path: "videos/file_1.mp4",
+            file_size: mp4Bytes.byteLength
+          }
+        });
+      }
+
+      if (inputUrl.includes("/file/bot")) {
+        return new Response(mp4Bytes, {
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": String(mp4Bytes.byteLength)
+          }
+        });
+      }
+
+      return jsonResponse({
+        ok: true,
+        result: {
+          document: {
+            file_id: "copied-tg-file-id",
+            file_name: "movie.mp4",
+            mime_type: "application/octet-stream",
+            file_size: mp4Bytes.byteLength
+          }
+        }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/files", {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ url: sourceUrl })
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      ok: boolean;
+      file: { file_name: string; mime_type: string; size: number };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.file.file_name).toBe("movie.mp4");
+    expect(body.file.mime_type).toBe("video/mp4");
+    expect(body.file.size).toBe(mp4Bytes.byteLength);
+    expect(fetchCalls).not.toContain(sourceUrl);
+    expect(fetchCalls).toEqual([
+      "https://api.telegram.org/bot123456:test-token/getFile?file_id=original-tg-file-id",
+      "https://api.telegram.org/file/bot123456:test-token/videos/file_1.mp4",
+      "https://api.telegram.org/bot123456:test-token/sendDocument"
+    ]);
+  });
+
   it("rejects unsupported source URL protocols before fetching", async () => {
     const db = new FakeD1();
     const adminEnv: Env = {
