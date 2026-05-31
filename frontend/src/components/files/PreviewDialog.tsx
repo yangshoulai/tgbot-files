@@ -171,9 +171,9 @@ function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolea
 
   useEffect(() => {
     if (playerRef.current) {
-      playerRef.current.ratio = ratio.label;
+      applyPlyrAspectRatio(videoRef.current, ratio);
     }
-  }, [ratio.label]);
+  }, [ratio]);
 
   return (
     <div className={(fullscreen ? "h-full min-h-0" : "h-[min(64dvh,760px)]") + " flex w-full items-center justify-center bg-foreground p-3 sm:p-4"}>
@@ -193,7 +193,9 @@ function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolea
           onLoadedMetadata={(event) => {
             const target = event.currentTarget;
             if (target.videoWidth > 0 && target.videoHeight > 0) {
-              setRatio(toAspectRatio(target.videoWidth, target.videoHeight));
+              const nextRatio = toAspectRatio(target.videoWidth, target.videoHeight);
+              setRatio(nextRatio);
+              applyPlyrAspectRatio(target, nextRatio);
             }
           }}
         >
@@ -202,6 +204,23 @@ function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolea
       </div>
     </div>
   );
+}
+
+function applyPlyrAspectRatio(
+  video: HTMLVideoElement | null,
+  ratio: { label: string; value: number }
+) {
+  const player = video?.closest<HTMLElement>(".plyr");
+  const wrapper = player?.querySelector<HTMLElement>(".plyr__video-wrapper");
+  const cssRatio = ratio.label.replace(":", " / ");
+
+  if (player) {
+    player.style.aspectRatio = cssRatio;
+  }
+
+  if (wrapper) {
+    wrapper.style.aspectRatio = cssRatio;
+  }
 }
 
 function toAspectRatio(width: number, height: number): { label: string; value: number } {
