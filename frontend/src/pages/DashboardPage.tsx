@@ -1,18 +1,25 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { RefreshCw, Search, Trash2 } from "lucide-react";
+import { ArrowUp, ChevronRight, FolderPlus, MoveRight, RefreshCw, Search, Trash2 } from "lucide-react";
 import {
   ApiError,
+  DirectoryItem,
   FileItem,
   Pagination as PaginationType,
   SessionResponse,
+  createDirectory,
+  deleteDirectory,
   deleteFile,
-  listFiles
+  listDirectories,
+  listFiles,
+  moveFiles
 } from "../api";
 import { dateInputToIso, formatBytes, formatDateTime, sumFileSize } from "../utils";
 import { useToast } from "../lib/toast";
 import { useConfirm } from "../lib/confirm";
 import { Input } from "../components/ui/Input";
 import { IconButton } from "../components/ui/IconButton";
+import { Button } from "../components/ui/Button";
+import { Modal } from "../components/ui/Modal";
 import { Spinner } from "../components/ui/Spinner";
 import { MetricsRow, Metric } from "../components/files/MetricsRow";
 import { FileTable } from "../components/files/FileTable";
@@ -26,6 +33,7 @@ interface DashboardPageProps {
   session: SessionResponse;
   uploadVersion: number;
   copyText: (value: string) => void;
+  onDirectoryChange: (path: string) => void;
 }
 
 function errorMessage(error: unknown): string {
@@ -44,11 +52,39 @@ const FILE_TYPE_OPTIONS: Array<{ value: FileTypeFilter; label: string }> = [
   { value: "other", label: "其他" }
 ];
 
-export function DashboardPage({ session, uploadVersion, copyText }: DashboardPageProps) {
+function parentDirectoryPath(path: string): string {
+  if (path === "/") return "/";
+  const segments = path.split("/").filter(Boolean);
+  segments.pop();
+  return segments.length === 0 ? "/" : `/${segments.join("/")}`;
+}
+
+function directoryBreadcrumbs(path: string): Array<{ label: string; path: string }> {
+  const segments = path.split("/").filter(Boolean);
+  const breadcrumbs = [{ label: "/", path: "/" }];
+  let current = "";
+
+  for (const segment of segments) {
+    current += `/${segment}`;
+    breadcrumbs.push({ label: segment, path: current });
+  }
+
+  return breadcrumbs;
+}
+
+function directoryOptionLabel(path: string): string {
+  if (path === "/") return "/ 根目录";
+  return path;
+}
+
+export function DashboardPage({ session, uploadVersion, copyText, onDirectoryChange }: DashboardPageProps) {
   const toast = useToast();
   const confirm = useConfirm();
 
   const [files, setFiles] = useState<FileItem[]>([]);
+  const [directories, setDirectories] = useState<DirectoryItem[]>([]);
+  const [directoryOptions, setDirectoryOptions] = useState<DirectoryItem[]>([]);
+  const [currentDirPath, setCurrentDirPath] = useState("/");
   const [pagination, setPagination] = useState<PaginationType>(INITIAL_PAGINATION);
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState<FileTypeFilter>("all");
@@ -59,6 +95,15 @@ export function DashboardPage({ session, uploadVersion, copyText }: DashboardPag
   const [previewFile, setPreviewFile] = useState<FileItem | null>(null);
   const [detailFile, setDetailFile] = useState<FileItem | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [createDirOpen, setCreateDirOpen] = useState(false);
+  const [newDirName, setNewDirName] = useState("");
+  const [creatingDir, setCreatingDir] = useState(false);
+  const [moveOpen, setMoveOpen] = useState(false);
+  const [moveTargetPath, setMoveTargetPath] = useState("/");
+  const [moveCreateNew, setMoveCreateNew] = useState(false);
+  const [moveNewParentPath, setMoveNewParentPath] = useState("/");
+  const [moveNewDirName, setMoveNewDirName] = useState("");
+  const [movingFiles, setMovingFiles] = useState(false);
 
   const loadFiles = useCallback(
     async (nextPage: number) => {
@@ -68,10 +113,12 @@ export function DashboardPage({ session, uploadVersion, copyText }: DashboardPag
           q: query,
           page: nextPage,
           limit,
+          dir: currentDirPath,
           type: typeFilter,
           created_from: dateInputToIso(uploadedFrom, "start"),
           created_to: dateInputToIso(uploadedTo, "end")
         });
+        setDirectories(response.directories);
         setFiles(response.files);
         setPagination(response.pagination);
       } catch (error) {
@@ -80,12 +127,29 @@ export function DashboardPage({ session, uploadVersion, copyText }: DashboardPag
         setLoading(false);
       }
     },
-    [limit, query, toast, typeFilter, uploadedFrom, uploadedTo]
+    [currentDirPath, limit, query, toast, typeFilter, uploadedFrom, uploadedTo]
   );
+
+  const loadDirectoryOptions = useCallback(async () => {
+    try {
+      const response = await listDirectories(true);
+      setDirectoryOptions(response.directories);
+    } catch (error) {
+      toast.danger(errorMessage(error));
+    }
+  }, [toast]);
 
   useEffect(() => {
     void loadFiles(1);
   }, [loadFiles]);
+
+  useEffect(() => {
+    void loadDirectoryOptions();
+  }, [loadDirectoryOptions]);
+
+  useEffect(() => {
+    onDirectoryChange(currentDirPath);
+  }, [currentDirPath, onDirectoryChange]);
 
   useEffect(() => {
     if (uploadVersion > 0) {
@@ -106,14 +170,14 @@ export function DashboardPage({ session, uploadVersion, copyText }: DashboardPag
     const latest = files[0];
     return [
       {
-        label: "全部文件",
+        label: "目录文件",
         value: String(pagination.total),
-        hint: `当前 ${pagination.page} / ${pagination.total_pages} 页`
+        hint: `${currentDirPath} · ${pagination.page} / ${pagination.total_pages} 页`
       },
       {
         label: "当前页占用",
         value: formatBytes(sumFileSize(files)),
-        hint: `${files.length} 个文件`
+        hint: `${directories.length} 个子目录 · ${files.length} 个文件`
       },
       {
         label: "最近上传",
@@ -127,7 +191,7 @@ export function DashboardPage({ session, uploadVersion, copyText }: DashboardPag
         hint: "Telegram Bot API"
       }
     ];
-  }, [files, pagination.page, pagination.total, pagination.total_pages, session.config]);
+  }, [currentDirPath, directories.length, files, pagination.page, pagination.total, pagination.total_pages, session.config]);
 
   async function onDelete(file: FileItem) {
     const ok = await confirm({
@@ -185,6 +249,100 @@ export function DashboardPage({ session, uploadVersion, copyText }: DashboardPag
     }
   }
 
+  async function onCreateDirectory() {
+    const name = newDirName.trim();
+    if (!name) {
+      toast.danger("请输入目录名称");
+      return;
+    }
+
+    setCreatingDir(true);
+    try {
+      await createDirectory(currentDirPath, name);
+      toast.success("目录已创建");
+      setCreateDirOpen(false);
+      setNewDirName("");
+      await Promise.all([loadFiles(pagination.page), loadDirectoryOptions()]);
+    } catch (error) {
+      toast.danger(errorMessage(error));
+    } finally {
+      setCreatingDir(false);
+    }
+  }
+
+  async function onDeleteDirectory(directory: DirectoryItem) {
+    const ok = await confirm({
+      title: `删除目录 ${directory.name}？`,
+      description: (
+        <>
+          将递归删除 <span className="font-mono text-foreground">{directory.path}</span>{" "}
+          下的所有子目录和文件索引。Telegram 中的原始消息和已分发的签名链接不会被影响。
+        </>
+      ),
+      tone: "danger",
+      confirmText: "递归删除"
+    });
+    if (!ok) return;
+
+    try {
+      const result = await deleteDirectory(directory.id);
+      toast.success(`已删除 ${result.deleted_directories} 个目录、${result.deleted_files} 个文件索引`);
+      await Promise.all([loadFiles(pagination.page), loadDirectoryOptions()]);
+    } catch (error) {
+      toast.danger(errorMessage(error));
+    }
+  }
+
+  function openMoveDialog() {
+    if (selectedCount === 0) return;
+    setMoveTargetPath(currentDirPath);
+    setMoveNewParentPath(currentDirPath);
+    setMoveNewDirName("");
+    setMoveCreateNew(false);
+    setMoveOpen(true);
+    void loadDirectoryOptions();
+  }
+
+  async function onMoveSelected() {
+    const ids = files.filter((file) => selectedIds.has(file.id)).map((file) => file.id);
+    if (ids.length === 0) return;
+
+    const newName = moveNewDirName.trim();
+    if (moveCreateNew && !newName) {
+      toast.danger("请输入新目录名称");
+      return;
+    }
+
+    setMovingFiles(true);
+    try {
+      const result = await moveFiles(
+        moveCreateNew
+          ? {
+              file_ids: ids,
+              new_directory_parent_path: moveNewParentPath,
+              new_directory_name: newName
+            }
+          : {
+              file_ids: ids,
+              directory_path: moveTargetPath
+            }
+      );
+      toast.success(`已移动 ${result.moved} 个文件到 ${result.directory_path}`);
+      setMoveOpen(false);
+      setSelectedIds(new Set());
+      await Promise.all([loadFiles(pagination.page), loadDirectoryOptions()]);
+    } catch (error) {
+      toast.danger(errorMessage(error));
+    } finally {
+      setMovingFiles(false);
+    }
+  }
+
+  function goToDirectory(path: string) {
+    setCurrentDirPath(path);
+    setSelectedIds(new Set());
+  }
+
   function onCopy(file: FileItem) {
     copyText(file.url);
   }
@@ -226,18 +384,68 @@ export function DashboardPage({ session, uploadVersion, copyText }: DashboardPag
           <h1 className="mt-1 text-2xl font-semibold text-foreground sm:text-3xl">文件管理</h1>
           <p className="mt-1 text-sm text-muted">上传、检索、预览与分发存储在 Telegram 中的文件。</p>
         </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant="secondary"
+            leadingIcon={<ArrowUp size={16} />}
+            disabled={currentDirPath === "/"}
+            onClick={() => goToDirectory(parentDirectoryPath(currentDirPath))}
+          >
+            返回上级
+          </Button>
+          <Button
+            variant="primary"
+            leadingIcon={<FolderPlus size={16} />}
+            onClick={() => setCreateDirOpen(true)}
+          >
+            新建目录
+          </Button>
+        </div>
       </div>
 
       <MetricsRow metrics={metrics} />
 
       <div className="flex flex-col gap-3 rounded-2xl border border-border bg-surface p-3 shadow-card sm:p-4">
-        <div className="grid grid-cols-1 gap-2 lg:grid-cols-[minmax(260px,1fr)_150px_150px_150px_auto] lg:items-center">
+        <div className="flex flex-wrap items-center gap-1 rounded-xl border border-border bg-background/60 px-3 py-2">
+          {directoryBreadcrumbs(currentDirPath).map((item, index, array) => (
+            <div key={item.path} className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => goToDirectory(item.path)}
+                className="rounded-md px-2 py-1 text-sm font-medium text-foreground transition-colors hover:bg-primary-soft hover:text-primary-strong focus-visible:outline-none focus-visible:focus-ring"
+              >
+                {item.label}
+              </button>
+              {index < array.length - 1 ? <ChevronRight size={14} className="text-subtle" /> : null}
+            </div>
+          ))}
+          {query.trim() ? (
+            <span className="ml-auto rounded-full bg-primary-soft px-2 py-1 text-xs font-medium text-primary-strong">
+              当前目录及子目录内搜索
+            </span>
+          ) : null}
+        </div>
+
+        <div className="grid grid-cols-1 gap-2 xl:grid-cols-[minmax(240px,1fr)_220px_145px_145px_145px_auto] xl:items-center">
           <Input
             placeholder="搜索文件名、备注"
             leadingIcon={<Search size={15} />}
             value={query}
             onChange={(event) => setQuery(event.target.value)}
           />
+          <select
+            aria-label="目录过滤"
+            value={currentDirPath}
+            onChange={(event) => goToDirectory(event.target.value)}
+            className="h-11 rounded-lg border border-border bg-surface px-3 text-sm text-foreground shadow-card outline-none transition-colors hover:border-border-strong focus:border-primary focus:shadow-[0_0_0_4px_var(--color-primary-ring)]"
+          >
+            <option value="/">{directoryOptionLabel("/")}</option>
+            {directoryOptions.map((directory) => (
+              <option key={directory.id} value={directory.path}>
+                {directoryOptionLabel(directory.path)}
+              </option>
+            ))}
+          </select>
           <select
             aria-label="文件类型过滤"
             value={typeFilter}
@@ -276,21 +484,34 @@ export function DashboardPage({ session, uploadVersion, copyText }: DashboardPag
         {selectedCount > 0 ? (
           <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-danger/20 bg-danger-soft px-3 py-2">
             <p className="text-sm font-medium text-danger">已选 {selectedCount} 个文件</p>
-            <button
-              type="button"
-              onClick={() => void onBulkDelete()}
-              className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-danger px-3 text-sm font-medium text-white shadow-card transition-colors hover:bg-danger-strong focus-visible:outline-none focus-visible:focus-ring"
-            >
-              <Trash2 size={15} />
-              批量删除
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={openMoveDialog}
+                className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-border bg-surface px-3 text-sm font-medium text-foreground shadow-card transition-colors hover:border-border-strong hover:bg-background focus-visible:outline-none focus-visible:focus-ring"
+              >
+                <MoveRight size={15} />
+                移动
+              </button>
+              <button
+                type="button"
+                onClick={() => void onBulkDelete()}
+                className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-danger px-3 text-sm font-medium text-white shadow-card transition-colors hover:bg-danger-strong focus-visible:outline-none focus-visible:focus-ring"
+              >
+                <Trash2 size={15} />
+                批量删除
+              </button>
+            </div>
           </div>
         ) : null}
 
         <FileTable
+          directories={directories}
           files={files}
           selectedIds={selectedIds}
           allPageSelected={allPageSelected}
+          onOpenDirectory={(directory) => goToDirectory(directory.path)}
+          onDeleteDirectory={(directory) => void onDeleteDirectory(directory)}
           onToggleSelected={toggleSelected}
           onTogglePage={togglePage}
           onDetail={setDetailFile}
@@ -308,6 +529,157 @@ export function DashboardPage({ session, uploadVersion, copyText }: DashboardPag
 
       <PreviewDialog file={previewFile} onClose={() => setPreviewFile(null)} onCopy={copyText} />
       <FileDetailDialog file={detailFile} onClose={() => setDetailFile(null)} onCopy={copyText} />
+
+      <Modal
+        open={createDirOpen}
+        onClose={() => {
+          if (!creatingDir) {
+            setCreateDirOpen(false);
+            setNewDirName("");
+          }
+        }}
+        title="新建目录"
+        description={`将在 ${currentDirPath} 下创建子目录`}
+        footer={
+          <>
+            <Button variant="secondary" disabled={creatingDir} onClick={() => setCreateDirOpen(false)}>
+              取消
+            </Button>
+            <Button
+              type="submit"
+              form="create-directory-form"
+              variant="primary"
+              loading={creatingDir}
+              leadingIcon={<FolderPlus size={16} />}
+            >
+              创建
+            </Button>
+          </>
+        }
+      >
+        <form
+          id="create-directory-form"
+          className="flex flex-col gap-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void onCreateDirectory();
+          }}
+        >
+          <label htmlFor="directory-name" className="text-xs font-medium text-muted">
+            目录名称
+          </label>
+          <Input
+            id="directory-name"
+            value={newDirName}
+            placeholder="例如 photos"
+            maxLength={80}
+            disabled={creatingDir}
+            onChange={(event) => setNewDirName(event.target.value)}
+          />
+        </form>
+      </Modal>
+
+      <Modal
+        open={moveOpen}
+        onClose={() => {
+          if (!movingFiles) setMoveOpen(false);
+        }}
+        title="移动文件"
+        description={`将 ${selectedCount} 个文件移动到其他目录`}
+        footer={
+          <>
+            <Button variant="secondary" disabled={movingFiles} onClick={() => setMoveOpen(false)}>
+              取消
+            </Button>
+            <Button
+              type="submit"
+              form="move-files-form"
+              variant="primary"
+              loading={movingFiles}
+              leadingIcon={<MoveRight size={16} />}
+            >
+              移动
+            </Button>
+          </>
+        }
+      >
+        <form
+          id="move-files-form"
+          className="flex flex-col gap-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void onMoveSelected();
+          }}
+        >
+          <label className="flex items-center gap-2 text-sm font-medium text-foreground">
+            <input
+              type="checkbox"
+              checked={moveCreateNew}
+              disabled={movingFiles}
+              onChange={(event) => setMoveCreateNew(event.target.checked)}
+              className="size-4 rounded border-border text-primary accent-primary focus-visible:outline-none focus-visible:focus-ring"
+            />
+            移动到新目录
+          </label>
+
+          {moveCreateNew ? (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-[1fr_1fr]">
+              <div className="flex flex-col gap-1.5">
+                <label htmlFor="move-new-parent" className="text-xs font-medium text-muted">
+                  父目录
+                </label>
+                <select
+                  id="move-new-parent"
+                  value={moveNewParentPath}
+                  disabled={movingFiles}
+                  onChange={(event) => setMoveNewParentPath(event.target.value)}
+                  className="h-11 rounded-lg border border-border bg-surface px-3 text-sm text-foreground shadow-card outline-none transition-colors hover:border-border-strong focus:border-primary focus:shadow-[0_0_0_4px_var(--color-primary-ring)]"
+                >
+                  <option value="/">{directoryOptionLabel("/")}</option>
+                  {directoryOptions.map((directory) => (
+                    <option key={directory.id} value={directory.path}>
+                      {directoryOptionLabel(directory.path)}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <label htmlFor="move-new-name" className="text-xs font-medium text-muted">
+                  新目录名称
+                </label>
+                <Input
+                  id="move-new-name"
+                  value={moveNewDirName}
+                  placeholder="例如 2026"
+                  maxLength={80}
+                  disabled={movingFiles}
+                  onChange={(event) => setMoveNewDirName(event.target.value)}
+                />
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-1.5">
+              <label htmlFor="move-target" className="text-xs font-medium text-muted">
+                目标目录
+              </label>
+              <select
+                id="move-target"
+                value={moveTargetPath}
+                disabled={movingFiles}
+                onChange={(event) => setMoveTargetPath(event.target.value)}
+                className="h-11 rounded-lg border border-border bg-surface px-3 text-sm text-foreground shadow-card outline-none transition-colors hover:border-border-strong focus:border-primary focus:shadow-[0_0_0_4px_var(--color-primary-ring)]"
+              >
+                <option value="/">{directoryOptionLabel("/")}</option>
+                {directoryOptions.map((directory) => (
+                  <option key={directory.id} value={directory.path}>
+                    {directoryOptionLabel(directory.path)}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+        </form>
+      </Modal>
     </div>
   );
 }

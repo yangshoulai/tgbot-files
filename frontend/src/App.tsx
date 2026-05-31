@@ -43,6 +43,7 @@ function AppShell() {
   const [uploadOpen, setUploadOpen] = useState(false);
   const [uploadFiles, setUploadFiles] = useState<File[]>([]);
   const [uploadVersion, setUploadVersion] = useState(0);
+  const [dashboardDirectoryPath, setDashboardDirectoryPath] = useState("/");
 
   const navigate = useCallback((route: Route) => {
     if (window.location.pathname !== route) {
@@ -146,7 +147,12 @@ function AppShell() {
         {active === "settings" ? (
           <SettingsPage session={session} copyText={copyText} />
         ) : (
-          <DashboardPage session={session} uploadVersion={uploadVersion} copyText={copyText} />
+          <DashboardPage
+            session={session}
+            uploadVersion={uploadVersion}
+            copyText={copyText}
+            onDirectoryChange={setDashboardDirectoryPath}
+          />
         )}
       </Shell>
 
@@ -156,6 +162,7 @@ function AppShell() {
         maxBytes={session.max_file_bytes}
         multipartChunkBytes={session.multipart_chunk_bytes}
         maxMultipartBytes={session.max_multipart_file_bytes}
+        directoryPath={dashboardDirectoryPath}
         onClose={() => setUploadOpen(false)}
         onUploaded={(count) => {
           if (count > 0) {

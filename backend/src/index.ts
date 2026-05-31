@@ -8,23 +8,30 @@ import {
 import { createSignedToken, TokenError, verifySignedToken } from "./crypto";
 import {
   completeMultipartUploadRecord,
+  getDirectoryRecordByPath,
   findActiveApiKeyRecord,
   getApiKeyRecord,
   getMultipartUploadRecord,
+  insertDirectoryRecord,
   insertApiKeyRecord,
   insertFileRecord,
   insertMultipartUploadRecord,
+  listAllDirectoryRecords,
+  listDirectoryChildren,
   listFileChunkRecords,
   listApiKeyRecords,
   listFileRecords,
+  moveFileRecords,
   requireDb,
   softDeleteApiKeyRecord,
+  softDeleteDirectoryTree,
   softDeleteFileRecord,
   touchApiKeyRecord,
   updateApiKeyRecord,
   upsertFileChunkRecord,
   type ApiKeyRecord,
   type ApiKeyStatus,
+  type DirectoryRecord,
   type FileChunkRecord,
   type FileRecord,
   type FileTypeFilter,
@@ -71,6 +78,8 @@ interface UploadResult {
   telegramFileUniqueId?: string;
   remark?: string;
   createdAt: string;
+  directoryId?: string | null;
+  directoryPath: string;
 }
 
 interface MultipartInitResult {
@@ -80,6 +89,7 @@ interface MultipartInitResult {
   size: number;
   chunkSize: number;
   chunkCount: number;
+  directoryPath: string;
 }
 
 interface ParsedByteRange {
@@ -152,6 +162,10 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
     );
   }
 
+  if (url.pathname === "/api/admin/directories" || url.pathname.startsWith("/api/admin/directories/")) {
+    return handleAuthenticatedAdminRequest(request, env, () => handleAdminDirectories(request, env));
+  }
+
   if (url.pathname === "/api/admin/files" || url.pathname.startsWith("/api/admin/files/")) {
     return handleAuthenticatedAdminRequest(request, env, (username) =>
       handleAdminFiles(request, env, username)
@@ -177,12 +191,15 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const db = requireDb(env);
   await requireUploadApiKey(request, db);
 
-  const { file } = await readUploadInput(request, env);
+  const { file, directoryPath } = await readUploadInput(request, env);
+  const directory = await requireWritableDirectory(db, directoryPath);
   const result = await uploadAndRecordFile({
     request,
     env,
     file,
-    db
+    db,
+    directoryPath,
+    directoryId: directory?.id ?? null
   });
 
   return jsonResponse({
@@ -305,20 +322,29 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
     const type = normalizeFileTypeFilter(url.searchParams.get("type"));
     const createdFrom = normalizeDateTimeParam(url.searchParams.get("created_from"), "created_from");
     const createdTo = normalizeDateTimeParam(url.searchParams.get("created_to"), "created_to");
+    const directoryPath = normalizeDirectoryPath(url.searchParams.get("dir") || "/");
+    const currentDirectory = await requireReadableDirectory(db, directoryPath);
+    const normalizedQuery = url.searchParams.get("q") || "";
     const result = await listFileRecords({
       db,
-      query: url.searchParams.get("q") || "",
+      query: normalizedQuery,
+      directoryPath,
+      recursive: normalizedQuery.trim().length > 0,
       ...(type ? { type } : {}),
       ...(createdFrom ? { createdFrom } : {}),
       ...(createdTo ? { createdTo } : {}),
       page,
       limit
     });
+    const directories = await listDirectoryChildren(db, directoryPath);
     const baseUrl = getPublicBaseUrl(request, env);
     const files = result.files.map((file) => serializeFileRecord(file, baseUrl));
 
     return jsonResponse({
       ok: true,
+      current_directory: serializeCurrentDirectory(currentDirectory, directoryPath),
+      directories: directories.map(serializeDirectoryRecord),
+      search_scope: normalizedQuery.trim() ? "subtree" : "current",
       files,
       pagination: {
         page,
@@ -333,13 +359,16 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
   }
 
   if (request.method === "POST" && url.pathname === "/api/admin/files") {
-    const { file: formFile, remark } = await readUploadInput(request, env);
+    const { file: formFile, remark, directoryPath } = await readUploadInput(request, env);
+    const directory = await requireWritableDirectory(db, directoryPath);
     const result = await uploadAndRecordFile({
       request,
       env,
       file: formFile,
       db,
       uploadedBy: username,
+      directoryPath,
+      directoryId: directory?.id ?? null,
       ...(remark ? { remark } : {})
     });
 
@@ -347,6 +376,19 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
       ok: true,
       file: serializeUploadedFileResult(result, username)
     });
+  }
+
+  if (request.method === "PATCH" && url.pathname === "/api/admin/files/move") {
+    const body = await readJsonObject(request);
+    const fileIds = normalizeFileIdList(body.file_ids);
+    const directoryPath = await resolveMoveTargetDirectory(db, body);
+    const moved = await moveFileRecords({
+      db,
+      ids: fileIds,
+      directoryPath
+    });
+
+    return jsonResponse({ ok: true, moved, directory_path: directoryPath });
   }
 
   const deleteMatch = /^\/api\/admin\/files\/([^/]+)$/.exec(url.pathname);
@@ -363,6 +405,63 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
   return errorResponse(new AppError(404, "NotFound", "Admin file route not found"));
 }
 
+async function handleAdminDirectories(request: Request, env: Env): Promise<Response> {
+  const db = requireDb(env);
+  const url = new URL(request.url);
+
+  if (request.method === "GET" && url.pathname === "/api/admin/directories") {
+    const flat = url.searchParams.get("flat") === "1" || url.searchParams.get("flat") === "true";
+    const parentPath = normalizeDirectoryPath(url.searchParams.get("parent_path") || "/");
+    if (!flat) {
+      await requireReadableDirectory(db, parentPath);
+    }
+    const directories = flat
+      ? await listAllDirectoryRecords(db)
+      : await listDirectoryChildren(db, parentPath);
+
+    return jsonResponse({
+      ok: true,
+      directories: directories.map(serializeDirectoryRecord)
+    });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/admin/directories") {
+    const body = await readJsonObject(request);
+    const parentPath = normalizeDirectoryPath(body.parent_path ?? "/");
+    const name = normalizeDirectoryName(body.name);
+    const record = await insertDirectoryRecord({
+      db,
+      parentPath,
+      name,
+      createdAt: new Date().toISOString()
+    });
+
+    return jsonResponse({ ok: true, directory: serializeDirectoryRecord(record) }, 201);
+  }
+
+  const match = /^\/api\/admin\/directories\/([^/]+)$/.exec(url.pathname);
+  if (request.method === "DELETE" && match?.[1]) {
+    const result = await softDeleteDirectoryTree({
+      db,
+      id: decodeURIComponent(match[1]),
+      deletedAt: new Date().toISOString()
+    });
+
+    if (!result) {
+      throw new AppError(404, "DirectoryNotFound", "Directory not found");
+    }
+
+    return jsonResponse({
+      ok: true,
+      deleted_directories: result.deletedDirectories,
+      deleted_files: result.deletedFiles,
+      directory: serializeDirectoryRecord(result.directory)
+    });
+  }
+
+  return errorResponse(new AppError(404, "NotFound", "Admin directory route not found"));
+}
+
 async function handleAdminMultipartUploads(request: Request, env: Env, username: string): Promise<Response> {
   const db = requireDb(env);
   const url = new URL(request.url);
@@ -373,6 +472,8 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
     const mimeType = normalizeMimeTypeField(body.mime_type);
     const size = positiveIntegerField(body.size, "size");
     const remark = normalizeRemark(body.remark);
+    const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
+    const directory = await requireWritableDirectory(db, directoryPath);
     const result = await createMultipartUpload({
       db,
       sourceKind: "local",
@@ -380,6 +481,8 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
       mimeType,
       size,
       uploadedBy: username,
+      directoryPath,
+      directoryId: directory?.id ?? null,
       ...(remark ? { remark } : {})
     });
 
@@ -393,6 +496,8 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
     const body = await readJsonObject(request);
     const sourceUrl = normalizeSourceUrl(body.url);
     const remark = normalizeRemark(body.remark);
+    const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
+    const directory = await requireWritableDirectory(db, directoryPath);
 
     if (!sourceUrl) {
       throw new AppError(400, "MissingUrl", "JSON field 'url' is required");
@@ -406,7 +511,8 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
         mode: "single",
         max_file_bytes: parseMaxFileBytes(env.MAX_FILE_BYTES),
         max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
-        multipart_chunk_bytes: TELEGRAM_CHUNK_SIZE_BYTES
+        multipart_chunk_bytes: TELEGRAM_CHUNK_SIZE_BYTES,
+        directory_path: directoryPath
       });
     }
 
@@ -418,6 +524,8 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
       mimeType: probe.mimeType,
       size: probe.size,
       uploadedBy: username,
+      directoryPath,
+      directoryId: directory?.id ?? null,
       ...(remark ? { remark } : {})
     });
 
@@ -571,7 +679,7 @@ async function handleAdminApiKeys(request: Request, env: Env): Promise<Response>
   return errorResponse(new AppError(405, "MethodNotAllowed", "Unsupported API key method"));
 }
 
-async function readUploadInput(request: Request, env: Env): Promise<{ file: File; remark?: string }> {
+async function readUploadInput(request: Request, env: Env): Promise<{ file: File; remark?: string; directoryPath: string }> {
   const contentType = request.headers.get("Content-Type") || "";
   const normalizedContentType = contentType.toLowerCase();
 
@@ -587,12 +695,14 @@ async function readUploadInput(request: Request, env: Env): Promise<{ file: File
   const formData = await request.formData();
   const formFile = formData.get("file");
   const remark = normalizeRemark(formData.get("remark"));
+  const directoryPath = normalizeDirectoryPath(formData.get("directory_path") ?? formData.get("dir") ?? "/");
 
   if (formFile instanceof File) {
     validateUploadFileSize(formFile, maxFileBytes);
 
     return {
       file: formFile,
+      directoryPath,
       ...(remark ? { remark } : {})
     };
   }
@@ -607,6 +717,7 @@ async function readUploadInput(request: Request, env: Env): Promise<{ file: File
 
     return {
       file,
+      directoryPath,
       ...(remark ? { remark } : {})
     };
   }
@@ -614,7 +725,7 @@ async function readUploadInput(request: Request, env: Env): Promise<{ file: File
   throw new AppError(400, "MissingFile", "Multipart field 'file' is required");
 }
 
-async function readUrlUploadJson(request: Request, env: Env): Promise<{ file: File; remark?: string }> {
+async function readUrlUploadJson(request: Request, env: Env): Promise<{ file: File; remark?: string; directoryPath: string }> {
   const maxFileBytes = parseMaxFileBytes(env.MAX_FILE_BYTES);
   const body = await readJsonObject(request);
   const sourceUrl = normalizeSourceUrl(body.url);
@@ -623,6 +734,7 @@ async function readUrlUploadJson(request: Request, env: Env): Promise<{ file: Fi
     throw new AppError(400, "MissingUrl", "JSON field 'url' is required");
   }
 
+  const directoryPath = normalizeDirectoryPath(body.directory_path ?? body.dir ?? "/");
   const file = await downloadFileFromUrl({
     sourceUrl,
     env,
@@ -632,6 +744,7 @@ async function readUrlUploadJson(request: Request, env: Env): Promise<{ file: Fi
 
   return {
     file,
+    directoryPath,
     ...(remark ? { remark } : {})
   };
 }
@@ -892,6 +1005,8 @@ async function createMultipartUpload(params: {
   size: number;
   uploadedBy: string;
   remark?: string;
+  directoryId?: string | null;
+  directoryPath: string;
 }): Promise<MultipartInitResult> {
   validateMultipartFileSize(params.size);
   const chunkCount = Math.ceil(params.size / TELEGRAM_CHUNK_SIZE_BYTES);
@@ -906,6 +1021,8 @@ async function createMultipartUpload(params: {
     chunkSize: TELEGRAM_CHUNK_SIZE_BYTES,
     chunkCount,
     uploadedBy: params.uploadedBy,
+    directoryId: params.directoryId ?? null,
+    directoryPath: params.directoryPath,
     ...(params.remark ? { remark: params.remark } : {}),
     createdAt
   });
@@ -916,7 +1033,8 @@ async function createMultipartUpload(params: {
     mimeType: record.mime_type,
     size: record.size,
     chunkSize: record.chunk_size,
-    chunkCount: record.chunk_count
+    chunkCount: record.chunk_count,
+    directoryPath: record.directory_path ?? "/"
   };
 }
 
@@ -1188,6 +1306,8 @@ async function completeMultipartUpload(params: {
     storageBackend: "telegram_multipart",
     chunkSize: params.upload.chunk_size,
     chunkCount: params.upload.chunk_count,
+    directoryId: params.upload.directory_id ?? null,
+    directoryPath: params.upload.directory_path ?? "/",
     ...(params.upload.remark ? { remark: params.upload.remark } : {}),
     ...(params.upload.uploaded_by ? { uploadedBy: params.upload.uploaded_by } : {})
   });
@@ -1203,7 +1323,9 @@ async function completeMultipartUpload(params: {
     publicUrl,
     telegramFileId: `multipart:${params.upload.id}`,
     ...(params.upload.remark ? { remark: params.upload.remark } : {}),
-    createdAt
+    createdAt,
+    directoryId: params.upload.directory_id ?? null,
+    directoryPath: params.upload.directory_path ?? "/"
   };
 }
 
@@ -1239,6 +1361,8 @@ async function uploadAndRecordFile(params: {
   db?: D1Database;
   uploadedBy?: string;
   remark?: string;
+  directoryId?: string | null;
+  directoryPath?: string;
 }): Promise<UploadResult> {
   const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
   const chatId = requireEnv(params.env, "TELEGRAM_STORAGE_CHAT_ID");
@@ -1296,6 +1420,8 @@ async function uploadAndRecordFile(params: {
       telegramFileId: telegramDocument.file_id,
       filePath,
       createdAt,
+      directoryId: params.directoryId ?? null,
+      directoryPath: params.directoryPath ?? "/",
       ...(params.remark ? { remark: params.remark } : {}),
       ...(telegramDocument.file_unique_id ? { telegramFileUniqueId: telegramDocument.file_unique_id } : {}),
       ...(params.uploadedBy ? { uploadedBy: params.uploadedBy } : {})
@@ -1313,7 +1439,9 @@ async function uploadAndRecordFile(params: {
     telegramFileId: telegramDocument.file_id,
     ...(telegramDocument.file_unique_id ? { telegramFileUniqueId: telegramDocument.file_unique_id } : {}),
     ...(params.remark ? { remark: params.remark } : {}),
-    createdAt
+    createdAt,
+    directoryId: params.directoryId ?? null,
+    directoryPath: params.directoryPath ?? "/"
   };
 }
 
@@ -1578,6 +1706,8 @@ function serializeFileRecord(file: FileRecord, baseUrl: string): Record<string, 
 
   return {
     ...file,
+    directory_id: file.directory_id ?? null,
+    directory_path: file.directory_path ?? "/",
     url,
     download_url: appendDownloadParam(url)
   };
@@ -1591,8 +1721,46 @@ function serializeMultipartInit(result: MultipartInitResult): Record<string, unk
     size: result.size,
     chunk_size: result.chunkSize,
     chunk_count: result.chunkCount,
+    directory_path: result.directoryPath,
     max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES
   };
+}
+
+function serializeDirectoryRecord(record: DirectoryRecord): Record<string, unknown> {
+  return {
+    id: record.id,
+    parent_id: record.parent_id,
+    name: record.name,
+    path: record.path,
+    created_at: record.created_at,
+    deleted_at: record.deleted_at
+  };
+}
+
+function serializeCurrentDirectory(record: DirectoryRecord | null, path: string): Record<string, unknown> {
+  if (path === "/") {
+    return {
+      id: null,
+      parent_id: null,
+      name: "/",
+      path: "/",
+      created_at: null,
+      deleted_at: null
+    };
+  }
+
+  if (!record) {
+    return {
+      id: null,
+      parent_id: null,
+      name: path.split("/").filter(Boolean).at(-1) ?? path,
+      path,
+      created_at: null,
+      deleted_at: null
+    };
+  }
+
+  return serializeDirectoryRecord(record);
 }
 
 function serializeChunk(record: Awaited<ReturnType<typeof uploadChunkToTelegram>>): Record<string, unknown> {
@@ -1619,6 +1787,8 @@ function serializeUploadedFileResult(result: UploadResult, username: string): Re
     download_url: appendDownloadParam(result.publicUrl),
     uploaded_by: username,
     created_at: result.createdAt,
+    directory_id: result.directoryId ?? null,
+    directory_path: result.directoryPath,
     storage_backend: result.telegramFileId.startsWith("multipart:") ? "telegram_multipart" : "telegram_single"
   };
 }
@@ -1734,6 +1904,127 @@ function normalizeName(value: unknown, fieldName: string): string {
   }
 
   return normalized;
+}
+
+function normalizeDirectoryName(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new AppError(400, "InvalidDirectoryName", "Directory name is required");
+  }
+
+  const normalized = value.trim();
+
+  if (normalized.length === 0 || normalized.length > 80) {
+    throw new AppError(400, "InvalidDirectoryName", "Directory name must be 1-80 characters");
+  }
+
+  if (
+    normalized === "." ||
+    normalized === ".." ||
+    normalized.includes("/") ||
+    normalized.includes("\\") ||
+    /[\u0000-\u001f\u007f]/.test(normalized)
+  ) {
+    throw new AppError(400, "InvalidDirectoryName", "Directory name contains unsupported characters");
+  }
+
+  return normalized;
+}
+
+function normalizeDirectoryPath(value: unknown): string {
+  if (typeof value !== "string") {
+    return "/";
+  }
+
+  let normalized = value.trim();
+
+  if (!normalized) {
+    return "/";
+  }
+
+  if (normalized.length > 512) {
+    throw new AppError(400, "InvalidDirectoryPath", "Directory path is too long");
+  }
+
+  if (!normalized.startsWith("/")) {
+    normalized = `/${normalized}`;
+  }
+
+  normalized = normalized.replace(/\/+/g, "/");
+  if (normalized.length > 1) {
+    normalized = normalized.replace(/\/+$/g, "");
+  }
+
+  const segments = normalized.split("/").filter(Boolean);
+  for (const segment of segments) {
+    if (
+      segment.length > 80 ||
+      segment !== segment.trim() ||
+      segment === "." ||
+      segment === ".." ||
+      segment.includes("\\") ||
+      /[\u0000-\u001f\u007f]/.test(segment)
+    ) {
+      throw new AppError(400, "InvalidDirectoryPath", "Directory path is invalid");
+    }
+  }
+
+  return segments.length === 0 ? "/" : `/${segments.join("/")}`;
+}
+
+async function requireReadableDirectory(db: D1Database, path: string): Promise<DirectoryRecord | null> {
+  if (path === "/") {
+    return null;
+  }
+
+  const directory = await getDirectoryRecordByPath(db, path);
+  if (!directory) {
+    throw new AppError(404, "DirectoryNotFound", "Directory not found");
+  }
+
+  return directory;
+}
+
+async function requireWritableDirectory(db: D1Database, path: string): Promise<DirectoryRecord | null> {
+  return requireReadableDirectory(db, path);
+}
+
+function normalizeFileIdList(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    throw new AppError(400, "InvalidBody", "file_ids must be an array");
+  }
+
+  const ids = Array.from(new Set(value.map((item) => typeof item === "string" ? item.trim() : ""))).filter(Boolean);
+
+  if (ids.length === 0) {
+    throw new AppError(400, "InvalidBody", "file_ids must not be empty");
+  }
+
+  if (ids.length > 100) {
+    throw new AppError(400, "InvalidBody", "file_ids must contain at most 100 ids");
+  }
+
+  return ids;
+}
+
+async function resolveMoveTargetDirectory(db: D1Database, body: Record<string, unknown>): Promise<string> {
+  if (body.new_directory_name !== undefined) {
+    const parentPath = normalizeDirectoryPath(
+      body.new_directory_parent_path ?? body.parent_path ?? body.directory_path ?? "/"
+    );
+    const name = normalizeDirectoryName(body.new_directory_name);
+    const directory = await insertDirectoryRecord({
+      db,
+      parentPath,
+      name,
+      createdAt: new Date().toISOString()
+    });
+
+    return directory.path;
+  }
+
+  const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
+  await requireWritableDirectory(db, directoryPath);
+  return directoryPath;
 }
 
 function normalizeApiKeyStatus(value: unknown): ApiKeyStatus {

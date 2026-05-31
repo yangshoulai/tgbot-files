@@ -48,6 +48,8 @@ export interface FileItem {
   uploaded_by: string | null;
   created_at: string;
   deleted_at: string | null;
+  directory_id: string | null;
+  directory_path: string;
   url: string;
   download_url: string;
   storage_backend?: "telegram_single" | "telegram_multipart";
@@ -55,8 +57,29 @@ export interface FileItem {
   chunk_count?: number | null;
 }
 
+export interface DirectoryItem {
+  id: string;
+  parent_id: string | null;
+  name: string;
+  path: string;
+  created_at: string;
+  deleted_at: string | null;
+}
+
+export interface CurrentDirectory {
+  id: string | null;
+  parent_id: string | null;
+  name: string;
+  path: string;
+  created_at: string | null;
+  deleted_at: string | null;
+}
+
 export interface FileListResponse {
   ok: boolean;
+  current_directory: CurrentDirectory;
+  directories: DirectoryItem[];
+  search_scope: "current" | "subtree";
   files: FileItem[];
   pagination: Pagination;
   max_file_bytes: number;
@@ -69,6 +92,29 @@ export interface AdminUploadResponse {
   file: FileItem;
 }
 
+export interface DirectoryListResponse {
+  ok: boolean;
+  directories: DirectoryItem[];
+}
+
+export interface DirectoryCreateResponse {
+  ok: boolean;
+  directory: DirectoryItem;
+}
+
+export interface DirectoryDeleteResponse {
+  ok: boolean;
+  deleted_directories: number;
+  deleted_files: number;
+  directory: DirectoryItem;
+}
+
+export interface MoveFilesResponse {
+  ok: boolean;
+  moved: number;
+  directory_path: string;
+}
+
 export interface MultipartUpload {
   id: string;
   file_name: string;
@@ -76,6 +122,7 @@ export interface MultipartUpload {
   size: number;
   chunk_size: number;
   chunk_count: number;
+  directory_path: string;
   max_multipart_file_bytes: number;
 }
 
@@ -197,6 +244,7 @@ export function listFiles(params: {
   q: string;
   page: number;
   limit: number;
+  dir?: string;
   type?: "all" | "image" | "text" | "pdf" | "archive" | "other";
   created_from?: string;
   created_to?: string;
@@ -204,7 +252,8 @@ export function listFiles(params: {
   const search = new URLSearchParams({
     q: params.q,
     page: String(params.page),
-    limit: String(params.limit)
+    limit: String(params.limit),
+    dir: params.dir || "/"
   });
 
   if (params.type && params.type !== "all") {
@@ -229,7 +278,7 @@ export function uploadFile(formData: FormData) {
   });
 }
 
-export function uploadFileFromUrl(url: string, remark?: string) {
+export function uploadFileFromUrl(url: string, remark?: string, directoryPath = "/") {
   return requestJson<AdminUploadResponse>("/api/admin/files", {
     method: "POST",
     headers: {
@@ -237,6 +286,7 @@ export function uploadFileFromUrl(url: string, remark?: string) {
     },
     body: JSON.stringify({
       url,
+      directory_path: directoryPath,
       ...(remark ? { remark } : {})
     })
   });
@@ -247,6 +297,7 @@ export function initMultipartUpload(params: {
   mime_type: string;
   size: number;
   remark?: string;
+  directory_path?: string;
 }) {
   return requestJson<MultipartInitResponse>("/api/admin/uploads/init", {
     method: "POST",
@@ -266,7 +317,7 @@ export function uploadMultipartChunk(uploadId: string, chunkIndex: number, chunk
   });
 }
 
-export function initUrlMultipartUpload(url: string, remark?: string) {
+export function initUrlMultipartUpload(url: string, remark?: string, directoryPath = "/") {
   return requestJson<UrlMultipartInitResponse>("/api/admin/uploads/url/init", {
     method: "POST",
     headers: {
@@ -274,6 +325,7 @@ export function initUrlMultipartUpload(url: string, remark?: string) {
     },
     body: JSON.stringify({
       url,
+      directory_path: directoryPath,
       ...(remark ? { remark } : {})
     })
   });
@@ -295,6 +347,48 @@ export function completeMultipartUpload(uploadId: string) {
 export function deleteFile(id: string) {
   return requestJson<{ ok: boolean }>(`/api/admin/files/${encodeURIComponent(id)}`, {
     method: "DELETE"
+  });
+}
+
+export function listDirectories(flat = false, parentPath = "/") {
+  const search = new URLSearchParams();
+  if (flat) {
+    search.set("flat", "1");
+  } else {
+    search.set("parent_path", parentPath);
+  }
+
+  return requestJson<DirectoryListResponse>(`/api/admin/directories?${search.toString()}`);
+}
+
+export function createDirectory(parentPath: string, name: string) {
+  return requestJson<DirectoryCreateResponse>("/api/admin/directories", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ parent_path: parentPath, name })
+  });
+}
+
+export function deleteDirectory(id: string) {
+  return requestJson<DirectoryDeleteResponse>(`/api/admin/directories/${encodeURIComponent(id)}`, {
+    method: "DELETE"
+  });
+}
+
+export function moveFiles(params: {
+  file_ids: string[];
+  directory_path?: string;
+  new_directory_parent_path?: string;
+  new_directory_name?: string;
+}) {
+  return requestJson<MoveFilesResponse>("/api/admin/files/move", {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(params)
   });
 }
 

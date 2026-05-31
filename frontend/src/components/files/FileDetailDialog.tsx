@@ -72,6 +72,7 @@ export function FileDetailDialog({ file, onClose, onCopy }: FileDetailDialogProp
         <DetailRow label="文件名" value={file.file_name} mono />
         <DetailRow label="MIME 类型" value={file.mime_type} mono />
         <DetailRow label="大小" value={formatBytes(file.size)} />
+        <DetailRow label="目录" value={file.directory_path || "/"} mono />
         <DetailRow label="存储方式" value={isMultipart ? `Telegram 分片（${file.chunk_count ?? "?"} 片）` : "Telegram 单文件"} />
         <DetailRow label="MD5" value={isMultipart ? "分片文件不计算整文件 MD5" : file.md5} mono={!isMultipart} />
         <DetailRow label={isMultipart ? "分片记录 ID" : "Telegram ID"} value={file.telegram_file_id} mono />

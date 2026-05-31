@@ -26,6 +26,7 @@ interface UploadDialogProps {
   maxBytes: number;
   multipartChunkBytes: number;
   maxMultipartBytes: number;
+  directoryPath: string;
   onClose: () => void;
   onUploaded: (uploadedCount: number) => void;
   onError: (message: string) => void;
@@ -67,6 +68,7 @@ export function UploadDialog({
   maxBytes,
   multipartChunkBytes,
   maxMultipartBytes,
+  directoryPath,
   onClose,
   onUploaded,
   onError
@@ -198,6 +200,7 @@ export function UploadDialog({
         } else {
           const form = new FormData();
           form.set("file", target.file);
+          form.set("directory_path", directoryPath);
           if (remark.trim()) form.set("remark", remark.trim());
           await uploadFile(form);
         }
@@ -227,6 +230,7 @@ export function UploadDialog({
       file_name: target.file.name,
       mime_type: target.file.type || "application/octet-stream",
       size: target.file.size,
+      directory_path: directoryPath,
       ...(remark.trim() ? { remark: remark.trim() } : {})
     });
     const upload = init.upload;
@@ -271,7 +275,7 @@ export function UploadDialog({
     setUrlUpload({ status: "uploading", progress: { completed: 0, total: 1, label: "探测远程文件" } });
 
     try {
-      const init = await initUrlMultipartUpload(normalizedSourceUrl, remark.trim() || undefined);
+      const init = await initUrlMultipartUpload(normalizedSourceUrl, remark.trim() || undefined, directoryPath);
       if (init.mode === "multipart" && init.upload) {
         const upload = init.upload;
         for (let index = 0; index < upload.chunk_count; index += 1) {
@@ -304,7 +308,7 @@ export function UploadDialog({
         await completeMultipartUpload(upload.id);
       } else {
         setUrlUpload({ status: "uploading", progress: { completed: 0, total: 1, label: "拉取远程文件" } });
-        await uploadFileFromUrl(normalizedSourceUrl, remark.trim() || undefined);
+        await uploadFileFromUrl(normalizedSourceUrl, remark.trim() || undefined, directoryPath);
       }
       setUrlUpload({ status: "done", message: "已从 URL 上传" });
       onUploaded(1);
@@ -334,7 +338,7 @@ export function UploadDialog({
       open={open}
       onClose={onClose}
       title="上传文件"
-      description={`单文件 ${formatBytes(maxBytes)} 内直传；大文件分片上限 ${formatBytes(maxMultipartBytes)}`}
+      description={`上传到 ${directoryPath}；单文件 ${formatBytes(maxBytes)} 内直传，大文件分片上限 ${formatBytes(maxMultipartBytes)}`}
       size="lg"
       closeOnBackdrop={!submitting}
       closeOnEscape={!submitting}

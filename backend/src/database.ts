@@ -3,6 +3,15 @@ import { AppError } from "./http";
 export type StorageBackend = "telegram_single" | "telegram_multipart";
 export type MultipartSourceKind = "local" | "url";
 
+export interface DirectoryRecord {
+  id: string;
+  parent_id: string | null;
+  name: string;
+  path: string;
+  created_at: string;
+  deleted_at: string | null;
+}
+
 export interface FileRecord {
   id: string;
   file_name: string;
@@ -16,6 +25,8 @@ export interface FileRecord {
   uploaded_by: string | null;
   created_at: string;
   deleted_at: string | null;
+  directory_id?: string | null;
+  directory_path?: string;
   storage_backend?: StorageBackend;
   chunk_size?: number | null;
   chunk_count?: number | null;
@@ -33,6 +44,8 @@ export interface NewFileRecord {
   remark?: string;
   uploadedBy?: string;
   createdAt: string;
+  directoryId?: string | null;
+  directoryPath?: string;
   storageBackend?: StorageBackend;
   chunkSize?: number;
   chunkCount?: number;
@@ -78,6 +91,8 @@ export interface MultipartUploadRecord {
   uploaded_by: string | null;
   created_at: string;
   completed_at: string | null;
+  directory_id?: string | null;
+  directory_path?: string;
 }
 
 export interface NewMultipartUploadRecord {
@@ -92,6 +107,8 @@ export interface NewMultipartUploadRecord {
   remark?: string;
   uploadedBy?: string;
   createdAt: string;
+  directoryId?: string | null;
+  directoryPath?: string;
 }
 
 export interface FileChunkRecord {
@@ -137,11 +154,13 @@ export async function insertFileRecord(db: D1Database, record: NewFileRecord): P
         remark,
         uploaded_by,
         created_at,
+        directory_id,
+        directory_path,
         deleted_at,
         storage_backend,
         chunk_size,
         chunk_count
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
     )
     .bind(
       record.id,
@@ -155,6 +174,8 @@ export async function insertFileRecord(db: D1Database, record: NewFileRecord): P
       record.remark ?? null,
       record.uploadedBy ?? null,
       record.createdAt,
+      record.directoryId ?? null,
+      record.directoryPath ?? "/",
       record.storageBackend ?? "telegram_single",
       record.chunkSize ?? null,
       record.chunkCount ?? null
@@ -168,12 +189,25 @@ export async function listFileRecords(params: {
   type?: FileTypeFilter;
   createdFrom?: string;
   createdTo?: string;
+  directoryPath?: string;
+  recursive?: boolean;
   page: number;
   limit: number;
 }): Promise<FileListResult> {
   const whereParts = ["deleted_at IS NULL"];
   const bindings: Array<number | string> = [];
   const normalizedQuery = params.query.trim().toLowerCase();
+  const directoryPath = params.directoryPath ?? "/";
+
+  if (params.recursive) {
+    if (directoryPath !== "/") {
+      whereParts.push("(COALESCE(directory_path, '/') = ? OR COALESCE(directory_path, '/') LIKE ? ESCAPE '\\')");
+      bindings.push(directoryPath, `${escapeLikePattern(directoryPath)}/%`);
+    }
+  } else {
+    whereParts.push("COALESCE(directory_path, '/') = ?");
+    bindings.push(directoryPath);
+  }
 
   if (normalizedQuery) {
     const pattern = `%${escapeLikePattern(normalizedQuery)}%`;
@@ -218,6 +252,8 @@ export async function listFileRecords(params: {
         uploaded_by,
         created_at,
         deleted_at,
+        directory_id,
+        COALESCE(directory_path, '/') AS directory_path,
         COALESCE(storage_backend, 'telegram_single') AS storage_backend,
         chunk_size,
         chunk_count
@@ -251,6 +287,8 @@ export async function getFileRecord(db: D1Database, id: string): Promise<FileRec
         uploaded_by,
         created_at,
         deleted_at,
+        directory_id,
+        COALESCE(directory_path, '/') AS directory_path,
         COALESCE(storage_backend, 'telegram_single') AS storage_backend,
         chunk_size,
         chunk_count
@@ -275,6 +313,211 @@ export async function softDeleteFileRecord(db: D1Database, id: string, deletedAt
   return true;
 }
 
+export async function getDirectoryRecord(db: D1Database, id: string): Promise<DirectoryRecord | null> {
+  return await db
+    .prepare(
+      `SELECT id, parent_id, name, path, created_at, deleted_at
+      FROM directories
+      WHERE id = ? AND deleted_at IS NULL`
+    )
+    .bind(id)
+    .first<DirectoryRecord>();
+}
+
+export async function getDirectoryRecordByPath(db: D1Database, path: string): Promise<DirectoryRecord | null> {
+  if (path === "/") {
+    return null;
+  }
+
+  return await db
+    .prepare(
+      `SELECT id, parent_id, name, path, created_at, deleted_at
+      FROM directories
+      WHERE path = ? AND deleted_at IS NULL`
+    )
+    .bind(path)
+    .first<DirectoryRecord>();
+}
+
+export async function listDirectoryChildren(db: D1Database, parentPath: string): Promise<DirectoryRecord[]> {
+  let statement: D1PreparedStatement;
+
+  if (parentPath === "/") {
+    statement = db.prepare(
+      `SELECT id, parent_id, name, path, created_at, deleted_at
+      FROM directories
+      WHERE parent_id IS NULL AND deleted_at IS NULL
+      ORDER BY LOWER(name) ASC, created_at ASC`
+    );
+  } else {
+    const parent = await getDirectoryRecordByPath(db, parentPath);
+    if (!parent) {
+      return [];
+    }
+    statement = db
+      .prepare(
+        `SELECT id, parent_id, name, path, created_at, deleted_at
+        FROM directories
+        WHERE parent_id = ? AND deleted_at IS NULL
+        ORDER BY LOWER(name) ASC, created_at ASC`
+      )
+      .bind(parent.id);
+  }
+
+  const result = await statement.all<DirectoryRecord>();
+  return result.results ?? [];
+}
+
+export async function listAllDirectoryRecords(db: D1Database): Promise<DirectoryRecord[]> {
+  const result = await db
+    .prepare(
+      `SELECT id, parent_id, name, path, created_at, deleted_at
+      FROM directories
+      WHERE deleted_at IS NULL
+      ORDER BY path ASC`
+    )
+    .all<DirectoryRecord>();
+
+  return result.results ?? [];
+}
+
+export async function insertDirectoryRecord(params: {
+  db: D1Database;
+  parentPath: string;
+  name: string;
+  createdAt: string;
+}): Promise<DirectoryRecord> {
+  const parent = params.parentPath === "/" ? null : await getDirectoryRecordByPath(params.db, params.parentPath);
+
+  if (params.parentPath !== "/" && !parent) {
+    throw new AppError(404, "DirectoryNotFound", "Parent directory not found");
+  }
+
+  const path = params.parentPath === "/" ? `/${params.name}` : `${params.parentPath}/${params.name}`;
+  const existing = await getDirectoryRecordByPath(params.db, path);
+
+  if (existing) {
+    throw new AppError(409, "DirectoryExists", "Directory already exists");
+  }
+
+  const record: DirectoryRecord = {
+    id: crypto.randomUUID(),
+    parent_id: parent?.id ?? null,
+    name: params.name,
+    path,
+    created_at: params.createdAt,
+    deleted_at: null
+  };
+
+  await params.db
+    .prepare(
+      `INSERT INTO directories (
+        id,
+        parent_id,
+        name,
+        path,
+        created_at,
+        deleted_at
+      ) VALUES (?, ?, ?, ?, ?, NULL)`
+    )
+    .bind(record.id, record.parent_id, record.name, record.path, record.created_at)
+    .run();
+
+  return record;
+}
+
+export async function softDeleteDirectoryTree(params: {
+  db: D1Database;
+  id: string;
+  deletedAt: string;
+}): Promise<{ directory: DirectoryRecord; deletedDirectories: number; deletedFiles: number } | null> {
+  const directory = await getDirectoryRecord(params.db, params.id);
+
+  if (!directory) {
+    return null;
+  }
+
+  const prefixPattern = `${escapeLikePattern(directory.path)}/%`;
+  const fileCount = await params.db
+    .prepare(
+      `SELECT COUNT(*) AS total
+      FROM files
+      WHERE deleted_at IS NULL
+        AND (COALESCE(directory_path, '/') = ? OR COALESCE(directory_path, '/') LIKE ? ESCAPE '\\')`
+    )
+    .bind(directory.path, prefixPattern)
+    .first<{ total: number }>();
+  const directoryCount = await params.db
+    .prepare(
+      `SELECT COUNT(*) AS total
+      FROM directories
+      WHERE deleted_at IS NULL
+        AND (path = ? OR path LIKE ? ESCAPE '\\')`
+    )
+    .bind(directory.path, prefixPattern)
+    .first<{ total: number }>();
+
+  await params.db
+    .prepare(
+      `UPDATE files
+      SET deleted_at = ?
+      WHERE deleted_at IS NULL
+        AND (COALESCE(directory_path, '/') = ? OR COALESCE(directory_path, '/') LIKE ? ESCAPE '\\')`
+    )
+    .bind(params.deletedAt, directory.path, prefixPattern)
+    .run();
+  await params.db
+    .prepare(
+      `UPDATE directories
+      SET deleted_at = ?
+      WHERE deleted_at IS NULL
+        AND (path = ? OR path LIKE ? ESCAPE '\\')`
+    )
+    .bind(params.deletedAt, directory.path, prefixPattern)
+    .run();
+
+  return {
+    directory,
+    deletedDirectories: directoryCount?.total ?? 0,
+    deletedFiles: fileCount?.total ?? 0
+  };
+}
+
+export async function moveFileRecords(params: {
+  db: D1Database;
+  ids: string[];
+  directoryPath: string;
+}): Promise<number> {
+  const ids = Array.from(new Set(params.ids)).filter(Boolean);
+
+  if (ids.length === 0) {
+    return 0;
+  }
+
+  const directory = params.directoryPath === "/" ? null : await getDirectoryRecordByPath(params.db, params.directoryPath);
+
+  if (params.directoryPath !== "/" && !directory) {
+    throw new AppError(404, "DirectoryNotFound", "Target directory not found");
+  }
+
+  const inClause = placeholders(ids.length);
+  const existing = await params.db
+    .prepare(`SELECT COUNT(*) AS total FROM files WHERE deleted_at IS NULL AND id IN (${inClause})`)
+    .bind(...ids)
+    .first<{ total: number }>();
+
+  await params.db
+    .prepare(
+      `UPDATE files
+      SET directory_id = ?, directory_path = ?
+      WHERE deleted_at IS NULL AND id IN (${inClause})`
+    )
+    .bind(directory?.id ?? null, params.directoryPath, ...ids)
+    .run();
+
+  return existing?.total ?? 0;
+}
+
 export async function insertMultipartUploadRecord(
   db: D1Database,
   record: NewMultipartUploadRecord
@@ -293,8 +536,10 @@ export async function insertMultipartUploadRecord(
         remark,
         uploaded_by,
         created_at,
+        directory_id,
+        directory_path,
         completed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
     )
     .bind(
       record.id,
@@ -307,7 +552,9 @@ export async function insertMultipartUploadRecord(
       record.chunkCount,
       record.remark ?? null,
       record.uploadedBy ?? null,
-      record.createdAt
+      record.createdAt,
+      record.directoryId ?? null,
+      record.directoryPath ?? "/"
     )
     .run();
 
@@ -323,6 +570,8 @@ export async function insertMultipartUploadRecord(
     remark: record.remark ?? null,
     uploaded_by: record.uploadedBy ?? null,
     created_at: record.createdAt,
+    directory_id: record.directoryId ?? null,
+    directory_path: record.directoryPath ?? "/",
     completed_at: null
   };
 }
@@ -342,6 +591,8 @@ export async function getMultipartUploadRecord(db: D1Database, id: string): Prom
         remark,
         uploaded_by,
         created_at,
+        directory_id,
+        COALESCE(directory_path, '/') AS directory_path,
         completed_at
       FROM multipart_uploads
       WHERE id = ? AND completed_at IS NULL`
@@ -547,6 +798,10 @@ export async function softDeleteApiKeyRecord(db: D1Database, id: string, deleted
 
 function escapeLikePattern(value: string): string {
   return value.replace(/[\\%_]/g, (char) => `\\${char}`);
+}
+
+function placeholders(count: number): string {
+  return Array.from({ length: count }, () => "?").join(", ");
 }
 
 function fileTypeWhereClause(type: FileTypeFilter): string {

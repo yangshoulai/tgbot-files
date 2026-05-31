@@ -1,14 +1,17 @@
-import { Copy, Download, Eye, Info, Trash2 } from "lucide-react";
-import type { FileItem } from "../../api";
+import { Copy, Download, Eye, Folder, FolderOpen, Info, Trash2 } from "lucide-react";
+import type { DirectoryItem, FileItem } from "../../api";
 import { canPreview, formatBytes, formatDateTime } from "../../utils";
 import { FileVisual } from "../ui/FileVisual";
 import { IconButton } from "../ui/IconButton";
 import { EmptyState } from "../ui/EmptyState";
 
 interface FileTableProps {
+  directories: DirectoryItem[];
   files: FileItem[];
   selectedIds: Set<string>;
   allPageSelected: boolean;
+  onOpenDirectory: (directory: DirectoryItem) => void;
+  onDeleteDirectory: (directory: DirectoryItem) => void;
   onToggleSelected: (file: FileItem, selected: boolean) => void;
   onTogglePage: (selected: boolean) => void;
   onDetail: (file: FileItem) => void;
@@ -21,9 +24,12 @@ const checkboxClass =
   "size-4 rounded border-border text-primary accent-primary focus-visible:outline-none focus-visible:focus-ring";
 
 export function FileTable({
+  directories,
   files,
   selectedIds,
   allPageSelected,
+  onOpenDirectory,
+  onDeleteDirectory,
   onToggleSelected,
   onTogglePage,
   onDetail,
@@ -31,8 +37,8 @@ export function FileTable({
   onCopy,
   onDelete
 }: FileTableProps) {
-  if (files.length === 0) {
-    return <EmptyState title="没有文件" description="试试调整搜索条件，或上传一个新文件。" />;
+  if (files.length === 0 && directories.length === 0) {
+    return <EmptyState title="没有文件或子目录" description="试试调整搜索条件，或新建目录、上传文件。" />;
   }
 
   return (
@@ -46,6 +52,7 @@ export function FileTable({
                   type="checkbox"
                   aria-label="选择当前页文件"
                   checked={allPageSelected}
+                  disabled={files.length === 0}
                   onChange={(event) => onTogglePage(event.target.checked)}
                   className={checkboxClass}
                 />
@@ -57,6 +64,57 @@ export function FileTable({
             </tr>
           </thead>
           <tbody>
+            {directories.map((directory) => (
+              <tr
+                key={directory.id}
+                className="border-b border-border last:border-b-0 transition-colors duration-150 hover:bg-primary-soft/25"
+              >
+                <td className="px-4 py-3 align-middle" />
+                <td className="px-4 py-3 align-middle">
+                  <button
+                    type="button"
+                    onClick={() => onOpenDirectory(directory)}
+                    className="flex min-w-0 items-center gap-3 text-left focus-visible:outline-none focus-visible:focus-ring"
+                  >
+                    <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-primary-soft text-primary-strong">
+                      <Folder size={20} />
+                    </span>
+                    <div className="flex min-w-0 flex-col gap-0.5">
+                      <span className="truncate text-sm font-semibold text-foreground" title={directory.name}>
+                        {directory.name}
+                      </span>
+                      <span className="truncate text-xs text-muted">{directory.path}</span>
+                    </div>
+                  </button>
+                </td>
+                <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted lg:table-cell">
+                  目录
+                </td>
+                <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted md:table-cell">
+                  {formatDateTime(directory.created_at)}
+                </td>
+                <td className="px-4 py-3 align-middle">
+                  <div className="flex items-center justify-end gap-1.5">
+                    <IconButton
+                      variant="ghost"
+                      size="sm"
+                      label="进入目录"
+                      onClick={() => onOpenDirectory(directory)}
+                    >
+                      <FolderOpen size={16} />
+                    </IconButton>
+                    <IconButton
+                      variant="danger"
+                      size="sm"
+                      label="删除目录"
+                      onClick={() => onDeleteDirectory(directory)}
+                    >
+                      <Trash2 size={16} />
+                    </IconButton>
+                  </div>
+                </td>
+              </tr>
+            ))}
             {files.map((file) => (
               <tr
                 key={file.id}
