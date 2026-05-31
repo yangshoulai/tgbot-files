@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import Plyr from "plyr";
+import "plyr/dist/plyr.css";
 import { Copy, Download, Maximize2, Minimize2 } from "lucide-react";
 import type { FileItem } from "../../api";
 import { previewKind } from "../../utils";
@@ -135,16 +137,71 @@ export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
 }
 
 function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolean }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const playerRef = useRef<Plyr | null>(null);
+  const [ratio, setRatio] = useState(16 / 9);
+  const heightLimit = fullscreen ? "calc(100dvh - 12rem)" : "60vh";
+
+  useEffect(() => {
+    const node = videoRef.current;
+    if (!node) return;
+
+    const player = new Plyr(node, {
+      controls: [
+        "play-large",
+        "play",
+        "progress",
+        "current-time",
+        "mute",
+        "volume",
+        "settings",
+        "pip",
+        "fullscreen"
+      ],
+      settings: ["speed"],
+      speed: { selected: 1, options: [0.5, 0.75, 1, 1.25, 1.5, 2] },
+      tooltips: { controls: true, seek: true },
+      ratio: "16:9"
+    });
+    playerRef.current = player;
+
+    return () => {
+      player.destroy();
+      playerRef.current = null;
+    };
+  }, [file.file_path]);
+
+  useEffect(() => {
+    if (playerRef.current) {
+      playerRef.current.ratio = `${ratio}`;
+    }
+  }, [ratio]);
+
   return (
-    <div className={(fullscreen ? "h-full" : "h-[60vh]") + " grid w-full place-items-center bg-foreground p-3"}>
-      <video
-        src={file.file_path}
-        controls
-        preload="metadata"
-        className="max-h-full w-full max-w-full rounded-lg bg-black"
+    <div className={(fullscreen ? "h-full min-h-0" : "h-[60vh]") + " flex w-full items-center justify-center bg-foreground p-3"}>
+      <div
+        className="max-h-full max-w-full overflow-hidden rounded-xl bg-black shadow-dialog"
+        style={{
+          aspectRatio: String(ratio),
+          width: `min(100%, calc(${heightLimit} * ${ratio}))`
+        }}
       >
-        当前浏览器不支持该视频预览。
-      </video>
+        <video
+          ref={videoRef}
+          src={file.file_path}
+          playsInline
+          preload="metadata"
+          className="h-full w-full object-contain"
+          onLoadedMetadata={(event) => {
+            const target = event.currentTarget;
+            if (target.videoWidth > 0 && target.videoHeight > 0) {
+              setRatio(target.videoWidth / target.videoHeight);
+            }
+          }}
+        >
+          当前浏览器不支持该视频预览。
+        </video>
+      </div>
     </div>
   );
 }
