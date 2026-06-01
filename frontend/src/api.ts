@@ -64,6 +64,8 @@ export interface DirectoryItem {
   path: string;
   created_at: string;
   deleted_at: string | null;
+  file_count: number;
+  total_size: number;
 }
 
 export interface CurrentDirectory {
@@ -82,6 +84,10 @@ export interface FileListResponse {
   search_scope: "current";
   files: FileItem[];
   pagination: Pagination;
+  global_stats: {
+    file_count: number;
+    total_size: number;
+  };
   max_file_bytes: number;
   multipart_chunk_bytes: number;
   max_multipart_file_bytes: number;

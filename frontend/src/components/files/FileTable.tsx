@@ -1,5 +1,6 @@
-import { Copy, Download, Eye, Folder, FolderInput, FolderOpen, Info, Pencil, Trash2 } from "lucide-react";
+import { Copy, Download, Eye, Folder, FolderInput, FolderOpen, Info, Pencil, Trash2, Zap } from "lucide-react";
 import type { DirectoryItem, FileItem } from "../../api";
+import { canUseAcceleratedDownload } from "../../lib/accelerated-download";
 import { canPreview, formatBytes, formatDateTime } from "../../utils";
 import { FileVisual } from "../ui/FileVisual";
 import { IconButton } from "../ui/IconButton";
@@ -23,11 +24,16 @@ interface FileTableProps {
   onMoveFile: (file: FileItem) => void;
   onPreview: (file: FileItem) => void;
   onCopy: (file: FileItem) => void;
+  onAcceleratedDownload: (file: FileItem) => void;
   onDelete: (file: FileItem) => void;
 }
 
 const checkboxClass =
   "size-4 rounded border-border text-primary accent-primary focus-visible:outline-none focus-visible:focus-ring";
+
+function isInteractiveTarget(target: EventTarget | null): boolean {
+  return target instanceof Element && Boolean(target.closest("button, a, input, select, textarea, [role='button']"));
+}
 
 export function FileTable({
   directories,
@@ -47,6 +53,7 @@ export function FileTable({
   onMoveFile,
   onPreview,
   onCopy,
+  onAcceleratedDownload,
   onDelete
 }: FileTableProps) {
   if (files.length === 0 && directories.length === 0) {
@@ -79,7 +86,11 @@ export function FileTable({
             {directories.map((directory) => (
               <tr
                 key={directory.id}
-                className="border-b border-border last:border-b-0 transition-colors duration-150 hover:bg-primary-soft/25"
+                onDoubleClick={(event) => {
+                  if (isInteractiveTarget(event.target)) return;
+                  onOpenDirectory(directory);
+                }}
+                className="cursor-pointer border-b border-border last:border-b-0 transition-colors duration-150 hover:bg-primary-soft/25"
               >
                 <td className="px-4 py-3 align-middle">
                   <input
@@ -104,11 +115,17 @@ export function FileTable({
                         {directory.name}
                       </span>
                       <span className="truncate text-xs text-muted">{directory.path}</span>
+                      <span className="truncate text-xs text-muted lg:hidden">
+                        {directory.file_count} 个文件 · {formatBytes(directory.total_size)}
+                      </span>
                     </div>
                   </button>
                 </td>
-                <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted lg:table-cell">
-                  目录
+                <td className="hidden whitespace-nowrap px-4 py-3 align-middle lg:table-cell">
+                  <div className="flex flex-col gap-0.5">
+                    <span className="text-sm text-foreground">{formatBytes(directory.total_size)}</span>
+                    <span className="text-xs text-muted">{directory.file_count} 个文件</span>
+                  </div>
                 </td>
                 <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted md:table-cell">
                   {formatDateTime(directory.created_at)}
@@ -237,6 +254,16 @@ export function FileTable({
                     >
                       <Download size={16} />
                     </a>
+                    {canUseAcceleratedDownload(file) ? (
+                      <IconButton
+                        variant="ghost"
+                        size="sm"
+                        label="加速下载"
+                        onClick={() => onAcceleratedDownload(file)}
+                      >
+                        <Zap size={16} />
+                      </IconButton>
+                    ) : null}
                     <IconButton
                       variant="danger"
                       size="sm"

@@ -56,6 +56,11 @@ export interface FileListResult {
   total: number;
 }
 
+export interface FileUsageStats {
+  file_count: number;
+  total_size: number;
+}
+
 export type FileTypeFilter = "image" | "text" | "pdf" | "archive" | "other";
 
 export type ApiKeyStatus = "active" | "disabled";
@@ -401,6 +406,61 @@ export async function listAllDirectoryRecords(db: D1Database): Promise<Directory
     .all<DirectoryRecord>();
 
   return result.results ?? [];
+}
+
+export async function getGlobalFileUsageStats(db: D1Database): Promise<FileUsageStats> {
+  const row = await db
+    .prepare(
+      `SELECT COUNT(*) AS file_count, COALESCE(SUM(size), 0) AS total_size
+      FROM files
+      WHERE deleted_at IS NULL`
+    )
+    .first<FileUsageStats>();
+
+  return {
+    file_count: row?.file_count ?? 0,
+    total_size: row?.total_size ?? 0
+  };
+}
+
+export async function getDirectoryUsageStats(
+  db: D1Database,
+  directories: DirectoryRecord[]
+): Promise<Map<string, FileUsageStats>> {
+  const result = new Map<string, FileUsageStats>();
+  if (directories.length === 0) {
+    return result;
+  }
+
+  for (const directory of directories) {
+    result.set(directory.path, { file_count: 0, total_size: 0 });
+  }
+
+  const rows = await db
+    .prepare(
+      `SELECT COALESCE(directory_path, '/') AS directory_path,
+        COUNT(*) AS file_count,
+        COALESCE(SUM(size), 0) AS total_size
+      FROM files
+      WHERE deleted_at IS NULL
+      GROUP BY COALESCE(directory_path, '/')`
+    )
+    .all<FileUsageStats & { directory_path: string }>();
+
+  for (const row of rows.results ?? []) {
+    for (const directory of directories) {
+      if (row.directory_path !== directory.path && !row.directory_path.startsWith(`${directory.path}/`)) {
+        continue;
+      }
+
+      const current = result.get(directory.path) ?? { file_count: 0, total_size: 0 };
+      current.file_count += row.file_count;
+      current.total_size += row.total_size;
+      result.set(directory.path, current);
+    }
+  }
+
+  return result;
 }
 
 export async function insertDirectoryRecord(params: {
@@ -862,6 +922,29 @@ export async function listFileChunkRecords(db: D1Database, fileId: string): Prom
     .all<FileChunkRecord>();
 
   return result.results ?? [];
+}
+
+export async function getFileChunkRecord(
+  db: D1Database,
+  fileId: string,
+  chunkIndex: number
+): Promise<FileChunkRecord | null> {
+  return db
+    .prepare(
+      `SELECT
+        file_id,
+        chunk_index,
+        size,
+        md5,
+        telegram_file_id,
+        telegram_file_unique_id,
+        created_at
+      FROM file_chunks
+      WHERE file_id = ? AND chunk_index = ?
+      LIMIT 1`
+    )
+    .bind(fileId, chunkIndex)
+    .first<FileChunkRecord>();
 }
 
 export async function insertApiKeyRecord(db: D1Database, record: NewApiKeyRecord): Promise<ApiKeyRecord> {

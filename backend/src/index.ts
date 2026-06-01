@@ -10,9 +10,12 @@ import {
   completeMultipartUploadRecord,
   getDirectoryRecord,
   getDirectoryRecordByPath,
+  getDirectoryUsageStats,
   findActiveApiKeyRecord,
   getApiKeyRecord,
+  getFileChunkRecord,
   getFileRecord,
+  getGlobalFileUsageStats,
   getMultipartUploadRecord,
   insertDirectoryRecord,
   insertApiKeyRecord,
@@ -344,14 +347,18 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
       page,
       limit
     });
-    const directories = await listDirectoryChildren(db, directoryPath);
+    const [directories, globalStats] = await Promise.all([
+      listDirectoryChildren(db, directoryPath),
+      getGlobalFileUsageStats(db)
+    ]);
+    const directoryStats = await getDirectoryUsageStats(db, directories);
     const baseUrl = getPublicBaseUrl(request, env);
     const files = result.files.map((file) => serializeFileRecord(file, baseUrl));
 
     return jsonResponse({
       ok: true,
       current_directory: serializeCurrentDirectory(currentDirectory, directoryPath),
-      directories: directories.map(serializeDirectoryRecord),
+      directories: directories.map((directory) => serializeDirectoryRecord(directory, directoryStats.get(directory.path))),
       search_scope: "current",
       files,
       pagination: {
@@ -360,6 +367,7 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
         total: result.total,
         total_pages: Math.max(1, Math.ceil(result.total / limit))
       },
+      global_stats: globalStats,
       max_file_bytes: parseMaxFileBytes(env.MAX_FILE_BYTES),
       multipart_chunk_bytes: TELEGRAM_CHUNK_SIZE_BYTES,
       max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES
@@ -469,7 +477,7 @@ async function handleAdminDirectories(request: Request, env: Env): Promise<Respo
 
     return jsonResponse({
       ok: true,
-      directories: directories.map(serializeDirectoryRecord)
+      directories: directories.map((directory) => serializeDirectoryRecord(directory))
     });
   }
 
@@ -1704,10 +1712,19 @@ function requirePositiveRecordInteger(value: number | null | undefined, fieldNam
 
 async function handleFileAccess(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
-  const token = extractFileToken(url.pathname);
+  const chunkAccess = extractMultipartChunkAccess(url.pathname);
+  const token = chunkAccess?.token ?? extractFileToken(url.pathname);
   const payload = await verifySignedToken(token, requireEnv(env, "LINK_SIGNING_SECRET"));
   const rangeHeader = request.headers.get("Range");
   const forceDownload = url.searchParams.get("download") === "1" || url.searchParams.get("download") === "true";
+
+  if (chunkAccess) {
+    return handleMultipartChunkAccess({
+      env,
+      payload,
+      chunkIndex: chunkAccess.chunkIndex
+    });
+  }
 
   if (payload.v === 2) {
     return handleMultipartFileAccess({
@@ -1740,6 +1757,51 @@ async function handleFileAccess(request: Request, env: Env): Promise<Response> {
   return new Response(telegramResponse.body, {
     status: telegramResponse.status,
     statusText: telegramResponse.statusText,
+    headers
+  });
+}
+
+async function handleMultipartChunkAccess(params: {
+  env: Env;
+  payload: Awaited<ReturnType<typeof verifySignedToken>>;
+  chunkIndex: number;
+}): Promise<Response> {
+  if (params.payload.v !== 2) {
+    throw new AppError(400, "NotMultipartFile", "Chunk download is only available for multipart files");
+  }
+
+  validatePayloadChunkIndex(params.payload, params.chunkIndex);
+
+  const db = requireDb(params.env);
+  const chunk = await getFileChunkRecord(db, params.payload.file_record_id, params.chunkIndex);
+  const expectedSize = expectedPayloadChunkSize(params.payload, params.chunkIndex);
+
+  if (!chunk || chunk.size !== expectedSize) {
+    throw new AppError(404, "FileChunkNotFound", "Multipart file chunk was not found");
+  }
+
+  const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
+  const telegramFileUrl = await getTelegramFileUrl({ botToken, fileId: chunk.telegram_file_id });
+  const telegramResponse = await fetchTelegramFile({
+    fileUrl: telegramFileUrl,
+    rangeHeader: null
+  });
+
+  if (!telegramResponse.body) {
+    throw new AppError(502, "TelegramFileDownloadFailed", "Telegram file response did not include a body");
+  }
+
+  const headers = withSecurityHeaders();
+  headers.set("Content-Type", params.payload.mime_type || telegramResponse.headers.get("Content-Type") || "application/octet-stream");
+  headers.set("Content-Disposition", contentDispositionAttachment(chunkDownloadFileName(params.payload, params.chunkIndex)));
+  headers.set("Content-Length", String(chunk.size));
+  headers.set("Cache-Control", "public, max-age=31536000, immutable");
+  headers.set("X-Chunk-Index", String(params.chunkIndex));
+  headers.set("X-Chunk-Count", String(params.payload.chunk_count));
+  headers.set("X-Chunk-Offset", String(params.chunkIndex * params.payload.chunk_size));
+
+  return new Response(telegramResponse.body, {
+    status: 200,
     headers
   });
 }
@@ -1796,14 +1858,38 @@ function validateTokenChunks(
 
   for (let index = 0; index < payload.chunk_count; index += 1) {
     const chunk = chunks[index];
-    const expectedSize = index === payload.chunk_count - 1
-      ? payload.size - payload.chunk_size * index
-      : payload.chunk_size;
+    const expectedSize = expectedPayloadChunkSize(payload, index);
 
     if (!chunk || chunk.chunk_index !== index || chunk.size !== expectedSize) {
       throw new AppError(404, "FileChunksNotFound", "Multipart file chunks are incomplete");
     }
   }
+}
+
+function validatePayloadChunkIndex(
+  payload: Extract<Awaited<ReturnType<typeof verifySignedToken>>, { v: 2 }>,
+  chunkIndex: number
+): void {
+  if (!Number.isSafeInteger(chunkIndex) || chunkIndex < 0 || chunkIndex >= payload.chunk_count) {
+    throw new AppError(400, "InvalidChunkIndex", "Chunk index is out of range");
+  }
+}
+
+function expectedPayloadChunkSize(
+  payload: Extract<Awaited<ReturnType<typeof verifySignedToken>>, { v: 2 }>,
+  chunkIndex: number
+): number {
+  return chunkIndex === payload.chunk_count - 1
+    ? payload.size - payload.chunk_size * chunkIndex
+    : payload.chunk_size;
+}
+
+function chunkDownloadFileName(
+  payload: Extract<Awaited<ReturnType<typeof verifySignedToken>>, { v: 2 }>,
+  chunkIndex: number
+): string {
+  const paddedIndex = String(chunkIndex + 1).padStart(String(payload.chunk_count).length, "0");
+  return `${payload.name}.part-${paddedIndex}-of-${payload.chunk_count}`;
 }
 
 function streamMultipartFile(params: {
@@ -1983,14 +2069,16 @@ function serializeMultipartInit(result: MultipartInitResult): Record<string, unk
   };
 }
 
-function serializeDirectoryRecord(record: DirectoryRecord): Record<string, unknown> {
+function serializeDirectoryRecord(record: DirectoryRecord, usage?: { file_count: number; total_size: number }): Record<string, unknown> {
   return {
     id: record.id,
     parent_id: record.parent_id,
     name: record.name,
     path: record.path,
     created_at: record.created_at,
-    deleted_at: record.deleted_at
+    deleted_at: record.deleted_at,
+    file_count: usage?.file_count ?? 0,
+    total_size: usage?.total_size ?? 0
   };
 }
 
@@ -2535,6 +2623,29 @@ function extractFileToken(pathname: string): string {
   }
 
   return token;
+}
+
+function extractMultipartChunkAccess(pathname: string): { token: string; chunkIndex: number } | null {
+  const match = /^\/f\/([^/]+)\/chunks\/([^/]+)$/.exec(pathname);
+
+  if (!match) {
+    return null;
+  }
+
+  const token = match[1];
+  const chunkIndex = Number(match[2]);
+  if (!token) {
+    throw new AppError(404, "NotFound", "File route not found");
+  }
+
+  if (!Number.isSafeInteger(chunkIndex) || chunkIndex < 0) {
+    throw new AppError(400, "InvalidChunkIndex", "Chunk index must be a non-negative integer");
+  }
+
+  return {
+    token,
+    chunkIndex
+  };
 }
 
 function extractOptionalFileToken(pathname: string): string | undefined {

@@ -1,5 +1,6 @@
-import { Copy, Download, ExternalLink } from "lucide-react";
+import { Copy, Download, ExternalLink, Zap } from "lucide-react";
 import type { FileItem } from "../../api";
+import { canUseAcceleratedDownload } from "../../lib/accelerated-download";
 import { fileKind, formatBytes, formatDateTime } from "../../utils";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
@@ -10,9 +11,10 @@ interface FileDetailDialogProps {
   file: FileItem | null;
   onClose: () => void;
   onCopy: (value: string) => void;
+  onAcceleratedDownload?: (file: FileItem) => void;
 }
 
-export function FileDetailDialog({ file, onClose, onCopy }: FileDetailDialogProps) {
+export function FileDetailDialog({ file, onClose, onCopy, onAcceleratedDownload }: FileDetailDialogProps) {
   if (!file) {
     return <Modal open={false} onClose={onClose}>{null}</Modal>;
   }
@@ -64,6 +66,11 @@ export function FileDetailDialog({ file, onClose, onCopy }: FileDetailDialogProp
             <Download size={15} />
             下载
           </a>
+          {onAcceleratedDownload && canUseAcceleratedDownload(file) ? (
+            <Button variant="primary" leadingIcon={<Zap size={15} />} onClick={() => onAcceleratedDownload(file)}>
+              加速下载
+            </Button>
+          ) : null}
         </>
       }
       bodyClassName="bg-background/40"

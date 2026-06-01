@@ -298,6 +298,23 @@ class FakeD1Statement {
     const normalizedSql = this.sql.trim().toUpperCase();
 
     if (normalizedSql.startsWith("SELECT COUNT(*)")) {
+      if (normalizedSql.includes("AS FILE_COUNT")) {
+        let files = this.visibleFiles();
+        if (normalizedSql.includes("COALESCE(DIRECTORY_PATH")) {
+          const [path, likePattern] = this.bindings;
+          const prefix = String(likePattern).replace(/\/%$/, "/");
+          files = files.filter((file) => {
+            const directoryPath = file.directory_path ?? "/";
+            return directoryPath === path || directoryPath.startsWith(prefix);
+          });
+        }
+
+        return {
+          file_count: files.length,
+          total_size: files.reduce((total, file) => total + file.size, 0)
+        } as T;
+      }
+
       if (normalizedSql.includes("FROM DIRECTORIES")) {
         return { total: this.visibleDirectories().length } as T;
       }
@@ -328,6 +345,14 @@ class FakeD1Statement {
       const id = this.bindings[0];
       const upload = this.db.multipartUploads.find((item) => item.id === id && item.completed_at === null);
       return (upload ?? null) as T | null;
+    }
+
+    if (normalizedSql.includes("FROM FILE_CHUNKS")) {
+      const [fileId, chunkIndex] = this.bindings;
+      const chunk = this.db.fileChunks.find((item) =>
+        item.file_id === fileId && item.chunk_index === Number(chunkIndex)
+      );
+      return (chunk ?? null) as T | null;
     }
 
     if (normalizedSql.includes("FROM DIRECTORIES")) {
@@ -369,6 +394,27 @@ class FakeD1Statement {
         success: true,
         meta: fakeD1Meta(),
         results: this.visibleDirectories() as T[]
+      };
+    }
+
+    if (normalizedSql.includes("GROUP BY COALESCE(DIRECTORY_PATH")) {
+      const rows = new Map<string, { directory_path: string; file_count: number; total_size: number }>();
+      for (const file of this.db.files) {
+        if (file.deleted_at !== null) {
+          continue;
+        }
+
+        const directoryPath = file.directory_path ?? "/";
+        const row = rows.get(directoryPath) ?? { directory_path: directoryPath, file_count: 0, total_size: 0 };
+        row.file_count += 1;
+        row.total_size += file.size;
+        rows.set(directoryPath, row);
+      }
+
+      return {
+        success: true,
+        meta: fakeD1Meta(),
+        results: Array.from(rows.values()) as T[]
       };
     }
 
@@ -1128,6 +1174,144 @@ describe("worker file access endpoint", () => {
     expect(response.headers.get("Content-Length")).toBe("3");
     expect(await response.text()).toBe("cde");
     expect(fetchCalls).toHaveLength(4);
+  });
+
+  it("downloads an existing multipart chunk without issuing Telegram range requests", async () => {
+    const db = new FakeD1();
+    db.fileChunks.push(
+      {
+        file_id: "file-multipart",
+        chunk_index: 0,
+        size: 3,
+        md5: "chunk-a",
+        telegram_file_id: "tg-chunk-0",
+        telegram_file_unique_id: null,
+        created_at: "2026-05-31T00:00:00.000Z"
+      },
+      {
+        file_id: "file-multipart",
+        chunk_index: 1,
+        size: 2,
+        md5: "chunk-b",
+        telegram_file_id: "tg-chunk-1",
+        telegram_file_unique_id: null,
+        created_at: "2026-05-31T00:00:01.000Z"
+      }
+    );
+    const token = await createSignedToken(
+      {
+        v: 2,
+        file_record_id: "file-multipart",
+        name: "letters.txt",
+        mime_type: "text/plain",
+        size: 5,
+        chunk_size: 3,
+        chunk_count: 2,
+        iat: 1_768_566_400
+      },
+      env.LINK_SIGNING_SECRET
+    );
+    const fetchCalls: Array<{ input: string; range: string | null }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const inputUrl = String(input);
+        const range = new Headers(init?.headers).get("Range");
+        fetchCalls.push({ input: inputUrl, range });
+
+        if (inputUrl.includes("file_id=tg-chunk-1")) {
+          return jsonResponse({ ok: true, result: { file_id: "tg-chunk-1", file_path: "documents/chunk1" } });
+        }
+        if (inputUrl.endsWith("/documents/chunk1")) {
+          expect(range).toBeNull();
+          return new Response("de", {
+            status: 200,
+            headers: {
+              "Content-Type": "application/octet-stream",
+              "Content-Length": "2"
+            }
+          });
+        }
+
+        throw new Error(`Unexpected fetch ${inputUrl}`);
+      })
+    );
+
+    const response = await worker.fetch(
+      new Request(`https://files.example.com/f/${token}/chunks/1`),
+      envWithDb(db)
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("de");
+    expect(response.headers.get("Content-Type")).toBe("text/plain");
+    expect(response.headers.get("Content-Length")).toBe("2");
+    expect(response.headers.get("X-Chunk-Index")).toBe("1");
+    expect(response.headers.get("X-Chunk-Count")).toBe("2");
+    expect(response.headers.get("X-Chunk-Offset")).toBe("3");
+    expect(response.headers.get("Content-Disposition")).toContain("letters.txt.part-2-of-2");
+    expect(fetchCalls).toEqual([
+      {
+        input: "https://api.telegram.org/bot123456:test-token/getFile?file_id=tg-chunk-1",
+        range: null
+      },
+      {
+        input: "https://api.telegram.org/file/bot123456:test-token/documents/chunk1",
+        range: null
+      }
+    ]);
+  });
+
+  it("rejects out-of-range multipart chunk downloads before fetching Telegram", async () => {
+    const db = new FakeD1();
+    const token = await createSignedToken(
+      {
+        v: 2,
+        file_record_id: "file-multipart",
+        name: "letters.txt",
+        mime_type: "text/plain",
+        size: 5,
+        chunk_size: 3,
+        chunk_count: 2,
+        iat: 1_768_566_400
+      },
+      env.LINK_SIGNING_SECRET
+    );
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await worker.fetch(
+      new Request(`https://files.example.com/f/${token}/chunks/2`),
+      envWithDb(db)
+    );
+    const body = await response.json() as { error: string };
+
+    expect(response.status).toBe(400);
+    expect(body.error).toBe("InvalidChunkIndex");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects chunk downloads for single-file tokens", async () => {
+    const token = await createSignedToken(
+      {
+        v: 1,
+        file_id: "tg-file-id",
+        name: "hello.txt",
+        mime_type: "text/plain",
+        size: 5,
+        iat: 1_768_566_400
+      },
+      env.LINK_SIGNING_SECRET
+    );
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await worker.fetch(new Request(`https://files.example.com/f/${token}/chunks/0`), env);
+    const body = await response.json() as { error: string };
+
+    expect(response.status).toBe(400);
+    expect(body.error).toBe("NotMultipartFile");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("rejects tampered file links", async () => {
@@ -2163,13 +2347,22 @@ describe("admin file manager", () => {
       adminEnv
     );
     const rootListBody = await rootListResponse.json() as {
-      directories: Array<{ path: string }>;
+      directories: Array<{ path: string; file_count: number; total_size: number }>;
       files: Array<{ id: string; directory_path: string }>;
       pagination: { total: number };
+      global_stats: { file_count: number; total_size: number };
     };
     expect(rootListBody.directories.map((item) => item.path)).toEqual(["/photos"]);
+    expect(rootListBody.directories[0]).toMatchObject({
+      file_count: 1,
+      total_size: 10
+    });
     expect(rootListBody.files.map((item) => item.id)).toEqual(["file-root"]);
     expect(rootListBody.pagination.total).toBe(1);
+    expect(rootListBody.global_stats).toEqual({
+      file_count: 2,
+      total_size: 15
+    });
 
     const rootSearchResponse = await worker.fetch(
       new Request("https://files.example.com/api/admin/files?dir=/&q=%E6%97%85%E8%A1%8C", {

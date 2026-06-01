@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, ChevronRight, FolderInput, FolderPlus, Pencil, RefreshCw, Search, Trash2 } from "lucide-react";
 import {
   ApiError,
@@ -17,7 +17,7 @@ import {
   renameDirectory,
   updateFileMetadata
 } from "../api";
-import { dateInputToIso, formatBytes, formatDateTime, sumFileSize } from "../utils";
+import { dateInputToIso, formatBytes, sumFileSize } from "../utils";
 import { useToast } from "../lib/toast";
 import { useConfirm } from "../lib/confirm";
 import { Input } from "../components/ui/Input";
@@ -32,6 +32,23 @@ import { Pagination } from "../components/files/Pagination";
 import { PreviewDialog } from "../components/files/PreviewDialog";
 import { FileDetailDialog } from "../components/files/FileDetailDialog";
 import { DirectoryTreeSelect } from "../components/files/DirectoryTreeSelect";
+import {
+  AcceleratedDownloadDialog,
+  type AcceleratedChunkState,
+  type AcceleratedDownloadState
+} from "../components/files/AcceleratedDownloadDialog";
+import {
+  DEFAULT_ACCELERATED_DOWNLOAD_CONCURRENCY,
+  type MultipartDownloadFile,
+  type NativeFileWritableStream,
+  canUseAcceleratedDownload,
+  createWritableFile,
+  downloadMultipartChunk,
+  extractSignedFileToken,
+  expectedMultipartChunkSize,
+  isAbortError,
+  supportsNativeFileSave
+} from "../lib/accelerated-download";
 
 type FileTypeFilter = "all" | "image" | "text" | "pdf" | "archive" | "other";
 
@@ -58,6 +75,21 @@ const FILE_TYPE_OPTIONS: Array<{ value: FileTypeFilter; label: string }> = [
   { value: "other", label: "其他" }
 ];
 
+interface AcceleratedDownloadTask {
+  file: MultipartDownloadFile;
+  token: string;
+  writable: NativeFileWritableStream;
+  concurrency: number;
+  queue: number[];
+  running: Set<number>;
+  completed: Set<number>;
+  failed: Set<number>;
+  controllers: Map<number, AbortController>;
+  writeChain: Promise<void>;
+  cancelled: boolean;
+  finalized: boolean;
+}
+
 function parentDirectoryPath(path: string): string {
   if (path === "/") return "/";
   const segments = path.split("/").filter(Boolean);
@@ -81,10 +113,12 @@ function directoryBreadcrumbs(path: string): Array<{ label: string; path: string
 export function DashboardPage({ session, uploadVersion, copyText, onDirectoryChange }: DashboardPageProps) {
   const toast = useToast();
   const confirm = useConfirm();
+  const acceleratedDownloadTaskRef = useRef<AcceleratedDownloadTask | null>(null);
 
   const [files, setFiles] = useState<FileItem[]>([]);
   const [directories, setDirectories] = useState<DirectoryItem[]>([]);
   const [directoryOptions, setDirectoryOptions] = useState<DirectoryItem[]>([]);
+  const [globalStats, setGlobalStats] = useState({ file_count: 0, total_size: 0 });
   const [currentDirPath, setCurrentDirPath] = useState("/");
   const [pagination, setPagination] = useState<PaginationType>(INITIAL_PAGINATION);
   const [query, setQuery] = useState("");
@@ -103,6 +137,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   const [selectedDirectoryIds, setSelectedDirectoryIds] = useState<Set<string>>(() => new Set());
   const [createDirOpen, setCreateDirOpen] = useState(false);
   const [newDirName, setNewDirName] = useState("");
+  const [createDirParentPath, setCreateDirParentPath] = useState("/");
   const [creatingDir, setCreatingDir] = useState(false);
   const [moveOpen, setMoveOpen] = useState(false);
   const [moveFileIds, setMoveFileIds] = useState<string[]>([]);
@@ -118,6 +153,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   const [renamingDirectory, setRenamingDirectory] = useState<DirectoryItem | null>(null);
   const [directoryRenameName, setDirectoryRenameName] = useState("");
   const [renamingDirectorySaving, setRenamingDirectorySaving] = useState(false);
+  const [acceleratedDownload, setAcceleratedDownload] = useState<AcceleratedDownloadState | null>(null);
 
   const loadFiles = useCallback(
     async (nextPage: number) => {
@@ -135,6 +171,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         setDirectories(response.directories);
         setFiles(response.files);
         setPagination(response.pagination);
+        setGlobalStats(response.global_stats);
       } catch (error) {
         toast.danger(errorMessage(error));
       } finally {
@@ -189,7 +226,9 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   }, [directories]);
 
   const metrics = useMemo<Metric[]>(() => {
-    const latest = files[0];
+    const recursiveFileCount = files.length + directories.reduce((total, directory) => total + directory.file_count, 0);
+    const recursiveTotalSize = sumFileSize(files) + directories.reduce((total, directory) => total + directory.total_size, 0);
+
     return [
       {
         label: "目录文件",
@@ -198,13 +237,13 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       },
       {
         label: "当前页占用",
-        value: formatBytes(sumFileSize(files)),
-        hint: `${directories.length} 个子目录 · ${files.length} 个文件`
+        value: formatBytes(recursiveTotalSize),
+        hint: `${directories.length} 个子目录 · ${recursiveFileCount} 个文件（含子目录）`
       },
       {
-        label: "最近上传",
-        value: latest ? formatDateTime(latest.created_at).slice(5, 16) : "暂无",
-        hint: latest?.file_name ?? "尚未上传"
+        label: "全局文件",
+        value: String(globalStats.file_count),
+        hint: `全局占用 ${formatBytes(globalStats.total_size)}`
       },
       {
         label: "存储后端",
@@ -213,7 +252,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         hint: "Telegram Bot API"
       }
     ];
-  }, [currentDirPath, directories.length, files, pagination.page, pagination.total, pagination.total_pages, session.config]);
+  }, [currentDirPath, directories.length, files, globalStats, pagination.page, pagination.total, pagination.total_pages, session.config]);
 
   async function onDelete(file: FileItem) {
     const ok = await confirm({
@@ -292,10 +331,11 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
 
     setCreatingDir(true);
     try {
-      await createDirectory(currentDirPath, name);
+      await createDirectory(createDirParentPath, name);
       toast.success("目录已创建");
       setCreateDirOpen(false);
       setNewDirName("");
+      setCreateDirParentPath("/");
       await Promise.all([loadFiles(pagination.page), loadDirectoryOptions()]);
     } catch (error) {
       toast.danger(errorMessage(error));
@@ -490,6 +530,341 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     copyText(file.url);
   }
 
+  async function onAcceleratedDownload(file: FileItem) {
+    if (acceleratedDownloadTaskRef.current) {
+      toast.info("已有加速下载任务进行中，请先完成或取消当前任务");
+      return;
+    }
+
+    if (!canUseAcceleratedDownload(file)) {
+      toast.info("该文件不是 Telegram 分片文件，已保留普通下载入口");
+      return;
+    }
+
+    if (!supportsNativeFileSave()) {
+      toast.info("当前浏览器不支持加速下载，已切换为普通下载");
+      triggerFallbackDownload(file);
+      return;
+    }
+
+    const token = extractSignedFileToken(file.file_path);
+    if (!token) {
+      toast.info("无法解析分片下载 token，已切换为普通下载");
+      triggerFallbackDownload(file);
+      return;
+    }
+
+    setAcceleratedDownload({
+      fileId: file.id,
+      fileName: file.file_name,
+      status: "preparing",
+      concurrency: DEFAULT_ACCELERATED_DOWNLOAD_CONCURRENCY,
+      totalBytes: file.size,
+      chunks: createInitialAcceleratedChunks(file)
+    });
+
+    let writable: Awaited<ReturnType<typeof createWritableFile>>;
+    try {
+      writable = await createWritableFile(file.file_name);
+    } catch (error) {
+      setAcceleratedDownload(null);
+      if (!isAbortError(error)) {
+        toast.danger(errorMessage(error));
+      }
+      return;
+    }
+
+    const task: AcceleratedDownloadTask = {
+      file,
+      token,
+      writable,
+      concurrency: DEFAULT_ACCELERATED_DOWNLOAD_CONCURRENCY,
+      queue: Array.from({ length: file.chunk_count }, (_, index) => index),
+      running: new Set(),
+      completed: new Set(),
+      failed: new Set(),
+      controllers: new Map(),
+      writeChain: Promise.resolve(),
+      cancelled: false,
+      finalized: false
+    };
+
+    acceleratedDownloadTaskRef.current = task;
+    setAcceleratedDownload((current) =>
+      current?.fileId === file.id
+        ? { ...current, status: "downloading" }
+        : current
+    );
+    startAcceleratedQueuedChunks(task);
+  }
+
+  function startAcceleratedQueuedChunks(task: AcceleratedDownloadTask) {
+    if (task.cancelled || task.finalized) {
+      return;
+    }
+
+    while (task.running.size < task.concurrency && task.queue.length > 0) {
+      const chunkIndex = task.queue.shift();
+      if (chunkIndex === undefined || task.running.has(chunkIndex) || task.completed.has(chunkIndex)) {
+        continue;
+      }
+
+      task.failed.delete(chunkIndex);
+      task.running.add(chunkIndex);
+      void runAcceleratedChunk(task, chunkIndex);
+    }
+
+    updateAcceleratedOverallStatus(task);
+  }
+
+  async function runAcceleratedChunk(task: AcceleratedDownloadTask, chunkIndex: number) {
+    const controller = new AbortController();
+    task.controllers.set(chunkIndex, controller);
+    updateAcceleratedChunk(task.file.id, chunkIndex, (chunk) => ({
+      ...chunk,
+      status: "downloading",
+      downloadedBytes: 0,
+      attempts: chunk.attempts + 1,
+      errorMessage: undefined
+    }));
+
+    try {
+      const bytes = await downloadMultipartChunk({
+        file: task.file,
+        token: task.token,
+        chunkIndex,
+        signal: controller.signal,
+        onProgress: (progress) => {
+          updateAcceleratedChunk(task.file.id, chunkIndex, (chunk) => ({
+            ...chunk,
+            downloadedBytes: progress.downloadedBytes
+          }));
+        }
+      });
+
+      if (task.cancelled) {
+        return;
+      }
+
+      await writeAcceleratedChunk(task, chunkIndex, bytes);
+
+      if (task.cancelled) {
+        return;
+      }
+
+      task.failed.delete(chunkIndex);
+      task.completed.add(chunkIndex);
+      updateAcceleratedChunk(task.file.id, chunkIndex, (chunk) => ({
+        ...chunk,
+        status: "completed",
+        downloadedBytes: chunk.size,
+        errorMessage: undefined
+      }));
+      await finalizeAcceleratedDownloadIfReady(task);
+    } catch (error) {
+      if (!task.cancelled) {
+        task.failed.add(chunkIndex);
+        updateAcceleratedChunk(task.file.id, chunkIndex, (chunk) => ({
+          ...chunk,
+          status: "failed",
+          errorMessage: errorMessage(error)
+        }));
+      }
+    } finally {
+      task.controllers.delete(chunkIndex);
+      task.running.delete(chunkIndex);
+      if (!task.cancelled && !task.finalized) {
+        startAcceleratedQueuedChunks(task);
+      }
+    }
+  }
+
+  function writeAcceleratedChunk(
+    task: AcceleratedDownloadTask,
+    chunkIndex: number,
+    bytes: ArrayBuffer
+  ): Promise<void> {
+    const writeOperation = task.writeChain.then(() =>
+      task.writable.write({
+        type: "write",
+        position: chunkIndex * task.file.chunk_size,
+        data: bytes
+      })
+    );
+
+    task.writeChain = writeOperation.catch(() => undefined);
+    return writeOperation;
+  }
+
+  async function finalizeAcceleratedDownloadIfReady(task: AcceleratedDownloadTask) {
+    if (task.finalized || task.cancelled || task.completed.size !== task.file.chunk_count) {
+      return;
+    }
+
+    task.finalized = true;
+    setAcceleratedDownload((current) =>
+      current?.fileId === task.file.id ? { ...current, status: "finalizing" } : current
+    );
+
+    try {
+      await task.writeChain;
+      await task.writable.close();
+      if (acceleratedDownloadTaskRef.current === task) {
+        acceleratedDownloadTaskRef.current = null;
+      }
+      setAcceleratedDownload((current) =>
+        current?.fileId === task.file.id ? { ...current, status: "completed" } : current
+      );
+      toast.success("加速下载完成");
+    } catch (error) {
+      if (acceleratedDownloadTaskRef.current === task) {
+        acceleratedDownloadTaskRef.current = null;
+      }
+      setAcceleratedDownload((current) =>
+        current?.fileId === task.file.id
+          ? {
+              ...current,
+              status: "error",
+              errorMessage: errorMessage(error)
+            }
+          : current
+      );
+      toast.danger(errorMessage(error));
+    }
+  }
+
+  function retryAcceleratedChunk(chunkIndex: number) {
+    const task = acceleratedDownloadTaskRef.current;
+    if (!task || task.cancelled || task.finalized || task.running.has(chunkIndex) || task.completed.has(chunkIndex)) {
+      return;
+    }
+
+    task.failed.delete(chunkIndex);
+    if (!task.queue.includes(chunkIndex)) {
+      task.queue.unshift(chunkIndex);
+    }
+    updateAcceleratedChunk(task.file.id, chunkIndex, (chunk) => ({
+      ...chunk,
+      status: "queued",
+      downloadedBytes: 0,
+      errorMessage: undefined
+    }));
+    startAcceleratedQueuedChunks(task);
+  }
+
+  function retryFailedAcceleratedChunks() {
+    const task = acceleratedDownloadTaskRef.current;
+    if (!task || task.cancelled || task.finalized) {
+      return;
+    }
+
+    const failedChunks = Array.from(task.failed).sort((left, right) => left - right);
+    if (failedChunks.length === 0) {
+      return;
+    }
+
+    for (const chunkIndex of failedChunks) {
+      if (task.running.has(chunkIndex) || task.completed.has(chunkIndex) || task.queue.includes(chunkIndex)) {
+        continue;
+      }
+      task.queue.push(chunkIndex);
+      updateAcceleratedChunk(task.file.id, chunkIndex, (chunk) => ({
+        ...chunk,
+        status: "queued",
+        downloadedBytes: 0,
+        errorMessage: undefined
+      }));
+    }
+    task.failed.clear();
+    startAcceleratedQueuedChunks(task);
+  }
+
+  function cancelAcceleratedDownload() {
+    const task = acceleratedDownloadTaskRef.current;
+    if (!task) {
+      setAcceleratedDownload((current) =>
+        current && current.status === "preparing" ? { ...current, status: "cancelled" } : current
+      );
+      return;
+    }
+
+    task.cancelled = true;
+    task.queue = [];
+    for (const controller of task.controllers.values()) {
+      controller.abort();
+    }
+    task.controllers.clear();
+    task.running.clear();
+    acceleratedDownloadTaskRef.current = null;
+    void task.writeChain
+      .catch(() => undefined)
+      .finally(async () => {
+        try {
+          await task.writable.abort?.("cancelled");
+        } catch {
+          // 忽略取消写入时的浏览器实现差异。
+        }
+      });
+    setAcceleratedDownload((current) =>
+      current?.fileId === task.file.id ? { ...current, status: "cancelled" } : current
+    );
+    toast.info("下载已取消");
+  }
+
+  function triggerFallbackDownload(file: FileItem) {
+    const link = document.createElement("a");
+    link.href = file.download_url;
+    link.download = file.file_name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
+
+  function updateAcceleratedChunk(
+    fileId: string,
+    chunkIndex: number,
+    updater: (chunk: AcceleratedChunkState) => AcceleratedChunkState
+  ) {
+    setAcceleratedDownload((current) => {
+      if (!current || current.fileId !== fileId) {
+        return current;
+      }
+
+      return {
+        ...current,
+        chunks: current.chunks.map((chunk) => (chunk.index === chunkIndex ? updater(chunk) : chunk))
+      };
+    });
+  }
+
+  function updateAcceleratedOverallStatus(task: AcceleratedDownloadTask) {
+    setAcceleratedDownload((current) => {
+      if (!current || current.fileId !== task.file.id || task.finalized || task.cancelled) {
+        return current;
+      }
+
+      if (task.running.size > 0 || task.queue.length > 0) {
+        return { ...current, status: "downloading" };
+      }
+
+      if (task.failed.size > 0) {
+        return { ...current, status: "partial_failed" };
+      }
+
+      return current;
+    });
+  }
+
+  function createInitialAcceleratedChunks(file: MultipartDownloadFile): AcceleratedChunkState[] {
+    return Array.from({ length: file.chunk_count }, (_, index) => ({
+      index,
+      size: expectedMultipartChunkSize(file, index),
+      downloadedBytes: 0,
+      status: "queued",
+      attempts: 0
+    }));
+  }
+
   function toggleFileSelected(file: FileItem, selected: boolean) {
     setSelectedFileIds((current) => {
       const next = new Set(current);
@@ -584,7 +959,10 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
           <Button
             variant="primary"
             leadingIcon={<FolderPlus size={16} />}
-            onClick={() => setCreateDirOpen(true)}
+            onClick={() => {
+              setCreateDirParentPath("/");
+              setCreateDirOpen(true);
+            }}
           >
             新建目录
           </Button>
@@ -709,6 +1087,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
           onMoveFile={openMoveDialog}
           onPreview={setPreviewFile}
           onCopy={onCopy}
+          onAcceleratedDownload={(file) => void onAcceleratedDownload(file)}
           onDelete={onDelete}
         />
 
@@ -720,7 +1099,19 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       </div>
 
       <PreviewDialog file={previewFile} onClose={() => setPreviewFile(null)} onCopy={copyText} />
-      <FileDetailDialog file={detailFile} onClose={() => setDetailFile(null)} onCopy={copyText} />
+      <FileDetailDialog
+        file={detailFile}
+        onClose={() => setDetailFile(null)}
+        onCopy={copyText}
+        onAcceleratedDownload={(file) => void onAcceleratedDownload(file)}
+      />
+      <AcceleratedDownloadDialog
+        state={acceleratedDownload}
+        onCancel={cancelAcceleratedDownload}
+        onClose={() => setAcceleratedDownload(null)}
+        onRetryChunk={retryAcceleratedChunk}
+        onRetryFailed={retryFailedAcceleratedChunks}
+      />
 
       <Modal
         open={Boolean(editingFile)}
@@ -787,13 +1178,21 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
           if (!creatingDir) {
             setCreateDirOpen(false);
             setNewDirName("");
+            setCreateDirParentPath("/");
           }
         }}
         title="新建目录"
-        description={`将在 ${currentDirPath} 下创建子目录`}
+        description="选择上级目录后创建新的虚拟子目录；默认创建在根目录。"
         footer={
           <>
-            <Button variant="secondary" disabled={creatingDir} onClick={() => setCreateDirOpen(false)}>
+            <Button
+              variant="secondary"
+              disabled={creatingDir}
+              onClick={() => {
+                setCreateDirOpen(false);
+                setCreateDirParentPath("/");
+              }}
+            >
               取消
             </Button>
             <Button
@@ -810,23 +1209,38 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       >
         <form
           id="create-directory-form"
-          className="flex flex-col gap-2"
+          className="flex flex-col gap-4"
           onSubmit={(event) => {
             event.preventDefault();
             void onCreateDirectory();
           }}
         >
-          <label htmlFor="directory-name" className="text-xs font-medium text-muted">
-            目录名称
-          </label>
-          <Input
-            id="directory-name"
-            value={newDirName}
-            placeholder="例如 photos"
-            maxLength={80}
-            disabled={creatingDir}
-            onChange={(event) => setNewDirName(event.target.value)}
-          />
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="create-directory-parent" className="text-xs font-medium text-muted">
+              上级目录
+            </label>
+            <DirectoryTreeSelect
+              id="create-directory-parent"
+              ariaLabel="新目录上级目录"
+              value={createDirParentPath}
+              directories={directoryOptions}
+              disabled={creatingDir}
+              onChange={setCreateDirParentPath}
+            />
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="directory-name" className="text-xs font-medium text-muted">
+              目录名称
+            </label>
+            <Input
+              id="directory-name"
+              value={newDirName}
+              placeholder="例如 photos"
+              maxLength={80}
+              disabled={creatingDir}
+              onChange={(event) => setNewDirName(event.target.value)}
+            />
+          </div>
         </form>
       </Modal>
 
