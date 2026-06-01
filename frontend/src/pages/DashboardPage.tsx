@@ -32,6 +32,7 @@ import { Pagination } from "../components/files/Pagination";
 import { PreviewDialog } from "../components/files/PreviewDialog";
 import { FileDetailDialog } from "../components/files/FileDetailDialog";
 import { DirectoryTreeSelect } from "../components/files/DirectoryTreeSelect";
+import { DirectoryTree } from "../components/files/DirectoryTree";
 import {
   AcceleratedDownloadDialog,
   type AcceleratedChunkState,
@@ -1202,7 +1203,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         }}
         title="新建目录"
         description="选择上级目录后创建新的虚拟子目录；默认创建在根目录。"
-        className="h-[min(34rem,92dvh)]"
+        size="lg"
         footer={
           <>
             <Button
@@ -1236,16 +1237,17 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
           }}
         >
           <div className="flex flex-col gap-1.5">
-            <label htmlFor="create-directory-parent" className="text-xs font-medium text-muted">
+            <span className="text-xs font-medium text-muted">
               上级目录
-            </label>
-            <DirectoryTreeSelect
+            </span>
+            <DirectoryTree
               id="create-directory-parent"
               ariaLabel="新目录上级目录"
               value={createDirParentPath}
               directories={directoryOptions}
               disabled={creatingDir}
               onChange={setCreateDirParentPath}
+              treeClassName="max-h-[min(24rem,48dvh)]"
             />
           </div>
           <div className="flex flex-col gap-1.5">
@@ -1275,7 +1277,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
             ? `将 ${movingDirectory.path} 移动到目标目录下，目录名保持为 ${movingDirectory.name}`
             : undefined
         }
-        className="h-[min(34rem,92dvh)]"
+        size="lg"
         footer={
           <>
             <Button variant="secondary" disabled={movingDirectorySaving} onClick={() => setMovingDirectory(null)}>
@@ -1302,16 +1304,17 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
           }}
         >
           <div className="flex flex-col gap-1.5">
-            <label htmlFor="move-directory-target" className="text-xs font-medium text-muted">
+            <span className="text-xs font-medium text-muted">
               目标父目录
-            </label>
-            <DirectoryTreeSelect
+            </span>
+            <DirectoryTree
               id="move-directory-target"
               ariaLabel="目标父目录"
               value={directoryMoveTargetPath}
               directories={directoryMoveTargets}
               disabled={movingDirectorySaving}
               onChange={setDirectoryMoveTargetPath}
+              treeClassName="max-h-[min(24rem,48dvh)]"
             />
           </div>
           {movingDirectory ? (
@@ -1388,7 +1391,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         }}
         title="移动项目"
         description={`将 ${moveDirectoryIds.length} 个目录、${moveFileIds.length} 个文件移动到其他目录`}
-        className="h-[min(34rem,92dvh)]"
+        size="lg"
         footer={
           <>
             <Button
@@ -1434,20 +1437,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
           </label>
 
           {moveCreateNew ? (
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-[1fr_1fr]">
-              <div className="flex flex-col gap-1.5">
-                <label htmlFor="move-new-parent" className="text-xs font-medium text-muted">
-                  父目录
-                </label>
-                <DirectoryTreeSelect
-                  id="move-new-parent"
-                  ariaLabel="父目录"
-                  value={moveNewParentPath}
-                  directories={bulkMoveTargets}
-                  disabled={movingFiles}
-                  onChange={setMoveNewParentPath}
-                />
-              </div>
+            <div className="flex flex-col gap-3">
               <div className="flex flex-col gap-1.5">
                 <label htmlFor="move-new-name" className="text-xs font-medium text-muted">
                   新目录名称
@@ -1461,19 +1451,34 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
                   onChange={(event) => setMoveNewDirName(event.target.value)}
                 />
               </div>
+              <div className="flex flex-col gap-1.5">
+                <span className="text-xs font-medium text-muted">
+                  父目录
+                </span>
+                <DirectoryTree
+                  id="move-new-parent"
+                  ariaLabel="父目录"
+                  value={moveNewParentPath}
+                  directories={bulkMoveTargets}
+                  disabled={movingFiles}
+                  onChange={setMoveNewParentPath}
+                  treeClassName="max-h-[min(24rem,46dvh)]"
+                />
+              </div>
             </div>
           ) : (
             <div className="flex flex-col gap-1.5">
-              <label htmlFor="move-target" className="text-xs font-medium text-muted">
+              <span className="text-xs font-medium text-muted">
                 目标目录
-              </label>
-              <DirectoryTreeSelect
+              </span>
+              <DirectoryTree
                 id="move-target"
                 ariaLabel="目标目录"
                 value={moveTargetPath}
                 directories={bulkMoveTargets}
                 disabled={movingFiles}
                 onChange={setMoveTargetPath}
+                treeClassName="max-h-[min(26rem,52dvh)]"
               />
             </div>
           )}
