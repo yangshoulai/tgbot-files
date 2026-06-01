@@ -171,7 +171,14 @@ class FakeD1Statement {
 
     if (normalizedSql.startsWith("UPDATE FILES") && normalizedSql.includes("SET DELETED_AT")) {
       const [deletedAt, first, second] = this.bindings;
-      if (normalizedSql.includes("COALESCE(DIRECTORY_PATH")) {
+      if (normalizedSql.includes("DIRECTORY_ID IN")) {
+        const selectionBindings = this.bindings.slice(1);
+        for (const file of this.db.files) {
+          if (file.deleted_at === null && this.fileMatchesDirectorySelection(file, selectionBindings)) {
+            file.deleted_at = String(deletedAt);
+          }
+        }
+      } else if (normalizedSql.includes("COALESCE(DIRECTORY_PATH")) {
         for (const file of this.db.files) {
           const path = file.directory_path ?? "/";
           if (file.deleted_at === null && (path === first || path.startsWith(String(second).replace(/\/%$/, "/")))) {
@@ -248,10 +255,19 @@ class FakeD1Statement {
 
     if (normalizedSql.startsWith("UPDATE DIRECTORIES") && normalizedSql.includes("SET DELETED_AT")) {
       const [deletedAt, path, likePattern] = this.bindings;
-      const prefix = String(likePattern).replace(/\/%$/, "/");
-      for (const directory of this.db.directories) {
-        if (directory.deleted_at === null && (directory.path === path || directory.path.startsWith(prefix))) {
-          directory.deleted_at = String(deletedAt);
+      if (normalizedSql.includes("ID IN")) {
+        const ids = new Set(this.bindings.slice(1).map(String));
+        for (const directory of this.db.directories) {
+          if (directory.deleted_at === null && ids.has(directory.id)) {
+            directory.deleted_at = String(deletedAt);
+          }
+        }
+      } else {
+        const prefix = String(likePattern).replace(/\/%$/, "/");
+        for (const directory of this.db.directories) {
+          if (directory.deleted_at === null && (directory.path === path || directory.path.startsWith(prefix))) {
+            directory.deleted_at = String(deletedAt);
+          }
         }
       }
     }
@@ -313,6 +329,14 @@ class FakeD1Statement {
         return {
           file_count: files.length,
           total_size: files.reduce((total, file) => total + file.size, 0)
+        } as T;
+      }
+
+      if (normalizedSql.includes("FROM FILES") && normalizedSql.includes("DIRECTORY_ID IN")) {
+        return {
+          total: this.db.files.filter((item) =>
+            item.deleted_at === null && this.fileMatchesDirectorySelection(item, this.bindings)
+          ).length
         } as T;
       }
 
@@ -532,6 +556,45 @@ class FakeD1Statement {
     }
 
     return directories.sort((left, right) => left.path.localeCompare(right.path));
+  }
+
+  private fileMatchesDirectorySelection(file: FileRecord, bindings: unknown[]): boolean {
+    const { directoryIds, directoryPaths } = this.selectedDirectoryValues(bindings);
+    const directoryId = file.directory_id ?? null;
+
+    return (
+      (directoryId !== null && directoryIds.has(directoryId)) ||
+      directoryPaths.has(file.directory_path ?? "/")
+    );
+  }
+
+  private selectedDirectoryValues(bindings: unknown[]): {
+    directoryIds: Set<string>;
+    directoryPaths: Set<string>;
+  } {
+    const normalizedSql = this.sql.trim().toUpperCase();
+    const directoryIdCount = this.placeholderCount(normalizedSql, "DIRECTORY_ID IN (");
+    const directoryPathCount = this.placeholderCount(normalizedSql, "COALESCE(DIRECTORY_PATH, '/') IN (");
+
+    return {
+      directoryIds: new Set(bindings.slice(0, directoryIdCount).map(String)),
+      directoryPaths: new Set(bindings.slice(directoryIdCount, directoryIdCount + directoryPathCount).map(String))
+    };
+  }
+
+  private placeholderCount(normalizedSql: string, marker: string): number {
+    const start = normalizedSql.indexOf(marker);
+    if (start < 0) {
+      return 0;
+    }
+
+    const bodyStart = start + marker.length;
+    const bodyEnd = normalizedSql.indexOf(")", bodyStart);
+    if (bodyEnd < 0) {
+      return 0;
+    }
+
+    return normalizedSql.slice(bodyStart, bodyEnd).split("?").length - 1;
   }
 
   private matchingApiKey(normalizedSql: string): ApiKeyRecord | undefined {
@@ -913,8 +976,11 @@ describe("API key multipart endpoints", () => {
     const db = new FakeD1();
     addApiKey(db);
     const apiEnv = envWithDb(db);
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const telegramFileRanges: Array<string | null> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const inputUrl = String(input);
+      const headers = new Headers(init?.headers);
+      const range = headers.get("Range");
 
       if (inputUrl.endsWith("/sendDocument")) {
         return jsonResponse({
@@ -942,6 +1008,18 @@ describe("API key multipart endpoints", () => {
       }
 
       if (inputUrl.endsWith("/documents/small-part")) {
+        telegramFileRanges.push(range);
+        if (range === "bytes=1-3") {
+          return new Response("ell", {
+            status: 206,
+            headers: {
+              "Content-Type": "application/octet-stream",
+              "Content-Range": "bytes 1-3/5",
+              "Content-Length": "3"
+            }
+          });
+        }
+
         return new Response("hello", {
           headers: {
             "Content-Type": "application/octet-stream",
@@ -1049,6 +1127,32 @@ describe("API key multipart endpoints", () => {
     expect(await downloadResponse.text()).toBe("hello");
     expect(downloadResponse.headers.get("X-Chunk-Count")).toBe("1");
     expect(downloadResponse.headers.get("Content-Disposition")).toContain("small.txt.part-1-of-1");
+
+    const publicPathParts = new URL(completeBody.file.url).pathname.split("/");
+    const token = publicPathParts[2] ?? "";
+    const rangeResponse = await worker.fetch(
+      new Request(`https://files.example.com/f/${token}/chunks/0`, {
+        headers: { Range: "bytes=1-3" }
+      }),
+      apiEnv
+    );
+
+    expect(rangeResponse.status).toBe(206);
+    expect(rangeResponse.headers.get("Accept-Ranges")).toBe("bytes");
+    expect(rangeResponse.headers.get("Content-Range")).toBe("bytes 1-3/5");
+    expect(rangeResponse.headers.get("Content-Length")).toBe("3");
+    expect(await rangeResponse.text()).toBe("ell");
+    expect(telegramFileRanges).toContain("bytes=1-3");
+
+    const unsatisfiableResponse = await worker.fetch(
+      new Request(`https://files.example.com/f/${token}/chunks/0`, {
+        headers: { Range: "bytes=5-6" }
+      }),
+      apiEnv
+    );
+
+    expect(unsatisfiableResponse.status).toBe(416);
+    expect(unsatisfiableResponse.headers.get("Content-Range")).toBe("bytes */5");
   });
 
   it("imports a small URL through the API key multipart URL flow", async () => {
@@ -2876,6 +2980,140 @@ describe("admin file manager", () => {
     expect(deleteBody.deleted_files).toBe(2);
     expect(db.files.every((item) => item.deleted_at !== null)).toBe(true);
     expect(db.directories.every((item) => item.deleted_at !== null)).toBe(true);
+  });
+
+  it("deletes directory trees without touching case-different sibling paths", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    db.directories.push(
+      {
+        id: "dir-upper",
+        parent_id: null,
+        name: "AImage",
+        path: "/AImage",
+        created_at: "2026-06-01T00:00:00.000Z",
+        deleted_at: null
+      },
+      {
+        id: "dir-upper-child",
+        parent_id: "dir-upper",
+        name: "raw",
+        path: "/AImage/raw",
+        created_at: "2026-06-01T00:01:00.000Z",
+        deleted_at: null
+      },
+      {
+        id: "dir-lower",
+        parent_id: null,
+        name: "aimage",
+        path: "/aimage",
+        created_at: "2026-06-01T00:02:00.000Z",
+        deleted_at: null
+      },
+      {
+        id: "dir-lower-child",
+        parent_id: "dir-lower",
+        name: "raw",
+        path: "/aimage/raw",
+        created_at: "2026-06-01T00:03:00.000Z",
+        deleted_at: null
+      }
+    );
+    db.files.push(
+      {
+        id: "file-upper",
+        file_name: "upper.jpg",
+        mime_type: "image/jpeg",
+        size: 1,
+        md5: "upper-md5",
+        telegram_file_id: "tg-upper",
+        telegram_file_unique_id: null,
+        file_path: "/f/token/upper.jpg",
+        remark: null,
+        uploaded_by: "admin",
+        created_at: "2026-06-01T00:04:00.000Z",
+        deleted_at: null,
+        directory_id: "dir-upper",
+        directory_path: "/AImage"
+      },
+      {
+        id: "file-upper-child",
+        file_name: "upper-raw.jpg",
+        mime_type: "image/jpeg",
+        size: 1,
+        md5: "upper-child-md5",
+        telegram_file_id: "tg-upper-child",
+        telegram_file_unique_id: null,
+        file_path: "/f/token/upper-raw.jpg",
+        remark: null,
+        uploaded_by: "admin",
+        created_at: "2026-06-01T00:05:00.000Z",
+        deleted_at: null,
+        directory_id: "dir-upper-child",
+        directory_path: "/AImage/raw"
+      },
+      {
+        id: "file-lower",
+        file_name: "lower.jpg",
+        mime_type: "image/jpeg",
+        size: 1,
+        md5: "lower-md5",
+        telegram_file_id: "tg-lower",
+        telegram_file_unique_id: null,
+        file_path: "/f/token/lower.jpg",
+        remark: null,
+        uploaded_by: "admin",
+        created_at: "2026-06-01T00:06:00.000Z",
+        deleted_at: null,
+        directory_id: "dir-lower",
+        directory_path: "/aimage"
+      },
+      {
+        id: "file-lower-child",
+        file_name: "lower-raw.jpg",
+        mime_type: "image/jpeg",
+        size: 1,
+        md5: "lower-child-md5",
+        telegram_file_id: "tg-lower-child",
+        telegram_file_unique_id: null,
+        file_path: "/f/token/lower-raw.jpg",
+        remark: null,
+        uploaded_by: "admin",
+        created_at: "2026-06-01T00:07:00.000Z",
+        deleted_at: null,
+        directory_id: "dir-lower-child",
+        directory_path: "/aimage/raw"
+      }
+    );
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/directories/dir-upper", {
+        method: "DELETE",
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const body = await response.json() as { deleted_directories: number; deleted_files: number };
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({
+      deleted_directories: 2,
+      deleted_files: 2
+    });
+    expect(db.directories.find((item) => item.id === "dir-upper")?.deleted_at).not.toBeNull();
+    expect(db.directories.find((item) => item.id === "dir-upper-child")?.deleted_at).not.toBeNull();
+    expect(db.files.find((item) => item.id === "file-upper")?.deleted_at).not.toBeNull();
+    expect(db.files.find((item) => item.id === "file-upper-child")?.deleted_at).not.toBeNull();
+    expect(db.directories.find((item) => item.id === "dir-lower")?.deleted_at).toBeNull();
+    expect(db.directories.find((item) => item.id === "dir-lower-child")?.deleted_at).toBeNull();
+    expect(db.files.find((item) => item.id === "file-lower")?.deleted_at).toBeNull();
+    expect(db.files.find((item) => item.id === "file-lower-child")?.deleted_at).toBeNull();
   });
 
   it("moves a directory tree to another parent directory", async () => {

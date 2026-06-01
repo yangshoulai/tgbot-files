@@ -519,24 +519,22 @@ export async function softDeleteDirectoryTree(params: {
     return null;
   }
 
-  const prefixPattern = `${escapeLikePattern(directory.path)}/%`;
+  const subtree = collectDirectorySubtree(directory, await listAllDirectoryRecords(params.db));
+  const directoryIds = subtree.map((item) => item.id);
+  const directoryPaths = subtree.map((item) => item.path);
+  const directoryIdClause = placeholders(directoryIds.length);
+  const directoryPathClause = placeholders(directoryPaths.length);
   const fileCount = await params.db
     .prepare(
       `SELECT COUNT(*) AS total
       FROM files
       WHERE deleted_at IS NULL
-        AND (COALESCE(directory_path, '/') = ? OR COALESCE(directory_path, '/') LIKE ? ESCAPE '\\')`
+        AND (
+          directory_id IN (${directoryIdClause})
+          OR COALESCE(directory_path, '/') IN (${directoryPathClause})
+        )`
     )
-    .bind(directory.path, prefixPattern)
-    .first<{ total: number }>();
-  const directoryCount = await params.db
-    .prepare(
-      `SELECT COUNT(*) AS total
-      FROM directories
-      WHERE deleted_at IS NULL
-        AND (path = ? OR path LIKE ? ESCAPE '\\')`
-    )
-    .bind(directory.path, prefixPattern)
+    .bind(...directoryIds, ...directoryPaths)
     .first<{ total: number }>();
 
   await params.db
@@ -544,23 +542,26 @@ export async function softDeleteDirectoryTree(params: {
       `UPDATE files
       SET deleted_at = ?
       WHERE deleted_at IS NULL
-        AND (COALESCE(directory_path, '/') = ? OR COALESCE(directory_path, '/') LIKE ? ESCAPE '\\')`
+        AND (
+          directory_id IN (${directoryIdClause})
+          OR COALESCE(directory_path, '/') IN (${directoryPathClause})
+        )`
     )
-    .bind(params.deletedAt, directory.path, prefixPattern)
+    .bind(params.deletedAt, ...directoryIds, ...directoryPaths)
     .run();
   await params.db
     .prepare(
       `UPDATE directories
       SET deleted_at = ?
       WHERE deleted_at IS NULL
-        AND (path = ? OR path LIKE ? ESCAPE '\\')`
+        AND id IN (${directoryIdClause})`
     )
-    .bind(params.deletedAt, directory.path, prefixPattern)
+    .bind(params.deletedAt, ...directoryIds)
     .run();
 
   return {
     directory,
-    deletedDirectories: directoryCount?.total ?? 0,
+    deletedDirectories: directoryIds.length,
     deletedFiles: fileCount?.total ?? 0
   };
 }
@@ -1091,6 +1092,37 @@ function escapeLikePattern(value: string): string {
 
 function placeholders(count: number): string {
   return Array.from({ length: count }, () => "?").join(", ");
+}
+
+function collectDirectorySubtree(root: DirectoryRecord, directories: DirectoryRecord[]): DirectoryRecord[] {
+  const childrenByParent = new Map<string, DirectoryRecord[]>();
+
+  for (const directory of directories) {
+    if (!directory.parent_id) {
+      continue;
+    }
+
+    const children = childrenByParent.get(directory.parent_id) ?? [];
+    children.push(directory);
+    childrenByParent.set(directory.parent_id, children);
+  }
+
+  const subtree: DirectoryRecord[] = [];
+  const visited = new Set<string>();
+  const stack = [root];
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current || visited.has(current.id)) {
+      continue;
+    }
+
+    visited.add(current.id);
+    subtree.push(current);
+    stack.push(...(childrenByParent.get(current.id) ?? []));
+  }
+
+  return subtree;
 }
 
 function parentPathForDirectory(path: string): string {

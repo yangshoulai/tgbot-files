@@ -1920,7 +1920,8 @@ async function handleFileAccess(request: Request, env: Env): Promise<Response> {
     return handleMultipartChunkAccess({
       env,
       payload,
-      chunkIndex: chunkAccess.chunkIndex
+      chunkIndex: chunkAccess.chunkIndex,
+      rangeHeader
     });
   }
 
@@ -1963,6 +1964,7 @@ async function handleMultipartChunkAccess(params: {
   env: Env;
   payload: Awaited<ReturnType<typeof verifySignedToken>>;
   chunkIndex: number;
+  rangeHeader: string | null;
 }): Promise<Response> {
   if (params.payload.v !== 2) {
     throw new AppError(400, "NotMultipartFile", "Chunk download is only available for multipart files");
@@ -1978,12 +1980,21 @@ async function handleMultipartChunkAccess(params: {
     throw new AppError(404, "FileChunkNotFound", "Multipart file chunk was not found");
   }
 
+  const range = parseByteRange(params.rangeHeader, chunk.size);
+  if (!range) {
+    return rangeNotSatisfiableResponse(chunk.size);
+  }
+
   const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
   const telegramFileUrl = await getTelegramFileUrl({ botToken, fileId: chunk.telegram_file_id });
   const telegramResponse = await fetchTelegramFile({
     fileUrl: telegramFileUrl,
-    rangeHeader: null
+    rangeHeader: range.partial ? `bytes=${range.start}-${range.end}` : null
   });
+
+  if (range.partial && telegramResponse.status !== 206 && (range.start !== 0 || range.end !== chunk.size - 1)) {
+    throw new AppError(502, "TelegramFileDownloadFailed", "Telegram file server ignored a partial Range request");
+  }
 
   if (!telegramResponse.body) {
     throw new AppError(502, "TelegramFileDownloadFailed", "Telegram file response did not include a body");
@@ -1992,14 +2003,18 @@ async function handleMultipartChunkAccess(params: {
   const headers = withSecurityHeaders();
   headers.set("Content-Type", params.payload.mime_type || telegramResponse.headers.get("Content-Type") || "application/octet-stream");
   headers.set("Content-Disposition", contentDispositionAttachment(chunkDownloadFileName(params.payload, params.chunkIndex)));
-  headers.set("Content-Length", String(chunk.size));
+  headers.set("Content-Length", String(range.end - range.start + 1));
   headers.set("Cache-Control", "public, max-age=31536000, immutable");
+  headers.set("Accept-Ranges", "bytes");
+  if (range.partial) {
+    headers.set("Content-Range", `bytes ${range.start}-${range.end}/${chunk.size}`);
+  }
   headers.set("X-Chunk-Index", String(params.chunkIndex));
   headers.set("X-Chunk-Count", String(params.payload.chunk_count));
   headers.set("X-Chunk-Offset", String(params.chunkIndex * params.payload.chunk_size));
 
   return new Response(telegramResponse.body, {
-    status: 200,
+    status: range.partial ? 206 : 200,
     headers
   });
 }

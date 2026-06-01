@@ -1202,6 +1202,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         }}
         title="新建目录"
         description="选择上级目录后创建新的虚拟子目录；默认创建在根目录。"
+        className="h-[min(34rem,92dvh)]"
         footer={
           <>
             <Button
@@ -1274,6 +1275,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
             ? `将 ${movingDirectory.path} 移动到目标目录下，目录名保持为 ${movingDirectory.name}`
             : undefined
         }
+        className="h-[min(34rem,92dvh)]"
         footer={
           <>
             <Button variant="secondary" disabled={movingDirectorySaving} onClick={() => setMovingDirectory(null)}>
@@ -1386,6 +1388,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         }}
         title="移动项目"
         description={`将 ${moveDirectoryIds.length} 个目录、${moveFileIds.length} 个文件移动到其他目录`}
+        className="h-[min(34rem,92dvh)]"
         footer={
           <>
             <Button

@@ -155,6 +155,7 @@ function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolea
   const playerRef = useRef<Plyr | null>(null);
   const [ratio, setRatio] = useState({ label: "16:9", value: 16 / 9 });
   const [serviceWorkerReady, setServiceWorkerReady] = useState(isVideoPreviewServiceWorkerControlling);
+  const [isVideoLoading, setIsVideoLoading] = useState(true);
   const heightLimit = fullscreen ? "calc(100dvh - 11rem)" : "min(64dvh, 760px)";
   const directFile = hasDirectFileAccess(file) ? file : null;
   const chunkedPreviewUrl = serviceWorkerReady ? buildChunkedVideoPreviewUrl(file) : null;
@@ -185,6 +186,10 @@ function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolea
       player.destroy();
       playerRef.current = null;
     };
+  }, [videoSrc]);
+
+  useEffect(() => {
+    setIsVideoLoading(Boolean(videoSrc));
   }, [videoSrc]);
 
   useEffect(() => {
@@ -229,7 +234,7 @@ function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolea
   return (
     <div className={(fullscreen ? "h-full min-h-0" : "h-[min(64dvh,760px)]") + " flex w-full items-center justify-center bg-foreground p-3 sm:p-4"}>
       <div
-        className="max-h-full max-w-full overflow-hidden rounded-xl bg-black shadow-dialog [&_.plyr]:h-full [&_.plyr]:w-full [&_.plyr]:min-w-0 [&_.plyr]:rounded-xl [&_.plyr]:[aspect-ratio:inherit] [&_.plyr__controls]:rounded-b-xl [&_.plyr__video-wrapper]:h-full [&_.plyr__video-wrapper]:w-full [&_.plyr__video-wrapper]:rounded-xl [&_.plyr__video-wrapper]:[aspect-ratio:inherit] [&_.plyr__video-wrapper--fixed-ratio]:[aspect-ratio:inherit]"
+        className="relative max-h-full max-w-full overflow-hidden rounded-xl bg-black shadow-dialog [&_.plyr]:h-full [&_.plyr]:w-full [&_.plyr]:min-w-0 [&_.plyr]:rounded-xl [&_.plyr]:[aspect-ratio:inherit] [&_.plyr__controls]:rounded-b-xl [&_.plyr__video-wrapper]:h-full [&_.plyr__video-wrapper]:w-full [&_.plyr__video-wrapper]:rounded-xl [&_.plyr__video-wrapper]:[aspect-ratio:inherit] [&_.plyr__video-wrapper--fixed-ratio]:[aspect-ratio:inherit]"
         style={{
           aspectRatio: ratio.label.replace(":", " / "),
           width: `min(100%, calc(${heightLimit} * ${ratio.value}))`
@@ -239,8 +244,20 @@ function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolea
           ref={videoRef}
           src={videoSrc}
           playsInline
-          preload="metadata"
+          preload="auto"
           className="h-full w-full object-contain"
+          onLoadStart={() => setIsVideoLoading(true)}
+          onWaiting={() => setIsVideoLoading(true)}
+          onSeeking={() => setIsVideoLoading(true)}
+          onLoadedData={() => setIsVideoLoading(false)}
+          onCanPlay={() => setIsVideoLoading(false)}
+          onPlaying={() => setIsVideoLoading(false)}
+          onSeeked={(event) => {
+            if (event.currentTarget.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+              setIsVideoLoading(false);
+            }
+          }}
+          onError={() => setIsVideoLoading(false)}
           onLoadedMetadata={(event) => {
             const target = event.currentTarget;
             if (target.videoWidth > 0 && target.videoHeight > 0) {
@@ -252,6 +269,14 @@ function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolea
         >
           当前浏览器不支持该视频预览。
         </video>
+        {isVideoLoading ? (
+          <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center rounded-xl bg-black/35 text-white">
+            <div className="inline-flex items-center gap-2 rounded-full bg-black/60 px-4 py-2 text-sm font-medium shadow-card backdrop-blur">
+              <Spinner size={18} className="text-white" />
+              视频加载中…
+            </div>
+          </div>
+        ) : null}
       </div>
     </div>
   );

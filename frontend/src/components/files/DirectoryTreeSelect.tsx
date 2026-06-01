@@ -151,7 +151,7 @@ export function DirectoryTreeSelect({
             </div>
           </div>
 
-          <div role="tree" aria-label={ariaLabel} className="max-h-80 overflow-auto p-1.5 scroll-thin">
+          <div role="tree" aria-label={ariaLabel} className="max-h-[min(24rem,52dvh)] overflow-auto p-1.5 scroll-thin">
             <DirectoryTreeRow
               node={tree}
               selectedPath={value}
