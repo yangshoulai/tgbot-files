@@ -296,7 +296,7 @@ export async function getFileRecord(db: D1Database, id: string): Promise<FileRec
     .first<FileRecord>();
 }
 
-export async function softDeleteFileRecord(db: D1Database, id: string, deletedAt: string): Promise<boolean> {
+export async function deleteFileRecord(db: D1Database, id: string): Promise<boolean> {
   const existing = await db
     .prepare("SELECT id FROM files WHERE id = ? AND deleted_at IS NULL")
     .bind(id)
@@ -306,7 +306,8 @@ export async function softDeleteFileRecord(db: D1Database, id: string, deletedAt
     return false;
   }
 
-  await db.prepare("UPDATE files SET deleted_at = ? WHERE id = ?").bind(deletedAt, id).run();
+  await db.prepare("DELETE FROM file_chunks WHERE file_id = ?").bind(id).run();
+  await db.prepare("DELETE FROM files WHERE id = ?").bind(id).run();
   return true;
 }
 
@@ -401,6 +402,18 @@ export async function listAllDirectoryRecords(db: D1Database): Promise<Directory
       `SELECT id, parent_id, name, path, created_at, deleted_at
       FROM directories
       WHERE deleted_at IS NULL
+      ORDER BY path ASC`
+    )
+    .all<DirectoryRecord>();
+
+  return result.results ?? [];
+}
+
+async function listAllDirectoryRecordsIncludingDeleted(db: D1Database): Promise<DirectoryRecord[]> {
+  const result = await db
+    .prepare(
+      `SELECT id, parent_id, name, path, created_at, deleted_at
+      FROM directories
       ORDER BY path ASC`
     )
     .all<DirectoryRecord>();
@@ -508,10 +521,9 @@ export async function insertDirectoryRecord(params: {
   return record;
 }
 
-export async function softDeleteDirectoryTree(params: {
+export async function deleteDirectoryTree(params: {
   db: D1Database;
   id: string;
-  deletedAt: string;
 }): Promise<{ directory: DirectoryRecord; deletedDirectories: number; deletedFiles: number } | null> {
   const directory = await getDirectoryRecord(params.db, params.id);
 
@@ -519,49 +531,65 @@ export async function softDeleteDirectoryTree(params: {
     return null;
   }
 
-  const subtree = collectDirectorySubtree(directory, await listAllDirectoryRecords(params.db));
+  const subtree = collectDirectorySubtree(directory, await listAllDirectoryRecordsIncludingDeleted(params.db));
   const directoryIds = subtree.map((item) => item.id);
   const directoryPaths = subtree.map((item) => item.path);
   const directoryIdClause = placeholders(directoryIds.length);
   const directoryPathClause = placeholders(directoryPaths.length);
+  const fileSelectionClause = `(
+    directory_id IN (${directoryIdClause})
+    OR COALESCE(directory_path, '/') IN (${directoryPathClause})
+  )`;
   const fileCount = await params.db
     .prepare(
       `SELECT COUNT(*) AS total
       FROM files
       WHERE deleted_at IS NULL
-        AND (
-          directory_id IN (${directoryIdClause})
-          OR COALESCE(directory_path, '/') IN (${directoryPathClause})
-        )`
+        AND ${fileSelectionClause}`
     )
     .bind(...directoryIds, ...directoryPaths)
     .first<{ total: number }>();
 
   await params.db
     .prepare(
-      `UPDATE files
-      SET deleted_at = ?
-      WHERE deleted_at IS NULL
-        AND (
-          directory_id IN (${directoryIdClause})
-          OR COALESCE(directory_path, '/') IN (${directoryPathClause})
-        )`
+      `DELETE FROM file_chunks
+      WHERE file_id IN (
+        SELECT id
+        FROM files
+        WHERE ${fileSelectionClause}
+      )`
     )
-    .bind(params.deletedAt, ...directoryIds, ...directoryPaths)
+    .bind(...directoryIds, ...directoryPaths)
     .run();
   await params.db
     .prepare(
-      `UPDATE directories
-      SET deleted_at = ?
-      WHERE deleted_at IS NULL
-        AND id IN (${directoryIdClause})`
+      `DELETE FROM files
+      WHERE ${fileSelectionClause}`
     )
-    .bind(params.deletedAt, ...directoryIds)
+    .bind(...directoryIds, ...directoryPaths)
     .run();
+  await params.db
+    .prepare(
+      `DELETE FROM multipart_uploads
+      WHERE directory_id IN (${directoryIdClause})
+        OR COALESCE(directory_path, '/') IN (${directoryPathClause})`
+    )
+    .bind(...directoryIds, ...directoryPaths)
+    .run();
+
+  const directoriesByDepthDesc = subtree
+    .slice()
+    .sort((left, right) => right.path.length - left.path.length);
+  for (const item of directoriesByDepthDesc) {
+    await params.db
+      .prepare("DELETE FROM directories WHERE id = ?")
+      .bind(item.id)
+      .run();
+  }
 
   return {
     directory,
-    deletedDirectories: directoryIds.length,
+    deletedDirectories: subtree.filter((item) => item.deleted_at === null).length,
     deletedFiles: fileCount?.total ?? 0
   };
 }

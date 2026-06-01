@@ -257,11 +257,11 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
 
   async function onDelete(file: FileItem) {
     const ok = await confirm({
-      title: "删除该文件索引？",
+      title: "永久删除该文件索引？",
       description: (
         <>
-          将从控制台移除 <span className="font-mono text-foreground">{file.file_name}</span>。
-          Telegram 中的原始消息和已分发的签名链接不会被影响。
+          将从控制台永久移除 <span className="font-mono text-foreground">{file.file_name}</span>{" "}
+          的索引和分片索引。Telegram 中的原始消息不会被删除；分片文件的已分发签名链接会失效。
         </>
       ),
       tone: "danger",
@@ -296,8 +296,8 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       title: `删除选中的 ${totalTargets} 个项目？`,
       description: (
         <>
-          将删除 {targetDirectories.length} 个目录及其子项、{targetFiles.length} 个文件索引。
-          Telegram 中的原始消息和已分发的签名链接不会被影响。
+          将永久删除 {targetDirectories.length} 个目录及其子项、{targetFiles.length} 个文件索引。
+          Telegram 中的原始消息不会被删除；分片文件的已分发签名链接会失效。
         </>
       ),
       tone: "danger",
@@ -350,8 +350,8 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       title: `删除目录 ${directory.name}？`,
       description: (
         <>
-          将递归删除 <span className="font-mono text-foreground">{directory.path}</span>{" "}
-          下的所有子目录和文件索引。Telegram 中的原始消息和已分发的签名链接不会被影响。
+          将递归永久删除 <span className="font-mono text-foreground">{directory.path}</span>{" "}
+          下的所有子目录、文件索引和分片索引。Telegram 中的原始消息不会被删除；分片文件的已分发签名链接会失效。
         </>
       ),
       tone: "danger",

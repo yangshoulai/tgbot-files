@@ -31,8 +31,8 @@ import {
   renameDirectoryTree,
   requireDb,
   softDeleteApiKeyRecord,
-  softDeleteDirectoryTree,
-  softDeleteFileRecord,
+  deleteDirectoryTree,
+  deleteFileRecord,
   touchApiKeyRecord,
   updateApiKeyRecord,
   updateFileRecordMetadata,
@@ -491,7 +491,7 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
 
   const deleteMatch = /^\/api\/admin\/files\/([^/]+)$/.exec(url.pathname);
   if (request.method === "DELETE" && deleteMatch?.[1]) {
-    const deleted = await softDeleteFileRecord(db, decodeURIComponent(deleteMatch[1]), new Date().toISOString());
+    const deleted = await deleteFileRecord(db, decodeURIComponent(deleteMatch[1]));
 
     if (!deleted) {
       throw new AppError(404, "NotFound", "File record not found");
@@ -582,10 +582,9 @@ async function handleAdminDirectories(request: Request, env: Env): Promise<Respo
   }
 
   if (request.method === "DELETE" && match?.[1]) {
-    const result = await softDeleteDirectoryTree({
+    const result = await deleteDirectoryTree({
       db,
-      id: decodeURIComponent(match[1]),
-      deletedAt: new Date().toISOString()
+      id: decodeURIComponent(match[1])
     });
 
     if (!result) {
@@ -660,12 +659,11 @@ async function handleAdminEntries(request: Request, env: Env): Promise<Response>
     await requireFileRecords(db, fileIds);
     await requireDirectoryRecords(db, directoryIds);
 
-    const deletedAt = new Date().toISOString();
     let deletedDirectories = 0;
     let deletedFiles = 0;
 
     for (const fileId of fileIds) {
-      const deleted = await softDeleteFileRecord(db, fileId, deletedAt);
+      const deleted = await deleteFileRecord(db, fileId);
       if (!deleted) {
         throw new AppError(404, "NotFound", "File record not found");
       }
@@ -673,10 +671,9 @@ async function handleAdminEntries(request: Request, env: Env): Promise<Response>
     }
 
     for (const directoryId of directoryIds) {
-      const result = await softDeleteDirectoryTree({
+      const result = await deleteDirectoryTree({
         db,
-        id: directoryId,
-        deletedAt
+        id: directoryId
       });
 
       if (!result) {

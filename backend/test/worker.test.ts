@@ -272,6 +272,35 @@ class FakeD1Statement {
       }
     }
 
+    if (normalizedSql.startsWith("DELETE FROM FILE_CHUNKS")) {
+      const fileIds = normalizedSql.includes("WHERE FILE_ID = ?")
+        ? new Set([String(this.bindings[0])])
+        : new Set(
+            this.db.files
+              .filter((file) => this.fileMatchesDirectorySelection(file, this.bindings))
+              .map((file) => file.id)
+          );
+      this.deleteWhere(this.db.fileChunks, (chunk) => fileIds.has(chunk.file_id));
+    }
+
+    if (normalizedSql.startsWith("DELETE FROM FILES")) {
+      if (normalizedSql.includes("WHERE ID = ?")) {
+        const id = String(this.bindings[0]);
+        this.deleteWhere(this.db.files, (file) => file.id === id);
+      } else {
+        this.deleteWhere(this.db.files, (file) => this.fileMatchesDirectorySelection(file, this.bindings));
+      }
+    }
+
+    if (normalizedSql.startsWith("DELETE FROM MULTIPART_UPLOADS")) {
+      this.deleteWhere(this.db.multipartUploads, (upload) => this.uploadMatchesDirectorySelection(upload, this.bindings));
+    }
+
+    if (normalizedSql.startsWith("DELETE FROM DIRECTORIES")) {
+      const id = String(this.bindings[0]);
+      this.deleteWhere(this.db.directories, (directory) => directory.id === id);
+    }
+
     if (normalizedSql.startsWith("UPDATE API_KEYS SET LAST_USED_AT")) {
       const [lastUsedAt, updatedAt, id] = this.bindings;
       const apiKey = this.db.apiKeys.find((item) => item.id === id && item.deleted_at === null);
@@ -333,10 +362,11 @@ class FakeD1Statement {
       }
 
       if (normalizedSql.includes("FROM FILES") && normalizedSql.includes("DIRECTORY_ID IN")) {
+        const files = normalizedSql.includes("DELETED_AT IS NULL")
+          ? this.db.files.filter((item) => item.deleted_at === null)
+          : this.db.files;
         return {
-          total: this.db.files.filter((item) =>
-            item.deleted_at === null && this.fileMatchesDirectorySelection(item, this.bindings)
-          ).length
+          total: files.filter((item) => this.fileMatchesDirectorySelection(item, this.bindings)).length
         } as T;
       }
 
@@ -415,10 +445,16 @@ class FakeD1Statement {
     }
 
     if (normalizedSql.includes("FROM DIRECTORIES")) {
+      const directories = normalizedSql.includes("DELETED_AT IS NULL") ||
+        normalizedSql.includes("PARENT_ID IS NULL") ||
+        normalizedSql.includes("PARENT_ID = ?") ||
+        normalizedSql.includes("PATH = ? OR PATH LIKE ?")
+        ? this.visibleDirectories()
+        : this.db.directories.slice().sort((left, right) => left.path.localeCompare(right.path));
       return {
         success: true,
         meta: fakeD1Meta(),
-        results: this.visibleDirectories() as T[]
+        results: directories as T[]
       };
     }
 
@@ -566,6 +602,25 @@ class FakeD1Statement {
       (directoryId !== null && directoryIds.has(directoryId)) ||
       directoryPaths.has(file.directory_path ?? "/")
     );
+  }
+
+  private uploadMatchesDirectorySelection(upload: MultipartUploadRecord, bindings: unknown[]): boolean {
+    const { directoryIds, directoryPaths } = this.selectedDirectoryValues(bindings);
+    const directoryId = upload.directory_id ?? null;
+
+    return (
+      (directoryId !== null && directoryIds.has(directoryId)) ||
+      directoryPaths.has(upload.directory_path ?? "/")
+    );
+  }
+
+  private deleteWhere<T>(items: T[], predicate: (item: T) => boolean): void {
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index];
+      if (item !== undefined && predicate(item)) {
+        items.splice(index, 1);
+      }
+    }
   }
 
   private selectedDirectoryValues(bindings: unknown[]): {
@@ -2589,7 +2644,7 @@ describe("admin file manager", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("lists and soft-deletes D1 file records", async () => {
+  it("lists and hard-deletes D1 file records", async () => {
     const db = new FakeD1();
     const adminEnv: Env = {
       ...env,
@@ -2611,6 +2666,15 @@ describe("admin file manager", () => {
       uploaded_by: "admin",
       created_at: "2026-05-27T00:00:00.000Z",
       deleted_at: null
+    });
+    db.fileChunks.push({
+      file_id: "file-1",
+      chunk_index: 0,
+      size: 12,
+      md5: "chunk-md5",
+      telegram_file_id: "tg-chunk-id",
+      telegram_file_unique_id: null,
+      created_at: "2026-05-27T00:00:00.000Z"
     });
     const cookie = await loginAndGetCookie(adminEnv);
 
@@ -2637,7 +2701,8 @@ describe("admin file manager", () => {
     );
     const deleteBody = await deleteResponse.json() as { ok: boolean };
     expect(deleteBody.ok).toBe(true);
-    expect(db.files[0]?.deleted_at).not.toBeNull();
+    expect(db.files).toHaveLength(0);
+    expect(db.fileChunks).toHaveLength(0);
 
     const afterDeleteResponse = await worker.fetch(
       new Request("https://files.example.com/api/admin/files", {
@@ -2835,7 +2900,7 @@ describe("admin file manager", () => {
     });
   });
 
-  it("creates virtual directories, moves files, searches current directory, and recursive deletes", async () => {
+  it("creates virtual directories, moves files, searches current directory, and recursively hard-deletes directories", async () => {
     const db = new FakeD1();
     const adminEnv: Env = {
       ...env,
@@ -2978,8 +3043,8 @@ describe("admin file manager", () => {
     const deleteBody = await deleteResponse.json() as { deleted_directories: number; deleted_files: number };
     expect(deleteBody.deleted_directories).toBe(2);
     expect(deleteBody.deleted_files).toBe(2);
-    expect(db.files.every((item) => item.deleted_at !== null)).toBe(true);
-    expect(db.directories.every((item) => item.deleted_at !== null)).toBe(true);
+    expect(db.files).toHaveLength(0);
+    expect(db.directories).toHaveLength(0);
   });
 
   it("deletes directory trees without touching case-different sibling paths", async () => {
@@ -3090,6 +3155,26 @@ describe("admin file manager", () => {
         directory_path: "/aimage/raw"
       }
     );
+    db.fileChunks.push(
+      {
+        file_id: "file-upper",
+        chunk_index: 0,
+        size: 1,
+        md5: "upper-chunk-md5",
+        telegram_file_id: "tg-upper-chunk",
+        telegram_file_unique_id: null,
+        created_at: "2026-06-01T00:08:00.000Z"
+      },
+      {
+        file_id: "file-lower",
+        chunk_index: 0,
+        size: 1,
+        md5: "lower-chunk-md5",
+        telegram_file_id: "tg-lower-chunk",
+        telegram_file_unique_id: null,
+        created_at: "2026-06-01T00:09:00.000Z"
+      }
+    );
     const cookie = await loginAndGetCookie(adminEnv);
 
     const response = await worker.fetch(
@@ -3106,10 +3191,12 @@ describe("admin file manager", () => {
       deleted_directories: 2,
       deleted_files: 2
     });
-    expect(db.directories.find((item) => item.id === "dir-upper")?.deleted_at).not.toBeNull();
-    expect(db.directories.find((item) => item.id === "dir-upper-child")?.deleted_at).not.toBeNull();
-    expect(db.files.find((item) => item.id === "file-upper")?.deleted_at).not.toBeNull();
-    expect(db.files.find((item) => item.id === "file-upper-child")?.deleted_at).not.toBeNull();
+    expect(db.directories.find((item) => item.id === "dir-upper")).toBeUndefined();
+    expect(db.directories.find((item) => item.id === "dir-upper-child")).toBeUndefined();
+    expect(db.files.find((item) => item.id === "file-upper")).toBeUndefined();
+    expect(db.files.find((item) => item.id === "file-upper-child")).toBeUndefined();
+    expect(db.fileChunks.find((item) => item.file_id === "file-upper")).toBeUndefined();
+    expect(db.fileChunks.find((item) => item.file_id === "file-lower")).toBeDefined();
     expect(db.directories.find((item) => item.id === "dir-lower")?.deleted_at).toBeNull();
     expect(db.directories.find((item) => item.id === "dir-lower-child")?.deleted_at).toBeNull();
     expect(db.files.find((item) => item.id === "file-lower")?.deleted_at).toBeNull();
@@ -3395,9 +3482,11 @@ describe("admin file manager", () => {
       deleted_directories: 2,
       deleted_files: 2
     });
-    expect(db.files.every((item) => item.deleted_at !== null)).toBe(true);
+    expect(db.files.find((item) => item.id === "file-root")).toBeUndefined();
+    expect(db.files.find((item) => item.id === "file-draft")).toBeUndefined();
     expect(db.directories.find((item) => item.id === "dir-archive")?.deleted_at).toBeNull();
-    expect(db.directories.filter((item) => item.id !== "dir-archive").every((item) => item.deleted_at !== null)).toBe(true);
+    expect(db.directories.find((item) => item.id === "dir-docs")).toBeUndefined();
+    expect(db.directories.find((item) => item.id === "dir-docs-child")).toBeUndefined();
   });
 
 });
