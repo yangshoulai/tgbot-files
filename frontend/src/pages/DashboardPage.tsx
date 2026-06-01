@@ -31,6 +31,7 @@ import { FileTable } from "../components/files/FileTable";
 import { Pagination } from "../components/files/Pagination";
 import { PreviewDialog } from "../components/files/PreviewDialog";
 import { FileDetailDialog } from "../components/files/FileDetailDialog";
+import { DirectoryTreeSelect } from "../components/files/DirectoryTreeSelect";
 
 type FileTypeFilter = "all" | "image" | "text" | "pdf" | "archive" | "other";
 
@@ -75,11 +76,6 @@ function directoryBreadcrumbs(path: string): Array<{ label: string; path: string
   }
 
   return breadcrumbs;
-}
-
-function directoryOptionLabel(path: string): string {
-  if (path === "/") return "/ 根目录";
-  return path;
 }
 
 export function DashboardPage({ session, uploadVersion, copyText, onDirectoryChange }: DashboardPageProps) {
@@ -625,19 +621,12 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
             value={query}
             onChange={(event) => setQuery(event.target.value)}
           />
-          <select
-            aria-label="目录过滤"
+          <DirectoryTreeSelect
+            ariaLabel="目录过滤"
             value={currentDirPath}
-            onChange={(event) => goToDirectory(event.target.value)}
-            className="h-11 rounded-lg border border-border bg-surface px-3 text-sm text-foreground shadow-card outline-none transition-colors hover:border-border-strong focus:border-primary focus:shadow-[0_0_0_4px_var(--color-primary-ring)]"
-          >
-            <option value="/">{directoryOptionLabel("/")}</option>
-            {directoryOptions.map((directory) => (
-              <option key={directory.id} value={directory.path}>
-                {directoryOptionLabel(directory.path)}
-              </option>
-            ))}
-          </select>
+            directories={directoryOptions}
+            onChange={goToDirectory}
+          />
           <select
             aria-label="文件类型过滤"
             value={typeFilter}
@@ -881,20 +870,14 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
             <label htmlFor="move-directory-target" className="text-xs font-medium text-muted">
               目标父目录
             </label>
-            <select
+            <DirectoryTreeSelect
               id="move-directory-target"
+              ariaLabel="目标父目录"
               value={directoryMoveTargetPath}
+              directories={directoryMoveTargets}
               disabled={movingDirectorySaving}
-              onChange={(event) => setDirectoryMoveTargetPath(event.target.value)}
-              className="h-11 rounded-lg border border-border bg-surface px-3 text-sm text-foreground shadow-card outline-none transition-colors hover:border-border-strong focus:border-primary focus:shadow-[0_0_0_4px_var(--color-primary-ring)]"
-            >
-              <option value="/">{directoryOptionLabel("/")}</option>
-              {directoryMoveTargets.map((directory) => (
-                <option key={directory.id} value={directory.path}>
-                  {directoryOptionLabel(directory.path)}
-                </option>
-              ))}
-            </select>
+              onChange={setDirectoryMoveTargetPath}
+            />
           </div>
           {movingDirectory ? (
             <p className="rounded-xl border border-border bg-background px-3 py-2 text-xs leading-5 text-muted">
@@ -1020,20 +1003,14 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
                 <label htmlFor="move-new-parent" className="text-xs font-medium text-muted">
                   父目录
                 </label>
-                <select
+                <DirectoryTreeSelect
                   id="move-new-parent"
+                  ariaLabel="父目录"
                   value={moveNewParentPath}
+                  directories={bulkMoveTargets}
                   disabled={movingFiles}
-                  onChange={(event) => setMoveNewParentPath(event.target.value)}
-                  className="h-11 rounded-lg border border-border bg-surface px-3 text-sm text-foreground shadow-card outline-none transition-colors hover:border-border-strong focus:border-primary focus:shadow-[0_0_0_4px_var(--color-primary-ring)]"
-                >
-                  <option value="/">{directoryOptionLabel("/")}</option>
-                  {bulkMoveTargets.map((directory) => (
-                    <option key={directory.id} value={directory.path}>
-                      {directoryOptionLabel(directory.path)}
-                    </option>
-                  ))}
-                </select>
+                  onChange={setMoveNewParentPath}
+                />
               </div>
               <div className="flex flex-col gap-1.5">
                 <label htmlFor="move-new-name" className="text-xs font-medium text-muted">
@@ -1054,20 +1031,14 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
               <label htmlFor="move-target" className="text-xs font-medium text-muted">
                 目标目录
               </label>
-              <select
+              <DirectoryTreeSelect
                 id="move-target"
+                ariaLabel="目标目录"
                 value={moveTargetPath}
+                directories={bulkMoveTargets}
                 disabled={movingFiles}
-                onChange={(event) => setMoveTargetPath(event.target.value)}
-                className="h-11 rounded-lg border border-border bg-surface px-3 text-sm text-foreground shadow-card outline-none transition-colors hover:border-border-strong focus:border-primary focus:shadow-[0_0_0_4px_var(--color-primary-ring)]"
-              >
-                <option value="/">{directoryOptionLabel("/")}</option>
-                {bulkMoveTargets.map((directory) => (
-                  <option key={directory.id} value={directory.path}>
-                    {directoryOptionLabel(directory.path)}
-                  </option>
-                ))}
-              </select>
+                onChange={setMoveTargetPath}
+              />
             </div>
           )}
         </form>
