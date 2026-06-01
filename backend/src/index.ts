@@ -88,6 +88,9 @@ interface UploadResult {
   createdAt: string;
   directoryId?: string | null;
   directoryPath: string;
+  storageBackend: "telegram_single" | "telegram_multipart";
+  chunkSize?: number | null;
+  chunkCount?: number | null;
 }
 
 interface MultipartInitResult {
@@ -107,8 +110,10 @@ interface ParsedByteRange {
 }
 
 const TELEGRAM_CHUNK_SIZE_BYTES = 18 * 1024 * 1024;
-const MAX_TELEGRAM_MULTIPART_CHUNKS = 24;
-const MAX_TELEGRAM_MULTIPART_BYTES = TELEGRAM_CHUNK_SIZE_BYTES * MAX_TELEGRAM_MULTIPART_CHUNKS;
+const DIRECT_MULTIPART_ACCESS_MAX_CHUNKS = 24;
+const DIRECT_MULTIPART_ACCESS_MAX_BYTES = TELEGRAM_CHUNK_SIZE_BYTES * DIRECT_MULTIPART_ACCESS_MAX_CHUNKS;
+const MAX_TELEGRAM_MULTIPART_BYTES = 5 * 1024 * 1024 * 1024;
+const MAX_TELEGRAM_MULTIPART_CHUNKS = Math.ceil(MAX_TELEGRAM_MULTIPART_BYTES / TELEGRAM_CHUNK_SIZE_BYTES);
 
 const worker = {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -297,6 +302,8 @@ async function handleAdminSession(request: Request, env: Env, username: string):
     max_file_bytes: maxFileBytes,
     multipart_chunk_bytes: TELEGRAM_CHUNK_SIZE_BYTES,
     max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
+    direct_access_max_chunks: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
+    direct_access_max_bytes: DIRECT_MULTIPART_ACCESS_MAX_BYTES,
     base_url: baseUrl,
     config: {
       files_db: Boolean(env.FILES_DB),
@@ -319,7 +326,8 @@ async function handleAdminSession(request: Request, env: Env, username: string):
         : "未单独配置，使用签名密钥",
       public_base_url: baseUrl,
       max_file_bytes: String(maxFileBytes),
-      max_multipart_file_bytes: String(MAX_TELEGRAM_MULTIPART_BYTES)
+      max_multipart_file_bytes: String(MAX_TELEGRAM_MULTIPART_BYTES),
+      direct_access_max_bytes: String(DIRECT_MULTIPART_ACCESS_MAX_BYTES)
     }
   });
 }
@@ -370,7 +378,9 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
       global_stats: globalStats,
       max_file_bytes: parseMaxFileBytes(env.MAX_FILE_BYTES),
       multipart_chunk_bytes: TELEGRAM_CHUNK_SIZE_BYTES,
-      max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES
+      max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
+      direct_access_max_chunks: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
+      direct_access_max_bytes: DIRECT_MULTIPART_ACCESS_MAX_BYTES
     });
   }
 
@@ -705,6 +715,8 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
         max_file_bytes: parseMaxFileBytes(env.MAX_FILE_BYTES),
         max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
         multipart_chunk_bytes: TELEGRAM_CHUNK_SIZE_BYTES,
+        direct_access_max_chunks: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
+        direct_access_max_bytes: DIRECT_MULTIPART_ACCESS_MAX_BYTES,
         directory_path: directoryPath
       });
     }
@@ -1549,7 +1561,10 @@ async function completeMultipartUpload(params: {
     ...(params.upload.remark ? { remark: params.upload.remark } : {}),
     createdAt,
     directoryId: params.upload.directory_id ?? null,
-    directoryPath: params.upload.directory_path ?? "/"
+    directoryPath: params.upload.directory_path ?? "/",
+    storageBackend: "telegram_multipart",
+    chunkSize: params.upload.chunk_size,
+    chunkCount: params.upload.chunk_count
   };
 }
 
@@ -1665,7 +1680,10 @@ async function uploadAndRecordFile(params: {
     ...(params.remark ? { remark: params.remark } : {}),
     createdAt,
     directoryId: params.directoryId ?? null,
-    directoryPath: params.directoryPath ?? "/"
+    directoryPath: params.directoryPath ?? "/",
+    storageBackend: "telegram_single",
+    chunkSize: null,
+    chunkCount: null
   };
 }
 
@@ -1812,6 +1830,18 @@ async function handleMultipartFileAccess(params: {
   rangeHeader: string | null;
   forceDownload: boolean;
 }): Promise<Response> {
+  if (!canDirectlyAccessMultipartPayload(params.payload)) {
+    throw new AppError(
+      403,
+      "DirectAccessDisabled",
+      "该文件分片数量过多，不提供完整文件访问链接，请在控制台使用加速下载",
+      {
+        chunk_count: params.payload.chunk_count,
+        direct_access_max_chunks: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS
+      }
+    );
+  }
+
   const db = requireDb(params.env);
   const chunks = await listFileChunkRecords(db, params.payload.file_record_id);
 
@@ -2045,14 +2075,21 @@ function isFormContentType(contentType: string | null): boolean {
 }
 
 function serializeFileRecord(file: FileRecord, baseUrl: string): Record<string, unknown> {
-  const url = `${baseUrl}${file.file_path}`;
+  const storageBackend = fileStorageBackend(file);
+  const directAccess = canDirectlyAccessFileRecord(file);
+  const url = directAccess ? `${baseUrl}${file.file_path}` : null;
 
   return {
     ...file,
     directory_id: file.directory_id ?? null,
     directory_path: file.directory_path ?? "/",
+    storage_backend: storageBackend,
+    chunk_size: storageBackend === "telegram_multipart" ? file.chunk_size ?? null : null,
+    chunk_count: storageBackend === "telegram_multipart" ? file.chunk_count ?? null : null,
+    direct_access: directAccess,
+    download_strategy: downloadStrategy(storageBackend, directAccess),
     url,
-    download_url: appendDownloadParam(url)
+    download_url: url ? appendDownloadParam(url) : null
   };
 }
 
@@ -2065,7 +2102,10 @@ function serializeMultipartInit(result: MultipartInitResult): Record<string, unk
     chunk_size: result.chunkSize,
     chunk_count: result.chunkCount,
     directory_path: result.directoryPath,
-    max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES
+    max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
+    direct_access: result.chunkCount <= DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
+    direct_access_max_chunks: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
+    direct_access_max_bytes: DIRECT_MULTIPART_ACCESS_MAX_BYTES
   };
 }
 
@@ -2118,6 +2158,9 @@ function serializeChunk(record: Awaited<ReturnType<typeof uploadChunkToTelegram>
 }
 
 function serializeUploadedFileResult(result: UploadResult, username: string): Record<string, unknown> {
+  const directAccess = canDirectlyAccessUploadResult(result);
+  const url = directAccess ? result.publicUrl : null;
+
   return {
     id: result.id,
     file_name: result.name,
@@ -2128,14 +2171,65 @@ function serializeUploadedFileResult(result: UploadResult, username: string): Re
     telegram_file_unique_id: result.telegramFileUniqueId ?? null,
     file_path: result.filePath,
     remark: result.remark ?? null,
-    url: result.publicUrl,
-    download_url: appendDownloadParam(result.publicUrl),
+    url,
+    download_url: url ? appendDownloadParam(url) : null,
     uploaded_by: username,
     created_at: result.createdAt,
     directory_id: result.directoryId ?? null,
     directory_path: result.directoryPath,
-    storage_backend: result.telegramFileId.startsWith("multipart:") ? "telegram_multipart" : "telegram_single"
+    storage_backend: result.storageBackend,
+    chunk_size: result.storageBackend === "telegram_multipart" ? result.chunkSize ?? null : null,
+    chunk_count: result.storageBackend === "telegram_multipart" ? result.chunkCount ?? null : null,
+    direct_access: directAccess,
+    download_strategy: downloadStrategy(result.storageBackend, directAccess)
   };
+}
+
+function fileStorageBackend(file: FileRecord): "telegram_single" | "telegram_multipart" {
+  if (file.storage_backend === "telegram_multipart" || file.telegram_file_id.startsWith("multipart:")) {
+    return "telegram_multipart";
+  }
+
+  return "telegram_single";
+}
+
+function canDirectlyAccessFileRecord(file: FileRecord): boolean {
+  const storageBackend = fileStorageBackend(file);
+
+  if (storageBackend === "telegram_single") {
+    return true;
+  }
+
+  return Number.isSafeInteger(file.chunk_count) &&
+    Number(file.chunk_count) > 0 &&
+    Number(file.chunk_count) <= DIRECT_MULTIPART_ACCESS_MAX_CHUNKS;
+}
+
+function canDirectlyAccessUploadResult(result: UploadResult): boolean {
+  if (result.storageBackend === "telegram_single") {
+    return true;
+  }
+
+  return Number.isSafeInteger(result.chunkCount) &&
+    Number(result.chunkCount) > 0 &&
+    Number(result.chunkCount) <= DIRECT_MULTIPART_ACCESS_MAX_CHUNKS;
+}
+
+function canDirectlyAccessMultipartPayload(
+  payload: Extract<Awaited<ReturnType<typeof verifySignedToken>>, { v: 2 }>
+): boolean {
+  return payload.chunk_count <= DIRECT_MULTIPART_ACCESS_MAX_CHUNKS;
+}
+
+function downloadStrategy(
+  storageBackend: "telegram_single" | "telegram_multipart",
+  directAccess: boolean
+): "direct" | "direct_or_accelerated" | "accelerated" {
+  if (storageBackend === "telegram_single") {
+    return "direct";
+  }
+
+  return directAccess ? "direct_or_accelerated" : "accelerated";
 }
 
 function serializeApiKeyRecord(record: ApiKeyRecord, includeKey: boolean): Record<string, unknown> {

@@ -1,7 +1,8 @@
 import { Copy, Download, Eye, Folder, FolderInput, FolderOpen, Info, Pencil, Trash2, Zap } from "lucide-react";
 import type { DirectoryItem, FileItem } from "../../api";
 import { canUseAcceleratedDownload } from "../../lib/accelerated-download";
-import { canPreview, formatBytes, formatDateTime } from "../../utils";
+import { canPreviewThroughAvailableAccess, fileAccessLabel, hasDirectFileAccess } from "../../lib/file-access";
+import { formatBytes, formatDateTime } from "../../utils";
 import { FileVisual } from "../ui/FileVisual";
 import { IconButton } from "../ui/IconButton";
 import { EmptyState } from "../ui/EmptyState";
@@ -168,7 +169,11 @@ export function FileTable({
                 </td>
               </tr>
             ))}
-            {files.map((file) => (
+            {files.map((file) => {
+              const directFile = hasDirectFileAccess(file) ? file : null;
+              const canPreviewFile = canPreviewThroughAvailableAccess(file);
+
+              return (
               <tr
                 key={file.id}
                 className="border-b border-border last:border-b-0 transition-colors duration-150 hover:bg-primary-soft/25"
@@ -184,15 +189,17 @@ export function FileTable({
                 </td>
                 <td className="px-4 py-3 align-middle">
                   <div className="flex min-w-0 items-center gap-3">
-                    <FileVisual mimeType={file.mime_type} fileName={file.file_name} url={file.file_path} size="sm" />
+                    <FileVisual mimeType={file.mime_type} fileName={file.file_name} url={directFile ? file.file_path : undefined} size="sm" />
                     <div className="flex min-w-0 flex-col gap-0.5">
                       <span className="truncate text-sm font-medium text-foreground" title={file.file_name}>
                         {file.file_name}
                       </span>
                       <span className="truncate text-xs text-muted lg:hidden">
-                        {formatBytes(file.size)} · {file.mime_type}
+                        {formatBytes(file.size)} · {fileAccessLabel(file)}
                       </span>
-                      <span className="hidden truncate text-xs text-muted lg:inline">{file.mime_type}</span>
+                      <span className="hidden truncate text-xs text-muted lg:inline">
+                        {file.mime_type} · {fileAccessLabel(file)}
+                      </span>
                     </div>
                   </div>
                 </td>
@@ -228,7 +235,7 @@ export function FileTable({
                     >
                       <FolderInput size={16} />
                     </IconButton>
-                    {canPreview(file) ? (
+                    {canPreviewFile ? (
                       <IconButton
                         variant="ghost"
                         size="sm"
@@ -238,22 +245,26 @@ export function FileTable({
                         <Eye size={16} />
                       </IconButton>
                     ) : null}
-                    <IconButton
-                      variant="ghost"
-                      size="sm"
-                      label="复制链接"
-                      onClick={() => onCopy(file)}
-                    >
-                      <Copy size={16} />
-                    </IconButton>
-                    <a
-                      href={file.download_url}
-                      title="下载"
-                      aria-label="下载"
-                      className="inline-grid size-8 place-items-center rounded-lg border border-transparent bg-transparent text-muted transition-colors duration-150 hover:bg-primary-soft hover:text-primary-strong"
-                    >
-                      <Download size={16} />
-                    </a>
+                    {directFile ? (
+                      <>
+                        <IconButton
+                          variant="ghost"
+                          size="sm"
+                          label="复制链接"
+                          onClick={() => onCopy(file)}
+                        >
+                          <Copy size={16} />
+                        </IconButton>
+                        <a
+                          href={directFile.download_url}
+                          title="下载"
+                          aria-label="下载"
+                          className="inline-grid size-8 place-items-center rounded-lg border border-transparent bg-transparent text-muted transition-colors duration-150 hover:bg-primary-soft hover:text-primary-strong"
+                        >
+                          <Download size={16} />
+                        </a>
+                      </>
+                    ) : null}
                     {canUseAcceleratedDownload(file) ? (
                       <IconButton
                         variant="ghost"
@@ -275,7 +286,8 @@ export function FileTable({
                   </div>
                 </td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </div>

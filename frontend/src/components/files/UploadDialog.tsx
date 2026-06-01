@@ -256,7 +256,7 @@ export function UploadDialog({
     updateItemProgress(target.id, {
       completed: upload.chunk_count,
       total: upload.chunk_count,
-      label: "正在生成访问链接"
+      label: upload.direct_access === false ? "正在生成文件索引" : "正在生成访问链接"
     });
     await completeMultipartUpload(upload.id);
   }
@@ -304,7 +304,7 @@ export function UploadDialog({
           progress: {
             completed: upload.chunk_count,
             total: upload.chunk_count,
-            label: "正在生成访问链接"
+            label: upload.direct_access === false ? "正在生成文件索引" : "正在生成访问链接"
           }
         });
         await completeMultipartUpload(upload.id);

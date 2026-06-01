@@ -49,6 +49,7 @@ import {
   isAbortError,
   supportsNativeFileSave
 } from "../lib/accelerated-download";
+import { hasDirectFileAccess } from "../lib/file-access";
 
 type FileTypeFilter = "all" | "image" | "text" | "pdf" | "archive" | "other";
 
@@ -527,6 +528,11 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   }
 
   function onCopy(file: FileItem) {
+    if (!hasDirectFileAccess(file)) {
+      toast.info("该文件仅支持加速下载，不提供完整文件链接");
+      return;
+    }
+
     copyText(file.url);
   }
 
@@ -542,6 +548,10 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     }
 
     if (!supportsNativeFileSave()) {
+      if (!hasDirectFileAccess(file)) {
+        toast.info("当前浏览器不支持加速下载，该文件也不提供普通下载链接");
+        return;
+      }
       toast.info("当前浏览器不支持加速下载，已切换为普通下载");
       triggerFallbackDownload(file);
       return;
@@ -549,6 +559,10 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
 
     const token = extractSignedFileToken(file.file_path);
     if (!token) {
+      if (!hasDirectFileAccess(file)) {
+        toast.info("无法解析分片下载 token，该文件也不提供普通下载链接");
+        return;
+      }
       toast.info("无法解析分片下载 token，已切换为普通下载");
       triggerFallbackDownload(file);
       return;
@@ -812,6 +826,11 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   }
 
   function triggerFallbackDownload(file: FileItem) {
+    if (!hasDirectFileAccess(file)) {
+      toast.info("该文件仅支持加速下载，不提供普通下载链接");
+      return;
+    }
+
     const link = document.createElement("a");
     link.href = file.download_url;
     link.download = file.file_name;

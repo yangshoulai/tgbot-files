@@ -17,7 +17,8 @@ const env: Env = {
   LINK_SIGNING_SECRET: "link-secret",
   MAX_FILE_BYTES: "20971520"
 };
-const maxMultipartFileBytes = 18 * 1024 * 1024 * 24;
+const directAccessMaxChunks = 24;
+const maxMultipartFileBytes = 5 * 1024 * 1024 * 1024;
 
 class FakeD1 {
   readonly directories: DirectoryRecord[] = [];
@@ -1176,6 +1177,36 @@ describe("worker file access endpoint", () => {
     expect(fetchCalls).toHaveLength(4);
   });
 
+  it("rejects direct multipart file access when the chunk count exceeds the direct-link budget", async () => {
+    const token = await createSignedToken(
+      {
+        v: 2,
+        file_record_id: "file-large-multipart",
+        name: "large.bin",
+        mime_type: "application/octet-stream",
+        size: 75,
+        chunk_size: 3,
+        chunk_count: directAccessMaxChunks + 1,
+        iat: 1_768_566_400
+      },
+      env.LINK_SIGNING_SECRET
+    );
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await worker.fetch(new Request(`https://files.example.com/f/${token}/large.bin`), env);
+    const body = await response.json() as {
+      error: string;
+      details: { chunk_count: number; direct_access_max_chunks: number };
+    };
+
+    expect(response.status).toBe(403);
+    expect(body.error).toBe("DirectAccessDisabled");
+    expect(body.details.chunk_count).toBe(directAccessMaxChunks + 1);
+    expect(body.details.direct_access_max_chunks).toBe(directAccessMaxChunks);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("downloads an existing multipart chunk without issuing Telegram range requests", async () => {
     const db = new FakeD1();
     db.fileChunks.push(
@@ -1794,6 +1825,78 @@ describe("admin file manager", () => {
     expect(db.multipartUploads[0]?.directory_path).toBe("/incoming/big");
   });
 
+  it("completes oversized-direct multipart uploads without returning a full file link", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      PUBLIC_BASE_URL: "https://cdn.example.com",
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const cookie = await loginAndGetCookie(adminEnv);
+    const chunkCount = directAccessMaxChunks + 1;
+    const upload: MultipartUploadRecord = {
+      id: "upload-large",
+      source_kind: "local",
+      source_url: null,
+      file_name: "large.bin",
+      mime_type: "application/octet-stream",
+      size: chunkCount * 3,
+      chunk_size: 3,
+      chunk_count: chunkCount,
+      remark: "仅加速下载",
+      uploaded_by: "admin",
+      created_at: "2026-06-01T00:00:00.000Z",
+      completed_at: null,
+      directory_id: null,
+      directory_path: "/"
+    };
+    db.multipartUploads.push(upload);
+    for (let index = 0; index < chunkCount; index += 1) {
+      db.fileChunks.push({
+        file_id: upload.id,
+        chunk_index: index,
+        size: 3,
+        md5: `chunk-${index}`,
+        telegram_file_id: `tg-chunk-${index}`,
+        telegram_file_unique_id: null,
+        created_at: "2026-06-01T00:00:00.000Z"
+      });
+    }
+
+    const response = await worker.fetch(
+      new Request(`https://files.example.com/api/admin/uploads/${upload.id}/complete`, {
+        method: "POST",
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      ok: boolean;
+      file: {
+        file_path: string;
+        url: string | null;
+        download_url: string | null;
+        direct_access: boolean;
+        download_strategy: string;
+        storage_backend: string;
+        chunk_count: number;
+      };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.file.file_path).toMatch(/^\/f\//);
+    expect(body.file.url).toBeNull();
+    expect(body.file.download_url).toBeNull();
+    expect(body.file.direct_access).toBe(false);
+    expect(body.file.download_strategy).toBe("accelerated");
+    expect(body.file.storage_backend).toBe("telegram_multipart");
+    expect(body.file.chunk_count).toBe(chunkCount);
+    expect(db.files[0]?.file_path).toBe(body.file.file_path);
+  });
+
   it("rejects multipart upload sessions over the limit with human-readable sizes", async () => {
     const db = new FakeD1();
     const adminEnv: Env = {
@@ -1833,12 +1936,12 @@ describe("admin file manager", () => {
 
     expect(response.status).toBe(413);
     expect(body.error).toBe("FileTooLarge");
-    expect(body.message).toContain("432MB");
-    expect(body.message).toContain("432MB1B");
+    expect(body.message).toContain("5G");
+    expect(body.message).toContain("5G1B");
     expect(body.details.max_file_bytes).toBe(maxMultipartFileBytes);
     expect(body.details.actual_file_bytes).toBe(actualFileBytes);
-    expect(body.details.max_file_size).toBe("432MB");
-    expect(body.details.actual_file_size).toBe("432MB1B");
+    expect(body.details.max_file_size).toBe("5G");
+    expect(body.details.actual_file_size).toBe("5G1B");
     expect(body.details.chunk_size).toBe("18MB");
   });
 
@@ -1891,11 +1994,11 @@ describe("admin file manager", () => {
 
     expect(response.status).toBe(413);
     expect(body.error).toBe("FileTooLarge");
-    expect(body.message).toContain("432MB");
+    expect(body.message).toContain("5G");
     expect(body.message).toContain("1T20G");
     expect(body.details.max_file_bytes).toBe(maxMultipartFileBytes);
     expect(body.details.actual_file_bytes).toBe(actualFileBytes);
-    expect(body.details.max_file_size).toBe("432MB");
+    expect(body.details.max_file_size).toBe("5G");
     expect(body.details.actual_file_size).toBe("1T20G");
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });

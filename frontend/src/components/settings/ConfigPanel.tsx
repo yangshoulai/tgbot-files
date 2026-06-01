@@ -34,6 +34,7 @@ export function ConfigPanel({ session }: ConfigPanelProps) {
         <RuntimeValue label="BASE_URL" value={session.config_values.public_base_url || session.base_url} />
         <RuntimeValue label="直传上限" value={formatBytes(session.max_file_bytes)} />
         <RuntimeValue label="分片上限" value={formatBytes(session.max_multipart_file_bytes)} />
+        <RuntimeValue label="直链上限" value={`${formatBytes(session.direct_access_max_bytes)} · ${session.direct_access_max_chunks} 片`} />
       </div>
 
       <ul className="flex flex-col gap-2">

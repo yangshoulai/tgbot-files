@@ -9,6 +9,7 @@ import { UploadDialog } from "./components/files/UploadDialog";
 import { GlobalDropzone } from "./lib/dropzone";
 import { ToastProvider, useToast } from "./lib/toast";
 import { ConfirmProvider } from "./lib/confirm";
+import { registerVideoPreviewServiceWorker } from "./lib/video-preview-service-worker";
 
 type Route = "/login" | "/admin" | "/settings";
 
@@ -97,6 +98,10 @@ function AppShell() {
       navigate("/login");
     }
   }, [navigate, path, session, sessionLoading]);
+
+  useEffect(() => {
+    void registerVideoPreviewServiceWorker();
+  }, []);
 
   const openUpload = useCallback((files: File[] = []) => {
     setUploadFiles(files);

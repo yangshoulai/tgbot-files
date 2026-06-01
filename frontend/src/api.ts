@@ -4,6 +4,8 @@ export interface SessionResponse {
   max_file_bytes: number;
   multipart_chunk_bytes: number;
   max_multipart_file_bytes: number;
+  direct_access_max_chunks: number;
+  direct_access_max_bytes: number;
   base_url: string;
   config: {
     files_db: boolean;
@@ -25,6 +27,7 @@ export interface SessionResponse {
     public_base_url: string;
     max_file_bytes: string;
     max_multipart_file_bytes: string;
+    direct_access_max_bytes: string;
   };
 }
 
@@ -50,8 +53,10 @@ export interface FileItem {
   deleted_at: string | null;
   directory_id: string | null;
   directory_path: string;
-  url: string;
-  download_url: string;
+  url: string | null;
+  download_url: string | null;
+  direct_access?: boolean;
+  download_strategy?: "direct" | "direct_or_accelerated" | "accelerated";
   storage_backend?: "telegram_single" | "telegram_multipart";
   chunk_size?: number | null;
   chunk_count?: number | null;
@@ -91,6 +96,8 @@ export interface FileListResponse {
   max_file_bytes: number;
   multipart_chunk_bytes: number;
   max_multipart_file_bytes: number;
+  direct_access_max_chunks: number;
+  direct_access_max_bytes: number;
 }
 
 export interface AdminUploadResponse {
@@ -163,6 +170,9 @@ export interface MultipartUpload {
   chunk_count: number;
   directory_path: string;
   max_multipart_file_bytes: number;
+  direct_access?: boolean;
+  direct_access_max_chunks?: number;
+  direct_access_max_bytes?: number;
 }
 
 export interface MultipartInitResponse {
@@ -177,6 +187,8 @@ export interface UrlMultipartInitResponse {
   max_file_bytes?: number;
   multipart_chunk_bytes?: number;
   max_multipart_file_bytes?: number;
+  direct_access_max_chunks?: number;
+  direct_access_max_bytes?: number;
 }
 
 export interface MultipartChunkResponse {

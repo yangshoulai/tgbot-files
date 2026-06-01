@@ -1,6 +1,7 @@
 import { Copy, Download, ExternalLink, Zap } from "lucide-react";
 import type { FileItem } from "../../api";
 import { canUseAcceleratedDownload } from "../../lib/accelerated-download";
+import { fileAccessLabel, hasDirectFileAccess } from "../../lib/file-access";
 import { fileKind, formatBytes, formatDateTime } from "../../utils";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
@@ -21,6 +22,7 @@ export function FileDetailDialog({ file, onClose, onCopy, onAcceleratedDownload 
 
   const kind = fileKind(file);
   const isMultipart = file.storage_backend === "telegram_multipart";
+  const directFile = hasDirectFileAccess(file) ? file : null;
 
   return (
     <Modal
@@ -29,7 +31,7 @@ export function FileDetailDialog({ file, onClose, onCopy, onAcceleratedDownload 
       size="xl"
       title={
         <span className="flex items-center gap-3">
-          <FileVisual mimeType={file.mime_type} fileName={file.file_name} url={file.file_path} size="sm" />
+          <FileVisual mimeType={file.mime_type} fileName={file.file_name} url={directFile ? file.file_path : undefined} size="sm" />
           <span className="min-w-0 truncate" title={file.file_name}>
             {file.file_name}
           </span>
@@ -47,25 +49,29 @@ export function FileDetailDialog({ file, onClose, onCopy, onAcceleratedDownload 
       }
       footer={
         <>
-          <Button variant="secondary" leadingIcon={<Copy size={15} />} onClick={() => onCopy(file.url)}>
-            复制链接
-          </Button>
-          <a
-            href={file.url}
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-border bg-surface px-4 text-sm font-medium text-foreground shadow-card transition-colors duration-150 hover:border-border-strong hover:bg-background"
-          >
-            <ExternalLink size={15} />
-            打开
-          </a>
-          <a
-            href={file.download_url}
-            className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-primary bg-primary px-4 text-sm font-medium text-white shadow-card transition-colors duration-150 hover:border-primary-strong hover:bg-primary-strong"
-          >
-            <Download size={15} />
-            下载
-          </a>
+          {directFile ? (
+            <>
+              <Button variant="secondary" leadingIcon={<Copy size={15} />} onClick={() => onCopy(directFile.url)}>
+                复制链接
+              </Button>
+              <a
+                href={directFile.url}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-border bg-surface px-4 text-sm font-medium text-foreground shadow-card transition-colors duration-150 hover:border-border-strong hover:bg-background"
+              >
+                <ExternalLink size={15} />
+                打开
+              </a>
+              <a
+                href={directFile.download_url}
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-primary bg-primary px-4 text-sm font-medium text-white shadow-card transition-colors duration-150 hover:border-primary-strong hover:bg-primary-strong"
+              >
+                <Download size={15} />
+                下载
+              </a>
+            </>
+          ) : null}
           {onAcceleratedDownload && canUseAcceleratedDownload(file) ? (
             <Button variant="primary" leadingIcon={<Zap size={15} />} onClick={() => onAcceleratedDownload(file)}>
               加速下载
@@ -81,13 +87,14 @@ export function FileDetailDialog({ file, onClose, onCopy, onAcceleratedDownload 
         <DetailRow label="大小" value={formatBytes(file.size)} />
         <DetailRow label="目录" value={file.directory_path || "/"} mono />
         <DetailRow label="存储方式" value={isMultipart ? `Telegram 分片（${file.chunk_count ?? "?"} 片）` : "Telegram 单文件"} />
+        <DetailRow label="访问方式" value={fileAccessLabel(file)} />
         <DetailRow label="MD5" value={isMultipart ? "分片文件不计算整文件 MD5" : file.md5} mono={!isMultipart} />
         <DetailRow label={isMultipart ? "分片记录 ID" : "Telegram ID"} value={file.telegram_file_id} mono />
         <DetailRow label="Telegram Unique ID" value={file.telegram_file_unique_id || "未记录"} mono />
         <DetailRow label="上传时间" value={formatDateTime(file.created_at)} />
         <DetailRow label="上传者" value={file.uploaded_by || "接口上传"} />
         <DetailRow label="备注" value={file.remark || "无备注"} fullWidth />
-        <DetailRow label="链接" value={file.url} mono fullWidth />
+        <DetailRow label="链接" value={directFile ? directFile.url : "该文件超过直链能力，仅支持控制台加速下载"} mono={Boolean(directFile)} fullWidth />
       </div>
     </Modal>
   );

@@ -5,6 +5,9 @@ import Plyr from "plyr";
 import "plyr/dist/plyr.css";
 import { Copy, Download, Maximize2, Minimize2 } from "lucide-react";
 import type { FileItem } from "../../api";
+import { buildChunkedVideoPreviewUrl } from "../../lib/video-preview";
+import { isVideoPreviewServiceWorkerControlling } from "../../lib/video-preview-service-worker";
+import { hasDirectFileAccess } from "../../lib/file-access";
 import { previewKind } from "../../utils";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
@@ -28,6 +31,15 @@ export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
   useEffect(() => {
     if (!file || (preview !== "text" && preview !== "markdown")) {
       setTextState({ status: "idle", content: "" });
+      return;
+    }
+
+    if (!hasDirectFileAccess(file)) {
+      setTextState({
+        status: "error",
+        content: "",
+        message: "该文件不提供完整访问链接，无法直接读取文本预览"
+      });
       return;
     }
 
@@ -68,7 +80,7 @@ export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
   }
 
   const canCopyContent = (preview === "text" || preview === "markdown") && textState.status === "ready";
-  const downloadHref = appendDownloadParam(file.file_path);
+  const directFile = hasDirectFileAccess(file) ? file : null;
 
   return (
     <Modal
@@ -95,13 +107,15 @@ export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
           >
             {fullscreen ? "退出全屏" : "全屏"}
           </Button>
-          <a
-            href={downloadHref}
-            className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-primary bg-primary px-4 text-sm font-medium text-white shadow-card transition-colors duration-150 hover:border-primary-strong hover:bg-primary-strong"
-          >
-            <Download size={15} />
-            下载
-          </a>
+          {directFile ? (
+            <a
+              href={directFile.download_url}
+              className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-primary bg-primary px-4 text-sm font-medium text-white shadow-card transition-colors duration-150 hover:border-primary-strong hover:bg-primary-strong"
+            >
+              <Download size={15} />
+              下载
+            </a>
+          ) : null}
         </>
       }
       bodyClassName={fullscreen ? "flex bg-background/40" : "bg-background/40"}
@@ -113,7 +127,7 @@ export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
             : "grid min-h-72 place-items-center overflow-hidden rounded-xl border border-border bg-surface"
         }
       >
-        {preview === "image" ? (
+        {preview === "image" && directFile ? (
           <img
             src={file.file_path}
             alt={file.file_name}
@@ -140,7 +154,11 @@ function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolea
   const videoRef = useRef<HTMLVideoElement>(null);
   const playerRef = useRef<Plyr | null>(null);
   const [ratio, setRatio] = useState({ label: "16:9", value: 16 / 9 });
+  const [serviceWorkerReady, setServiceWorkerReady] = useState(isVideoPreviewServiceWorkerControlling);
   const heightLimit = fullscreen ? "calc(100dvh - 11rem)" : "min(64dvh, 760px)";
+  const directFile = hasDirectFileAccess(file) ? file : null;
+  const chunkedPreviewUrl = serviceWorkerReady ? buildChunkedVideoPreviewUrl(file) : null;
+  const videoSrc = chunkedPreviewUrl ?? (directFile ? file.file_path : null);
 
   useEffect(() => {
     const node = videoRef.current;
@@ -167,13 +185,46 @@ function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolea
       player.destroy();
       playerRef.current = null;
     };
-  }, [file.file_path]);
+  }, [videoSrc]);
+
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) {
+      return;
+    }
+
+    let disposed = false;
+    const refresh = () => {
+      if (!disposed) {
+        setServiceWorkerReady(isVideoPreviewServiceWorkerControlling());
+      }
+    };
+
+    navigator.serviceWorker.addEventListener("controllerchange", refresh);
+    void navigator.serviceWorker.ready.then(refresh).catch(() => undefined);
+    refresh();
+
+    return () => {
+      disposed = true;
+      navigator.serviceWorker.removeEventListener("controllerchange", refresh);
+    };
+  }, []);
 
   useEffect(() => {
     if (playerRef.current) {
       applyPlyrAspectRatio(videoRef.current, ratio);
     }
   }, [ratio]);
+
+  if (!videoSrc) {
+    return (
+      <div className="grid w-full place-items-center gap-3 px-6 py-12 text-center">
+        <p className="text-sm font-medium text-foreground">该大文件不提供完整访问链接</p>
+        <p className="max-w-md text-xs leading-6 text-muted">
+          视频预览需要 Service Worker 分片代理接管页面；如果刚部署或首次打开，请刷新页面后再试。
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className={(fullscreen ? "h-full min-h-0" : "h-[min(64dvh,760px)]") + " flex w-full items-center justify-center bg-foreground p-3 sm:p-4"}>
@@ -186,7 +237,7 @@ function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolea
       >
         <video
           ref={videoRef}
-          src={file.file_path}
+          src={videoSrc}
           playsInline
           preload="metadata"
           className="h-full w-full object-contain"
@@ -245,10 +296,6 @@ function greatestCommonDivisor(left: number, right: number): number {
   }
 
   return a || 1;
-}
-
-function appendDownloadParam(url: string): string {
-  return `${url}${url.includes("?") ? "&" : "?"}download=1`;
 }
 
 function TextPreview({
