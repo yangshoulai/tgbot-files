@@ -92,6 +92,11 @@ export interface AdminUploadResponse {
   file: FileItem;
 }
 
+export interface FileUpdateResponse {
+  ok: boolean;
+  file: FileItem;
+}
+
 export interface DirectoryListResponse {
   ok: boolean;
   directories: DirectoryItem[];
@@ -106,6 +111,20 @@ export interface DirectoryDeleteResponse {
   ok: boolean;
   deleted_directories: number;
   deleted_files: number;
+  directory: DirectoryItem;
+}
+
+export interface DirectoryMoveResponse {
+  ok: boolean;
+  moved_directories: number;
+  moved_files: number;
+  directory: DirectoryItem;
+}
+
+export interface DirectoryRenameResponse {
+  ok: boolean;
+  renamed_directories: number;
+  updated_files: number;
   directory: DirectoryItem;
 }
 
@@ -350,6 +369,16 @@ export function deleteFile(id: string) {
   });
 }
 
+export function updateFileMetadata(id: string, body: { file_name?: string; remark?: string | null }) {
+  return requestJson<FileUpdateResponse>(`/api/admin/files/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+}
+
 export function listDirectories(flat = false, parentPath = "/") {
   const search = new URLSearchParams();
   if (flat) {
@@ -374,6 +403,26 @@ export function createDirectory(parentPath: string, name: string) {
 export function deleteDirectory(id: string) {
   return requestJson<DirectoryDeleteResponse>(`/api/admin/directories/${encodeURIComponent(id)}`, {
     method: "DELETE"
+  });
+}
+
+export function moveDirectory(id: string, parentPath: string) {
+  return requestJson<DirectoryMoveResponse>(`/api/admin/directories/${encodeURIComponent(id)}/move`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ parent_path: parentPath })
+  });
+}
+
+export function renameDirectory(id: string, name: string) {
+  return requestJson<DirectoryRenameResponse>(`/api/admin/directories/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ name })
   });
 }
 

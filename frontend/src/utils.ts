@@ -12,6 +12,34 @@ export function formatBytes(value: number): string {
   return `${normalized >= 10 || index === 0 ? normalized.toFixed(0) : normalized.toFixed(1)} ${units[index]}`;
 }
 
+export function formatCompactBytes(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0B";
+  }
+
+  const units = [
+    { label: "T", bytes: 1024 ** 4 },
+    { label: "G", bytes: 1024 ** 3 },
+    { label: "MB", bytes: 1024 ** 2 },
+    { label: "KB", bytes: 1024 },
+    { label: "B", bytes: 1 }
+  ];
+  let remaining = Math.floor(value);
+  const parts: string[] = [];
+
+  for (const unit of units) {
+    const count = Math.floor(remaining / unit.bytes);
+    if (count <= 0) {
+      continue;
+    }
+
+    parts.push(`${count}${unit.label}`);
+    remaining -= count * unit.bytes;
+  }
+
+  return parts.join("") || "0B";
+}
+
 export function formatDateTime(value: string | null | undefined): string {
   if (!value) {
     return "未记录";

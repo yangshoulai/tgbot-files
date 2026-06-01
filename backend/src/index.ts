@@ -11,6 +11,7 @@ import {
   getDirectoryRecordByPath,
   findActiveApiKeyRecord,
   getApiKeyRecord,
+  getFileRecord,
   getMultipartUploadRecord,
   insertDirectoryRecord,
   insertApiKeyRecord,
@@ -22,12 +23,15 @@ import {
   listApiKeyRecords,
   listFileRecords,
   moveFileRecords,
+  moveDirectoryTree,
+  renameDirectoryTree,
   requireDb,
   softDeleteApiKeyRecord,
   softDeleteDirectoryTree,
   softDeleteFileRecord,
   touchApiKeyRecord,
   updateApiKeyRecord,
+  updateFileRecordMetadata,
   upsertFileChunkRecord,
   type ApiKeyRecord,
   type ApiKeyStatus,
@@ -192,7 +196,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   await requireUploadApiKey(request, db);
 
   const { file, directoryPath } = await readUploadInput(request, env);
-  const directory = await requireWritableDirectory(db, directoryPath);
+  const directory = await ensureWritableDirectory(db, directoryPath);
   const result = await uploadAndRecordFile({
     request,
     env,
@@ -359,7 +363,7 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
 
   if (request.method === "POST" && url.pathname === "/api/admin/files") {
     const { file: formFile, remark, directoryPath } = await readUploadInput(request, env);
-    const directory = await requireWritableDirectory(db, directoryPath);
+    const directory = await ensureWritableDirectory(db, directoryPath);
     const result = await uploadAndRecordFile({
       request,
       env,
@@ -388,6 +392,46 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
     });
 
     return jsonResponse({ ok: true, moved, directory_path: directoryPath });
+  }
+
+  const updateMatch = /^\/api\/admin\/files\/([^/]+)$/.exec(url.pathname);
+  if (request.method === "PATCH" && updateMatch?.[1]) {
+    const id = decodeURIComponent(updateMatch[1]);
+    const existing = await getFileRecord(db, id);
+
+    if (!existing) {
+      throw new AppError(404, "NotFound", "File record not found");
+    }
+
+    const body = await readJsonObject(request);
+    const hasFileName = Object.prototype.hasOwnProperty.call(body, "file_name");
+    const hasRemark = Object.prototype.hasOwnProperty.call(body, "remark");
+
+    if (!hasFileName && !hasRemark) {
+      throw new AppError(400, "InvalidBody", "file_name or remark is required");
+    }
+
+    const nextFileName = hasFileName ? normalizeFileNameUpdate(body.file_name) : existing.file_name;
+    const nextRemark = hasRemark ? normalizeRemarkUpdate(body.remark) : existing.remark;
+    const nextFilePath = nextFileName === existing.file_name
+      ? existing.file_path
+      : await createFilePathForRecord(existing, nextFileName, env);
+    const updated = await updateFileRecordMetadata({
+      db,
+      id,
+      fileName: nextFileName,
+      remark: nextRemark,
+      filePath: nextFilePath
+    });
+
+    if (!updated) {
+      throw new AppError(404, "NotFound", "File record not found");
+    }
+
+    return jsonResponse({
+      ok: true,
+      file: serializeFileRecord(updated, getPublicBaseUrl(request, env))
+    });
   }
 
   const deleteMatch = /^\/api\/admin\/files\/([^/]+)$/.exec(url.pathname);
@@ -439,6 +483,49 @@ async function handleAdminDirectories(request: Request, env: Env): Promise<Respo
   }
 
   const match = /^\/api\/admin\/directories\/([^/]+)$/.exec(url.pathname);
+  const moveMatch = /^\/api\/admin\/directories\/([^/]+)\/move$/.exec(url.pathname);
+  if (request.method === "PATCH" && moveMatch?.[1]) {
+    const body = await readJsonObject(request);
+    const parentPath = normalizeDirectoryPath(body.parent_path ?? "/");
+    const result = await moveDirectoryTree({
+      db,
+      id: decodeURIComponent(moveMatch[1]),
+      parentPath
+    });
+
+    if (!result) {
+      throw new AppError(404, "DirectoryNotFound", "Directory not found");
+    }
+
+    return jsonResponse({
+      ok: true,
+      directory: serializeDirectoryRecord(result.directory),
+      moved_directories: result.movedDirectories,
+      moved_files: result.movedFiles
+    });
+  }
+
+  if (request.method === "PATCH" && match?.[1]) {
+    const body = await readJsonObject(request);
+    const name = normalizeDirectoryName(body.name);
+    const result = await renameDirectoryTree({
+      db,
+      id: decodeURIComponent(match[1]),
+      name
+    });
+
+    if (!result) {
+      throw new AppError(404, "DirectoryNotFound", "Directory not found");
+    }
+
+    return jsonResponse({
+      ok: true,
+      directory: serializeDirectoryRecord(result.directory),
+      renamed_directories: result.renamedDirectories,
+      updated_files: result.updatedFiles
+    });
+  }
+
   if (request.method === "DELETE" && match?.[1]) {
     const result = await softDeleteDirectoryTree({
       db,
@@ -472,7 +559,7 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
     const size = positiveIntegerField(body.size, "size");
     const remark = normalizeRemark(body.remark);
     const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
-    const directory = await requireWritableDirectory(db, directoryPath);
+    const directory = await ensureWritableDirectory(db, directoryPath);
     const result = await createMultipartUpload({
       db,
       sourceKind: "local",
@@ -496,7 +583,7 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
     const sourceUrl = normalizeSourceUrl(body.url);
     const remark = normalizeRemark(body.remark);
     const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
-    const directory = await requireWritableDirectory(db, directoryPath);
+    const directory = await ensureWritableDirectory(db, directoryPath);
 
     if (!sourceUrl) {
       throw new AppError(400, "MissingUrl", "JSON field 'url' is required");
@@ -754,11 +841,53 @@ function validateUploadFileSize(file: File, maxFileBytes: number): void {
   }
 
   if (file.size > maxFileBytes) {
-    throw new AppError(413, "FileTooLarge", `File size must be <= ${maxFileBytes} bytes`, {
-      max_file_bytes: maxFileBytes,
-      actual_file_bytes: file.size
-    });
+    throw fileTooLargeError(maxFileBytes, file.size);
   }
+}
+
+function fileTooLargeError(
+  maxFileBytes: number,
+  actualFileBytes: number,
+  extraDetails: Record<string, unknown> = {}
+): AppError {
+  const maxFileSize = formatHumanFileSize(maxFileBytes);
+  const actualFileSize = formatHumanFileSize(actualFileBytes);
+
+  return new AppError(413, "FileTooLarge", `文件大小不能超过 ${maxFileSize}（当前 ${actualFileSize}）`, {
+    max_file_bytes: maxFileBytes,
+    actual_file_bytes: actualFileBytes,
+    max_file_size: maxFileSize,
+    actual_file_size: actualFileSize,
+    ...extraDetails
+  });
+}
+
+function formatHumanFileSize(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0B";
+  }
+
+  const units = [
+    { label: "T", bytes: 1024 ** 4 },
+    { label: "G", bytes: 1024 ** 3 },
+    { label: "MB", bytes: 1024 ** 2 },
+    { label: "KB", bytes: 1024 },
+    { label: "B", bytes: 1 }
+  ];
+  let remaining = Math.floor(value);
+  const parts: string[] = [];
+
+  for (const unit of units) {
+    const count = Math.floor(remaining / unit.bytes);
+    if (count <= 0) {
+      continue;
+    }
+
+    parts.push(`${count}${unit.label}`);
+    remaining -= count * unit.bytes;
+  }
+
+  return parts.join("") || "0B";
 }
 
 function normalizeSourceUrl(value: unknown): URL | undefined {
@@ -824,10 +953,7 @@ async function downloadFileFromUrl(params: {
 
   const contentLength = parseContentLength(response.headers.get("Content-Length"));
   if (contentLength !== undefined && contentLength > params.maxFileBytes) {
-    throw new AppError(413, "FileTooLarge", `File size must be <= ${params.maxFileBytes} bytes`, {
-      max_file_bytes: params.maxFileBytes,
-      actual_file_bytes: contentLength
-    });
+    throw fileTooLargeError(params.maxFileBytes, contentLength);
   }
 
   let bytes: ArrayBuffer;
@@ -874,10 +1000,7 @@ async function downloadSignedFileUrl(params: {
   }
 
   if (payload.size > params.maxFileBytes) {
-    throw new AppError(413, "FileTooLarge", `File size must be <= ${params.maxFileBytes} bytes`, {
-      max_file_bytes: params.maxFileBytes,
-      actual_file_bytes: payload.size
-    });
+    throw fileTooLargeError(params.maxFileBytes, payload.size);
   }
 
   if (payload.v !== 1) {
@@ -1043,10 +1166,9 @@ function validateMultipartFileSize(size: number): void {
   }
 
   if (size > MAX_TELEGRAM_MULTIPART_BYTES) {
-    throw new AppError(413, "FileTooLarge", `File size must be <= ${MAX_TELEGRAM_MULTIPART_BYTES} bytes`, {
-      max_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
-      actual_file_bytes: size,
+    throw fileTooLargeError(MAX_TELEGRAM_MULTIPART_BYTES, size, {
       chunk_size_bytes: TELEGRAM_CHUNK_SIZE_BYTES,
+      chunk_size: formatHumanFileSize(TELEGRAM_CHUNK_SIZE_BYTES),
       max_chunks: MAX_TELEGRAM_MULTIPART_CHUNKS
     });
   }
@@ -1069,10 +1191,7 @@ async function probeRemoteSourceForMultipart(
   }
 
   if (size !== undefined && size > MAX_TELEGRAM_MULTIPART_BYTES) {
-    throw new AppError(413, "FileTooLarge", `File size must be <= ${MAX_TELEGRAM_MULTIPART_BYTES} bytes`, {
-      max_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
-      actual_file_bytes: size
-    });
+    throw fileTooLargeError(MAX_TELEGRAM_MULTIPART_BYTES, size);
   }
 
   const rangeProbe = await fetchRemoteRange(sourceUrl, 0, 0);
@@ -1092,10 +1211,7 @@ async function probeRemoteSourceForMultipart(
   }
 
   if (size > MAX_TELEGRAM_MULTIPART_BYTES) {
-    throw new AppError(413, "FileTooLarge", `File size must be <= ${MAX_TELEGRAM_MULTIPART_BYTES} bytes`, {
-      max_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
-      actual_file_bytes: size
-    });
+    throw fileTooLargeError(MAX_TELEGRAM_MULTIPART_BYTES, size);
   }
 
   const detectedMimeType = resolveStoredMimeType({
@@ -1193,9 +1309,11 @@ function expectedChunkSize(upload: MultipartUploadRecord, chunkIndex: number): n
 
 function validateChunkFile(chunk: Blob, expectedSize: number): void {
   if (chunk.size !== expectedSize) {
-    throw new AppError(400, "InvalidChunkSize", `Chunk size must be ${expectedSize} bytes`, {
+    throw new AppError(400, "InvalidChunkSize", `分片大小必须为 ${formatHumanFileSize(expectedSize)}（当前 ${formatHumanFileSize(chunk.size)}）`, {
       expected_chunk_bytes: expectedSize,
-      actual_chunk_bytes: chunk.size
+      actual_chunk_bytes: chunk.size,
+      expected_chunk_size: formatHumanFileSize(expectedSize),
+      actual_chunk_size: formatHumanFileSize(chunk.size)
     });
   }
 }
@@ -1442,6 +1560,47 @@ async function uploadAndRecordFile(params: {
     directoryId: params.directoryId ?? null,
     directoryPath: params.directoryPath ?? "/"
   };
+}
+
+async function createFilePathForRecord(record: FileRecord, fileName: string, env: Env): Promise<string> {
+  const signingSecret = requireEnv(env, "LINK_SIGNING_SECRET");
+  const iat = Math.floor(Date.now() / 1000);
+  const isMultipart = record.storage_backend === "telegram_multipart";
+  const token = isMultipart
+    ? await createSignedToken(
+        {
+          v: 2,
+          file_record_id: record.id,
+          name: fileName,
+          mime_type: record.mime_type,
+          size: record.size,
+          chunk_size: requirePositiveRecordInteger(record.chunk_size, "chunk_size"),
+          chunk_count: requirePositiveRecordInteger(record.chunk_count, "chunk_count"),
+          iat
+        },
+        signingSecret
+      )
+    : await createSignedToken(
+        {
+          v: 1,
+          file_id: record.telegram_file_id,
+          name: fileName,
+          mime_type: record.mime_type,
+          size: record.size,
+          iat
+        },
+        signingSecret
+      );
+
+  return `/f/${token}/${encodeURIComponent(fileName)}`;
+}
+
+function requirePositiveRecordInteger(value: number | null | undefined, fieldName: string): number {
+  if (!Number.isSafeInteger(value) || (value ?? 0) <= 0) {
+    throw new AppError(500, "InvalidFileRecord", `File record is missing ${fieldName}`);
+  }
+
+  return value as number;
 }
 
 async function handleFileAccess(request: Request, env: Env): Promise<Response> {
@@ -1905,6 +2064,20 @@ function normalizeName(value: unknown, fieldName: string): string {
   return normalized;
 }
 
+function normalizeFileNameUpdate(value: unknown): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new AppError(400, "InvalidFileName", "File name must be 1-180 characters");
+  }
+
+  const normalized = sanitizeFileName(value);
+
+  if (!normalized || normalized === "file" && value.trim().length === 0) {
+    throw new AppError(400, "InvalidFileName", "File name must be 1-180 characters");
+  }
+
+  return normalized;
+}
+
 function normalizeDirectoryName(value: unknown): string {
   if (typeof value !== "string") {
     throw new AppError(400, "InvalidDirectoryName", "Directory name is required");
@@ -1987,6 +2160,45 @@ async function requireWritableDirectory(db: D1Database, path: string): Promise<D
   return requireReadableDirectory(db, path);
 }
 
+async function ensureWritableDirectory(db: D1Database, path: string): Promise<DirectoryRecord | null> {
+  if (path === "/") {
+    return null;
+  }
+
+  const segments = path.split("/").filter(Boolean);
+  let parentPath = "/";
+  let current: DirectoryRecord | null = null;
+
+  for (const segment of segments) {
+    const currentPath = parentPath === "/" ? `/${segment}` : `${parentPath}/${segment}`;
+    current = await getDirectoryRecordByPath(db, currentPath);
+
+    if (!current) {
+      try {
+        current = await insertDirectoryRecord({
+          db,
+          parentPath,
+          name: segment,
+          createdAt: new Date().toISOString()
+        });
+      } catch (error) {
+        if (!(error instanceof AppError) || error.error !== "DirectoryExists") {
+          throw error;
+        }
+
+        current = await getDirectoryRecordByPath(db, currentPath);
+        if (!current) {
+          throw error;
+        }
+      }
+    }
+
+    parentPath = currentPath;
+  }
+
+  return current;
+}
+
 function normalizeFileIdList(value: unknown): string[] {
   if (!Array.isArray(value)) {
     throw new AppError(400, "InvalidBody", "file_ids must be an array");
@@ -2046,6 +2258,19 @@ function normalizeRemark(value: unknown): string | undefined {
   }
 
   return normalized.slice(0, 1000);
+}
+
+function normalizeRemarkUpdate(value: unknown): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (typeof value !== "string") {
+    throw new AppError(400, "InvalidBody", "remark must be a string or null");
+  }
+
+  const normalized = value.trim();
+  return normalized ? normalized.slice(0, 1000) : null;
 }
 
 function appendDownloadParam(url: string): string {

@@ -1,4 +1,4 @@
-import { Copy, Download, Eye, Folder, FolderOpen, Info, Trash2 } from "lucide-react";
+import { Copy, Download, Eye, Folder, FolderOpen, Info, MoveRight, Pencil, Trash2 } from "lucide-react";
 import type { DirectoryItem, FileItem } from "../../api";
 import { canPreview, formatBytes, formatDateTime } from "../../utils";
 import { FileVisual } from "../ui/FileVisual";
@@ -11,10 +11,14 @@ interface FileTableProps {
   selectedIds: Set<string>;
   allPageSelected: boolean;
   onOpenDirectory: (directory: DirectoryItem) => void;
+  onRenameDirectory: (directory: DirectoryItem) => void;
+  onMoveDirectory: (directory: DirectoryItem) => void;
   onDeleteDirectory: (directory: DirectoryItem) => void;
   onToggleSelected: (file: FileItem, selected: boolean) => void;
   onTogglePage: (selected: boolean) => void;
   onDetail: (file: FileItem) => void;
+  onEdit: (file: FileItem) => void;
+  onMoveFile: (file: FileItem) => void;
   onPreview: (file: FileItem) => void;
   onCopy: (file: FileItem) => void;
   onDelete: (file: FileItem) => void;
@@ -29,10 +33,14 @@ export function FileTable({
   selectedIds,
   allPageSelected,
   onOpenDirectory,
+  onRenameDirectory,
+  onMoveDirectory,
   onDeleteDirectory,
   onToggleSelected,
   onTogglePage,
   onDetail,
+  onEdit,
+  onMoveFile,
   onPreview,
   onCopy,
   onDelete
@@ -104,6 +112,22 @@ export function FileTable({
                       <FolderOpen size={16} />
                     </IconButton>
                     <IconButton
+                      variant="ghost"
+                      size="sm"
+                      label="重命名目录"
+                      onClick={() => onRenameDirectory(directory)}
+                    >
+                      <Pencil size={16} />
+                    </IconButton>
+                    <IconButton
+                      variant="ghost"
+                      size="sm"
+                      label="移动目录"
+                      onClick={() => onMoveDirectory(directory)}
+                    >
+                      <MoveRight size={16} />
+                    </IconButton>
+                    <IconButton
                       variant="danger"
                       size="sm"
                       label="删除目录"
@@ -158,6 +182,22 @@ export function FileTable({
                       onClick={() => onDetail(file)}
                     >
                       <Info size={16} />
+                    </IconButton>
+                    <IconButton
+                      variant="ghost"
+                      size="sm"
+                      label="编辑文件信息"
+                      onClick={() => onEdit(file)}
+                    >
+                      <Pencil size={16} />
+                    </IconButton>
+                    <IconButton
+                      variant="ghost"
+                      size="sm"
+                      label="移动文件"
+                      onClick={() => onMoveFile(file)}
+                    >
+                      <MoveRight size={16} />
                     </IconButton>
                     {canPreview(file) ? (
                       <IconButton

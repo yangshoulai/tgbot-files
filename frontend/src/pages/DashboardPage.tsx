@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ArrowUp, ChevronRight, FolderPlus, MoveRight, RefreshCw, Search, Trash2 } from "lucide-react";
+import { ArrowUp, ChevronRight, FolderPlus, MoveRight, Pencil, RefreshCw, Search, Trash2 } from "lucide-react";
 import {
   ApiError,
   DirectoryItem,
@@ -11,7 +11,10 @@ import {
   deleteFile,
   listDirectories,
   listFiles,
-  moveFiles
+  moveDirectory,
+  moveFiles,
+  renameDirectory,
+  updateFileMetadata
 } from "../api";
 import { dateInputToIso, formatBytes, formatDateTime, sumFileSize } from "../utils";
 import { useToast } from "../lib/toast";
@@ -20,6 +23,7 @@ import { Input } from "../components/ui/Input";
 import { IconButton } from "../components/ui/IconButton";
 import { Button } from "../components/ui/Button";
 import { Modal } from "../components/ui/Modal";
+import { Textarea } from "../components/ui/Textarea";
 import { Spinner } from "../components/ui/Spinner";
 import { MetricsRow, Metric } from "../components/files/MetricsRow";
 import { FileTable } from "../components/files/FileTable";
@@ -94,16 +98,27 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   const [loading, setLoading] = useState(false);
   const [previewFile, setPreviewFile] = useState<FileItem | null>(null);
   const [detailFile, setDetailFile] = useState<FileItem | null>(null);
+  const [editingFile, setEditingFile] = useState<FileItem | null>(null);
+  const [editFileName, setEditFileName] = useState("");
+  const [editRemark, setEditRemark] = useState("");
+  const [savingFile, setSavingFile] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [createDirOpen, setCreateDirOpen] = useState(false);
   const [newDirName, setNewDirName] = useState("");
   const [creatingDir, setCreatingDir] = useState(false);
   const [moveOpen, setMoveOpen] = useState(false);
+  const [moveFileIds, setMoveFileIds] = useState<string[]>([]);
   const [moveTargetPath, setMoveTargetPath] = useState("/");
   const [moveCreateNew, setMoveCreateNew] = useState(false);
   const [moveNewParentPath, setMoveNewParentPath] = useState("/");
   const [moveNewDirName, setMoveNewDirName] = useState("");
   const [movingFiles, setMovingFiles] = useState(false);
+  const [movingDirectory, setMovingDirectory] = useState<DirectoryItem | null>(null);
+  const [directoryMoveTargetPath, setDirectoryMoveTargetPath] = useState("/");
+  const [movingDirectorySaving, setMovingDirectorySaving] = useState(false);
+  const [renamingDirectory, setRenamingDirectory] = useState<DirectoryItem | null>(null);
+  const [directoryRenameName, setDirectoryRenameName] = useState("");
+  const [renamingDirectorySaving, setRenamingDirectorySaving] = useState(false);
 
   const loadFiles = useCallback(
     async (nextPage: number) => {
@@ -293,8 +308,65 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     }
   }
 
-  function openMoveDialog() {
-    if (selectedCount === 0) return;
+  function openRenameDirectoryDialog(directory: DirectoryItem) {
+    setRenamingDirectory(directory);
+    setDirectoryRenameName(directory.name);
+  }
+
+  async function onRenameDirectory() {
+    if (!renamingDirectory) return;
+
+    const name = directoryRenameName.trim();
+    if (!name) {
+      toast.danger("请输入目录名称");
+      return;
+    }
+
+    setRenamingDirectorySaving(true);
+    try {
+      const result = await renameDirectory(renamingDirectory.id, name);
+      toast.success(`已重命名 ${result.renamed_directories} 个目录、更新 ${result.updated_files} 个文件索引`);
+      setRenamingDirectory(null);
+      await Promise.all([loadFiles(pagination.page), loadDirectoryOptions()]);
+    } catch (error) {
+      toast.danger(errorMessage(error));
+    } finally {
+      setRenamingDirectorySaving(false);
+    }
+  }
+
+  function openMoveDirectoryDialog(directory: DirectoryItem) {
+    const currentParent = parentDirectoryPath(directory.path);
+    const firstOtherTarget = directoryOptions.find((option) =>
+      option.path !== directory.path &&
+      !option.path.startsWith(`${directory.path}/`) &&
+      option.path !== currentParent
+    );
+    setMovingDirectory(directory);
+    setDirectoryMoveTargetPath(currentParent === "/" && firstOtherTarget ? firstOtherTarget.path : "/");
+    void loadDirectoryOptions();
+  }
+
+  async function onMoveDirectory() {
+    if (!movingDirectory) return;
+
+    setMovingDirectorySaving(true);
+    try {
+      const result = await moveDirectory(movingDirectory.id, directoryMoveTargetPath);
+      toast.success(`已移动 ${result.moved_directories} 个目录、${result.moved_files} 个文件索引到 ${result.directory.path}`);
+      setMovingDirectory(null);
+      await Promise.all([loadFiles(pagination.page), loadDirectoryOptions()]);
+    } catch (error) {
+      toast.danger(errorMessage(error));
+    } finally {
+      setMovingDirectorySaving(false);
+    }
+  }
+
+  function openMoveDialog(file?: FileItem) {
+    const ids = file ? [file.id] : files.filter((item) => selectedIds.has(item.id)).map((item) => item.id);
+    if (ids.length === 0) return;
+    setMoveFileIds(ids);
     setMoveTargetPath(currentDirPath);
     setMoveNewParentPath(currentDirPath);
     setMoveNewDirName("");
@@ -303,8 +375,43 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     void loadDirectoryOptions();
   }
 
+  function openEditDialog(file: FileItem) {
+    setEditingFile(file);
+    setEditFileName(file.file_name);
+    setEditRemark(file.remark ?? "");
+  }
+
+  async function onSaveFileMetadata() {
+    if (!editingFile) return;
+
+    const nextName = editFileName.trim();
+    if (!nextName) {
+      toast.danger("请输入文件名");
+      return;
+    }
+
+    setSavingFile(true);
+    try {
+      const response = await updateFileMetadata(editingFile.id, {
+        file_name: nextName,
+        remark: editRemark
+      });
+      const updated = response.file;
+      setFiles((current) => current.map((file) => (file.id === updated.id ? updated : file)));
+      if (previewFile?.id === updated.id) setPreviewFile(updated);
+      if (detailFile?.id === updated.id) setDetailFile(updated);
+      setEditingFile(null);
+      toast.success(updated.file_path !== editingFile.file_path ? "文件信息已保存，链接已更新" : "文件信息已保存");
+      await loadFiles(pagination.page);
+    } catch (error) {
+      toast.danger(errorMessage(error));
+    } finally {
+      setSavingFile(false);
+    }
+  }
+
   async function onMoveSelected() {
-    const ids = files.filter((file) => selectedIds.has(file.id)).map((file) => file.id);
+    const ids = moveFileIds;
     if (ids.length === 0) return;
 
     const newName = moveNewDirName.trim();
@@ -329,6 +436,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       );
       toast.success(`已移动 ${result.moved} 个文件到 ${result.directory_path}`);
       setMoveOpen(false);
+      setMoveFileIds([]);
       setSelectedIds(new Set());
       await Promise.all([loadFiles(pagination.page), loadDirectoryOptions()]);
     } catch (error) {
@@ -375,6 +483,16 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
 
   const allPageSelected = files.length > 0 && files.every((file) => selectedIds.has(file.id));
   const selectedCount = files.filter((file) => selectedIds.has(file.id)).length;
+  const directoryMoveTargets = useMemo(() => {
+    if (!movingDirectory) {
+      return directoryOptions;
+    }
+
+    return directoryOptions.filter((directory) =>
+      directory.id !== movingDirectory.id &&
+      !directory.path.startsWith(`${movingDirectory.path}/`)
+    );
+  }, [directoryOptions, movingDirectory]);
 
   return (
     <div className="flex flex-col gap-5">
@@ -487,7 +605,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
-                onClick={openMoveDialog}
+                onClick={() => openMoveDialog()}
                 className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-border bg-surface px-3 text-sm font-medium text-foreground shadow-card transition-colors hover:border-border-strong hover:bg-background focus-visible:outline-none focus-visible:focus-ring"
               >
                 <MoveRight size={15} />
@@ -511,10 +629,14 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
           selectedIds={selectedIds}
           allPageSelected={allPageSelected}
           onOpenDirectory={(directory) => goToDirectory(directory.path)}
+          onRenameDirectory={openRenameDirectoryDialog}
+          onMoveDirectory={openMoveDirectoryDialog}
           onDeleteDirectory={(directory) => void onDeleteDirectory(directory)}
           onToggleSelected={toggleSelected}
           onTogglePage={togglePage}
           onDetail={setDetailFile}
+          onEdit={openEditDialog}
+          onMoveFile={openMoveDialog}
           onPreview={setPreviewFile}
           onCopy={onCopy}
           onDelete={onDelete}
@@ -529,6 +651,65 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
 
       <PreviewDialog file={previewFile} onClose={() => setPreviewFile(null)} onCopy={copyText} />
       <FileDetailDialog file={detailFile} onClose={() => setDetailFile(null)} onCopy={copyText} />
+
+      <Modal
+        open={Boolean(editingFile)}
+        onClose={() => {
+          if (!savingFile) setEditingFile(null);
+        }}
+        title="编辑文件信息"
+        description="修改备注不会影响链接；修改文件名会生成新的后台链接，旧链接仍可继续访问。"
+        footer={
+          <>
+            <Button variant="secondary" disabled={savingFile} onClick={() => setEditingFile(null)}>
+              取消
+            </Button>
+            <Button type="submit" form="edit-file-form" variant="primary" loading={savingFile}>
+              保存
+            </Button>
+          </>
+        }
+      >
+        <form
+          id="edit-file-form"
+          className="flex flex-col gap-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void onSaveFileMetadata();
+          }}
+        >
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="edit-file-name" className="text-xs font-medium text-muted">
+              文件名
+            </label>
+            <Input
+              id="edit-file-name"
+              value={editFileName}
+              maxLength={180}
+              disabled={savingFile}
+              onChange={(event) => setEditFileName(event.target.value)}
+            />
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="edit-file-remark" className="text-xs font-medium text-muted">
+              备注
+            </label>
+            <Textarea
+              id="edit-file-remark"
+              value={editRemark}
+              maxLength={1000}
+              disabled={savingFile}
+              placeholder="补充说明，留空则清除备注"
+              onChange={(event) => setEditRemark(event.target.value)}
+            />
+          </div>
+          {editingFile && editFileName.trim() && editFileName.trim() !== editingFile.file_name ? (
+            <p className="rounded-xl border border-warning/25 bg-warning-soft px-3 py-2 text-xs leading-5 text-warning">
+              保存后，列表里复制的新链接会使用新文件名；已经分享出去的旧链接不会失效。
+            </p>
+          ) : null}
+        </form>
+      </Modal>
 
       <Modal
         open={createDirOpen}
@@ -580,15 +761,143 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       </Modal>
 
       <Modal
-        open={moveOpen}
+        open={Boolean(movingDirectory)}
         onClose={() => {
-          if (!movingFiles) setMoveOpen(false);
+          if (!movingDirectorySaving) setMovingDirectory(null);
         }}
-        title="移动文件"
-        description={`将 ${selectedCount} 个文件移动到其他目录`}
+        title="移动目录"
+        description={
+          movingDirectory
+            ? `将 ${movingDirectory.path} 移动到目标目录下，目录名保持为 ${movingDirectory.name}`
+            : undefined
+        }
         footer={
           <>
-            <Button variant="secondary" disabled={movingFiles} onClick={() => setMoveOpen(false)}>
+            <Button variant="secondary" disabled={movingDirectorySaving} onClick={() => setMovingDirectory(null)}>
+              取消
+            </Button>
+            <Button
+              type="submit"
+              form="move-directory-form"
+              variant="primary"
+              loading={movingDirectorySaving}
+              leadingIcon={<MoveRight size={16} />}
+            >
+              移动目录
+            </Button>
+          </>
+        }
+      >
+        <form
+          id="move-directory-form"
+          className="flex flex-col gap-3"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void onMoveDirectory();
+          }}
+        >
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="move-directory-target" className="text-xs font-medium text-muted">
+              目标父目录
+            </label>
+            <select
+              id="move-directory-target"
+              value={directoryMoveTargetPath}
+              disabled={movingDirectorySaving}
+              onChange={(event) => setDirectoryMoveTargetPath(event.target.value)}
+              className="h-11 rounded-lg border border-border bg-surface px-3 text-sm text-foreground shadow-card outline-none transition-colors hover:border-border-strong focus:border-primary focus:shadow-[0_0_0_4px_var(--color-primary-ring)]"
+            >
+              <option value="/">{directoryOptionLabel("/")}</option>
+              {directoryMoveTargets.map((directory) => (
+                <option key={directory.id} value={directory.path}>
+                  {directoryOptionLabel(directory.path)}
+                </option>
+              ))}
+            </select>
+          </div>
+          {movingDirectory ? (
+            <p className="rounded-xl border border-border bg-background px-3 py-2 text-xs leading-5 text-muted">
+              会递归更新该目录、所有子目录和其中所有文件索引的虚拟路径；文件公开链接不会变化。
+            </p>
+          ) : null}
+        </form>
+      </Modal>
+
+      <Modal
+        open={Boolean(renamingDirectory)}
+        onClose={() => {
+          if (!renamingDirectorySaving) setRenamingDirectory(null);
+        }}
+        title="重命名目录"
+        description={
+          renamingDirectory
+            ? `重命名 ${renamingDirectory.path}，会递归更新子目录和文件索引路径`
+            : undefined
+        }
+        footer={
+          <>
+            <Button variant="secondary" disabled={renamingDirectorySaving} onClick={() => setRenamingDirectory(null)}>
+              取消
+            </Button>
+            <Button
+              type="submit"
+              form="rename-directory-form"
+              variant="primary"
+              loading={renamingDirectorySaving}
+              leadingIcon={<Pencil size={16} />}
+            >
+              保存
+            </Button>
+          </>
+        }
+      >
+        <form
+          id="rename-directory-form"
+          className="flex flex-col gap-3"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void onRenameDirectory();
+          }}
+        >
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="rename-directory-name" className="text-xs font-medium text-muted">
+              新目录名称
+            </label>
+            <Input
+              id="rename-directory-name"
+              value={directoryRenameName}
+              maxLength={80}
+              disabled={renamingDirectorySaving}
+              placeholder="例如 photos"
+              onChange={(event) => setDirectoryRenameName(event.target.value)}
+            />
+          </div>
+          <p className="rounded-xl border border-border bg-background px-3 py-2 text-xs leading-5 text-muted">
+            文件公开链接不会变化；如果同级目录已存在相同名称，保存会被拒绝。
+          </p>
+        </form>
+      </Modal>
+
+      <Modal
+        open={moveOpen}
+        onClose={() => {
+          if (!movingFiles) {
+            setMoveOpen(false);
+            setMoveFileIds([]);
+          }
+        }}
+        title="移动文件"
+        description={`将 ${moveFileIds.length} 个文件移动到其他目录`}
+        footer={
+          <>
+            <Button
+              variant="secondary"
+              disabled={movingFiles}
+              onClick={() => {
+                setMoveOpen(false);
+                setMoveFileIds([]);
+              }}
+            >
               取消
             </Button>
             <Button

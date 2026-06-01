@@ -10,7 +10,7 @@ import {
   uploadMultipartChunk,
   uploadUrlMultipartChunk
 } from "../../api";
-import { formatBytes } from "../../utils";
+import { formatBytes, formatCompactBytes } from "../../utils";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
 import { Textarea } from "../ui/Textarea";
@@ -178,13 +178,15 @@ export function UploadDialog({
 
     for (const target of targets) {
       if (target.file.size > maxMultipartBytes) {
+        const message = `文件大小不能超过 ${formatCompactBytes(maxMultipartBytes)}（当前 ${formatCompactBytes(target.file.size)}）`;
         setItems((current) =>
           current.map((item) =>
             item.id === target.id
-              ? { ...item, status: "error", message: `超过 ${formatBytes(maxMultipartBytes)} 分片上限` }
+              ? { ...item, status: "error", message }
               : item
           )
         );
+        onError(message);
         continue;
       }
 

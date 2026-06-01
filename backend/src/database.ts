@@ -305,6 +305,36 @@ export async function softDeleteFileRecord(db: D1Database, id: string, deletedAt
   return true;
 }
 
+export async function updateFileRecordMetadata(params: {
+  db: D1Database;
+  id: string;
+  fileName: string;
+  remark: string | null;
+  filePath: string;
+}): Promise<FileRecord | null> {
+  const existing = await getFileRecord(params.db, params.id);
+
+  if (!existing) {
+    return null;
+  }
+
+  await params.db
+    .prepare(
+      `UPDATE files
+      SET file_name = ?, remark = ?, file_path = ?
+      WHERE id = ? AND deleted_at IS NULL`
+    )
+    .bind(params.fileName, params.remark, params.filePath, params.id)
+    .run();
+
+  return {
+    ...existing,
+    file_name: params.fileName,
+    remark: params.remark,
+    file_path: params.filePath
+  };
+}
+
 export async function getDirectoryRecord(db: D1Database, id: string): Promise<DirectoryRecord | null> {
   return await db
     .prepare(
@@ -472,6 +502,190 @@ export async function softDeleteDirectoryTree(params: {
     directory,
     deletedDirectories: directoryCount?.total ?? 0,
     deletedFiles: fileCount?.total ?? 0
+  };
+}
+
+export async function moveDirectoryTree(params: {
+  db: D1Database;
+  id: string;
+  parentPath: string;
+}): Promise<{ directory: DirectoryRecord; movedDirectories: number; movedFiles: number } | null> {
+  const directory = await getDirectoryRecord(params.db, params.id);
+
+  if (!directory) {
+    return null;
+  }
+
+  const oldPath = directory.path;
+
+  if (params.parentPath === oldPath || params.parentPath.startsWith(`${oldPath}/`)) {
+    throw new AppError(400, "InvalidDirectoryMove", "Cannot move a directory into itself or its subdirectory");
+  }
+
+  const parent = params.parentPath === "/" ? null : await getDirectoryRecordByPath(params.db, params.parentPath);
+
+  if (params.parentPath !== "/" && !parent) {
+    throw new AppError(404, "DirectoryNotFound", "Target parent directory not found");
+  }
+
+  const nextPath = params.parentPath === "/" ? `/${directory.name}` : `${params.parentPath}/${directory.name}`;
+
+  if (nextPath !== oldPath) {
+    const conflict = await getDirectoryRecordByPath(params.db, nextPath);
+    if (conflict && conflict.id !== directory.id) {
+      throw new AppError(409, "DirectoryExists", "Target directory already contains a directory with the same name");
+    }
+  }
+
+  if (nextPath === oldPath && (parent?.id ?? null) === directory.parent_id) {
+    return {
+      directory,
+      movedDirectories: 0,
+      movedFiles: 0
+    };
+  }
+
+  const prefixPattern = `${escapeLikePattern(oldPath)}/%`;
+  const directoryCount = await params.db
+    .prepare(
+      `SELECT COUNT(*) AS total
+      FROM directories
+      WHERE deleted_at IS NULL
+        AND (path = ? OR path LIKE ? ESCAPE '\\')`
+    )
+    .bind(oldPath, prefixPattern)
+    .first<{ total: number }>();
+  const fileCount = await params.db
+    .prepare(
+      `SELECT COUNT(*) AS total
+      FROM files
+      WHERE deleted_at IS NULL
+        AND (COALESCE(directory_path, '/') = ? OR COALESCE(directory_path, '/') LIKE ? ESCAPE '\\')`
+    )
+    .bind(oldPath, prefixPattern)
+    .first<{ total: number }>();
+
+  await params.db
+    .prepare(
+      `UPDATE directories
+      SET parent_id = ?, path = ?
+      WHERE id = ? AND deleted_at IS NULL`
+    )
+    .bind(parent?.id ?? null, nextPath, directory.id)
+    .run();
+  await params.db
+    .prepare(
+      `UPDATE directories
+      SET path = ? || SUBSTR(path, ?)
+      WHERE deleted_at IS NULL
+        AND path LIKE ? ESCAPE '\\'`
+    )
+    .bind(nextPath, oldPath.length + 1, prefixPattern)
+    .run();
+  await params.db
+    .prepare(
+      `UPDATE files
+      SET directory_path = ? || SUBSTR(COALESCE(directory_path, '/'), ?)
+      WHERE deleted_at IS NULL
+        AND (COALESCE(directory_path, '/') = ? OR COALESCE(directory_path, '/') LIKE ? ESCAPE '\\')`
+    )
+    .bind(nextPath, oldPath.length + 1, oldPath, prefixPattern)
+    .run();
+
+  return {
+    directory: {
+      ...directory,
+      parent_id: parent?.id ?? null,
+      path: nextPath
+    },
+    movedDirectories: directoryCount?.total ?? 0,
+    movedFiles: fileCount?.total ?? 0
+  };
+}
+
+export async function renameDirectoryTree(params: {
+  db: D1Database;
+  id: string;
+  name: string;
+}): Promise<{ directory: DirectoryRecord; renamedDirectories: number; updatedFiles: number } | null> {
+  const directory = await getDirectoryRecord(params.db, params.id);
+
+  if (!directory) {
+    return null;
+  }
+
+  const oldPath = directory.path;
+  const parentPath = parentPathForDirectory(oldPath);
+  const nextPath = parentPath === "/" ? `/${params.name}` : `${parentPath}/${params.name}`;
+
+  if (nextPath === oldPath && params.name === directory.name) {
+    return {
+      directory,
+      renamedDirectories: 0,
+      updatedFiles: 0
+    };
+  }
+
+  const conflict = await getDirectoryRecordByPath(params.db, nextPath);
+  if (conflict && conflict.id !== directory.id) {
+    throw new AppError(409, "DirectoryExists", "Target directory already contains a directory with the same name");
+  }
+
+  const prefixPattern = `${escapeLikePattern(oldPath)}/%`;
+  const directoryCount = await params.db
+    .prepare(
+      `SELECT COUNT(*) AS total
+      FROM directories
+      WHERE deleted_at IS NULL
+        AND (path = ? OR path LIKE ? ESCAPE '\\')`
+    )
+    .bind(oldPath, prefixPattern)
+    .first<{ total: number }>();
+  const fileCount = await params.db
+    .prepare(
+      `SELECT COUNT(*) AS total
+      FROM files
+      WHERE deleted_at IS NULL
+        AND (COALESCE(directory_path, '/') = ? OR COALESCE(directory_path, '/') LIKE ? ESCAPE '\\')`
+    )
+    .bind(oldPath, prefixPattern)
+    .first<{ total: number }>();
+
+  await params.db
+    .prepare(
+      `UPDATE directories
+      SET name = ?, path = ?
+      WHERE id = ? AND deleted_at IS NULL`
+    )
+    .bind(params.name, nextPath, directory.id)
+    .run();
+  await params.db
+    .prepare(
+      `UPDATE directories
+      SET path = ? || SUBSTR(path, ?)
+      WHERE deleted_at IS NULL
+        AND path LIKE ? ESCAPE '\\'`
+    )
+    .bind(nextPath, oldPath.length + 1, prefixPattern)
+    .run();
+  await params.db
+    .prepare(
+      `UPDATE files
+      SET directory_path = ? || SUBSTR(COALESCE(directory_path, '/'), ?)
+      WHERE deleted_at IS NULL
+        AND (COALESCE(directory_path, '/') = ? OR COALESCE(directory_path, '/') LIKE ? ESCAPE '\\')`
+    )
+    .bind(nextPath, oldPath.length + 1, oldPath, prefixPattern)
+    .run();
+
+  return {
+    directory: {
+      ...directory,
+      name: params.name,
+      path: nextPath
+    },
+    renamedDirectories: directoryCount?.total ?? 0,
+    updatedFiles: fileCount?.total ?? 0
   };
 }
 
@@ -794,6 +1008,12 @@ function escapeLikePattern(value: string): string {
 
 function placeholders(count: number): string {
   return Array.from({ length: count }, () => "?").join(", ");
+}
+
+function parentPathForDirectory(path: string): string {
+  const segments = path.split("/").filter(Boolean);
+  segments.pop();
+  return segments.length === 0 ? "/" : `/${segments.join("/")}`;
 }
 
 function fileTypeWhereClause(type: FileTypeFilter): string {

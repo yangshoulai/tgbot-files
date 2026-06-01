@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import worker, { type Env } from "../src/index";
-import { createSignedToken } from "../src/crypto";
+import { createSignedToken, verifySignedToken } from "../src/crypto";
 import type {
   ApiKeyRecord,
   ApiKeyStatus,
@@ -17,6 +17,7 @@ const env: Env = {
   LINK_SIGNING_SECRET: "link-secret",
   MAX_FILE_BYTES: "20971520"
 };
+const maxMultipartFileBytes = 18 * 1024 * 1024 * 24;
 
 class FakeD1 {
   readonly directories: DirectoryRecord[] = [];
@@ -194,6 +195,56 @@ class FakeD1Statement {
       }
     }
 
+    if (normalizedSql.startsWith("UPDATE FILES") && normalizedSql.includes("SET FILE_NAME")) {
+      const [fileName, remark, filePath, id] = this.bindings;
+      const file = this.db.files.find((item) => item.id === id && item.deleted_at === null);
+      if (file) {
+        file.file_name = String(fileName);
+        file.remark = remark === null ? null : String(remark);
+        file.file_path = String(filePath);
+      }
+    }
+
+    if (normalizedSql.startsWith("UPDATE FILES") && normalizedSql.includes("DIRECTORY_PATH = ? || SUBSTR")) {
+      const [nextPath, , oldPath, likePattern] = this.bindings;
+      const prefix = String(likePattern).replace(/\/%$/, "/");
+      for (const file of this.db.files) {
+        const currentPath = file.directory_path ?? "/";
+        if (file.deleted_at === null && (currentPath === oldPath || currentPath.startsWith(prefix))) {
+          file.directory_path = String(nextPath) + currentPath.slice(String(oldPath).length);
+        }
+      }
+    }
+
+    if (normalizedSql.startsWith("UPDATE DIRECTORIES") && normalizedSql.includes("SET PARENT_ID")) {
+      const [parentId, path, id] = this.bindings;
+      const directory = this.db.directories.find((item) => item.id === id && item.deleted_at === null);
+      if (directory) {
+        directory.parent_id = parentId === null ? null : String(parentId);
+        directory.path = String(path);
+      }
+    }
+
+    if (normalizedSql.startsWith("UPDATE DIRECTORIES") && normalizedSql.includes("SET NAME")) {
+      const [name, path, id] = this.bindings;
+      const directory = this.db.directories.find((item) => item.id === id && item.deleted_at === null);
+      if (directory) {
+        directory.name = String(name);
+        directory.path = String(path);
+      }
+    }
+
+    if (normalizedSql.startsWith("UPDATE DIRECTORIES") && normalizedSql.includes("PATH = ? || SUBSTR")) {
+      const [nextPath, , likePattern] = this.bindings;
+      const prefix = String(likePattern).replace(/\/%$/, "/");
+      const oldPath = prefix.replace(/\/$/, "");
+      for (const directory of this.db.directories) {
+        if (directory.deleted_at === null && directory.path.startsWith(prefix)) {
+          directory.path = String(nextPath) + directory.path.slice(oldPath.length);
+        }
+      }
+    }
+
     if (normalizedSql.startsWith("UPDATE DIRECTORIES") && normalizedSql.includes("SET DELETED_AT")) {
       const [deletedAt, path, likePattern] = this.bindings;
       const prefix = String(likePattern).replace(/\/%$/, "/");
@@ -265,6 +316,12 @@ class FakeD1Statement {
       const id = this.bindings[0];
       const file = this.db.files.find((item) => item.id === id && item.deleted_at === null);
       return (file ? { id: file.id } : null) as T | null;
+    }
+
+    if (normalizedSql.includes("FROM FILES") && normalizedSql.includes("WHERE ID =")) {
+      const id = this.bindings[0];
+      const file = this.db.files.find((item) => item.id === id && item.deleted_at === null);
+      return (file ?? null) as T | null;
     }
 
     if (normalizedSql.includes("FROM MULTIPART_UPLOADS")) {
@@ -502,6 +559,7 @@ function uploadRequest(options?: {
   token?: string | null;
   file?: File | string | null;
   remark?: string;
+  directoryPath?: string;
   contentTypeOverride?: string;
 }): Request {
   const form = new FormData();
@@ -512,6 +570,9 @@ function uploadRequest(options?: {
   }
   if (options?.remark) {
     form.set("remark", options.remark);
+  }
+  if (options?.directoryPath) {
+    form.set("directory_path", options.directoryPath);
   }
 
   const headers = new Headers();
@@ -603,11 +664,25 @@ describe("worker upload endpoint", () => {
       uploadRequest({ file: new File(["123456"], "too-large.txt", { type: "text/plain" }) }),
       smallLimitEnv
     );
-    const body = await response.json() as { error: string; details: { max_file_bytes: number } };
+    const body = await response.json() as {
+      error: string;
+      message: string;
+      details: {
+        max_file_bytes: number;
+        actual_file_bytes: number;
+        max_file_size: string;
+        actual_file_size: string;
+      };
+    };
 
     expect(response.status).toBe(413);
     expect(body.error).toBe("FileTooLarge");
+    expect(body.message).toContain("5B");
+    expect(body.message).toContain("6B");
     expect(body.details.max_file_bytes).toBe(5);
+    expect(body.details.actual_file_bytes).toBe(6);
+    expect(body.details.max_file_size).toBe("5B");
+    expect(body.details.actual_file_size).toBe("6B");
   });
 
   it("uploads a file to Telegram and returns a signed public URL", async () => {
@@ -650,6 +725,41 @@ describe("worker upload endpoint", () => {
     expect(db.files).toHaveLength(1);
     expect(db.files[0]?.uploaded_by).toBeNull();
     expect(apiKey.last_used_at).not.toBeNull();
+  });
+
+  it("auto-creates missing directory path for upload API requests", async () => {
+    const db = new FakeD1();
+    addApiKey(db);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse({
+          ok: true,
+          result: {
+            document: {
+              file_id: "tg-auto-dir-file-id",
+              file_name: "hello.txt",
+              mime_type: "text/plain",
+              file_size: 5
+            }
+          }
+        })
+      )
+    );
+
+    const response = await worker.fetch(
+      uploadRequest({ directoryPath: "/auto/nested" }),
+      envWithDb(db)
+    );
+    const body = await response.json() as { ok: boolean; url: string };
+
+    expect(response.status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(db.directories.map((item) => item.path)).toEqual(["/auto", "/auto/nested"]);
+    expect(db.directories[0]?.parent_id).toBeNull();
+    expect(db.directories[1]?.parent_id).toBe(db.directories[0]?.id);
+    expect(db.files[0]?.directory_id).toBe(db.directories[1]?.id);
+    expect(db.files[0]?.directory_path).toBe("/auto/nested");
   });
 
   it("accepts small webp files when Telegram returns them as stickers", async () => {
@@ -1466,6 +1576,146 @@ describe("admin file manager", () => {
     expect(db.multipartUploads[0]?.remark).toBe("大文件 URL");
   });
 
+  it("auto-creates missing directory path for multipart upload sessions", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const cookie = await loginAndGetCookie(adminEnv);
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/uploads/init", {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          file_name: "big.bin",
+          mime_type: "application/octet-stream",
+          size: 25 * 1024 * 1024,
+          directory_path: "/incoming/big"
+        })
+      }),
+      adminEnv
+    );
+    const body = await response.json() as { upload: { directory_path: string } };
+
+    expect(response.status).toBe(201);
+    expect(body.upload.directory_path).toBe("/incoming/big");
+    expect(db.directories.map((item) => item.path)).toEqual(["/incoming", "/incoming/big"]);
+    expect(db.multipartUploads[0]?.directory_id).toBe(db.directories[1]?.id);
+    expect(db.multipartUploads[0]?.directory_path).toBe("/incoming/big");
+  });
+
+  it("rejects multipart upload sessions over the limit with human-readable sizes", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const cookie = await loginAndGetCookie(adminEnv);
+    const actualFileBytes = maxMultipartFileBytes + 1;
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/uploads/init", {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          file_name: "too-large.bin",
+          mime_type: "application/octet-stream",
+          size: actualFileBytes
+        })
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      error: string;
+      message: string;
+      details: {
+        max_file_bytes: number;
+        actual_file_bytes: number;
+        max_file_size: string;
+        actual_file_size: string;
+        chunk_size: string;
+      };
+    };
+
+    expect(response.status).toBe(413);
+    expect(body.error).toBe("FileTooLarge");
+    expect(body.message).toContain("432MB");
+    expect(body.message).toContain("432MB1B");
+    expect(body.details.max_file_bytes).toBe(maxMultipartFileBytes);
+    expect(body.details.actual_file_bytes).toBe(actualFileBytes);
+    expect(body.details.max_file_size).toBe("432MB");
+    expect(body.details.actual_file_size).toBe("432MB1B");
+    expect(body.details.chunk_size).toBe("18MB");
+  });
+
+  it("rejects oversized URL multipart sources with compact human-readable sizes", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const cookie = await loginAndGetCookie(adminEnv);
+    const sourceUrl = "https://source.example.com/huge-video.mp4";
+    const actualFileBytes = 1024 ** 4 + 20 * 1024 ** 3;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === sourceUrl && init?.method === "HEAD") {
+        return new Response(null, {
+          headers: {
+            "Content-Length": String(actualFileBytes),
+            "Content-Type": "video/mp4"
+          }
+        });
+      }
+
+      throw new Error(`Unexpected fetch ${String(input)}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/uploads/url/init", {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ url: sourceUrl })
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      error: string;
+      message: string;
+      details: {
+        max_file_bytes: number;
+        actual_file_bytes: number;
+        max_file_size: string;
+        actual_file_size: string;
+      };
+    };
+
+    expect(response.status).toBe(413);
+    expect(body.error).toBe("FileTooLarge");
+    expect(body.message).toContain("432MB");
+    expect(body.message).toContain("1T20G");
+    expect(body.details.max_file_bytes).toBe(maxMultipartFileBytes);
+    expect(body.details.actual_file_bytes).toBe(actualFileBytes);
+    expect(body.details.max_file_size).toBe("432MB");
+    expect(body.details.actual_file_size).toBe("1T20G");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("uploads an existing signed file URL without fetching the public source URL", async () => {
     const db = new FakeD1();
     const adminEnv: Env = {
@@ -1751,6 +2001,93 @@ describe("admin file manager", () => {
     expect(dateBody.files[0]?.id).toBe("file-text");
   });
 
+  it("updates file name and remark, and regenerates the admin file link only when renamed", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      PUBLIC_BASE_URL: "https://cdn.example.com",
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    db.files.push({
+      id: "file-edit",
+      file_name: "old.txt",
+      mime_type: "text/plain",
+      size: 8,
+      md5: "old-md5",
+      telegram_file_id: "tg-edit",
+      telegram_file_unique_id: null,
+      file_path: "/f/old-token/old.txt",
+      remark: "旧备注",
+      uploaded_by: "admin",
+      created_at: "2026-06-01T00:00:00.000Z",
+      deleted_at: null,
+      directory_id: null,
+      directory_path: "/"
+    });
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const remarkResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/files/file-edit", {
+        method: "PATCH",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ remark: "新备注" })
+      }),
+      adminEnv
+    );
+    const remarkBody = await remarkResponse.json() as {
+      file: { file_name: string; remark: string | null; file_path: string; url: string };
+    };
+    expect(remarkResponse.status).toBe(200);
+    expect(remarkBody.file).toMatchObject({
+      file_name: "old.txt",
+      remark: "新备注",
+      file_path: "/f/old-token/old.txt",
+      url: "https://cdn.example.com/f/old-token/old.txt"
+    });
+
+    const renameResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/files/file-edit", {
+        method: "PATCH",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ file_name: "new name.txt", remark: "" })
+      }),
+      adminEnv
+    );
+    const renameBody = await renameResponse.json() as {
+      file: { file_name: string; remark: string | null; file_path: string; url: string; download_url: string };
+    };
+    const token = renameBody.file.file_path.split("/")[2] || "";
+    const payload = await verifySignedToken(token, env.LINK_SIGNING_SECRET);
+
+    expect(renameResponse.status).toBe(200);
+    expect(renameBody.file.file_name).toBe("new name.txt");
+    expect(renameBody.file.remark).toBeNull();
+    expect(renameBody.file.file_path).toMatch(/^\/f\/.+\/new%20name\.txt$/);
+    expect(renameBody.file.file_path).not.toBe("/f/old-token/old.txt");
+    expect(renameBody.file.url).toBe(`https://cdn.example.com${renameBody.file.file_path}`);
+    expect(renameBody.file.download_url).toBe(`${renameBody.file.url}?download=1`);
+    expect(payload).toMatchObject({
+      v: 1,
+      file_id: "tg-edit",
+      name: "new name.txt",
+      mime_type: "text/plain",
+      size: 8
+    });
+    expect(db.files[0]).toMatchObject({
+      file_name: "new name.txt",
+      remark: null,
+      file_path: renameBody.file.file_path
+    });
+  });
+
   it("creates virtual directories, moves files, searches current directory, and recursive deletes", async () => {
     const db = new FakeD1();
     const adminEnv: Env = {
@@ -1887,6 +2224,157 @@ describe("admin file manager", () => {
     expect(deleteBody.deleted_files).toBe(2);
     expect(db.files.every((item) => item.deleted_at !== null)).toBe(true);
     expect(db.directories.every((item) => item.deleted_at !== null)).toBe(true);
+  });
+
+  it("moves a directory tree to another parent directory", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    db.directories.push(
+      {
+        id: "dir-archive",
+        parent_id: null,
+        name: "archive",
+        path: "/archive",
+        created_at: "2026-06-01T00:00:00.000Z",
+        deleted_at: null
+      },
+      {
+        id: "dir-photos",
+        parent_id: null,
+        name: "photos",
+        path: "/photos",
+        created_at: "2026-06-01T00:01:00.000Z",
+        deleted_at: null
+      },
+      {
+        id: "dir-child",
+        parent_id: "dir-photos",
+        name: "2026",
+        path: "/photos/2026",
+        created_at: "2026-06-01T00:02:00.000Z",
+        deleted_at: null
+      }
+    );
+    db.files.push(
+      {
+        id: "file-root-photo",
+        file_name: "cover.jpg",
+        mime_type: "image/jpeg",
+        size: 1,
+        md5: "cover-md5",
+        telegram_file_id: "tg-cover",
+        telegram_file_unique_id: null,
+        file_path: "/f/token/cover.jpg",
+        remark: null,
+        uploaded_by: "admin",
+        created_at: "2026-06-01T00:03:00.000Z",
+        deleted_at: null,
+        directory_id: "dir-photos",
+        directory_path: "/photos"
+      },
+      {
+        id: "file-child-photo",
+        file_name: "trip.jpg",
+        mime_type: "image/jpeg",
+        size: 1,
+        md5: "trip-md5",
+        telegram_file_id: "tg-trip",
+        telegram_file_unique_id: null,
+        file_path: "/f/token/trip.jpg",
+        remark: null,
+        uploaded_by: "admin",
+        created_at: "2026-06-01T00:04:00.000Z",
+        deleted_at: null,
+        directory_id: "dir-child",
+        directory_path: "/photos/2026"
+      }
+    );
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/directories/dir-photos/move", {
+        method: "PATCH",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ parent_path: "/archive" })
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      directory: { id: string; parent_id: string | null; path: string };
+      moved_directories: number;
+      moved_files: number;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.directory).toMatchObject({
+      id: "dir-photos",
+      parent_id: "dir-archive",
+      path: "/archive/photos"
+    });
+    expect(body.moved_directories).toBe(2);
+    expect(body.moved_files).toBe(2);
+    expect(db.directories.find((item) => item.id === "dir-photos")).toMatchObject({
+      parent_id: "dir-archive",
+      path: "/archive/photos"
+    });
+    expect(db.directories.find((item) => item.id === "dir-child")?.path).toBe("/archive/photos/2026");
+    expect(db.files.find((item) => item.id === "file-root-photo")?.directory_path).toBe("/archive/photos");
+    expect(db.files.find((item) => item.id === "file-child-photo")?.directory_path).toBe("/archive/photos/2026");
+
+    const invalidResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/directories/dir-photos/move", {
+        method: "PATCH",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ parent_path: "/archive/photos/2026" })
+      }),
+      adminEnv
+    );
+    const invalidBody = await invalidResponse.json() as { error: string };
+    expect(invalidResponse.status).toBe(400);
+    expect(invalidBody.error).toBe("InvalidDirectoryMove");
+
+    const renameResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/directories/dir-photos", {
+        method: "PATCH",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ name: "images" })
+      }),
+      adminEnv
+    );
+    const renameBody = await renameResponse.json() as {
+      directory: { id: string; name: string; path: string };
+      renamed_directories: number;
+      updated_files: number;
+    };
+    expect(renameResponse.status).toBe(200);
+    expect(renameBody.directory).toMatchObject({
+      id: "dir-photos",
+      name: "images",
+      path: "/archive/images"
+    });
+    expect(renameBody.renamed_directories).toBe(2);
+    expect(renameBody.updated_files).toBe(2);
+    expect(db.directories.find((item) => item.id === "dir-photos")).toMatchObject({
+      name: "images",
+      path: "/archive/images"
+    });
+    expect(db.directories.find((item) => item.id === "dir-child")?.path).toBe("/archive/images/2026");
+    expect(db.files.find((item) => item.id === "file-root-photo")?.directory_path).toBe("/archive/images");
+    expect(db.files.find((item) => item.id === "file-child-photo")?.directory_path).toBe("/archive/images/2026");
   });
 
 });

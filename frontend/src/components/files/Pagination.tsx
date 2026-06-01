@@ -8,7 +8,7 @@ interface PaginationProps {
   onLimitChange: (limit: number) => void;
 }
 
-const LIMIT_OPTIONS = [20, 50, 100];
+const LIMIT_OPTIONS = [20, 50];
 
 export function Pagination({ pagination, onPage, onLimitChange }: PaginationProps) {
   const { page, total, total_pages: totalPages, limit } = pagination;
