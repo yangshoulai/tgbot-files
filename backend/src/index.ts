@@ -193,8 +193,12 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
     return handleAuthenticatedAdminRequest(request, env, () => handleAdminApiKeys(request, env));
   }
 
-  if (request.method === "POST" && url.pathname === "/api/v1/files") {
-    return handleUpload(request, env);
+  if (url.pathname === "/api/v1/files" || url.pathname.startsWith("/api/v1/files/")) {
+    return handleApiFiles(request, env);
+  }
+
+  if (url.pathname === "/api/v1/uploads" || url.pathname.startsWith("/api/v1/uploads/")) {
+    return handleApiMultipartUploads(request, env);
   }
 
   if (request.method === "GET" && url.pathname.startsWith("/f/")) {
@@ -204,28 +208,56 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
   return errorResponse(new AppError(404, "NotFound", "Route not found"));
 }
 
-async function handleUpload(request: Request, env: Env): Promise<Response> {
+async function handleApiFiles(request: Request, env: Env): Promise<Response> {
   const db = requireDb(env);
   await requireUploadApiKey(request, db);
+  const url = new URL(request.url);
 
-  const { file, directoryPath } = await readUploadInput(request, env);
-  const directory = await ensureWritableDirectory(db, directoryPath);
-  const result = await uploadAndRecordFile({
-    request,
-    env,
-    file,
-    db,
-    directoryPath,
-    directoryId: directory?.id ?? null
-  });
+  if (request.method === "POST" && url.pathname === "/api/v1/files") {
+    const { file, directoryPath } = await readUploadInput(request, env);
+    const directory = await ensureWritableDirectory(db, directoryPath);
+    const result = await uploadAndRecordFile({
+      request,
+      env,
+      file,
+      db,
+      directoryPath,
+      directoryId: directory?.id ?? null
+    });
 
-  return jsonResponse({
-    ok: true,
-    url: result.publicUrl,
-    name: result.name,
-    size: result.size,
-    mime_type: result.mimeType
-  });
+    return jsonResponse({
+      ok: true,
+      id: result.id,
+      url: result.publicUrl,
+      name: result.name,
+      size: result.size,
+      mime_type: result.mimeType
+    });
+  }
+
+  const chunkMatch = /^\/api\/v1\/files\/([^/]+)\/chunks\/(\d+)$/.exec(url.pathname);
+  if (request.method === "GET" && chunkMatch?.[1] && chunkMatch?.[2]) {
+    const file = await requireFileRecord(db, decodeURIComponent(chunkMatch[1]));
+    const chunkIndex = Number(chunkMatch[2]);
+
+    return handleMultipartChunkRecordAccess({
+      env,
+      file,
+      chunkIndex
+    });
+  }
+
+  const fileMatch = /^\/api\/v1\/files\/([^/]+)$/.exec(url.pathname);
+  if (request.method === "GET" && fileMatch?.[1]) {
+    const file = await requireFileRecord(db, decodeURIComponent(fileMatch[1]));
+
+    return jsonResponse({
+      ok: true,
+      file: serializeFileRecord(file, getPublicBaseUrl(request, env))
+    });
+  }
+
+  return errorResponse(new AppError(404, "NotFound", "API file route not found"));
 }
 
 async function handleAdminLogin(request: Request, env: Env): Promise<Response> {
@@ -700,13 +732,16 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
     const sourceUrl = normalizeSourceUrl(body.url);
     const remark = normalizeRemark(body.remark);
     const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
+    const forceMultipart = body.force_multipart === true;
     const directory = await ensureWritableDirectory(db, directoryPath);
 
     if (!sourceUrl) {
       throw new AppError(400, "MissingUrl", "JSON field 'url' is required");
     }
 
-    const probe = await probeRemoteSourceForMultipart(sourceUrl, parseMaxFileBytes(env.MAX_FILE_BYTES));
+    const probe = await probeRemoteSourceForMultipart(sourceUrl, parseMaxFileBytes(env.MAX_FILE_BYTES), {
+      forceMultipart
+    });
 
     if (probe.mode === "single") {
       return jsonResponse({
@@ -806,6 +841,140 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
   }
 
   return errorResponse(new AppError(404, "NotFound", "Admin multipart upload route not found"));
+}
+
+async function handleApiMultipartUploads(request: Request, env: Env): Promise<Response> {
+  const db = requireDb(env);
+  const url = new URL(request.url);
+  await requireUploadApiKey(request, db);
+
+  if (request.method === "POST" && url.pathname === "/api/v1/uploads/init") {
+    const body = await readJsonObject(request);
+    const fileName = sanitizeFileName(stringField(body.file_name, "file_name"));
+    const mimeType = normalizeMimeTypeField(body.mime_type);
+    const size = positiveIntegerField(body.size, "size");
+    const remark = normalizeRemark(body.remark);
+    const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
+    const directory = await ensureWritableDirectory(db, directoryPath);
+    const result = await createMultipartUpload({
+      db,
+      sourceKind: "local",
+      fileName,
+      mimeType,
+      size,
+      directoryPath,
+      directoryId: directory?.id ?? null,
+      ...(remark ? { remark } : {})
+    });
+
+    return jsonResponse({
+      ok: true,
+      upload: serializeMultipartInit(result)
+    }, 201);
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/v1/uploads/url/init") {
+    const body = await readJsonObject(request);
+    const sourceUrl = normalizeSourceUrl(body.url);
+    const remark = normalizeRemark(body.remark);
+    const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
+    const directory = await ensureWritableDirectory(db, directoryPath);
+
+    if (!sourceUrl) {
+      throw new AppError(400, "MissingUrl", "JSON field 'url' is required");
+    }
+
+    const probe = await probeRemoteSourceForMultipart(sourceUrl, parseMaxFileBytes(env.MAX_FILE_BYTES), {
+      forceMultipart: true
+    });
+
+    if (probe.mode === "single") {
+      throw new AppError(500, "InternalError", "Forced URL multipart probe returned single mode");
+    }
+
+    const result = await createMultipartUpload({
+      db,
+      sourceKind: "url",
+      sourceUrl: sourceUrl.toString(),
+      fileName: probe.fileName,
+      mimeType: probe.mimeType,
+      size: probe.size,
+      directoryPath,
+      directoryId: directory?.id ?? null,
+      ...(remark ? { remark } : {})
+    });
+
+    return jsonResponse({
+      ok: true,
+      mode: "multipart",
+      upload: serializeMultipartInit(result)
+    }, 201);
+  }
+
+  const chunkMatch = /^\/api\/v1\/uploads\/([^/]+)\/chunks\/(\d+)$/.exec(url.pathname);
+  if (request.method === "POST" && chunkMatch?.[1] && chunkMatch?.[2]) {
+    const upload = await requireMultipartUpload(db, decodeURIComponent(chunkMatch[1]), "local");
+    const chunkIndex = normalizeChunkIndex(chunkMatch[2], upload);
+    const formData = await request.formData();
+    const chunk = formData.get("chunk");
+
+    if (!(chunk instanceof File)) {
+      throw new AppError(400, "MissingChunk", "Multipart field 'chunk' is required");
+    }
+
+    validateChunkFile(chunk, expectedChunkSize(upload, chunkIndex));
+    const record = await uploadChunkToTelegram({
+      env,
+      upload,
+      chunk,
+      chunkIndex
+    });
+
+    await upsertFileChunkRecord(db, record);
+    return jsonResponse({
+      ok: true,
+      chunk: serializeChunk(record),
+      uploaded_chunks: (await listFileChunkRecords(db, upload.id)).length
+    });
+  }
+
+  const urlChunkMatch = /^\/api\/v1\/uploads\/([^/]+)\/url-chunks\/(\d+)$/.exec(url.pathname);
+  if (request.method === "POST" && urlChunkMatch?.[1] && urlChunkMatch?.[2]) {
+    const upload = await requireMultipartUpload(db, decodeURIComponent(urlChunkMatch[1]), "url");
+    const chunkIndex = normalizeChunkIndex(urlChunkMatch[2], upload);
+    const chunk = await downloadRemoteChunk(upload, chunkIndex);
+    const record = await uploadChunkToTelegram({
+      env,
+      upload,
+      chunk,
+      chunkIndex
+    });
+
+    await upsertFileChunkRecord(db, record);
+    return jsonResponse({
+      ok: true,
+      chunk: serializeChunk(record),
+      uploaded_chunks: (await listFileChunkRecords(db, upload.id)).length
+    });
+  }
+
+  const completeMatch = /^\/api\/v1\/uploads\/([^/]+)\/complete$/.exec(url.pathname);
+  if (request.method === "POST" && completeMatch?.[1]) {
+    const upload = await requireMultipartUpload(db, decodeURIComponent(completeMatch[1]));
+    const result = await completeMultipartUpload({
+      request,
+      env,
+      db,
+      upload
+    });
+
+    return jsonResponse({
+      ok: true,
+      file: serializeUploadedFileResult(result, null)
+    });
+  }
+
+  return errorResponse(new AppError(404, "NotFound", "API multipart upload route not found"));
 }
 
 async function handleAdminApiKeys(request: Request, env: Env): Promise<Response> {
@@ -1244,7 +1413,7 @@ async function createMultipartUpload(params: {
   fileName: string;
   mimeType: string;
   size: number;
-  uploadedBy: string;
+  uploadedBy?: string;
   remark?: string;
   directoryId?: string | null;
   directoryPath: string;
@@ -1261,7 +1430,7 @@ async function createMultipartUpload(params: {
     size: params.size,
     chunkSize: TELEGRAM_CHUNK_SIZE_BYTES,
     chunkCount,
-    uploadedBy: params.uploadedBy,
+    ...(params.uploadedBy ? { uploadedBy: params.uploadedBy } : {}),
     directoryId: params.directoryId ?? null,
     directoryPath: params.directoryPath,
     ...(params.remark ? { remark: params.remark } : {}),
@@ -1295,7 +1464,8 @@ function validateMultipartFileSize(size: number): void {
 
 async function probeRemoteSourceForMultipart(
   sourceUrl: URL,
-  singleMaxFileBytes: number
+  singleMaxFileBytes: number,
+  options: { forceMultipart?: boolean } = {}
 ): Promise<
   | { mode: "single" }
   | { mode: "multipart"; fileName: string; mimeType: string; size: number }
@@ -1305,7 +1475,7 @@ async function probeRemoteSourceForMultipart(
   const initialFileName = inferRemoteFileName(sourceUrl, head?.headers ?? new Headers());
   const remoteMimeHint = pickRemoteMimeHint(head?.headers.get("Content-Type") ?? null, initialFileName);
 
-  if (size !== undefined && size <= singleMaxFileBytes) {
+  if (!options.forceMultipart && size !== undefined && size <= singleMaxFileBytes) {
     return { mode: "single" };
   }
 
@@ -1325,7 +1495,7 @@ async function probeRemoteSourceForMultipart(
     throw new AppError(400, "UnknownFileSize", "Source URL must expose Content-Length or Content-Range");
   }
 
-  if (size <= singleMaxFileBytes) {
+  if (!options.forceMultipart && size <= singleMaxFileBytes) {
     return { mode: "single" };
   }
 
@@ -1406,6 +1576,16 @@ async function requireMultipartUpload(
   }
 
   return upload;
+}
+
+async function requireFileRecord(db: D1Database, id: string): Promise<FileRecord> {
+  const file = await getFileRecord(db, id);
+
+  if (!file) {
+    throw new AppError(404, "FileNotFound", "File record not found");
+  }
+
+  return file;
 }
 
 function normalizeChunkIndex(value: string, upload: MultipartUploadRecord): number {
@@ -1824,6 +2004,56 @@ async function handleMultipartChunkAccess(params: {
   });
 }
 
+async function handleMultipartChunkRecordAccess(params: {
+  env: Env;
+  file: FileRecord;
+  chunkIndex: number;
+}): Promise<Response> {
+  if (fileStorageBackend(params.file) !== "telegram_multipart") {
+    throw new AppError(400, "NotMultipartFile", "Chunk download is only available for multipart files");
+  }
+
+  const chunkSize = requirePositiveRecordInteger(params.file.chunk_size, "chunk_size");
+  const chunkCount = requirePositiveRecordInteger(params.file.chunk_count, "chunk_count");
+
+  if (!Number.isSafeInteger(params.chunkIndex) || params.chunkIndex < 0 || params.chunkIndex >= chunkCount) {
+    throw new AppError(400, "InvalidChunkIndex", "Chunk index is out of range");
+  }
+
+  const db = requireDb(params.env);
+  const chunk = await getFileChunkRecord(db, params.file.id, params.chunkIndex);
+  const expectedSize = expectedRecordChunkSize(params.file.size, chunkSize, chunkCount, params.chunkIndex);
+
+  if (!chunk || chunk.size !== expectedSize) {
+    throw new AppError(404, "FileChunkNotFound", "Multipart file chunk was not found");
+  }
+
+  const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
+  const telegramFileUrl = await getTelegramFileUrl({ botToken, fileId: chunk.telegram_file_id });
+  const telegramResponse = await fetchTelegramFile({
+    fileUrl: telegramFileUrl,
+    rangeHeader: null
+  });
+
+  if (!telegramResponse.body) {
+    throw new AppError(502, "TelegramFileDownloadFailed", "Telegram file response did not include a body");
+  }
+
+  const headers = withSecurityHeaders();
+  headers.set("Content-Type", params.file.mime_type || telegramResponse.headers.get("Content-Type") || "application/octet-stream");
+  headers.set("Content-Disposition", contentDispositionAttachment(recordChunkDownloadFileName(params.file.file_name, chunkCount, params.chunkIndex)));
+  headers.set("Content-Length", String(chunk.size));
+  headers.set("Cache-Control", "public, max-age=31536000, immutable");
+  headers.set("X-Chunk-Index", String(params.chunkIndex));
+  headers.set("X-Chunk-Count", String(chunkCount));
+  headers.set("X-Chunk-Offset", String(params.chunkIndex * chunkSize));
+
+  return new Response(telegramResponse.body, {
+    status: 200,
+    headers
+  });
+}
+
 async function handleMultipartFileAccess(params: {
   env: Env;
   payload: Extract<Awaited<ReturnType<typeof verifySignedToken>>, { v: 2 }>;
@@ -1914,12 +2144,22 @@ function expectedPayloadChunkSize(
     : payload.chunk_size;
 }
 
+function expectedRecordChunkSize(size: number, chunkSize: number, chunkCount: number, chunkIndex: number): number {
+  return chunkIndex === chunkCount - 1
+    ? size - chunkSize * chunkIndex
+    : chunkSize;
+}
+
 function chunkDownloadFileName(
   payload: Extract<Awaited<ReturnType<typeof verifySignedToken>>, { v: 2 }>,
   chunkIndex: number
 ): string {
-  const paddedIndex = String(chunkIndex + 1).padStart(String(payload.chunk_count).length, "0");
-  return `${payload.name}.part-${paddedIndex}-of-${payload.chunk_count}`;
+  return recordChunkDownloadFileName(payload.name, payload.chunk_count, chunkIndex);
+}
+
+function recordChunkDownloadFileName(fileName: string, chunkCount: number, chunkIndex: number): string {
+  const paddedIndex = String(chunkIndex + 1).padStart(String(chunkCount).length, "0");
+  return `${fileName}.part-${paddedIndex}-of-${chunkCount}`;
 }
 
 function streamMultipartFile(params: {
@@ -2022,7 +2262,7 @@ function rangeNotSatisfiableResponse(size: number): Response {
   return new Response(null, { status: 416, headers });
 }
 
-async function requireUploadApiKey(request: Request, db: D1Database): Promise<void> {
+async function requireUploadApiKey(request: Request, db: D1Database): Promise<ApiKeyRecord> {
   const authorization = request.headers.get("Authorization") || "";
   const [scheme, token, extra] = authorization.split(/\s+/);
 
@@ -2037,6 +2277,7 @@ async function requireUploadApiKey(request: Request, db: D1Database): Promise<vo
   }
 
   await touchApiKeyRecord(db, apiKey.id, new Date().toISOString());
+  return apiKey;
 }
 
 async function readLoginCredentials(request: Request): Promise<{ username: string; password: string; rememberMe: boolean }> {
@@ -2157,7 +2398,7 @@ function serializeChunk(record: Awaited<ReturnType<typeof uploadChunkToTelegram>
   };
 }
 
-function serializeUploadedFileResult(result: UploadResult, username: string): Record<string, unknown> {
+function serializeUploadedFileResult(result: UploadResult, username: string | null): Record<string, unknown> {
   const directAccess = canDirectlyAccessUploadResult(result);
   const url = directAccess ? result.publicUrl : null;
 

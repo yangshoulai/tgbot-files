@@ -1,11 +1,11 @@
 import { ReactNode, useState } from "react";
-import { ChevronDown, LayoutDashboard, LogOut, Settings, UploadCloud, User } from "lucide-react";
+import { BookOpenText, ChevronDown, LayoutDashboard, LogOut, Settings, UploadCloud, User } from "lucide-react";
 import type { SessionResponse } from "../../api";
 import { cn } from "../../lib/cn";
 import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
 
-export type ShellRoute = "admin" | "settings";
+export type ShellRoute = "admin" | "docs" | "settings";
 
 interface ShellProps {
   active: ShellRoute;
@@ -18,6 +18,7 @@ interface ShellProps {
 
 const NAV: Array<{ key: ShellRoute; label: string; icon: typeof LayoutDashboard }> = [
   { key: "admin", label: "控制台", icon: LayoutDashboard },
+  { key: "docs", label: "API 文档", icon: BookOpenText },
   { key: "settings", label: "设置", icon: Settings }
 ];
 

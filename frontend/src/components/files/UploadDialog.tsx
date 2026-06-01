@@ -78,6 +78,7 @@ export function UploadDialog({
   const [sourceUrl, setSourceUrl] = useState("");
   const [urlUpload, setUrlUpload] = useState<UrlUploadState>({ status: "pending" });
   const [remark, setRemark] = useState("");
+  const [forceMultipart, setForceMultipart] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -89,6 +90,7 @@ export function UploadDialog({
       setSourceUrl("");
       setUrlUpload({ status: "pending" });
       setRemark("");
+      setForceMultipart(false);
       setSubmitting(false);
       setDragOver(false);
       return;
@@ -97,6 +99,7 @@ export function UploadDialog({
     setItems(initialFiles.map(makeItem));
     setSourceUrl("");
     setUrlUpload({ status: "pending" });
+    setForceMultipart(false);
   }, [open, initialFiles]);
 
   const addFiles = useCallback((files: File[]) => {
@@ -197,7 +200,7 @@ export function UploadDialog({
       );
 
       try {
-        if (target.file.size > maxBytes) {
+        if (forceMultipart || target.file.size > maxBytes) {
           await uploadLocalMultipart(target);
         } else {
           const form = new FormData();
@@ -277,7 +280,7 @@ export function UploadDialog({
     setUrlUpload({ status: "uploading", progress: { completed: 0, total: 1, label: "探测远程文件" } });
 
     try {
-      const init = await initUrlMultipartUpload(normalizedSourceUrl, remark.trim() || undefined, directoryPath);
+      const init = await initUrlMultipartUpload(normalizedSourceUrl, remark.trim() || undefined, directoryPath, forceMultipart);
       if (init.mode === "multipart" && init.upload) {
         const upload = init.upload;
         for (let index = 0; index < upload.chunk_count; index += 1) {
@@ -379,6 +382,21 @@ export function UploadDialog({
           />
           <span className="hidden text-xs text-muted sm:inline">分片上限 {formatBytes(maxMultipartBytes)}</span>
         </div>
+        <label className="flex items-start gap-2 rounded-xl border border-border bg-background px-3 py-2.5 text-sm text-foreground">
+          <input
+            type="checkbox"
+            checked={forceMultipart}
+            disabled={submitting}
+            onChange={(event) => setForceMultipart(event.target.checked)}
+            className="mt-0.5 size-4 rounded border-border text-primary accent-primary focus-visible:outline-none focus-visible:focus-ring"
+          />
+          <span className="flex flex-col gap-0.5">
+            <span className="font-medium">小文件也使用分片上传</span>
+            <span className="text-xs leading-5 text-muted">
+              开启后本地文件和 URL 导入都会走分片流程；URL 分片要求远端支持 Range。
+            </span>
+          </span>
+        </label>
 
         {mode === "file" ? (
           <>
@@ -423,6 +441,7 @@ export function UploadDialog({
                     key={item.id}
                     item={item}
                     directMaxBytes={maxBytes}
+                    forceMultipart={forceMultipart}
                     onRemove={() => removeItem(item.id)}
                     disabled={submitting}
                   />
@@ -455,7 +474,8 @@ export function UploadDialog({
                 }}
               />
               <p className="text-xs leading-5 text-muted">
-                小文件直接拉取；超过 {formatBytes(maxBytes)} 时要求远端支持 Range，并按
+                {forceMultipart ? "当前将强制使用分片导入；" : `小文件直接拉取；超过 ${formatBytes(maxBytes)} 时`}
+                要求远端支持 Range，并按
                 {" "}{formatBytes(multipartChunkBytes)} 分片导入。
               </p>
             </div>
@@ -493,11 +513,12 @@ export function UploadDialog({
 interface QueueRowProps {
   item: QueueItem;
   directMaxBytes: number;
+  forceMultipart: boolean;
   onRemove: () => void;
   disabled: boolean;
 }
 
-function QueueRow({ item, directMaxBytes, onRemove, disabled }: QueueRowProps) {
+function QueueRow({ item, directMaxBytes, forceMultipart, onRemove, disabled }: QueueRowProps) {
   const status = item.status;
   return (
     <div className="flex items-center gap-3 rounded-xl border border-border bg-surface px-3 py-2.5">
@@ -508,7 +529,7 @@ function QueueRow({ item, directMaxBytes, onRemove, disabled }: QueueRowProps) {
         </p>
         <p className="truncate text-xs text-muted">
           {formatBytes(item.file.size)}
-          {item.file.size > directMaxBytes ? <span> · 分片上传</span> : null}
+          {forceMultipart || item.file.size > directMaxBytes ? <span> · 分片上传</span> : null}
           {item.message ? <span className="text-danger"> · {item.message}</span> : null}
         </p>
         {item.progress ? <ProgressBar progress={item.progress} /> : null}

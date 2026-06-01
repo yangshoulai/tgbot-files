@@ -5,17 +5,19 @@ import { Shell, ShellRoute } from "./components/layout/Shell";
 import { LoginPage } from "./pages/LoginPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { SettingsPage } from "./pages/SettingsPage";
+import { ApiDocsPage } from "./pages/ApiDocsPage";
 import { UploadDialog } from "./components/files/UploadDialog";
 import { GlobalDropzone } from "./lib/dropzone";
 import { ToastProvider, useToast } from "./lib/toast";
 import { ConfirmProvider } from "./lib/confirm";
 import { registerVideoPreviewServiceWorker } from "./lib/video-preview-service-worker";
 
-type Route = "/login" | "/admin" | "/settings";
+type Route = "/login" | "/admin" | "/docs" | "/settings";
 
 function currentRoute(): Route {
   const pathname = window.location.pathname;
   if (pathname === "/login") return "/login";
+  if (pathname === "/docs") return "/docs";
   if (pathname === "/settings") return "/settings";
   return "/admin";
 }
@@ -138,19 +140,21 @@ function AppShell() {
     );
   }
 
-  const active: ShellRoute = path === "/settings" ? "settings" : "admin";
+  const active: ShellRoute = path === "/settings" ? "settings" : path === "/docs" ? "docs" : "admin";
 
   return (
     <>
       <Shell
         active={active}
         session={session}
-        onNavigate={(route) => navigate(route === "settings" ? "/settings" : "/admin")}
+        onNavigate={(route) => navigate(route === "settings" ? "/settings" : route === "docs" ? "/docs" : "/admin")}
         onLogout={() => void onLogout()}
         onUpload={() => openUpload([])}
       >
         {active === "settings" ? (
           <SettingsPage session={session} copyText={copyText} />
+        ) : active === "docs" ? (
+          <ApiDocsPage session={session} />
         ) : (
           <DashboardPage
             session={session}

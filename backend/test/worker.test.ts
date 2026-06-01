@@ -904,6 +904,303 @@ describe("worker upload endpoint", () => {
   });
 });
 
+describe("API key multipart endpoints", () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("uploads, inspects, and downloads a small multipart file", async () => {
+    const db = new FakeD1();
+    addApiKey(db);
+    const apiEnv = envWithDb(db);
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const inputUrl = String(input);
+
+      if (inputUrl.endsWith("/sendDocument")) {
+        return jsonResponse({
+          ok: true,
+          result: {
+            document: {
+              file_id: "tg-small-chunk",
+              file_unique_id: "tg-small-unique",
+              file_name: "small.txt.part-1-of-1",
+              mime_type: "text/plain",
+              file_size: 5
+            }
+          }
+        });
+      }
+
+      if (inputUrl.includes("/getFile?file_id=tg-small-chunk")) {
+        return jsonResponse({
+          ok: true,
+          result: {
+            file_id: "tg-small-chunk",
+            file_path: "documents/small-part"
+          }
+        });
+      }
+
+      if (inputUrl.endsWith("/documents/small-part")) {
+        return new Response("hello", {
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": "5"
+          }
+        });
+      }
+
+      throw new Error(`Unexpected fetch ${inputUrl}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const initResponse = await worker.fetch(
+      new Request("https://files.example.com/api/v1/uploads/init", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${uploadApiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          file_name: "small.txt",
+          mime_type: "text/plain",
+          size: 5,
+          directory_path: "/api/small"
+        })
+      }),
+      apiEnv
+    );
+    const initBody = await initResponse.json() as {
+      upload: { id: string; chunk_count: number; direct_access: boolean; directory_path: string };
+    };
+
+    expect(initResponse.status).toBe(201);
+    expect(initBody.upload.chunk_count).toBe(1);
+    expect(initBody.upload.direct_access).toBe(true);
+    expect(initBody.upload.directory_path).toBe("/api/small");
+
+    const chunkForm = new FormData();
+    chunkForm.set("chunk", new File(["hello"], "small.txt.part-1", { type: "text/plain" }));
+    const chunkResponse = await worker.fetch(
+      new Request(`https://files.example.com/api/v1/uploads/${initBody.upload.id}/chunks/0`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${uploadApiKey}` },
+        body: chunkForm
+      }),
+      apiEnv
+    );
+    const chunkBody = await chunkResponse.json() as { uploaded_chunks: number };
+
+    expect(chunkResponse.status).toBe(200);
+    expect(chunkBody.uploaded_chunks).toBe(1);
+
+    const completeResponse = await worker.fetch(
+      new Request(`https://files.example.com/api/v1/uploads/${initBody.upload.id}/complete`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${uploadApiKey}` }
+      }),
+      apiEnv
+    );
+    const completeBody = await completeResponse.json() as {
+      file: {
+        id: string;
+        storage_backend: string;
+        chunk_count: number;
+        direct_access: boolean;
+        url: string;
+        uploaded_by: string | null;
+      };
+    };
+
+    expect(completeResponse.status).toBe(200);
+    expect(completeBody.file.id).toBe(initBody.upload.id);
+    expect(completeBody.file.storage_backend).toBe("telegram_multipart");
+    expect(completeBody.file.chunk_count).toBe(1);
+    expect(completeBody.file.direct_access).toBe(true);
+    expect(completeBody.file.url).toMatch(/^https:\/\/files\.example\.com\/f\//);
+    expect(completeBody.file.uploaded_by).toBeNull();
+
+    const infoResponse = await worker.fetch(
+      new Request(`https://files.example.com/api/v1/files/${completeBody.file.id}`, {
+        headers: { Authorization: `Bearer ${uploadApiKey}` }
+      }),
+      apiEnv
+    );
+    const infoBody = await infoResponse.json() as {
+      file: { id: string; chunk_count: number; direct_access: boolean; download_strategy: string };
+    };
+
+    expect(infoResponse.status).toBe(200);
+    expect(infoBody.file).toMatchObject({
+      id: completeBody.file.id,
+      chunk_count: 1,
+      direct_access: true,
+      download_strategy: "direct_or_accelerated"
+    });
+
+    const downloadResponse = await worker.fetch(
+      new Request(`https://files.example.com/api/v1/files/${completeBody.file.id}/chunks/0`, {
+        headers: { Authorization: `Bearer ${uploadApiKey}` }
+      }),
+      apiEnv
+    );
+
+    expect(downloadResponse.status).toBe(200);
+    expect(await downloadResponse.text()).toBe("hello");
+    expect(downloadResponse.headers.get("X-Chunk-Count")).toBe("1");
+    expect(downloadResponse.headers.get("Content-Disposition")).toContain("small.txt.part-1-of-1");
+  });
+
+  it("imports a small URL through the API key multipart URL flow", async () => {
+    const db = new FakeD1();
+    addApiKey(db);
+    const apiEnv = envWithDb(db);
+    const sourceUrl = "https://source.example.com/small.txt";
+    const fetchCalls: Array<{ input: string; method: string | undefined; range: string | null }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const inputUrl = String(input);
+      const headers = new Headers(init?.headers);
+      fetchCalls.push({
+        input: inputUrl,
+        method: init?.method,
+        range: headers.get("Range")
+      });
+
+      if (inputUrl === sourceUrl && init?.method === "HEAD") {
+        return new Response(null, {
+          headers: {
+            "Content-Length": "5",
+            "Content-Type": "text/plain"
+          }
+        });
+      }
+
+      if (inputUrl === sourceUrl && headers.get("Range") === "bytes=0-0") {
+        return new Response("h", {
+          status: 206,
+          headers: {
+            "Content-Range": "bytes 0-0/5",
+            "Content-Length": "1"
+          }
+        });
+      }
+
+      if (inputUrl === sourceUrl && headers.get("Range") === "bytes=0-4") {
+        return new Response("hello", {
+          status: 206,
+          headers: {
+            "Content-Length": "5",
+            "Content-Range": "bytes 0-4/5"
+          }
+        });
+      }
+
+      if (inputUrl.endsWith("/sendDocument")) {
+        return jsonResponse({
+          ok: true,
+          result: {
+            document: {
+              file_id: "tg-url-small-chunk",
+              file_name: "small.txt.part-1-of-1",
+              mime_type: "text/plain",
+              file_size: 5
+            }
+          }
+        });
+      }
+
+      throw new Error(`Unexpected fetch ${inputUrl}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const initResponse = await worker.fetch(
+      new Request("https://files.example.com/api/v1/uploads/url/init", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${uploadApiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ url: sourceUrl, remark: "URL 小文件分片" })
+      }),
+      apiEnv
+    );
+    const initBody = await initResponse.json() as {
+      mode: string;
+      upload: { id: string; file_name: string; size: number; chunk_count: number };
+    };
+
+    expect(initResponse.status).toBe(201);
+    expect(initBody.mode).toBe("multipart");
+    expect(initBody.upload.file_name).toBe("small.txt");
+    expect(initBody.upload.size).toBe(5);
+    expect(initBody.upload.chunk_count).toBe(1);
+
+    const chunkResponse = await worker.fetch(
+      new Request(`https://files.example.com/api/v1/uploads/${initBody.upload.id}/url-chunks/0`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${uploadApiKey}` }
+      }),
+      apiEnv
+    );
+    expect(chunkResponse.status).toBe(200);
+
+    const completeResponse = await worker.fetch(
+      new Request(`https://files.example.com/api/v1/uploads/${initBody.upload.id}/complete`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${uploadApiKey}` }
+      }),
+      apiEnv
+    );
+    const completeBody = await completeResponse.json() as {
+      file: { storage_backend: string; chunk_count: number; remark: string | null };
+    };
+
+    expect(completeResponse.status).toBe(200);
+    expect(completeBody.file.storage_backend).toBe("telegram_multipart");
+    expect(completeBody.file.chunk_count).toBe(1);
+    expect(completeBody.file.remark).toBe("URL 小文件分片");
+    expect(fetchCalls.some((call) => call.range === "bytes=0-4")).toBe(true);
+  });
+
+  it("rejects API key chunk downloads for non-multipart files", async () => {
+    const db = new FakeD1();
+    addApiKey(db);
+    db.files.push({
+      id: "single-file",
+      file_name: "plain.txt",
+      mime_type: "text/plain",
+      size: 5,
+      md5: "md5",
+      telegram_file_id: "tg-single",
+      telegram_file_unique_id: null,
+      file_path: "/f/token/plain.txt",
+      remark: null,
+      uploaded_by: null,
+      created_at: "2026-06-01T00:00:00.000Z",
+      deleted_at: null,
+      directory_id: null,
+      directory_path: "/",
+      storage_backend: "telegram_single",
+      chunk_size: null,
+      chunk_count: null
+    });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/v1/files/single-file/chunks/0", {
+        headers: { Authorization: `Bearer ${uploadApiKey}` }
+      }),
+      envWithDb(db)
+    );
+    const body = await response.json() as { error: string };
+
+    expect(response.status).toBe(400);
+    expect(body.error).toBe("NotMultipartFile");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("worker file access endpoint", () => {
   beforeEach(() => {
     vi.unstubAllGlobals();
@@ -1789,6 +2086,65 @@ describe("admin file manager", () => {
     expect(body.upload.chunk_count).toBe(2);
     expect(db.multipartUploads[0]?.source_url).toBe(sourceUrl);
     expect(db.multipartUploads[0]?.remark).toBe("大文件 URL");
+  });
+
+  it("can force a small admin URL upload into multipart mode", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const cookie = await loginAndGetCookie(adminEnv);
+    const sourceUrl = "https://source.example.com/small-note.txt";
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+
+      if (String(input) === sourceUrl && init?.method === "HEAD") {
+        return new Response(null, {
+          headers: {
+            "Content-Length": "5",
+            "Content-Type": "text/plain"
+          }
+        });
+      }
+
+      if (String(input) === sourceUrl && headers.get("Range") === "bytes=0-0") {
+        return new Response("h", {
+          status: 206,
+          headers: {
+            "Content-Range": "bytes 0-0/5",
+            "Content-Length": "1"
+          }
+        });
+      }
+
+      throw new Error(`Unexpected fetch ${String(input)}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/uploads/url/init", {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ url: sourceUrl, force_multipart: true })
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      mode: string;
+      upload: { file_name: string; size: number; chunk_count: number };
+    };
+
+    expect(response.status).toBe(201);
+    expect(body.mode).toBe("multipart");
+    expect(body.upload.file_name).toBe("small-note.txt");
+    expect(body.upload.size).toBe(5);
+    expect(body.upload.chunk_count).toBe(1);
   });
 
   it("auto-creates missing directory path for multipart upload sessions", async () => {

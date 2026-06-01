@@ -368,7 +368,7 @@ export function uploadMultipartChunk(uploadId: string, chunkIndex: number, chunk
   });
 }
 
-export function initUrlMultipartUpload(url: string, remark?: string, directoryPath = "/") {
+export function initUrlMultipartUpload(url: string, remark?: string, directoryPath = "/", forceMultipart = false) {
   return requestJson<UrlMultipartInitResponse>("/api/admin/uploads/url/init", {
     method: "POST",
     headers: {
@@ -377,6 +377,7 @@ export function initUrlMultipartUpload(url: string, remark?: string, directoryPa
     body: JSON.stringify({
       url,
       directory_path: directoryPath,
+      ...(forceMultipart ? { force_multipart: true } : {}),
       ...(remark ? { remark } : {})
     })
   });

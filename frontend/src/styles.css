@@ -159,3 +159,36 @@
 @utility animate-toast-in {
   animation: toast-in 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
+
+@media print {
+  header,
+  .api-docs-actions,
+  .api-docs-nav {
+    display: none !important;
+  }
+
+  body {
+    background: white !important;
+  }
+
+  main {
+    max-width: none !important;
+    padding: 0 !important;
+  }
+
+  .api-docs-page {
+    gap: 16px !important;
+  }
+
+  .api-docs-content > section,
+  .api-docs-content > header,
+  .api-docs-content .rounded-2xl,
+  .api-docs-content .rounded-xl {
+    break-inside: avoid;
+    box-shadow: none !important;
+  }
+
+  pre {
+    white-space: pre-wrap;
+  }
+}
