@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ArrowUp, ChevronRight, FolderPlus, MoveRight, Pencil, RefreshCw, Search, Trash2 } from "lucide-react";
+import { ArrowUp, ChevronRight, FolderInput, FolderPlus, Pencil, RefreshCw, Search, Trash2 } from "lucide-react";
 import {
   ApiError,
   DirectoryItem,
@@ -7,12 +7,13 @@ import {
   Pagination as PaginationType,
   SessionResponse,
   createDirectory,
+  deleteEntries,
   deleteDirectory,
   deleteFile,
   listDirectories,
   listFiles,
   moveDirectory,
-  moveFiles,
+  moveEntries,
   renameDirectory,
   updateFileMetadata
 } from "../api";
@@ -102,12 +103,14 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   const [editFileName, setEditFileName] = useState("");
   const [editRemark, setEditRemark] = useState("");
   const [savingFile, setSavingFile] = useState(false);
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [selectedFileIds, setSelectedFileIds] = useState<Set<string>>(() => new Set());
+  const [selectedDirectoryIds, setSelectedDirectoryIds] = useState<Set<string>>(() => new Set());
   const [createDirOpen, setCreateDirOpen] = useState(false);
   const [newDirName, setNewDirName] = useState("");
   const [creatingDir, setCreatingDir] = useState(false);
   const [moveOpen, setMoveOpen] = useState(false);
   const [moveFileIds, setMoveFileIds] = useState<string[]>([]);
+  const [moveDirectoryIds, setMoveDirectoryIds] = useState<string[]>([]);
   const [moveTargetPath, setMoveTargetPath] = useState("/");
   const [moveCreateNew, setMoveCreateNew] = useState(false);
   const [moveNewParentPath, setMoveNewParentPath] = useState("/");
@@ -175,11 +178,19 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
 
   useEffect(() => {
     const visibleIds = new Set(files.map((file) => file.id));
-    setSelectedIds((current) => {
+    setSelectedFileIds((current) => {
       const next = new Set(Array.from(current).filter((id) => visibleIds.has(id)));
       return next.size === current.size ? current : next;
     });
   }, [files]);
+
+  useEffect(() => {
+    const visibleIds = new Set(directories.map((directory) => directory.id));
+    setSelectedDirectoryIds((current) => {
+      const next = new Set(Array.from(current).filter((id) => visibleIds.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [directories]);
 
   const metrics = useMemo<Metric[]>(() => {
     const latest = files[0];
@@ -227,7 +238,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       toast.success("索引已删除");
       if (previewFile?.id === file.id) setPreviewFile(null);
       if (detailFile?.id === file.id) setDetailFile(null);
-      setSelectedIds((current) => {
+      setSelectedFileIds((current) => {
         const next = new Set(current);
         next.delete(file.id);
         return next;
@@ -240,24 +251,36 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   }
 
   async function onBulkDelete() {
-    const targets = files.filter((file) => selectedIds.has(file.id));
-    if (targets.length === 0) return;
+    const targetFiles = files.filter((file) => selectedFileIds.has(file.id));
+    const targetDirectories = directories.filter((directory) => selectedDirectoryIds.has(directory.id));
+    const totalTargets = targetFiles.length + targetDirectories.length;
+    if (totalTargets === 0) return;
 
     const ok = await confirm({
-      title: `删除选中的 ${targets.length} 个文件索引？`,
-      description: "只会从控制台移除索引；Telegram 中的原始消息和已分发的签名链接不会被影响。",
+      title: `删除选中的 ${totalTargets} 个项目？`,
+      description: (
+        <>
+          将删除 {targetDirectories.length} 个目录及其子项、{targetFiles.length} 个文件索引。
+          Telegram 中的原始消息和已分发的签名链接不会被影响。
+        </>
+      ),
       tone: "danger",
       confirmText: "批量删除"
     });
     if (!ok) return;
 
     try {
-      await Promise.all(targets.map((file) => deleteFile(file.id)));
-      toast.success(`已删除 ${targets.length} 个文件索引`);
-      if (previewFile && targets.some((file) => file.id === previewFile.id)) setPreviewFile(null);
-      if (detailFile && targets.some((file) => file.id === detailFile.id)) setDetailFile(null);
-      setSelectedIds(new Set());
-      const targetPage = targets.length === files.length && pagination.page > 1 ? pagination.page - 1 : pagination.page;
+      const result = await deleteEntries({
+        file_ids: targetFiles.map((file) => file.id),
+        directory_ids: targetDirectories.map((directory) => directory.id)
+      });
+      toast.success(`已删除 ${result.deleted_directories} 个目录、${result.deleted_files} 个文件索引`);
+      if (previewFile && targetFiles.some((file) => file.id === previewFile.id)) setPreviewFile(null);
+      if (detailFile && targetFiles.some((file) => file.id === detailFile.id)) setDetailFile(null);
+      setSelectedFileIds(new Set());
+      setSelectedDirectoryIds(new Set());
+      const allVisibleSelected = targetFiles.length === files.length && targetDirectories.length === directories.length;
+      const targetPage = allVisibleSelected && pagination.page > 1 ? pagination.page - 1 : pagination.page;
       await loadFiles(targetPage);
     } catch (error) {
       toast.danger(errorMessage(error));
@@ -302,6 +325,11 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     try {
       const result = await deleteDirectory(directory.id);
       toast.success(`已删除 ${result.deleted_directories} 个目录、${result.deleted_files} 个文件索引`);
+      setSelectedDirectoryIds((current) => {
+        const next = new Set(current);
+        next.delete(directory.id);
+        return next;
+      });
       await Promise.all([loadFiles(pagination.page), loadDirectoryOptions()]);
     } catch (error) {
       toast.danger(errorMessage(error));
@@ -355,6 +383,11 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       const result = await moveDirectory(movingDirectory.id, directoryMoveTargetPath);
       toast.success(`已移动 ${result.moved_directories} 个目录、${result.moved_files} 个文件索引到 ${result.directory.path}`);
       setMovingDirectory(null);
+      setSelectedDirectoryIds((current) => {
+        const next = new Set(current);
+        next.delete(result.directory.id);
+        return next;
+      });
       await Promise.all([loadFiles(pagination.page), loadDirectoryOptions()]);
     } catch (error) {
       toast.danger(errorMessage(error));
@@ -364,9 +397,11 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   }
 
   function openMoveDialog(file?: FileItem) {
-    const ids = file ? [file.id] : files.filter((item) => selectedIds.has(item.id)).map((item) => item.id);
-    if (ids.length === 0) return;
-    setMoveFileIds(ids);
+    const fileIds = file ? [file.id] : files.filter((item) => selectedFileIds.has(item.id)).map((item) => item.id);
+    const directoryIds = file ? [] : directories.filter((item) => selectedDirectoryIds.has(item.id)).map((item) => item.id);
+    if (fileIds.length + directoryIds.length === 0) return;
+    setMoveFileIds(fileIds);
+    setMoveDirectoryIds(directoryIds);
     setMoveTargetPath(currentDirPath);
     setMoveNewParentPath(currentDirPath);
     setMoveNewDirName("");
@@ -411,8 +446,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   }
 
   async function onMoveSelected() {
-    const ids = moveFileIds;
-    if (ids.length === 0) return;
+    if (moveFileIds.length + moveDirectoryIds.length === 0) return;
 
     const newName = moveNewDirName.trim();
     if (moveCreateNew && !newName) {
@@ -422,22 +456,26 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
 
     setMovingFiles(true);
     try {
-      const result = await moveFiles(
+      const result = await moveEntries(
         moveCreateNew
           ? {
-              file_ids: ids,
+              file_ids: moveFileIds,
+              directory_ids: moveDirectoryIds,
               new_directory_parent_path: moveNewParentPath,
               new_directory_name: newName
             }
           : {
-              file_ids: ids,
+              file_ids: moveFileIds,
+              directory_ids: moveDirectoryIds,
               directory_path: moveTargetPath
             }
       );
-      toast.success(`已移动 ${result.moved} 个文件到 ${result.directory_path}`);
+      toast.success(`已移动 ${result.moved_directories} 个目录、${result.moved_files} 个文件索引到 ${result.directory_path}`);
       setMoveOpen(false);
       setMoveFileIds([]);
-      setSelectedIds(new Set());
+      setMoveDirectoryIds([]);
+      setSelectedFileIds(new Set());
+      setSelectedDirectoryIds(new Set());
       await Promise.all([loadFiles(pagination.page), loadDirectoryOptions()]);
     } catch (error) {
       toast.danger(errorMessage(error));
@@ -448,15 +486,16 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
 
   function goToDirectory(path: string) {
     setCurrentDirPath(path);
-    setSelectedIds(new Set());
+    setSelectedFileIds(new Set());
+    setSelectedDirectoryIds(new Set());
   }
 
   function onCopy(file: FileItem) {
     copyText(file.url);
   }
 
-  function toggleSelected(file: FileItem, selected: boolean) {
-    setSelectedIds((current) => {
+  function toggleFileSelected(file: FileItem, selected: boolean) {
+    setSelectedFileIds((current) => {
       const next = new Set(current);
       if (selected) {
         next.add(file.id);
@@ -467,22 +506,44 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     });
   }
 
-  function togglePage(selected: boolean) {
-    setSelectedIds((current) => {
+  function toggleDirectorySelected(directory: DirectoryItem, selected: boolean) {
+    setSelectedDirectoryIds((current) => {
       const next = new Set(current);
-      for (const file of files) {
-        if (selected) {
-          next.add(file.id);
-        } else {
-          next.delete(file.id);
-        }
+      if (selected) {
+        next.add(directory.id);
+      } else {
+        next.delete(directory.id);
       }
       return next;
     });
   }
 
-  const allPageSelected = files.length > 0 && files.every((file) => selectedIds.has(file.id));
-  const selectedCount = files.filter((file) => selectedIds.has(file.id)).length;
+  function togglePage(selected: boolean) {
+    setSelectedFileIds((current) => {
+      const next = new Set(current);
+      for (const file of files) {
+        if (selected) next.add(file.id);
+        else next.delete(file.id);
+      }
+      return next;
+    });
+    setSelectedDirectoryIds((current) => {
+      const next = new Set(current);
+      for (const directory of directories) {
+        if (selected) next.add(directory.id);
+        else next.delete(directory.id);
+      }
+      return next;
+    });
+  }
+
+  const visibleEntryCount = files.length + directories.length;
+  const selectedFileCount = files.filter((file) => selectedFileIds.has(file.id)).length;
+  const selectedDirectoryCount = directories.filter((directory) => selectedDirectoryIds.has(directory.id)).length;
+  const selectedCount = selectedFileCount + selectedDirectoryCount;
+  const allPageSelected = visibleEntryCount > 0 &&
+    files.every((file) => selectedFileIds.has(file.id)) &&
+    directories.every((directory) => selectedDirectoryIds.has(directory.id));
   const directoryMoveTargets = useMemo(() => {
     if (!movingDirectory) {
       return directoryOptions;
@@ -493,6 +554,19 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       !directory.path.startsWith(`${movingDirectory.path}/`)
     );
   }, [directoryOptions, movingDirectory]);
+  const bulkMoveTargets = useMemo(() => {
+    const selectedDirectories = directories.filter((directory) => selectedDirectoryIds.has(directory.id));
+    if (selectedDirectories.length === 0) {
+      return directoryOptions;
+    }
+
+    return directoryOptions.filter((directory) =>
+      selectedDirectories.every((selectedDirectory) =>
+        directory.id !== selectedDirectory.id &&
+        !directory.path.startsWith(`${selectedDirectory.path}/`)
+      )
+    );
+  }, [directories, directoryOptions, selectedDirectoryIds]);
 
   return (
     <div className="flex flex-col gap-5">
@@ -601,14 +675,19 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
 
         {selectedCount > 0 ? (
           <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-danger/20 bg-danger-soft px-3 py-2">
-            <p className="text-sm font-medium text-danger">已选 {selectedCount} 个文件</p>
+            <p className="text-sm font-medium text-danger">
+              已选 {selectedCount} 项
+              <span className="ml-2 text-xs font-normal text-muted">
+                {selectedDirectoryCount} 个目录 · {selectedFileCount} 个文件
+              </span>
+            </p>
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
                 onClick={() => openMoveDialog()}
                 className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-border bg-surface px-3 text-sm font-medium text-foreground shadow-card transition-colors hover:border-border-strong hover:bg-background focus-visible:outline-none focus-visible:focus-ring"
               >
-                <MoveRight size={15} />
+                <FolderInput size={15} />
                 移动
               </button>
               <button
@@ -626,13 +705,15 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         <FileTable
           directories={directories}
           files={files}
-          selectedIds={selectedIds}
+          selectedFileIds={selectedFileIds}
+          selectedDirectoryIds={selectedDirectoryIds}
           allPageSelected={allPageSelected}
           onOpenDirectory={(directory) => goToDirectory(directory.path)}
           onRenameDirectory={openRenameDirectoryDialog}
           onMoveDirectory={openMoveDirectoryDialog}
           onDeleteDirectory={(directory) => void onDeleteDirectory(directory)}
-          onToggleSelected={toggleSelected}
+          onToggleFileSelected={toggleFileSelected}
+          onToggleDirectorySelected={toggleDirectorySelected}
           onTogglePage={togglePage}
           onDetail={setDetailFile}
           onEdit={openEditDialog}
@@ -781,7 +862,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
               form="move-directory-form"
               variant="primary"
               loading={movingDirectorySaving}
-              leadingIcon={<MoveRight size={16} />}
+              leadingIcon={<FolderInput size={16} />}
             >
               移动目录
             </Button>
@@ -884,10 +965,11 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
           if (!movingFiles) {
             setMoveOpen(false);
             setMoveFileIds([]);
+            setMoveDirectoryIds([]);
           }
         }}
-        title="移动文件"
-        description={`将 ${moveFileIds.length} 个文件移动到其他目录`}
+        title="移动项目"
+        description={`将 ${moveDirectoryIds.length} 个目录、${moveFileIds.length} 个文件移动到其他目录`}
         footer={
           <>
             <Button
@@ -896,6 +978,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
               onClick={() => {
                 setMoveOpen(false);
                 setMoveFileIds([]);
+                setMoveDirectoryIds([]);
               }}
             >
               取消
@@ -905,7 +988,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
               form="move-files-form"
               variant="primary"
               loading={movingFiles}
-              leadingIcon={<MoveRight size={16} />}
+              leadingIcon={<FolderInput size={16} />}
             >
               移动
             </Button>
@@ -945,7 +1028,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
                   className="h-11 rounded-lg border border-border bg-surface px-3 text-sm text-foreground shadow-card outline-none transition-colors hover:border-border-strong focus:border-primary focus:shadow-[0_0_0_4px_var(--color-primary-ring)]"
                 >
                   <option value="/">{directoryOptionLabel("/")}</option>
-                  {directoryOptions.map((directory) => (
+                  {bulkMoveTargets.map((directory) => (
                     <option key={directory.id} value={directory.path}>
                       {directoryOptionLabel(directory.path)}
                     </option>
@@ -979,7 +1062,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
                 className="h-11 rounded-lg border border-border bg-surface px-3 text-sm text-foreground shadow-card outline-none transition-colors hover:border-border-strong focus:border-primary focus:shadow-[0_0_0_4px_var(--color-primary-ring)]"
               >
                 <option value="/">{directoryOptionLabel("/")}</option>
-                {directoryOptions.map((directory) => (
+                {bulkMoveTargets.map((directory) => (
                   <option key={directory.id} value={directory.path}>
                     {directoryOptionLabel(directory.path)}
                   </option>

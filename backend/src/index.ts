@@ -8,6 +8,7 @@ import {
 import { createSignedToken, TokenError, verifySignedToken } from "./crypto";
 import {
   completeMultipartUploadRecord,
+  getDirectoryRecord,
   getDirectoryRecordByPath,
   findActiveApiKeyRecord,
   getApiKeyRecord,
@@ -168,6 +169,10 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
 
   if (url.pathname === "/api/admin/directories" || url.pathname.startsWith("/api/admin/directories/")) {
     return handleAuthenticatedAdminRequest(request, env, () => handleAdminDirectories(request, env));
+  }
+
+  if (url.pathname === "/api/admin/entries" || url.pathname.startsWith("/api/admin/entries/")) {
+    return handleAuthenticatedAdminRequest(request, env, () => handleAdminEntries(request, env));
   }
 
   if (url.pathname === "/api/admin/files" || url.pathname.startsWith("/api/admin/files/")) {
@@ -546,6 +551,100 @@ async function handleAdminDirectories(request: Request, env: Env): Promise<Respo
   }
 
   return errorResponse(new AppError(404, "NotFound", "Admin directory route not found"));
+}
+
+async function handleAdminEntries(request: Request, env: Env): Promise<Response> {
+  const db = requireDb(env);
+  const url = new URL(request.url);
+
+  if (request.method === "PATCH" && url.pathname === "/api/admin/entries/move") {
+    const body = await readJsonObject(request);
+    const fileIds = normalizeOptionalIdList(body.file_ids, "file_ids");
+    const directoryIds = normalizeOptionalIdList(body.directory_ids, "directory_ids");
+    requireEntrySelection(fileIds, directoryIds);
+
+    const directoriesToMove = await requireDirectoryRecords(db, directoryIds);
+    await requireFileRecords(db, fileIds);
+    validateEntryMoveParent(directoriesToMove, moveTargetParentPath(body));
+    const directoryPath = await resolveMoveTargetDirectory(db, body);
+    await validateEntryMoveTarget(db, directoriesToMove, directoryPath);
+
+    let movedDirectories = 0;
+    let movedFiles = 0;
+
+    for (const directory of directoriesToMove) {
+      const result = await moveDirectoryTree({
+        db,
+        id: directory.id,
+        parentPath: directoryPath
+      });
+
+      if (!result) {
+        throw new AppError(404, "DirectoryNotFound", "Directory not found");
+      }
+
+      movedDirectories += result.movedDirectories;
+      movedFiles += result.movedFiles;
+    }
+
+    movedFiles += await moveFileRecords({
+      db,
+      ids: fileIds,
+      directoryPath
+    });
+
+    return jsonResponse({
+      ok: true,
+      moved: movedDirectories + movedFiles,
+      moved_directories: movedDirectories,
+      moved_files: movedFiles,
+      directory_path: directoryPath
+    });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/admin/entries/delete") {
+    const body = await readJsonObject(request);
+    const fileIds = normalizeOptionalIdList(body.file_ids, "file_ids");
+    const directoryIds = normalizeOptionalIdList(body.directory_ids, "directory_ids");
+    requireEntrySelection(fileIds, directoryIds);
+    await requireFileRecords(db, fileIds);
+    await requireDirectoryRecords(db, directoryIds);
+
+    const deletedAt = new Date().toISOString();
+    let deletedDirectories = 0;
+    let deletedFiles = 0;
+
+    for (const fileId of fileIds) {
+      const deleted = await softDeleteFileRecord(db, fileId, deletedAt);
+      if (!deleted) {
+        throw new AppError(404, "NotFound", "File record not found");
+      }
+      deletedFiles += 1;
+    }
+
+    for (const directoryId of directoryIds) {
+      const result = await softDeleteDirectoryTree({
+        db,
+        id: directoryId,
+        deletedAt
+      });
+
+      if (!result) {
+        throw new AppError(404, "DirectoryNotFound", "Directory not found");
+      }
+
+      deletedDirectories += result.deletedDirectories;
+      deletedFiles += result.deletedFiles;
+    }
+
+    return jsonResponse({
+      ok: true,
+      deleted_directories: deletedDirectories,
+      deleted_files: deletedFiles
+    });
+  }
+
+  return errorResponse(new AppError(404, "NotFound", "Admin entry route not found"));
 }
 
 async function handleAdminMultipartUploads(request: Request, env: Env, username: string): Promise<Response> {
@@ -2215,6 +2314,89 @@ function normalizeFileIdList(value: unknown): string[] {
   }
 
   return ids;
+}
+
+function normalizeOptionalIdList(value: unknown, fieldName: "file_ids" | "directory_ids"): string[] {
+  if (value === undefined) {
+    return [];
+  }
+
+  if (!Array.isArray(value)) {
+    throw new AppError(400, "InvalidBody", `${fieldName} must be an array`);
+  }
+
+  const ids = Array.from(new Set(value.map((item) => typeof item === "string" ? item.trim() : ""))).filter(Boolean);
+
+  if (ids.length > 100) {
+    throw new AppError(400, "InvalidBody", `${fieldName} must contain at most 100 ids`);
+  }
+
+  return ids;
+}
+
+function requireEntrySelection(fileIds: string[], directoryIds: string[]): void {
+  if (fileIds.length === 0 && directoryIds.length === 0) {
+    throw new AppError(400, "InvalidBody", "file_ids or directory_ids must not be empty");
+  }
+}
+
+async function requireFileRecords(db: D1Database, ids: string[]): Promise<void> {
+  for (const id of ids) {
+    const file = await getFileRecord(db, id);
+    if (!file) {
+      throw new AppError(404, "NotFound", "File record not found");
+    }
+  }
+}
+
+async function requireDirectoryRecords(db: D1Database, ids: string[]): Promise<DirectoryRecord[]> {
+  const records: DirectoryRecord[] = [];
+
+  for (const id of ids) {
+    const directory = await getDirectoryRecord(db, id);
+    if (!directory) {
+      throw new AppError(404, "DirectoryNotFound", "Directory not found");
+    }
+    records.push(directory);
+  }
+
+  return records;
+}
+
+function moveTargetParentPath(body: Record<string, unknown>): string {
+  if (body.new_directory_name !== undefined) {
+    return normalizeDirectoryPath(body.new_directory_parent_path ?? body.parent_path ?? body.directory_path ?? "/");
+  }
+
+  return normalizeDirectoryPath(body.directory_path ?? "/");
+}
+
+function validateEntryMoveParent(directories: DirectoryRecord[], parentPath: string): void {
+  for (const directory of directories) {
+    if (parentPath === directory.path || parentPath.startsWith(`${directory.path}/`)) {
+      throw new AppError(400, "InvalidDirectoryMove", "Cannot move a directory into itself or its subdirectory");
+    }
+  }
+}
+
+async function validateEntryMoveTarget(
+  db: D1Database,
+  directories: DirectoryRecord[],
+  parentPath: string
+): Promise<void> {
+  for (const directory of directories) {
+    validateEntryMoveParent([directory], parentPath);
+
+    const nextPath = parentPath === "/" ? `/${directory.name}` : `${parentPath}/${directory.name}`;
+    if (nextPath === directory.path) {
+      continue;
+    }
+
+    const conflict = await getDirectoryRecordByPath(db, nextPath);
+    if (conflict && conflict.id !== directory.id) {
+      throw new AppError(409, "DirectoryExists", "Target directory already contains a directory with the same name");
+    }
+  }
 }
 
 async function resolveMoveTargetDirectory(db: D1Database, body: Record<string, unknown>): Promise<string> {

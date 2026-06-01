@@ -134,6 +134,20 @@ export interface MoveFilesResponse {
   directory_path: string;
 }
 
+export interface EntryMoveResponse {
+  ok: boolean;
+  moved: number;
+  moved_directories: number;
+  moved_files: number;
+  directory_path: string;
+}
+
+export interface EntryDeleteResponse {
+  ok: boolean;
+  deleted_directories: number;
+  deleted_files: number;
+}
+
 export interface MultipartUpload {
   id: string;
   file_name: string;
@@ -434,6 +448,32 @@ export function moveFiles(params: {
 }) {
   return requestJson<MoveFilesResponse>("/api/admin/files/move", {
     method: "PATCH",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(params)
+  });
+}
+
+export function moveEntries(params: {
+  file_ids?: string[];
+  directory_ids?: string[];
+  directory_path?: string;
+  new_directory_parent_path?: string;
+  new_directory_name?: string;
+}) {
+  return requestJson<EntryMoveResponse>("/api/admin/entries/move", {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(params)
+  });
+}
+
+export function deleteEntries(params: { file_ids?: string[]; directory_ids?: string[] }) {
+  return requestJson<EntryDeleteResponse>("/api/admin/entries/delete", {
+    method: "POST",
     headers: {
       "Content-Type": "application/json"
     },

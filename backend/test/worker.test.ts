@@ -2377,6 +2377,139 @@ describe("admin file manager", () => {
     expect(db.files.find((item) => item.id === "file-child-photo")?.directory_path).toBe("/archive/images/2026");
   });
 
+  it("moves and deletes selected files and directories together", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    db.directories.push(
+      {
+        id: "dir-archive",
+        parent_id: null,
+        name: "archive",
+        path: "/archive",
+        created_at: "2026-06-01T00:00:00.000Z",
+        deleted_at: null
+      },
+      {
+        id: "dir-docs",
+        parent_id: null,
+        name: "docs",
+        path: "/docs",
+        created_at: "2026-06-01T00:01:00.000Z",
+        deleted_at: null
+      },
+      {
+        id: "dir-docs-child",
+        parent_id: "dir-docs",
+        name: "drafts",
+        path: "/docs/drafts",
+        created_at: "2026-06-01T00:02:00.000Z",
+        deleted_at: null
+      }
+    );
+    db.files.push(
+      {
+        id: "file-root",
+        file_name: "root.txt",
+        mime_type: "text/plain",
+        size: 1,
+        md5: "root-md5",
+        telegram_file_id: "tg-root",
+        telegram_file_unique_id: null,
+        file_path: "/f/token/root.txt",
+        remark: null,
+        uploaded_by: "admin",
+        created_at: "2026-06-01T00:03:00.000Z",
+        deleted_at: null,
+        directory_id: null,
+        directory_path: "/"
+      },
+      {
+        id: "file-draft",
+        file_name: "draft.txt",
+        mime_type: "text/plain",
+        size: 1,
+        md5: "draft-md5",
+        telegram_file_id: "tg-draft",
+        telegram_file_unique_id: null,
+        file_path: "/f/token/draft.txt",
+        remark: null,
+        uploaded_by: "admin",
+        created_at: "2026-06-01T00:04:00.000Z",
+        deleted_at: null,
+        directory_id: "dir-docs-child",
+        directory_path: "/docs/drafts"
+      }
+    );
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const moveResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/entries/move", {
+        method: "PATCH",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          file_ids: ["file-root"],
+          directory_ids: ["dir-docs"],
+          directory_path: "/archive"
+        })
+      }),
+      adminEnv
+    );
+    const moveBody = await moveResponse.json() as {
+      moved: number;
+      moved_directories: number;
+      moved_files: number;
+      directory_path: string;
+    };
+
+    expect(moveResponse.status).toBe(200);
+    expect(moveBody).toMatchObject({
+      moved: 4,
+      moved_directories: 2,
+      moved_files: 2,
+      directory_path: "/archive"
+    });
+    expect(db.directories.find((item) => item.id === "dir-docs")?.path).toBe("/archive/docs");
+    expect(db.directories.find((item) => item.id === "dir-docs-child")?.path).toBe("/archive/docs/drafts");
+    expect(db.files.find((item) => item.id === "file-root")?.directory_path).toBe("/archive");
+    expect(db.files.find((item) => item.id === "file-draft")?.directory_path).toBe("/archive/docs/drafts");
+
+    const deleteResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/entries/delete", {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          file_ids: ["file-root"],
+          directory_ids: ["dir-docs"]
+        })
+      }),
+      adminEnv
+    );
+    const deleteBody = await deleteResponse.json() as {
+      deleted_directories: number;
+      deleted_files: number;
+    };
+
+    expect(deleteResponse.status).toBe(200);
+    expect(deleteBody).toMatchObject({
+      deleted_directories: 2,
+      deleted_files: 2
+    });
+    expect(db.files.every((item) => item.deleted_at !== null)).toBe(true);
+    expect(db.directories.find((item) => item.id === "dir-archive")?.deleted_at).toBeNull();
+    expect(db.directories.filter((item) => item.id !== "dir-archive").every((item) => item.deleted_at !== null)).toBe(true);
+  });
+
 });
 
 async function loginAndGetCookie(envWithAdmin: Env): Promise<string> {

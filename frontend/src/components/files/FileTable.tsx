@@ -1,4 +1,4 @@
-import { Copy, Download, Eye, Folder, FolderOpen, Info, MoveRight, Pencil, Trash2 } from "lucide-react";
+import { Copy, Download, Eye, Folder, FolderInput, FolderOpen, Info, Pencil, Trash2 } from "lucide-react";
 import type { DirectoryItem, FileItem } from "../../api";
 import { canPreview, formatBytes, formatDateTime } from "../../utils";
 import { FileVisual } from "../ui/FileVisual";
@@ -8,13 +8,15 @@ import { EmptyState } from "../ui/EmptyState";
 interface FileTableProps {
   directories: DirectoryItem[];
   files: FileItem[];
-  selectedIds: Set<string>;
+  selectedFileIds: Set<string>;
+  selectedDirectoryIds: Set<string>;
   allPageSelected: boolean;
   onOpenDirectory: (directory: DirectoryItem) => void;
   onRenameDirectory: (directory: DirectoryItem) => void;
   onMoveDirectory: (directory: DirectoryItem) => void;
   onDeleteDirectory: (directory: DirectoryItem) => void;
-  onToggleSelected: (file: FileItem, selected: boolean) => void;
+  onToggleFileSelected: (file: FileItem, selected: boolean) => void;
+  onToggleDirectorySelected: (directory: DirectoryItem, selected: boolean) => void;
   onTogglePage: (selected: boolean) => void;
   onDetail: (file: FileItem) => void;
   onEdit: (file: FileItem) => void;
@@ -30,13 +32,15 @@ const checkboxClass =
 export function FileTable({
   directories,
   files,
-  selectedIds,
+  selectedFileIds,
+  selectedDirectoryIds,
   allPageSelected,
   onOpenDirectory,
   onRenameDirectory,
   onMoveDirectory,
   onDeleteDirectory,
-  onToggleSelected,
+  onToggleFileSelected,
+  onToggleDirectorySelected,
   onTogglePage,
   onDetail,
   onEdit,
@@ -58,9 +62,9 @@ export function FileTable({
               <th className="w-10 px-4 py-3 text-left font-medium text-muted">
                 <input
                   type="checkbox"
-                  aria-label="选择当前页文件"
+                  aria-label="选择当前页内容"
                   checked={allPageSelected}
-                  disabled={files.length === 0}
+                  disabled={files.length === 0 && directories.length === 0}
                   onChange={(event) => onTogglePage(event.target.checked)}
                   className={checkboxClass}
                 />
@@ -77,7 +81,15 @@ export function FileTable({
                 key={directory.id}
                 className="border-b border-border last:border-b-0 transition-colors duration-150 hover:bg-primary-soft/25"
               >
-                <td className="px-4 py-3 align-middle" />
+                <td className="px-4 py-3 align-middle">
+                  <input
+                    type="checkbox"
+                    aria-label={`选择目录 ${directory.name}`}
+                    checked={selectedDirectoryIds.has(directory.id)}
+                    onChange={(event) => onToggleDirectorySelected(directory, event.target.checked)}
+                    className={checkboxClass}
+                  />
+                </td>
                 <td className="px-4 py-3 align-middle">
                   <button
                     type="button"
@@ -125,7 +137,7 @@ export function FileTable({
                       label="移动目录"
                       onClick={() => onMoveDirectory(directory)}
                     >
-                      <MoveRight size={16} />
+                      <FolderInput size={16} />
                     </IconButton>
                     <IconButton
                       variant="danger"
@@ -148,8 +160,8 @@ export function FileTable({
                   <input
                     type="checkbox"
                     aria-label={`选择 ${file.file_name}`}
-                    checked={selectedIds.has(file.id)}
-                    onChange={(event) => onToggleSelected(file, event.target.checked)}
+                    checked={selectedFileIds.has(file.id)}
+                    onChange={(event) => onToggleFileSelected(file, event.target.checked)}
                     className={checkboxClass}
                   />
                 </td>
@@ -197,7 +209,7 @@ export function FileTable({
                       label="移动文件"
                       onClick={() => onMoveFile(file)}
                     >
-                      <MoveRight size={16} />
+                      <FolderInput size={16} />
                     </IconButton>
                     {canPreview(file) ? (
                       <IconButton
