@@ -15,7 +15,9 @@ self.addEventListener("install", (event) => {
 self.addEventListener("activate", (event) => {
   event.waitUntil((async () => {
     await self.clients.claim();
-    await cleanupPreviewCache();
+    void cleanupPreviewCache().catch((error) => {
+      warnPreviewCacheError("cleanup on activate", error);
+    });
   })());
 });
 
@@ -283,32 +285,37 @@ async function getCachedChunkBytes(metadata, chunkIndex) {
     throw new Error("Chunk index is out of range");
   }
 
-  const cache = await caches.open(CACHE_NAME);
-  const cacheKey = chunkCacheKey(metadata.fileId, chunkIndex);
-  const cached = await cache.match(cacheKey);
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    const cacheKey = chunkCacheKey(metadata.fileId, chunkIndex);
+    const cached = await cache.match(cacheKey);
 
-  if (!cached) {
+    if (!cached) {
+      return null;
+    }
+
+    const bytes = await cached.arrayBuffer();
+    const expectedSize = expectedChunkSize(metadata, chunkIndex);
+    if (bytes.byteLength !== expectedSize) {
+      await deleteChunk(cacheKey);
+      return null;
+    }
+
+    const now = Date.now();
+    await putChunkMetadata({
+      cacheKey,
+      fileId: metadata.fileId,
+      chunkIndex,
+      size: bytes.byteLength,
+      createdAt: now,
+      lastAccessed: now
+    }, true);
+
+    return bytes;
+  } catch (error) {
+    warnPreviewCacheError(`read chunk ${chunkIndex}`, error);
     return null;
   }
-
-  const bytes = await cached.arrayBuffer();
-  const expectedSize = expectedChunkSize(metadata, chunkIndex);
-  if (bytes.byteLength !== expectedSize) {
-    await deleteChunk(cacheKey);
-    return null;
-  }
-
-  const now = Date.now();
-  await putChunkMetadata({
-    cacheKey,
-    fileId: metadata.fileId,
-    chunkIndex,
-    size: bytes.byteLength,
-    createdAt: now,
-    lastAccessed: now
-  }, true);
-
-  return bytes;
 }
 
 async function getChunkBytes(metadata, chunkIndex) {
@@ -337,9 +344,6 @@ async function getChunkBytes(metadata, chunkIndex) {
 }
 
 async function fetchAndCacheChunkBytes(metadata, chunkIndex) {
-  const cache = await caches.open(CACHE_NAME);
-  const cacheKey = chunkCacheKey(metadata.fileId, chunkIndex);
-  const now = Date.now();
   const response = await fetch(`/f/${encodeURIComponent(metadata.token)}/chunks/${chunkIndex}`, {
     credentials: "omit"
   });
@@ -354,23 +358,31 @@ async function fetchAndCacheChunkBytes(metadata, chunkIndex) {
     throw new Error(`分片 ${chunkIndex + 1} 大小不匹配`);
   }
 
-  await cleanupPreviewCache(bytes.byteLength);
-  await cache.put(cacheKey, new Response(bytes.slice(0), {
-    headers: {
-      "Content-Type": "application/octet-stream",
-      "Content-Length": String(bytes.byteLength),
-      "Cache-Control": "public, max-age=31536000, immutable"
-    }
-  }));
-  await putChunkMetadata({
-    cacheKey,
-    fileId: metadata.fileId,
-    chunkIndex,
-    size: bytes.byteLength,
-    createdAt: now,
-    lastAccessed: now
-  }, true);
-  await cleanupPreviewCache();
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    const cacheKey = chunkCacheKey(metadata.fileId, chunkIndex);
+    const now = Date.now();
+
+    await cleanupPreviewCache(bytes.byteLength);
+    await cache.put(cacheKey, new Response(bytes.slice(0), {
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": String(bytes.byteLength),
+        "Cache-Control": "public, max-age=31536000, immutable"
+      }
+    }));
+    await putChunkMetadata({
+      cacheKey,
+      fileId: metadata.fileId,
+      chunkIndex,
+      size: bytes.byteLength,
+      createdAt: now,
+      lastAccessed: now
+    }, true);
+    await cleanupPreviewCache();
+  } catch (error) {
+    warnPreviewCacheError(`write chunk ${chunkIndex}`, error);
+  }
 
   return bytes;
 }
@@ -428,6 +440,13 @@ function safeSize(value) {
 
 function safeTime(value) {
   return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function warnPreviewCacheError(operation, error) {
+  console.warn(
+    `[video-preview-sw] preview cache ${operation} failed`,
+    error instanceof Error ? error.message : error
+  );
 }
 
 function openMetadataDb() {

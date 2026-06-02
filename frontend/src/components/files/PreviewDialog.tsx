@@ -1,12 +1,16 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import Plyr from "plyr";
 import "plyr/dist/plyr.css";
 import { Copy, Download, Maximize2, Minimize2 } from "lucide-react";
 import type { FileItem } from "../../api";
+import { canUseAcceleratedDownload, extractSignedFileToken } from "../../lib/accelerated-download";
 import { buildChunkedVideoPreviewUrl } from "../../lib/video-preview";
-import { isVideoPreviewServiceWorkerControlling } from "../../lib/video-preview-service-worker";
+import {
+  ensureVideoPreviewServiceWorker,
+  isVideoPreviewServiceWorkerControlling
+} from "../../lib/video-preview-service-worker";
 import { hasDirectFileAccess } from "../../lib/file-access";
 import { previewKind } from "../../utils";
 import { Modal } from "../ui/Modal";
@@ -154,12 +158,53 @@ function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolea
   const videoRef = useRef<HTMLVideoElement>(null);
   const playerRef = useRef<Plyr | null>(null);
   const [ratio, setRatio] = useState({ label: "16:9", value: 16 / 9 });
-  const [serviceWorkerReady, setServiceWorkerReady] = useState(isVideoPreviewServiceWorkerControlling);
+  const [serviceWorkerState, setServiceWorkerState] = useState<VideoPreviewServiceWorkerState>(initialVideoPreviewServiceWorkerState);
   const [isVideoLoading, setIsVideoLoading] = useState(true);
   const heightLimit = fullscreen ? "calc(100dvh - 11rem)" : "min(64dvh, 760px)";
   const directFile = hasDirectFileAccess(file) ? file : null;
+  const directAccessAvailable = Boolean(directFile);
+  const canUseMultipartPreview = canUseAcceleratedDownload(file);
+  const signedFileToken = canUseMultipartPreview ? extractSignedFileToken(file.file_path) : null;
+  const serviceWorkerReady = serviceWorkerState.status === "controlled";
+  const requiresChunkedPreview = !directAccessAvailable && canUseMultipartPreview && Boolean(signedFileToken);
   const chunkedPreviewUrl = serviceWorkerReady ? buildChunkedVideoPreviewUrl(file) : null;
   const videoSrc = chunkedPreviewUrl ?? (directFile ? file.file_path : null);
+
+  const refreshServiceWorker = useCallback(async () => {
+    if (isVideoPreviewServiceWorkerControlling()) {
+      setServiceWorkerState({ status: "controlled" });
+      return;
+    }
+
+    setServiceWorkerState({ status: "checking" });
+    const result = await ensureVideoPreviewServiceWorker();
+
+    if (result.controlled) {
+      setServiceWorkerState({ status: "controlled" });
+      return;
+    }
+
+    if (!result.supported) {
+      setServiceWorkerState({
+        status: "unsupported",
+        message: result.error || "当前浏览器不支持 Service Worker"
+      });
+      return;
+    }
+
+    if (!result.registered) {
+      setServiceWorkerState({
+        status: "failed",
+        message: result.error || "Service Worker 注册失败"
+      });
+      return;
+    }
+
+    setServiceWorkerState({
+      status: "need-reload",
+      message: "Service Worker 已注册，但当前页面还没有被它接管"
+    });
+  }, []);
 
   useEffect(() => {
     const node = videoRef.current;
@@ -193,26 +238,31 @@ function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolea
   }, [videoSrc]);
 
   useEffect(() => {
+    if (!requiresChunkedPreview) {
+      return;
+    }
+
     if (!("serviceWorker" in navigator)) {
+      void refreshServiceWorker();
       return;
     }
 
     let disposed = false;
     const refresh = () => {
       if (!disposed) {
-        setServiceWorkerReady(isVideoPreviewServiceWorkerControlling());
+        setServiceWorkerState(isVideoPreviewServiceWorkerControlling() ? { status: "controlled" } : { status: "checking" });
       }
     };
 
     navigator.serviceWorker.addEventListener("controllerchange", refresh);
-    void navigator.serviceWorker.ready.then(refresh).catch(() => undefined);
+    void refreshServiceWorker();
     refresh();
 
     return () => {
       disposed = true;
       navigator.serviceWorker.removeEventListener("controllerchange", refresh);
     };
-  }, []);
+  }, [refreshServiceWorker, requiresChunkedPreview]);
 
   useEffect(() => {
     if (playerRef.current) {
@@ -225,8 +275,24 @@ function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolea
       <div className="grid w-full place-items-center gap-3 px-6 py-12 text-center">
         <p className="text-sm font-medium text-foreground">该大文件不提供完整访问链接</p>
         <p className="max-w-md text-xs leading-6 text-muted">
-          视频预览需要 Service Worker 分片代理接管页面；如果刚部署或首次打开，请刷新页面后再试。
+          {videoPreviewUnavailableMessage({
+            canUseMultipartPreview,
+            hasSignedFileToken: Boolean(signedFileToken),
+            serviceWorkerState
+          })}
         </p>
+        {requiresChunkedPreview ? (
+          <div className="flex flex-wrap items-center justify-center gap-2">
+            <Button variant="secondary" onClick={() => void refreshServiceWorker()}>
+              重新检查
+            </Button>
+            {serviceWorkerState.status === "need-reload" ? (
+              <Button onClick={() => window.location.reload()}>
+                刷新页面
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -280,6 +346,55 @@ function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolea
       </div>
     </div>
   );
+}
+
+type VideoPreviewServiceWorkerState = {
+  status: "checking" | "controlled" | "need-reload" | "unsupported" | "failed";
+  message?: string;
+};
+
+function initialVideoPreviewServiceWorkerState(): VideoPreviewServiceWorkerState {
+  return isVideoPreviewServiceWorkerControlling() ? { status: "controlled" } : { status: "checking" };
+}
+
+function videoPreviewUnavailableMessage({
+  canUseMultipartPreview,
+  hasSignedFileToken,
+  serviceWorkerState
+}: {
+  canUseMultipartPreview: boolean;
+  hasSignedFileToken: boolean;
+  serviceWorkerState: VideoPreviewServiceWorkerState;
+}): string {
+  if (!canUseMultipartPreview) {
+    return "该视频缺少分片下载元数据，无法通过分片代理进行预览。";
+  }
+
+  if (!hasSignedFileToken) {
+    return "该视频缺少签名访问令牌，无法生成分片预览地址。";
+  }
+
+  if (serviceWorkerState.status === "checking") {
+    return "正在注册并等待 Service Worker 接管页面；如果长时间没有变化，请点击“重新检查”。";
+  }
+
+  if (serviceWorkerState.status === "need-reload") {
+    return serviceWorkerState.message
+      ? `${serviceWorkerState.message}，请点击“刷新页面”后再预览。`
+      : "Service Worker 已注册，但当前页面还没有被它接管，请点击“刷新页面”后再预览。";
+  }
+
+  if (serviceWorkerState.status === "unsupported") {
+    return serviceWorkerState.message || "当前浏览器不支持 Service Worker，无法预览超过直链上限的视频。";
+  }
+
+  if (serviceWorkerState.status === "failed") {
+    return serviceWorkerState.message
+      ? `Service Worker 注册或激活失败：${serviceWorkerState.message}`
+      : "Service Worker 注册或激活失败，无法接管分片预览请求。";
+  }
+
+  return "Service Worker 已接管页面，但分片预览地址未生成，请重新打开预览窗口。";
 }
 
 function applyPlyrAspectRatio(
