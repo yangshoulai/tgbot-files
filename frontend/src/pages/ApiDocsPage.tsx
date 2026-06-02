@@ -237,17 +237,21 @@ function buildDocs(session: SessionResponse): Record<DocAudience, { title: strin
               request: `curl -X POST '${baseUrl}/api/v1/files' \\
   -H 'Authorization: Bearer <API_KEY>' \\
   -F 'file=@./hello.txt' \\
+  -F 'file_name=hello-copy.txt' \\
   -F 'directory_path=/' \\
   -F 'remark=示例文件'`,
               response: `{
   "ok": true,
   "id": "file-id",
-  "url": "${baseUrl}/f/<token>/hello.txt",
-  "name": "hello.txt",
+  "url": "${baseUrl}/f/<token>/hello-copy.txt",
+  "name": "hello-copy.txt",
   "size": 12,
   "mime_type": "text/plain"
 }`,
-              notes: [`文件大小必须小于等于 ${maxFile}；更大的文件请使用分片上传接口。`]
+              notes: [
+                `文件大小必须小于等于 ${maxFile}；更大的文件请使用分片上传接口。`,
+                "file_name 为可选覆盖文件名；同一目录下已有同名文件或未完成分片会话时返回 409 FileNameConflict，details.suggested_name 可用于默认改名。"
+              ]
             },
             {
               method: "GET",
@@ -302,7 +306,10 @@ function buildDocs(session: SessionResponse): Record<DocAudience, { title: strin
     "direct_access": false,
     "max_multipart_file_bytes": 5368709120
   }
-}`
+}`,
+              notes: [
+                "同一目录下已有同名文件或未完成分片会话时返回 409 FileNameConflict，客户端应提示用户输入新的 file_name 后重新初始化。"
+              ]
             },
             {
               method: "POST",
@@ -343,7 +350,10 @@ function buildDocs(session: SessionResponse): Record<DocAudience, { title: strin
     "url": null,
     "download_url": null
   }
-}`
+}`,
+              notes: [
+                "完成阶段使用事务写入最终文件索引并标记上传完成；如果目标文件名已被占用，会返回 409 FileNameConflict。"
+              ]
             }
           ]
         },
@@ -359,19 +369,23 @@ function buildDocs(session: SessionResponse): Record<DocAudience, { title: strin
               auth: "Bearer API Key",
               request: `{
   "url": "https://example.com/video.mp4",
+  "file_name": "video-copy.mp4",
   "directory_path": "/videos",
   "remark": "远程导入"
 }`,
               response: `{
   "ok": true,
   "mode": "multipart",
-  "upload": {
-    "id": "upload-id",
-    "file_name": "video.mp4",
+    "upload": {
+      "id": "upload-id",
+    "file_name": "video-copy.mp4",
     "chunk_count": 42
   }
 }`,
-              notes: ["远端必须支持 Range 请求，并暴露 Content-Length 或 Content-Range。"]
+              notes: [
+                "file_name 为可选覆盖文件名；同名冲突时返回 409 FileNameConflict。",
+                "远端必须支持 Range 请求，并暴露 Content-Length 或 Content-Range。"
+              ]
             },
             {
               method: "POST",
@@ -511,12 +525,14 @@ X-Chunk-Offset: 0`,
 curl -X POST '${baseUrl}/api/admin/files' \\
   -H 'Cookie: admin_session=...' \\
   -F 'file=@./hello.txt' \\
+  -F 'file_name=hello-copy.txt' \\
   -F 'directory_path=/' \\
   -F 'remark=可选备注'
 
 # URL 拉取
 {
   "url": "https://example.com/hello.txt",
+  "file_name": "hello-copy.txt",
   "directory_path": "/",
   "remark": "从 URL 导入"
 }`,
@@ -524,13 +540,16 @@ curl -X POST '${baseUrl}/api/admin/files' \\
   "ok": true,
   "file": {
     "id": "file-id",
-    "file_name": "hello.txt",
-    "file_path": "/f/<token>/hello.txt",
-    "url": "${baseUrl}/f/<token>/hello.txt",
-    "download_url": "${baseUrl}/f/<token>/hello.txt?download=1"
+    "file_name": "hello-copy.txt",
+    "file_path": "/f/<token>/hello-copy.txt",
+    "url": "${baseUrl}/f/<token>/hello-copy.txt",
+    "download_url": "${baseUrl}/f/<token>/hello-copy.txt?download=1"
   }
 }`,
-              notes: [`文件大小必须小于等于 ${maxFile}；更大的文件请使用管理员分片上传。`]
+              notes: [
+                `文件大小必须小于等于 ${maxFile}；更大的文件请使用管理员分片上传。`,
+                "file_name 为可选覆盖文件名。本地上传和 URL 拉取都会校验同目录文件名；冲突返回 409 FileNameConflict，details.suggested_name 可作为改名默认值。"
+              ]
             },
             {
               method: "PATCH",
@@ -566,7 +585,10 @@ curl -X POST '${baseUrl}/api/admin/files' \\
   "ok": true,
   "moved": 2,
   "directory_path": "/archive"
-}`
+}`,
+              notes: [
+                "如果目标目录已有同名文件，或本次移动的多个文件存在同名，会返回 409 FileNameConflict。"
+              ]
             },
             {
               method: "DELETE",
@@ -680,7 +702,10 @@ curl -X POST '${baseUrl}/api/admin/files' \\
   "moved_directories": 1,
   "moved_files": 2,
   "directory_path": "/archive"
-}`
+}`,
+              notes: [
+                "文件移动部分同样执行同目录文件名唯一校验；冲突返回 409 FileNameConflict。"
+              ]
             },
             {
               method: "POST",
@@ -727,7 +752,10 @@ curl -X POST '${baseUrl}/api/admin/files' \\
     "direct_access": false,
     "max_multipart_file_bytes": ${session.max_multipart_file_bytes}
   }
-}`
+}`,
+              notes: [
+                "同一目录下已有同名文件或未完成分片会话时返回 409 FileNameConflict；管理员 APP 应让用户输入新 file_name 后重新初始化。"
+              ]
             },
             {
               method: "POST",
@@ -737,6 +765,7 @@ curl -X POST '${baseUrl}/api/admin/files' \\
               auth: "Admin Cookie",
               request: `{
   "url": "https://example.com/video.mp4",
+  "file_name": "video-copy.mp4",
   "force_multipart": true,
   "directory_path": "/videos",
   "remark": "远程导入"
@@ -744,9 +773,12 @@ curl -X POST '${baseUrl}/api/admin/files' \\
               response: `{
   "ok": true,
   "mode": "multipart",
-  "upload": { "id": "upload-id", "file_name": "video.mp4", "chunk_count": 42 }
+  "upload": { "id": "upload-id", "file_name": "video-copy.mp4", "chunk_count": 42 }
 }`,
-              notes: ["远端必须支持 Range 请求，并暴露 Content-Length 或 Content-Range。"]
+              notes: [
+                "file_name 为可选覆盖文件名；同名冲突时返回 409 FileNameConflict。",
+                "远端必须支持 Range 请求，并暴露 Content-Length 或 Content-Range。"
+              ]
             },
             {
               method: "POST",
@@ -792,7 +824,10 @@ curl -X POST '${baseUrl}/api/admin/files' \\
     "download_url": null
   }
 }`,
-              notes: ["如果缺少任意分片，会返回 409 UploadIncomplete，不会生成最终 files 记录。"]
+              notes: [
+                "如果缺少任意分片，会返回 409 UploadIncomplete，不会生成最终 files 记录。",
+                "如果分片上传期间目标目录下出现同名文件，完成阶段会返回 409 FileNameConflict，事务不会写入最终 files 记录。"
+              ]
             }
           ]
         },

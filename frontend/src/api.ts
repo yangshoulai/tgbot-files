@@ -240,7 +240,9 @@ export interface LoginResponse {
 export class ApiError extends Error {
   constructor(
     public readonly status: number,
-    message: string
+    message: string,
+    public readonly error?: string,
+    public readonly details?: Record<string, unknown>
   ) {
     super(message);
     this.name = "ApiError";
@@ -261,14 +263,26 @@ async function requestJson<T>(input: RequestInfo | URL, init?: RequestInit): Pro
   const body = isJson ? await response.json() as T : null;
 
   if (!response.ok) {
+    const errorName =
+      isJson && body && typeof body === "object" && "error" in body && typeof (body as { error?: unknown }).error === "string"
+        ? (body as { error: string }).error
+        : undefined;
     const message =
       isJson && body && typeof body === "object" && "message" in body && typeof (body as { message?: unknown }).message === "string"
         ? (body as { message: string }).message
         : response.statusText || "请求失败";
-    throw new ApiError(response.status, message);
+    const details =
+      isJson && body && typeof body === "object" && "details" in body && isRecord((body as { details?: unknown }).details)
+        ? (body as { details: Record<string, unknown> }).details
+        : undefined;
+    throw new ApiError(response.status, message, errorName, details);
   }
 
   return body as T;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function getSession() {
@@ -329,7 +343,7 @@ export function uploadFile(formData: FormData) {
   });
 }
 
-export function uploadFileFromUrl(url: string, remark?: string, directoryPath = "/") {
+export function uploadFileFromUrl(url: string, remark?: string, directoryPath = "/", fileName?: string) {
   return requestJson<AdminUploadResponse>("/api/admin/files", {
     method: "POST",
     headers: {
@@ -338,6 +352,7 @@ export function uploadFileFromUrl(url: string, remark?: string, directoryPath = 
     body: JSON.stringify({
       url,
       directory_path: directoryPath,
+      ...(fileName ? { file_name: fileName } : {}),
       ...(remark ? { remark } : {})
     })
   });
@@ -368,7 +383,7 @@ export function uploadMultipartChunk(uploadId: string, chunkIndex: number, chunk
   });
 }
 
-export function initUrlMultipartUpload(url: string, remark?: string, directoryPath = "/", forceMultipart = false) {
+export function initUrlMultipartUpload(url: string, remark?: string, directoryPath = "/", forceMultipart = false, fileName?: string) {
   return requestJson<UrlMultipartInitResponse>("/api/admin/uploads/url/init", {
     method: "POST",
     headers: {
@@ -378,6 +393,7 @@ export function initUrlMultipartUpload(url: string, remark?: string, directoryPa
       url,
       directory_path: directoryPath,
       ...(forceMultipart ? { force_multipart: true } : {}),
+      ...(fileName ? { file_name: fileName } : {}),
       ...(remark ? { remark } : {})
     })
   });

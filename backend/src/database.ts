@@ -61,6 +61,11 @@ export interface FileUsageStats {
   total_size: number;
 }
 
+export interface FileNameConflictRecord {
+  id: string;
+  source: "file" | "multipart_upload";
+}
+
 export type FileTypeFilter = "image" | "text" | "pdf" | "archive" | "other";
 
 export type ApiKeyStatus = "active" | "disabled";
@@ -302,6 +307,48 @@ export async function getFileRecord(db: D1Database, id: string): Promise<FileRec
     )
     .bind(id)
     .first<FileRecord>();
+}
+
+export async function findActiveFileNameConflict(params: {
+  db: D1Database;
+  directoryPath: string;
+  fileName: string;
+  excludeId?: string;
+}): Promise<FileNameConflictRecord | null> {
+  const bindings = [params.directoryPath, params.fileName];
+  const excludeClause = params.excludeId ? " AND id <> ?" : "";
+  const excludeBindings = params.excludeId ? [params.excludeId] : [];
+  const file = await params.db
+    .prepare(
+      `SELECT id
+      FROM files
+      WHERE deleted_at IS NULL
+        AND COALESCE(directory_path, '/') = ?
+        AND file_name = ?
+        ${excludeClause}
+      LIMIT 1`
+    )
+    .bind(...bindings, ...excludeBindings)
+    .first<{ id: string }>();
+
+  if (file) {
+    return { id: file.id, source: "file" };
+  }
+
+  const upload = await params.db
+    .prepare(
+      `SELECT id
+      FROM multipart_uploads
+      WHERE completed_at IS NULL
+        AND COALESCE(directory_path, '/') = ?
+        AND file_name = ?
+        ${excludeClause}
+      LIMIT 1`
+    )
+    .bind(...bindings, ...excludeBindings)
+    .first<{ id: string }>();
+
+  return upload ? { id: upload.id, source: "multipart_upload" } : null;
 }
 
 export async function deleteFileRecord(db: D1Database, id: string): Promise<boolean> {

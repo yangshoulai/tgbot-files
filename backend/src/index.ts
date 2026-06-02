@@ -13,6 +13,7 @@ import {
   getDirectoryRecordByPath,
   getDirectoryUsageStats,
   findActiveApiKeyRecord,
+  findActiveFileNameConflict,
   getApiKeyRecord,
   getFileChunkRecord,
   getFileRecord,
@@ -267,6 +268,11 @@ async function handleApiFiles(request: Request, env: Env): Promise<Response> {
   if (request.method === "POST" && url.pathname === "/api/v1/files") {
     const { file, directoryPath } = await readUploadInput(request, env);
     const directory = await ensureWritableDirectory(db, directoryPath);
+    await requireFileNameAvailable({
+      db,
+      directoryPath,
+      fileName: sanitizeFileName(file.name)
+    });
     const result = await uploadAndRecordFile({
       request,
       env,
@@ -470,6 +476,11 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
   if (request.method === "POST" && url.pathname === "/api/admin/files") {
     const { file: formFile, remark, directoryPath } = await readUploadInput(request, env);
     const directory = await ensureWritableDirectory(db, directoryPath);
+    await requireFileNameAvailable({
+      db,
+      directoryPath,
+      fileName: sanitizeFileName(formFile.name)
+    });
     const result = await uploadAndRecordFile({
       request,
       env,
@@ -491,6 +502,12 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
     const body = await readJsonObject(request);
     const fileIds = normalizeFileIdList(body.file_ids);
     const directoryPath = await resolveMoveTargetDirectory(db, body);
+    const files = await requireFileRecords(db, fileIds);
+    await requireFileMoveNamesAvailable({
+      db,
+      files,
+      directoryPath
+    });
     const moved = await moveFileRecords({
       db,
       ids: fileIds,
@@ -519,6 +536,14 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
 
     const nextFileName = hasFileName ? normalizeFileNameUpdate(body.file_name) : existing.file_name;
     const nextRemark = hasRemark ? normalizeRemarkUpdate(body.remark) : existing.remark;
+    if (nextFileName !== existing.file_name) {
+      await requireFileNameAvailable({
+        db,
+        directoryPath: existing.directory_path ?? "/",
+        fileName: nextFileName,
+        excludeId: existing.id
+      });
+    }
     const nextFilePath = nextFileName === existing.file_name
       ? existing.file_path
       : await createFilePathForRecord(existing, nextFileName, env);
@@ -664,10 +689,15 @@ async function handleAdminEntries(request: Request, env: Env): Promise<Response>
     requireEntrySelection(fileIds, directoryIds);
 
     const directoriesToMove = await requireDirectoryRecords(db, directoryIds);
-    await requireFileRecords(db, fileIds);
+    const filesToMove = await requireFileRecords(db, fileIds);
     validateEntryMoveParent(directoriesToMove, moveTargetParentPath(body));
     const directoryPath = await resolveMoveTargetDirectory(db, body);
     await validateEntryMoveTarget(db, directoriesToMove, directoryPath);
+    await requireFileMoveNamesAvailable({
+      db,
+      files: filesToMove,
+      directoryPath
+    });
 
     let movedDirectories = 0;
     let movedFiles = 0;
@@ -779,6 +809,7 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
     const body = await readJsonObject(request);
     const sourceUrl = normalizeSourceUrl(body.url);
     const remark = normalizeRemark(body.remark);
+    const fileNameOverride = normalizeOptionalFileName(body.file_name);
     const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
     const forceMultipart = body.force_multipart === true;
     const directory = await ensureWritableDirectory(db, directoryPath);
@@ -808,7 +839,7 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
       db,
       sourceKind: "url",
       sourceUrl: sourceUrl.toString(),
-      fileName: probe.fileName,
+      fileName: fileNameOverride ?? probe.fileName,
       mimeType: probe.mimeType,
       size: probe.size,
       uploadedBy: username,
@@ -925,6 +956,7 @@ async function handleApiMultipartUploads(request: Request, env: Env): Promise<Re
     const body = await readJsonObject(request);
     const sourceUrl = normalizeSourceUrl(body.url);
     const remark = normalizeRemark(body.remark);
+    const fileNameOverride = normalizeOptionalFileName(body.file_name);
     const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
     const directory = await ensureWritableDirectory(db, directoryPath);
 
@@ -944,7 +976,7 @@ async function handleApiMultipartUploads(request: Request, env: Env): Promise<Re
       db,
       sourceKind: "url",
       sourceUrl: sourceUrl.toString(),
-      fileName: probe.fileName,
+      fileName: fileNameOverride ?? probe.fileName,
       mimeType: probe.mimeType,
       size: probe.size,
       directoryPath,
@@ -1116,14 +1148,16 @@ async function readUploadInput(request: Request, env: Env): Promise<{ file: File
   const maxFileBytes = parseMaxFileBytes(env.MAX_FILE_BYTES);
   const formData = await request.formData();
   const formFile = formData.get("file");
+  const fileNameOverride = normalizeOptionalFileName(formData.get("file_name"));
   const remark = normalizeRemark(formData.get("remark"));
   const directoryPath = normalizeDirectoryPath(formData.get("directory_path") ?? formData.get("dir") ?? "/");
 
   if (formFile instanceof File) {
     validateUploadFileSize(formFile, maxFileBytes);
+    const file = fileNameOverride ? renameUploadFile(formFile, fileNameOverride) : formFile;
 
     return {
-      file: formFile,
+      file,
       directoryPath,
       ...(remark ? { remark } : {})
     };
@@ -1134,7 +1168,8 @@ async function readUploadInput(request: Request, env: Env): Promise<{ file: File
     const file = await downloadFileFromUrl({
       sourceUrl,
       env,
-      maxFileBytes
+      maxFileBytes,
+      ...(fileNameOverride ? { fileName: fileNameOverride } : {})
     });
 
     return {
@@ -1151,6 +1186,7 @@ async function readUrlUploadJson(request: Request, env: Env): Promise<{ file: Fi
   const maxFileBytes = parseMaxFileBytes(env.MAX_FILE_BYTES);
   const body = await readJsonObject(request);
   const sourceUrl = normalizeSourceUrl(body.url);
+  const fileNameOverride = normalizeOptionalFileName(body.file_name);
 
   if (!sourceUrl) {
     throw new AppError(400, "MissingUrl", "JSON field 'url' is required");
@@ -1160,7 +1196,8 @@ async function readUrlUploadJson(request: Request, env: Env): Promise<{ file: Fi
   const file = await downloadFileFromUrl({
     sourceUrl,
     env,
-    maxFileBytes
+    maxFileBytes,
+    ...(fileNameOverride ? { fileName: fileNameOverride } : {})
   });
   const remark = normalizeRemark(body.remark);
 
@@ -1179,6 +1216,13 @@ function validateUploadFileSize(file: File, maxFileBytes: number): void {
   if (file.size > maxFileBytes) {
     throw fileTooLargeError(maxFileBytes, file.size);
   }
+}
+
+function renameUploadFile(file: File, fileName: string): File {
+  return new File([file], fileName, {
+    type: file.type || "application/octet-stream",
+    lastModified: file.lastModified
+  });
 }
 
 function fileTooLargeError(
@@ -1259,10 +1303,11 @@ async function downloadFileFromUrl(params: {
   sourceUrl: URL;
   env: Env;
   maxFileBytes: number;
+  fileName?: string;
 }): Promise<File> {
   const signedFile = await downloadSignedFileUrl(params);
   if (signedFile) {
-    return signedFile;
+    return params.fileName ? renameUploadFile(signedFile, params.fileName) : signedFile;
   }
 
   let response: Response;
@@ -1305,7 +1350,7 @@ async function downloadFileFromUrl(params: {
     bytes,
     fileType: remoteMimeHint
   });
-  const fileName = ensureFileExtension(sanitizeFileName(initialFileName), detectedMimeType);
+  const fileName = params.fileName ?? ensureFileExtension(sanitizeFileName(initialFileName), detectedMimeType);
   const file = new File([bytes], fileName, { type: detectedMimeType });
 
   validateUploadFileSize(file, params.maxFileBytes);
@@ -1467,6 +1512,11 @@ async function createMultipartUpload(params: {
   directoryPath: string;
 }): Promise<MultipartInitResult> {
   validateMultipartFileSize(params.size);
+  await requireFileNameAvailable({
+    db: params.db,
+    directoryPath: params.directoryPath,
+    fileName: params.fileName
+  });
   const chunkCount = Math.ceil(params.size / TELEGRAM_CHUNK_SIZE_BYTES);
   const createdAt = new Date().toISOString();
   const record = await insertMultipartUploadRecord(params.db, {
@@ -1636,6 +1686,67 @@ async function requireFileRecord(db: D1Database, id: string): Promise<FileRecord
   return file;
 }
 
+async function requireFileNameAvailable(params: {
+  db: D1Database;
+  directoryPath: string;
+  fileName: string;
+  excludeId?: string;
+}): Promise<void> {
+  const conflict = await findActiveFileNameConflict(params);
+
+  if (conflict) {
+    throw fileNameConflictError(params.directoryPath, params.fileName, conflict.source);
+  }
+}
+
+async function requireFileMoveNamesAvailable(params: {
+  db: D1Database;
+  files: FileRecord[];
+  directoryPath: string;
+}): Promise<void> {
+  const seenNames = new Set<string>();
+
+  for (const file of params.files) {
+    if (seenNames.has(file.file_name)) {
+      throw fileNameConflictError(params.directoryPath, file.file_name, "file");
+    }
+
+    seenNames.add(file.file_name);
+    await requireFileNameAvailable({
+      db: params.db,
+      directoryPath: params.directoryPath,
+      fileName: file.file_name,
+      excludeId: file.id
+    });
+  }
+}
+
+function fileNameConflictError(
+  directoryPath: string,
+  fileName: string,
+  source: "file" | "multipart_upload"
+): AppError {
+  return new AppError(
+    409,
+    "FileNameConflict",
+    `当前目录已存在名为「${fileName}」的文件，请输入新的文件名`,
+    {
+      directory_path: directoryPath,
+      file_name: fileName,
+      suggested_name: suggestAlternativeFileName(fileName),
+      source
+    }
+  );
+}
+
+function suggestAlternativeFileName(fileName: string): string {
+  const match = /^(.*?)(\.[^./\\]{1,12})$/.exec(fileName);
+  const base = match?.[1] || fileName;
+  const extension = match?.[2] || "";
+
+  return `${base} (1)${extension}`;
+}
+
 function normalizeChunkIndex(value: string, upload: MultipartUploadRecord): number {
   const index = Number(value);
 
@@ -1736,6 +1847,12 @@ async function completeMultipartUpload(params: {
 }): Promise<UploadResult> {
   const chunks = await listFileChunkRecords(params.db, params.upload.id);
   validateCompleteChunks(params.upload, chunks);
+  await requireFileNameAvailable({
+    db: params.db,
+    directoryPath: params.upload.directory_path ?? "/",
+    fileName: params.upload.file_name,
+    excludeId: params.upload.id
+  });
 
   const signingSecret = requireEnv(params.env, "LINK_SIGNING_SECRET");
   const createdAt = new Date().toISOString();
@@ -1882,6 +1999,11 @@ async function uploadAndRecordFile(params: {
   const publicUrl = `${baseUrl}${filePath}`;
 
   if (params.db) {
+    await requireFileNameAvailable({
+      db: params.db,
+      directoryPath: params.directoryPath ?? "/",
+      fileName: storedName
+    });
     await insertFileRecord(params.db, {
       id,
       fileName: storedName,
@@ -2667,6 +2789,14 @@ function normalizeFileNameUpdate(value: unknown): string {
   return normalized;
 }
 
+function normalizeOptionalFileName(value: unknown): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+
+  return normalizeFileNameUpdate(value);
+}
+
 function normalizeDirectoryName(value: unknown): string {
   if (typeof value !== "string") {
     throw new AppError(400, "InvalidDirectoryName", "Directory name is required");
@@ -2830,13 +2960,18 @@ function requireEntrySelection(fileIds: string[], directoryIds: string[]): void 
   }
 }
 
-async function requireFileRecords(db: D1Database, ids: string[]): Promise<void> {
+async function requireFileRecords(db: D1Database, ids: string[]): Promise<FileRecord[]> {
+  const records: FileRecord[] = [];
+
   for (const id of ids) {
     const file = await getFileRecord(db, id);
     if (!file) {
       throw new AppError(404, "NotFound", "File record not found");
     }
+    records.push(file);
   }
+
+  return records;
 }
 
 async function requireDirectoryRecords(db: D1Database, ids: string[]): Promise<DirectoryRecord[]> {

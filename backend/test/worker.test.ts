@@ -448,6 +448,11 @@ class FakeD1Statement {
       return { total: this.visibleFiles().length } as T;
     }
 
+    if (normalizedSql.includes("FROM FILES") && normalizedSql.includes("FILE_NAME = ?")) {
+      const file = this.matchingFileNameConflict();
+      return (file ? { id: file.id } : null) as T | null;
+    }
+
     if (normalizedSql.startsWith("SELECT ID FROM FILES")) {
       const id = this.bindings[0];
       const file = this.db.files.find((item) => item.id === id && item.deleted_at === null);
@@ -458,6 +463,11 @@ class FakeD1Statement {
       const id = this.bindings[0];
       const file = this.db.files.find((item) => item.id === id && item.deleted_at === null);
       return (file ?? null) as T | null;
+    }
+
+    if (normalizedSql.includes("FROM MULTIPART_UPLOADS") && normalizedSql.includes("FILE_NAME = ?")) {
+      const upload = this.matchingMultipartFileNameConflict();
+      return (upload ? { id: upload.id } : null) as T | null;
     }
 
     if (normalizedSql.includes("FROM MULTIPART_UPLOADS")) {
@@ -747,6 +757,28 @@ class FakeD1Statement {
 
     return undefined;
   }
+
+  private matchingFileNameConflict(): FileRecord | undefined {
+    const [directoryPath, fileName, excludeId] = this.bindings;
+
+    return this.db.files.find((item) =>
+      item.deleted_at === null &&
+      (item.directory_path ?? "/") === directoryPath &&
+      item.file_name === fileName &&
+      (excludeId === undefined || item.id !== String(excludeId))
+    );
+  }
+
+  private matchingMultipartFileNameConflict(): MultipartUploadRecord | undefined {
+    const [directoryPath, fileName, excludeId] = this.bindings;
+
+    return this.db.multipartUploads.find((item) =>
+      item.completed_at === null &&
+      (item.directory_path ?? "/") === directoryPath &&
+      item.file_name === fileName &&
+      (excludeId === undefined || item.id !== String(excludeId))
+    );
+  }
 }
 
 function envWithDb(db: FakeD1): Env {
@@ -770,6 +802,29 @@ function addApiKey(db: FakeD1, options?: { key?: string; status?: ApiKeyStatus }
   db.apiKeys.push(apiKey);
 
   return apiKey;
+}
+
+function fileRecord(overrides: Partial<FileRecord> = {}): FileRecord {
+  return {
+    id: "file-existing",
+    file_name: "hello.txt",
+    mime_type: "text/plain",
+    size: 5,
+    md5: "md5-existing",
+    telegram_file_id: "tg-existing",
+    telegram_file_unique_id: null,
+    file_path: "/f/token/hello.txt",
+    remark: null,
+    uploaded_by: "admin",
+    created_at: "2026-06-01T00:00:00.000Z",
+    deleted_at: null,
+    directory_id: null,
+    directory_path: "/",
+    storage_backend: "telegram_single",
+    chunk_size: null,
+    chunk_count: null,
+    ...overrides
+  };
 }
 
 function fakeD1Meta(): D1Meta & Record<string, unknown> {
@@ -989,6 +1044,61 @@ describe("worker upload endpoint", () => {
     expect(db.directories[1]?.parent_id).toBe(db.directories[0]?.id);
     expect(db.files[0]?.directory_id).toBe(db.directories[1]?.id);
     expect(db.files[0]?.directory_path).toBe("/auto/nested");
+  });
+
+  it("rejects duplicate file names only within the same upload API directory", async () => {
+    const db = new FakeD1();
+    addApiKey(db);
+    db.files.push(fileRecord({
+      id: "existing-hello",
+      file_name: "hello.txt",
+      directory_path: "/docs"
+    }));
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({
+        ok: true,
+        result: {
+          document: {
+            file_id: "tg-new-hello",
+            file_name: "hello.txt",
+            mime_type: "text/plain",
+            file_size: 5
+          }
+        }
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const conflictResponse = await worker.fetch(
+      uploadRequest({ directoryPath: "/docs" }),
+      envWithDb(db)
+    );
+    const conflictBody = await conflictResponse.json() as {
+      error: string;
+      details: { directory_path: string; file_name: string; suggested_name: string; source: string };
+    };
+
+    expect(conflictResponse.status).toBe(409);
+    expect(conflictBody.error).toBe("FileNameConflict");
+    expect(conflictBody.details).toMatchObject({
+      directory_path: "/docs",
+      file_name: "hello.txt",
+      suggested_name: "hello (1).txt",
+      source: "file"
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const otherDirectoryResponse = await worker.fetch(
+      uploadRequest({ directoryPath: "/archive" }),
+      envWithDb(db)
+    );
+    const otherDirectoryBody = await otherDirectoryResponse.json() as { ok: boolean; name: string };
+
+    expect(otherDirectoryResponse.status).toBe(200);
+    expect(otherDirectoryBody).toMatchObject({ ok: true, name: "hello.txt" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(db.files).toHaveLength(2);
+    expect(db.files[1]?.directory_path).toBe("/archive");
   });
 
   it("accepts small webp files when Telegram returns them as stickers", async () => {
@@ -2248,6 +2358,110 @@ describe("admin file manager", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("rejects duplicate URL upload names and accepts an explicit replacement file name", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      PUBLIC_BASE_URL: "https://cdn.example.com",
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    db.files.push(fileRecord({
+      id: "existing-report",
+      file_name: "report.pdf",
+      mime_type: "application/pdf",
+      file_path: "/f/token/report.pdf",
+      directory_path: "/imports"
+    }));
+    const cookie = await loginAndGetCookie(adminEnv);
+    const sourceUrl = "https://source.example.com/report.pdf";
+    const pdfBytes = new Uint8Array([0x25, 0x50, 0x44, 0x46]);
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const inputUrl = String(input);
+
+      if (inputUrl === sourceUrl) {
+        return new Response(pdfBytes, {
+          headers: {
+            "Content-Type": "application/pdf",
+            "Content-Disposition": "attachment; filename=\"report.pdf\"",
+            "Content-Length": String(pdfBytes.byteLength)
+          }
+        });
+      }
+
+      return jsonResponse({
+        ok: true,
+        result: {
+          document: {
+            file_id: "tg-report-copy",
+            file_unique_id: "tg-report-copy-unique",
+            file_name: "report-copy.pdf",
+            mime_type: "application/pdf",
+            file_size: pdfBytes.byteLength
+          }
+        }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const conflictResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/files", {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          url: sourceUrl,
+          directory_path: "/imports"
+        })
+      }),
+      adminEnv
+    );
+    const conflictBody = await conflictResponse.json() as {
+      error: string;
+      details: { directory_path: string; file_name: string; suggested_name: string; source: string };
+    };
+
+    expect(conflictResponse.status).toBe(409);
+    expect(conflictBody.error).toBe("FileNameConflict");
+    expect(conflictBody.details).toMatchObject({
+      directory_path: "/imports",
+      file_name: "report.pdf",
+      suggested_name: "report (1).pdf",
+      source: "file"
+    });
+    expect(db.files).toHaveLength(1);
+
+    const renamedResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/files", {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          url: sourceUrl,
+          directory_path: "/imports",
+          file_name: "report-copy.pdf"
+        })
+      }),
+      adminEnv
+    );
+    const renamedBody = await renamedResponse.json() as { ok: boolean; file: { file_name: string; directory_path: string } };
+
+    expect(renamedResponse.status).toBe(200);
+    expect(renamedBody.ok).toBe(true);
+    expect(renamedBody.file).toMatchObject({
+      file_name: "report-copy.pdf",
+      directory_path: "/imports"
+    });
+    expect(db.files).toHaveLength(2);
+    expect(db.files[1]?.file_name).toBe("report-copy.pdf");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
   it("initializes a range-based URL multipart upload", async () => {
     const db = new FakeD1();
     const adminEnv: Env = {
@@ -2404,6 +2618,110 @@ describe("admin file manager", () => {
     expect(db.multipartUploads[0]?.directory_path).toBe("/incoming/big");
   });
 
+  it("rejects multipart upload sessions that reuse an active file name", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    db.files.push(fileRecord({
+      id: "existing-big-file",
+      file_name: "big.bin",
+      directory_path: "/incoming/big"
+    }));
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/uploads/init", {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          file_name: "big.bin",
+          mime_type: "application/octet-stream",
+          size: 25 * 1024 * 1024,
+          directory_path: "/incoming/big"
+        })
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      error: string;
+      details: { directory_path: string; file_name: string; suggested_name: string; source: string };
+    };
+
+    expect(response.status).toBe(409);
+    expect(body.error).toBe("FileNameConflict");
+    expect(body.details).toMatchObject({
+      directory_path: "/incoming/big",
+      file_name: "big.bin",
+      suggested_name: "big (1).bin",
+      source: "file"
+    });
+    expect(db.multipartUploads).toHaveLength(0);
+  });
+
+  it("reserves file names for incomplete multipart upload sessions", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    db.multipartUploads.push({
+      id: "pending-big-upload",
+      source_kind: "local",
+      source_url: null,
+      file_name: "big.bin",
+      mime_type: "application/octet-stream",
+      size: 25 * 1024 * 1024,
+      chunk_size: 18 * 1024 * 1024,
+      chunk_count: 2,
+      remark: null,
+      uploaded_by: "admin",
+      created_at: "2026-06-01T00:00:00.000Z",
+      completed_at: null,
+      directory_id: null,
+      directory_path: "/incoming/big"
+    });
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/uploads/init", {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          file_name: "big.bin",
+          mime_type: "application/octet-stream",
+          size: 25 * 1024 * 1024,
+          directory_path: "/incoming/big"
+        })
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      error: string;
+      details: { directory_path: string; file_name: string; source: string };
+    };
+
+    expect(response.status).toBe(409);
+    expect(body.error).toBe("FileNameConflict");
+    expect(body.details).toMatchObject({
+      directory_path: "/incoming/big",
+      file_name: "big.bin",
+      source: "multipart_upload"
+    });
+    expect(db.multipartUploads).toHaveLength(1);
+  });
+
   it("completes oversized-direct multipart uploads without returning a full file link", async () => {
     const db = new FakeD1();
     const adminEnv: Env = {
@@ -2476,6 +2794,81 @@ describe("admin file manager", () => {
     expect(db.files[0]?.file_path).toBe(body.file.file_path);
     expect(db.multipartUploads[0]?.completed_at).not.toBeNull();
     expect(db.batchCalls).toBe(1);
+  });
+
+  it("rejects multipart completion if the target file name was claimed during upload", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    db.files.push(fileRecord({
+      id: "existing-race-file",
+      file_name: "race.bin",
+      directory_path: "/race"
+    }));
+    db.multipartUploads.push({
+      id: "upload-race",
+      source_kind: "local",
+      source_url: null,
+      file_name: "race.bin",
+      mime_type: "application/octet-stream",
+      size: 6,
+      chunk_size: 3,
+      chunk_count: 2,
+      remark: null,
+      uploaded_by: "admin",
+      created_at: "2026-06-01T00:00:00.000Z",
+      completed_at: null,
+      directory_id: null,
+      directory_path: "/race"
+    });
+    db.fileChunks.push(
+      {
+        file_id: "upload-race",
+        chunk_index: 0,
+        size: 3,
+        md5: "chunk-0",
+        telegram_file_id: "tg-chunk-0",
+        telegram_file_unique_id: null,
+        created_at: "2026-06-01T00:00:01.000Z"
+      },
+      {
+        file_id: "upload-race",
+        chunk_index: 1,
+        size: 3,
+        md5: "chunk-1",
+        telegram_file_id: "tg-chunk-1",
+        telegram_file_unique_id: null,
+        created_at: "2026-06-01T00:00:02.000Z"
+      }
+    );
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/uploads/upload-race/complete", {
+        method: "POST",
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      error: string;
+      details: { directory_path: string; file_name: string; source: string };
+    };
+
+    expect(response.status).toBe(409);
+    expect(body.error).toBe("FileNameConflict");
+    expect(body.details).toMatchObject({
+      directory_path: "/race",
+      file_name: "race.bin",
+      source: "file"
+    });
+    expect(db.files).toHaveLength(1);
+    expect(db.multipartUploads[0]?.completed_at).toBeNull();
+    expect(db.batchCalls).toBe(0);
   });
 
   it("cleans stale incomplete multipart uploads on the scheduled trigger", async () => {
@@ -3098,6 +3491,67 @@ describe("admin file manager", () => {
       remark: null,
       file_path: renameBody.file.file_path
     });
+  });
+
+  it("rejects moving a file into a directory that already has the same file name", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    db.directories.push({
+      id: "dir-archive",
+      parent_id: null,
+      name: "archive",
+      path: "/archive",
+      created_at: "2026-06-01T00:00:00.000Z",
+      deleted_at: null
+    });
+    db.files.push(
+      fileRecord({
+        id: "file-source-report",
+        file_name: "report.txt",
+        directory_path: "/inbox"
+      }),
+      fileRecord({
+        id: "file-archive-report",
+        file_name: "report.txt",
+        directory_id: "dir-archive",
+        directory_path: "/archive"
+      })
+    );
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/files/move", {
+        method: "PATCH",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          file_ids: ["file-source-report"],
+          directory_path: "/archive"
+        })
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      error: string;
+      details: { directory_path: string; file_name: string; suggested_name: string; source: string };
+    };
+
+    expect(response.status).toBe(409);
+    expect(body.error).toBe("FileNameConflict");
+    expect(body.details).toMatchObject({
+      directory_path: "/archive",
+      file_name: "report.txt",
+      suggested_name: "report (1).txt",
+      source: "file"
+    });
+    expect(db.files.find((item) => item.id === "file-source-report")?.directory_path).toBe("/inbox");
   });
 
   it("creates virtual directories, moves files, searches current directory, and recursively hard-deletes directories", async () => {

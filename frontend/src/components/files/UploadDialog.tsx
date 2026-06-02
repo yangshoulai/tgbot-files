@@ -62,6 +62,12 @@ interface MultipartRetryState {
   failedChunks: number[];
 }
 
+interface FileNameConflictState {
+  fileName: string;
+  suggestedName: string;
+  directoryPath: string;
+}
+
 interface QueueItem {
   id: string;
   file: File;
@@ -70,6 +76,8 @@ interface QueueItem {
   progress?: ChunkProgress;
   chunks?: UploadChunkState[];
   retry?: MultipartRetryState;
+  fileNameOverride?: string;
+  conflict?: FileNameConflictState;
 }
 
 interface UrlUploadState {
@@ -78,6 +86,8 @@ interface UrlUploadState {
   progress?: ChunkProgress;
   chunks?: UploadChunkState[];
   retry?: MultipartRetryState;
+  fileNameOverride?: string;
+  conflict?: FileNameConflictState;
 }
 
 interface ChunkQueueResult {
@@ -178,6 +188,32 @@ export function UploadDialog({
     setUrlUpload({ status: "pending" });
   }
 
+  function updateItemFileName(id: string, value: string) {
+    setItems((current) =>
+      current.map((item) =>
+        item.id === id
+          ? {
+              ...item,
+              fileNameOverride: value,
+              status: item.conflict ? "pending" : item.status,
+              message: item.conflict ? undefined : item.message,
+              progress: item.conflict ? undefined : item.progress
+            }
+          : item
+      )
+    );
+  }
+
+  function updateUrlFileName(value: string) {
+    setUrlUpload((current) => ({
+      ...current,
+      fileNameOverride: value,
+      status: current.conflict ? "pending" : current.status,
+      message: current.conflict ? undefined : current.message,
+      progress: current.conflict ? undefined : current.progress
+    }));
+  }
+
   function extractFirstUrl(value: string): string | undefined {
     const match = value.match(/https?:\/\/[^\s<>"']+/i);
     return match?.[0];
@@ -238,16 +274,20 @@ export function UploadDialog({
 
       setItems((current) =>
         current.map((item) =>
-          item.id === target.id ? { ...item, status: "uploading", message: undefined, progress: undefined } : item
+          item.id === target.id
+            ? { ...item, status: "uploading", message: undefined, progress: undefined, conflict: undefined }
+            : item
         )
       );
 
       try {
+        const fileName = effectiveFileName(target);
         if (forceMultipart || target.file.size > maxBytes) {
-          await uploadLocalMultipart(target);
+          await uploadLocalMultipart(target, fileName);
         } else {
           const form = new FormData();
-          form.set("file", target.file);
+          form.set("file", fileForUpload(target, fileName));
+          form.set("file_name", fileName);
           form.set("directory_path", directoryPath);
           if (remark.trim()) form.set("remark", remark.trim());
           await uploadFile(form);
@@ -256,12 +296,13 @@ export function UploadDialog({
         setItems((current) =>
           current.map((item) =>
             item.id === target.id
-              ? { ...item, status: "done", message: undefined, progress: undefined, retry: undefined }
+              ? { ...item, status: "done", message: undefined, progress: undefined, retry: undefined, conflict: undefined }
               : item
           )
         );
       } catch (error) {
         const retry = error instanceof MultipartChunkUploadError ? error.retry : undefined;
+        const conflict = fileNameConflictFromError(error);
         const message = error instanceof ApiError ? error.message : error instanceof Error ? error.message : "上传失败";
         setItems((current) =>
           current.map((item) =>
@@ -270,8 +311,10 @@ export function UploadDialog({
                   ...item,
                   status: "error",
                   message,
-                  retry,
-                  progress: retry ? retryFailureProgress(retry, "分片上传失败，可手动重试") : undefined
+                  retry: conflict ? undefined : retry,
+                  conflict,
+                  fileNameOverride: conflict?.suggestedName ?? item.fileNameOverride,
+                  progress: retry && !conflict ? retryFailureProgress(retry, "分片上传失败，可手动重试") : undefined
                 }
               : item
           )
@@ -286,14 +329,14 @@ export function UploadDialog({
     }
   }
 
-  async function uploadLocalMultipart(target: QueueItem) {
+  async function uploadLocalMultipart(target: QueueItem, fileName: string) {
     if (target.retry?.kind === "local") {
       await retryLocalMultipart(target, target.retry);
       return;
     }
 
     const init = await initMultipartUpload({
-      file_name: target.file.name,
+      file_name: fileName,
       mime_type: target.file.type || "application/octet-stream",
       size: target.file.size,
       directory_path: directoryPath,
@@ -540,10 +583,23 @@ export function UploadDialog({
     }
 
     setSubmitting(true);
-    setUrlUpload({ status: "uploading", progress: { completed: 0, total: 1, label: "探测远程文件" } });
+    setUrlUpload((current) => ({
+      ...current,
+      status: "uploading",
+      message: undefined,
+      conflict: undefined,
+      progress: { completed: 0, total: 1, label: "探测远程文件" }
+    }));
 
     try {
-      const init = await initUrlMultipartUpload(normalizedSourceUrl, remark.trim() || undefined, directoryPath, forceMultipart);
+      const fileNameOverride = normalizedFileNameOverride(urlUpload.fileNameOverride);
+      const init = await initUrlMultipartUpload(
+        normalizedSourceUrl,
+        remark.trim() || undefined,
+        directoryPath,
+        forceMultipart,
+        fileNameOverride
+      );
       if (init.mode === "multipart" && init.upload) {
         const upload = init.upload;
         setUrlUpload((current) => ({
@@ -595,13 +651,25 @@ export function UploadDialog({
         }));
         await completeMultipartUpload(upload.id);
       } else {
-        setUrlUpload({ status: "uploading", progress: { completed: 0, total: 1, label: "拉取远程文件" } });
-        await uploadFileFromUrl(normalizedSourceUrl, remark.trim() || undefined, directoryPath);
+        setUrlUpload((current) => ({
+          ...current,
+          status: "uploading",
+          progress: { completed: 0, total: 1, label: "拉取远程文件" }
+        }));
+        await uploadFileFromUrl(normalizedSourceUrl, remark.trim() || undefined, directoryPath, fileNameOverride);
       }
-      setUrlUpload((current) => ({ ...current, status: "done", message: "已从 URL 上传", progress: undefined, retry: undefined }));
+      setUrlUpload((current) => ({
+        ...current,
+        status: "done",
+        message: "已从 URL 上传",
+        progress: undefined,
+        retry: undefined,
+        conflict: undefined
+      }));
       onUploaded(1);
     } catch (uploadError) {
       const retry = uploadError instanceof MultipartChunkUploadError ? uploadError.retry : undefined;
+      const conflict = fileNameConflictFromError(uploadError);
       const message = uploadError instanceof ApiError
         ? uploadError.message
         : uploadError instanceof Error
@@ -611,8 +679,10 @@ export function UploadDialog({
         ...current,
         status: "error",
         message,
-        retry,
-        progress: retry ? retryFailureProgress(retry, "分片导入失败，可手动重试") : undefined
+        retry: conflict ? undefined : retry,
+        conflict,
+        fileNameOverride: conflict?.suggestedName ?? current.fileNameOverride,
+        progress: retry && !conflict ? retryFailureProgress(retry, "分片导入失败，可手动重试") : undefined
       }));
       onError(message);
     } finally {
@@ -851,6 +921,7 @@ export function UploadDialog({
                     forceMultipart={forceMultipart}
                     onRemove={() => removeItem(item.id)}
                     onRetry={item.retry ? () => void retryItemFailedChunks(item.id) : undefined}
+                    onFileNameChange={(value) => updateItemFileName(item.id, value)}
                     disabled={submitting}
                   />
                 ))}
@@ -895,8 +966,11 @@ export function UploadDialog({
                 message={urlUpload.message}
                 progress={urlUpload.progress}
                 chunks={urlUpload.chunks}
+                fileNameOverride={urlUpload.fileNameOverride}
+                conflict={urlUpload.conflict}
                 onClear={() => handleSourceUrlChange("")}
                 onRetry={urlUpload.retry ? () => void retryUrlMultipart(urlUpload.retry!) : undefined}
+                onFileNameChange={updateUrlFileName}
                 disabled={submitting}
               />
             ) : null}
@@ -942,6 +1016,52 @@ function retryDelayMs(failedAttempt: number): number {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function effectiveFileName(item: QueueItem): string {
+  return normalizedFileNameOverride(item.fileNameOverride) ?? item.file.name;
+}
+
+function normalizedFileNameOverride(value: string | undefined): string | undefined {
+  const normalized = value?.trim();
+  return normalized || undefined;
+}
+
+function fileForUpload(item: QueueItem, fileName: string): File {
+  if (fileName === item.file.name) {
+    return item.file;
+  }
+
+  return new File([item.file], fileName, {
+    type: item.file.type || "application/octet-stream",
+    lastModified: item.file.lastModified
+  });
+}
+
+function fileNameConflictFromError(error: unknown): FileNameConflictState | undefined {
+  if (!(error instanceof ApiError) || error.status !== 409 || error.error !== "FileNameConflict") {
+    return undefined;
+  }
+
+  const fileName = stringDetail(error.details, "file_name") || "同名文件";
+  return {
+    fileName,
+    suggestedName: stringDetail(error.details, "suggested_name") || suggestAlternativeFileName(fileName),
+    directoryPath: stringDetail(error.details, "directory_path") || "/"
+  };
+}
+
+function stringDetail(details: Record<string, unknown> | undefined, key: string): string | undefined {
+  const value = details?.[key];
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function suggestAlternativeFileName(fileName: string): string {
+  const match = /^(.*?)(\.[^./\\]{1,12})$/.exec(fileName);
+  const base = match?.[1] || fileName;
+  const extension = match?.[2] || "";
+
+  return `${base} (1)${extension}`;
 }
 
 function chunkRange(count: number): number[] {
@@ -1004,10 +1124,11 @@ interface QueueRowProps {
   forceMultipart: boolean;
   onRemove: () => void;
   onRetry?: () => void;
+  onFileNameChange: (value: string) => void;
   disabled: boolean;
 }
 
-function QueueRow({ item, directMaxBytes, forceMultipart, onRemove, onRetry, disabled }: QueueRowProps) {
+function QueueRow({ item, directMaxBytes, forceMultipart, onRemove, onRetry, onFileNameChange, disabled }: QueueRowProps) {
   const status = item.status;
   return (
     <div className="flex flex-col gap-2 rounded-xl border border-border bg-surface px-3 py-2.5">
@@ -1045,6 +1166,14 @@ function QueueRow({ item, directMaxBytes, forceMultipart, onRemove, onRetry, dis
           {status === "done" ? <CheckCircle2 size={14} className="text-success" /> : <X size={14} />}
         </button>
       </div>
+      {item.conflict ? (
+        <FileNameConflictInput
+          value={item.fileNameOverride ?? ""}
+          conflict={item.conflict}
+          disabled={disabled}
+          onChange={onFileNameChange}
+        />
+      ) : null}
       {item.chunks ? <UploadChunkList chunks={item.chunks} /> : null}
     </div>
   );
@@ -1057,11 +1186,26 @@ interface UrlUploadRowProps {
   progress?: ChunkProgress;
   onClear: () => void;
   chunks?: UploadChunkState[];
+  fileNameOverride?: string;
+  conflict?: FileNameConflictState;
   onRetry?: () => void;
+  onFileNameChange: (value: string) => void;
   disabled: boolean;
 }
 
-function UrlUploadRow({ url, status, message, progress, chunks, onClear, onRetry, disabled }: UrlUploadRowProps) {
+function UrlUploadRow({
+  url,
+  status,
+  message,
+  progress,
+  chunks,
+  fileNameOverride,
+  conflict,
+  onClear,
+  onRetry,
+  onFileNameChange,
+  disabled
+}: UrlUploadRowProps) {
   return (
     <div className="flex flex-col gap-2 rounded-xl border border-border bg-surface px-3 py-2.5">
       <div className="flex items-center gap-3">
@@ -1099,7 +1243,47 @@ function UrlUploadRow({ url, status, message, progress, chunks, onClear, onRetry
           {status === "done" ? <CheckCircle2 size={14} className="text-success" /> : <X size={14} />}
         </button>
       </div>
+      {conflict ? (
+        <FileNameConflictInput
+          value={fileNameOverride ?? ""}
+          conflict={conflict}
+          disabled={disabled}
+          onChange={onFileNameChange}
+        />
+      ) : null}
       {chunks ? <UploadChunkList chunks={chunks} /> : null}
+    </div>
+  );
+}
+
+function FileNameConflictInput({
+  value,
+  conflict,
+  disabled,
+  onChange
+}: {
+  value: string;
+  conflict: FileNameConflictState;
+  disabled: boolean;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div className="rounded-lg border border-warning/35 bg-warning-soft/45 p-3">
+      <div className="flex flex-col gap-1.5">
+        <label className="text-xs font-medium text-warning">
+          新文件名
+        </label>
+        <Input
+          value={value}
+          disabled={disabled}
+          invalid={value.trim().length === 0}
+          placeholder={conflict.suggestedName}
+          onChange={(event) => onChange(event.target.value)}
+        />
+        <p className="text-xs leading-5 text-muted">
+          {conflict.directoryPath} 已存在 {conflict.fileName}，改名后重新上传。
+        </p>
+      </div>
     </div>
   );
 }
