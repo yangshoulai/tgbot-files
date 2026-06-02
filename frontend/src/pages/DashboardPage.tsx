@@ -112,6 +112,26 @@ function directoryBreadcrumbs(path: string): Array<{ label: string; path: string
   return breadcrumbs;
 }
 
+function FileListBusyOverlay({ label }: { label: string }) {
+  return (
+    <div className="absolute inset-0 z-10 grid place-items-center rounded-2xl bg-surface/75 px-4 backdrop-blur-[2px] animate-fade-in">
+      <div
+        role="status"
+        aria-live="polite"
+        className="flex min-w-48 flex-col items-center gap-3 rounded-2xl border border-border bg-background/90 px-5 py-4 text-center shadow-dialog"
+      >
+        <span className="grid size-11 place-items-center rounded-full bg-primary-soft text-primary-strong">
+          <Spinner size={20} />
+        </span>
+        <div className="flex flex-col gap-1">
+          <p className="text-sm font-semibold text-foreground">{label}</p>
+          <p className="text-xs text-muted">请稍候，列表会自动刷新</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function DashboardPage({ session, uploadVersion, copyText, onDirectoryChange }: DashboardPageProps) {
   const toast = useToast();
   const confirm = useConfirm();
@@ -129,6 +149,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   const [uploadedTo, setUploadedTo] = useState("");
   const [limit, setLimit] = useState(INITIAL_LIMIT);
   const [loading, setLoading] = useState(false);
+  const [operationLabel, setOperationLabel] = useState<string | null>(null);
   const [previewFile, setPreviewFile] = useState<FileItem | null>(null);
   const [detailFile, setDetailFile] = useState<FileItem | null>(null);
   const [editingFile, setEditingFile] = useState<FileItem | null>(null);
@@ -156,6 +177,8 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   const [directoryRenameName, setDirectoryRenameName] = useState("");
   const [renamingDirectorySaving, setRenamingDirectorySaving] = useState(false);
   const [acceleratedDownload, setAcceleratedDownload] = useState<AcceleratedDownloadState | null>(null);
+  const listBusyLabel = operationLabel ?? (loading ? "正在加载目录内容..." : undefined);
+  const isListBusy = Boolean(listBusyLabel);
 
   const loadFiles = useCallback(
     async (nextPage: number) => {
@@ -270,6 +293,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     });
     if (!ok) return;
 
+    setOperationLabel("正在删除文件索引...");
     try {
       await deleteFile(file.id);
       toast.success("索引已删除");
@@ -284,6 +308,8 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       await loadFiles(targetPage);
     } catch (error) {
       toast.danger(errorMessage(error));
+    } finally {
+      setOperationLabel(null);
     }
   }
 
@@ -306,6 +332,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     });
     if (!ok) return;
 
+    setOperationLabel("正在批量删除...");
     try {
       const result = await deleteEntries({
         file_ids: targetFiles.map((file) => file.id),
@@ -321,6 +348,8 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       await loadFiles(targetPage);
     } catch (error) {
       toast.danger(errorMessage(error));
+    } finally {
+      setOperationLabel(null);
     }
   }
 
@@ -360,6 +389,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     });
     if (!ok) return;
 
+    setOperationLabel("正在删除目录...");
     try {
       const result = await deleteDirectory(directory.id);
       toast.success(`已删除 ${result.deleted_directories} 个目录、${result.deleted_files} 个文件索引`);
@@ -371,6 +401,8 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       await Promise.all([loadFiles(pagination.page), loadDirectoryOptions()]);
     } catch (error) {
       toast.danger(errorMessage(error));
+    } finally {
+      setOperationLabel(null);
     }
   }
 
@@ -417,6 +449,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     if (!movingDirectory) return;
 
     setMovingDirectorySaving(true);
+    setOperationLabel("正在移动目录...");
     try {
       const result = await moveDirectory(movingDirectory.id, directoryMoveTargetPath);
       toast.success(`已移动 ${result.moved_directories} 个目录、${result.moved_files} 个文件索引到 ${result.directory.path}`);
@@ -431,6 +464,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       toast.danger(errorMessage(error));
     } finally {
       setMovingDirectorySaving(false);
+      setOperationLabel(null);
     }
   }
 
@@ -493,6 +527,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     }
 
     setMovingFiles(true);
+    setOperationLabel("正在移动项目...");
     try {
       const result = await moveEntries(
         moveCreateNew
@@ -519,10 +554,12 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       toast.danger(errorMessage(error));
     } finally {
       setMovingFiles(false);
+      setOperationLabel(null);
     }
   }
 
   function goToDirectory(path: string) {
+    if (isListBusy || path === currentDirPath) return;
     setCurrentDirPath(path);
     setSelectedFileIds(new Set());
     setSelectedDirectoryIds(new Set());
@@ -971,7 +1008,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
           <Button
             variant="secondary"
             leadingIcon={<ArrowUp size={16} />}
-            disabled={currentDirPath === "/"}
+            disabled={currentDirPath === "/" || isListBusy}
             onClick={() => goToDirectory(parentDirectoryPath(currentDirPath))}
           >
             返回上级
@@ -979,6 +1016,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
           <Button
             variant="primary"
             leadingIcon={<FolderPlus size={16} />}
+            disabled={isListBusy}
             onClick={() => {
               setCreateDirParentPath("/");
               setCreateDirOpen(true);
@@ -997,8 +1035,9 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
             <div key={item.path} className="flex items-center gap-1">
               <button
                 type="button"
+                disabled={isListBusy}
                 onClick={() => goToDirectory(item.path)}
-                className="rounded-md px-2 py-1 text-sm font-medium text-foreground transition-colors hover:bg-primary-soft hover:text-primary-strong focus-visible:outline-none focus-visible:focus-ring"
+                className="rounded-md px-2 py-1 text-sm font-medium text-foreground transition-colors hover:bg-primary-soft hover:text-primary-strong focus-visible:outline-none focus-visible:focus-ring disabled:pointer-events-none disabled:opacity-50"
               >
                 {item.label}
               </button>
@@ -1023,6 +1062,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
             ariaLabel="目录过滤"
             value={currentDirPath}
             directories={directoryOptions}
+            disabled={isListBusy}
             onChange={goToDirectory}
           />
           <select
@@ -1053,9 +1093,10 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
             <IconButton
               variant="default"
               label="刷新"
+              disabled={isListBusy}
               onClick={() => void loadFiles(pagination.page)}
             >
-              {loading ? <Spinner size={16} /> : <RefreshCw size={16} />}
+              {isListBusy ? <Spinner size={16} /> : <RefreshCw size={16} />}
             </IconButton>
           </div>
         </div>
@@ -1069,53 +1110,68 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
               </span>
             </p>
             <div className="flex flex-wrap items-center gap-2">
-              <button
-                type="button"
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={isListBusy}
+                loading={operationLabel === "正在移动项目..."}
+                leadingIcon={<FolderInput size={15} />}
                 onClick={() => openMoveDialog()}
-                className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-border bg-surface px-3 text-sm font-medium text-foreground shadow-card transition-colors hover:border-border-strong hover:bg-background focus-visible:outline-none focus-visible:focus-ring"
               >
-                <FolderInput size={15} />
                 移动
-              </button>
-              <button
-                type="button"
+              </Button>
+              <Button
+                variant="danger"
+                size="sm"
+                disabled={isListBusy}
+                loading={operationLabel === "正在批量删除..."}
+                leadingIcon={<Trash2 size={15} />}
                 onClick={() => void onBulkDelete()}
-                className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-danger px-3 text-sm font-medium text-white shadow-card transition-colors hover:bg-danger-strong focus-visible:outline-none focus-visible:focus-ring"
               >
-                <Trash2 size={15} />
                 批量删除
-              </button>
+              </Button>
             </div>
           </div>
         ) : null}
 
-        <FileTable
-          directories={directories}
-          files={files}
-          selectedFileIds={selectedFileIds}
-          selectedDirectoryIds={selectedDirectoryIds}
-          allPageSelected={allPageSelected}
-          onOpenDirectory={(directory) => goToDirectory(directory.path)}
-          onRenameDirectory={openRenameDirectoryDialog}
-          onMoveDirectory={openMoveDirectoryDialog}
-          onDeleteDirectory={(directory) => void onDeleteDirectory(directory)}
-          onToggleFileSelected={toggleFileSelected}
-          onToggleDirectorySelected={toggleDirectorySelected}
-          onTogglePage={togglePage}
-          onDetail={setDetailFile}
-          onEdit={openEditDialog}
-          onMoveFile={openMoveDialog}
-          onPreview={setPreviewFile}
-          onCopy={onCopy}
-          onAcceleratedDownload={(file) => void onAcceleratedDownload(file)}
-          onDelete={onDelete}
-        />
+        <div className="relative min-h-52" aria-busy={isListBusy}>
+          <div
+            className={
+              isListBusy
+                ? "pointer-events-none flex select-none flex-col gap-3 opacity-45 transition-opacity duration-200"
+                : "flex flex-col gap-3 transition-opacity duration-200"
+            }
+          >
+            <FileTable
+              directories={directories}
+              files={files}
+              selectedFileIds={selectedFileIds}
+              selectedDirectoryIds={selectedDirectoryIds}
+              allPageSelected={allPageSelected}
+              onOpenDirectory={(directory) => goToDirectory(directory.path)}
+              onRenameDirectory={openRenameDirectoryDialog}
+              onMoveDirectory={openMoveDirectoryDialog}
+              onDeleteDirectory={(directory) => void onDeleteDirectory(directory)}
+              onToggleFileSelected={toggleFileSelected}
+              onToggleDirectorySelected={toggleDirectorySelected}
+              onTogglePage={togglePage}
+              onDetail={setDetailFile}
+              onEdit={openEditDialog}
+              onMoveFile={openMoveDialog}
+              onPreview={setPreviewFile}
+              onCopy={onCopy}
+              onAcceleratedDownload={(file) => void onAcceleratedDownload(file)}
+              onDelete={onDelete}
+            />
 
-        <Pagination
-          pagination={pagination}
-          onPage={(page) => void loadFiles(page)}
-          onLimitChange={(nextLimit) => setLimit(nextLimit)}
-        />
+            <Pagination
+              pagination={pagination}
+              onPage={(page) => void loadFiles(page)}
+              onLimitChange={(nextLimit) => setLimit(nextLimit)}
+            />
+          </div>
+          {listBusyLabel ? <FileListBusyOverlay label={listBusyLabel} /> : null}
+        </div>
       </div>
 
       <PreviewDialog file={previewFile} onClose={() => setPreviewFile(null)} onCopy={copyText} />
