@@ -157,6 +157,7 @@ const MAX_TELEGRAM_MULTIPART_BYTES = 5 * 1024 * 1024 * 1024;
 const MAX_TELEGRAM_MULTIPART_CHUNKS = Math.ceil(MAX_TELEGRAM_MULTIPART_BYTES / TELEGRAM_CHUNK_SIZE_BYTES);
 const TELEGRAM_RATE_LIMITER_OBJECT_NAME = "telegram-api-global";
 const TELEGRAM_SEND_DOCUMENT_RATE_LIMIT_MS = 1_500;
+const TELEGRAM_SEND_DOCUMENT_LOCK_LEASE_MS = 2 * 60 * 1000;
 const TELEGRAM_GET_FILE_RATE_LIMIT_MS = 100;
 const DEFAULT_STALE_MULTIPART_UPLOAD_TTL_HOURS = 24;
 const MIN_STALE_MULTIPART_UPLOAD_TTL_HOURS = 1;
@@ -170,6 +171,11 @@ const ALLOWED_THUMBNAIL_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/
 
 type TelegramRateLimitScope = "sendDocument" | "getFile";
 
+interface TelegramApiSlot {
+  scope: TelegramRateLimitScope;
+  token?: string;
+}
+
 export class TelegramRateLimiter {
   private queue: Promise<void> = Promise.resolve();
 
@@ -178,7 +184,10 @@ export class TelegramRateLimiter {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    if (request.method !== "POST" || (url.pathname !== "/acquire" && url.pathname !== "/penalize")) {
+    if (
+      request.method !== "POST" ||
+      (url.pathname !== "/acquire" && url.pathname !== "/release" && url.pathname !== "/penalize")
+    ) {
       return new Response("Not found", { status: 404 });
     }
 
@@ -200,12 +209,23 @@ export class TelegramRateLimiter {
       });
     }
 
-    const result = await this.enqueue(() => this.reserve(scope));
-    if (result.waitMs > 0) {
+    if (url.pathname === "/release") {
+      const token = typeof body.token === "string" ? body.token : "";
+      await this.enqueue(() => this.release(scope, token));
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "Content-Type": "application/json; charset=utf-8" }
+      });
+    }
+
+    const result = scope === "sendDocument"
+      ? await this.acquireSendDocument()
+      : await this.enqueue(() => this.reserve(scope));
+
+    if (!result.token && result.waitMs > 0) {
       await delayMs(result.waitMs);
     }
 
-    return new Response(JSON.stringify({ ok: true, wait_ms: result.waitMs }), {
+    return new Response(JSON.stringify({ ok: true, wait_ms: result.waitMs, token: result.token }), {
       headers: { "Content-Type": "application/json; charset=utf-8" }
     });
   }
@@ -216,7 +236,49 @@ export class TelegramRateLimiter {
     return next;
   }
 
-  private async reserve(scope: TelegramRateLimitScope): Promise<{ waitMs: number }> {
+  private async acquireSendDocument(): Promise<{ waitMs: number; token: string }> {
+    let totalWaitMs = 0;
+
+    while (true) {
+      const result = await this.enqueue(() => this.tryAcquireSendDocument());
+      if (result.token) {
+        return { waitMs: totalWaitMs, token: result.token };
+      }
+
+      totalWaitMs += result.waitMs;
+      await delayMs(result.waitMs);
+    }
+  }
+
+  private async tryAcquireSendDocument(): Promise<{ waitMs: number; token?: string }> {
+    const now = Date.now();
+    const nextAvailableAt = await this.state.storage.get<number>(telegramRateLimitStorageKey("sendDocument")) ?? 0;
+    const lockToken = await this.state.storage.get<string>(telegramRateLimitLockTokenKey("sendDocument"));
+    const lockedUntil = await this.state.storage.get<number>(telegramRateLimitLockUntilKey("sendDocument")) ?? 0;
+
+    if (lockToken && lockedUntil > now) {
+      return { waitMs: Math.max(250, Math.min(1_000, lockedUntil - now)) };
+    }
+
+    if (lockToken) {
+      await this.clearLock("sendDocument");
+    }
+
+    if (nextAvailableAt > now) {
+      return { waitMs: Math.max(250, Math.min(1_000, nextAvailableAt - now)) };
+    }
+
+    const token = crypto.randomUUID();
+    await this.state.storage.put(telegramRateLimitLockTokenKey("sendDocument"), token);
+    await this.state.storage.put(
+      telegramRateLimitLockUntilKey("sendDocument"),
+      now + TELEGRAM_SEND_DOCUMENT_LOCK_LEASE_MS
+    );
+
+    return { waitMs: 0, token };
+  }
+
+  private async reserve(scope: TelegramRateLimitScope): Promise<{ waitMs: number; token?: string }> {
     const now = Date.now();
     const key = telegramRateLimitStorageKey(scope);
     const nextAvailableAt = await this.state.storage.get<number>(key) ?? 0;
@@ -233,6 +295,28 @@ export class TelegramRateLimiter {
     const penalizedUntil = Date.now() + retryAfterMs;
 
     await this.state.storage.put(key, Math.max(current, penalizedUntil));
+  }
+
+  private async release(scope: TelegramRateLimitScope, token: string): Promise<void> {
+    if (scope !== "sendDocument" || !token) {
+      return;
+    }
+
+    const currentToken = await this.state.storage.get<string>(telegramRateLimitLockTokenKey(scope));
+    if (currentToken !== token) {
+      return;
+    }
+
+    await this.clearLock(scope);
+
+    const key = telegramRateLimitStorageKey(scope);
+    const current = await this.state.storage.get<number>(key) ?? 0;
+    await this.state.storage.put(key, Math.max(current, Date.now() + telegramRateLimitIntervalMs(scope)));
+  }
+
+  private async clearLock(scope: TelegramRateLimitScope): Promise<void> {
+    await this.state.storage.delete(telegramRateLimitLockTokenKey(scope));
+    await this.state.storage.delete(telegramRateLimitLockUntilKey(scope));
   }
 }
 
@@ -330,6 +414,14 @@ function normalizeRetryAfterMs(value: unknown): number {
 
 function telegramRateLimitStorageKey(scope: TelegramRateLimitScope): string {
   return `telegram-rate-limit:${scope}:next`;
+}
+
+function telegramRateLimitLockTokenKey(scope: TelegramRateLimitScope): string {
+  return `telegram-rate-limit:${scope}:lock-token`;
+}
+
+function telegramRateLimitLockUntilKey(scope: TelegramRateLimitScope): string {
+  return `telegram-rate-limit:${scope}:locked-until`;
 }
 
 function telegramRateLimitIntervalMs(scope: TelegramRateLimitScope): number {
@@ -1039,11 +1131,9 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
   if (request.method === "POST" && urlChunkMatch?.[1] && urlChunkMatch?.[2]) {
     const upload = await requireMultipartUpload(db, decodeURIComponent(urlChunkMatch[1]), "url");
     const chunkIndex = normalizeChunkIndex(urlChunkMatch[2], upload);
-    const chunk = await downloadRemoteChunk(upload, chunkIndex);
-    const record = await uploadChunkToTelegram({
+    const record = await downloadAndUploadRemoteChunk({
       env,
       upload,
-      chunk,
       chunkIndex
     });
 
@@ -1195,11 +1285,9 @@ async function handleApiMultipartUploads(request: Request, env: Env): Promise<Re
   if (request.method === "POST" && urlChunkMatch?.[1] && urlChunkMatch?.[2]) {
     const upload = await requireMultipartUpload(db, decodeURIComponent(urlChunkMatch[1]), "url");
     const chunkIndex = normalizeChunkIndex(urlChunkMatch[2], upload);
-    const chunk = await downloadRemoteChunk(upload, chunkIndex);
-    const record = await uploadChunkToTelegram({
+    const record = await downloadAndUploadRemoteChunk({
       env,
       upload,
-      chunk,
       chunkIndex
     });
 
@@ -1647,8 +1735,9 @@ async function uploadRateLimitedTelegramDocument(params: {
   chatId: string;
   file: Blob;
   fileName: string;
+  telegramSlot?: TelegramApiSlot;
 }): Promise<Awaited<ReturnType<typeof uploadDocumentToTelegram>>> {
-  await acquireTelegramApiSlot(params.env, "sendDocument");
+  const slot = params.telegramSlot ?? await acquireTelegramApiSlot(params.env, "sendDocument");
 
   try {
     return await uploadDocumentToTelegram({
@@ -1660,6 +1749,8 @@ async function uploadRateLimitedTelegramDocument(params: {
   } catch (error) {
     await penalizeTelegramApiSlotFromError(params.env, "sendDocument", error);
     throw error;
+  } finally {
+    await releaseTelegramApiSlot(params.env, slot);
   }
 }
 
@@ -1681,10 +1772,10 @@ async function getRateLimitedTelegramFileUrl(params: {
   }
 }
 
-async function acquireTelegramApiSlot(env: Env, scope: TelegramRateLimitScope): Promise<void> {
+async function acquireTelegramApiSlot(env: Env, scope: TelegramRateLimitScope): Promise<TelegramApiSlot> {
   const limiter = env.TELEGRAM_RATE_LIMITER;
   if (!limiter) {
-    return;
+    return { scope };
   }
 
   const id = limiter.idFromName(TELEGRAM_RATE_LIMITER_OBJECT_NAME);
@@ -1696,6 +1787,35 @@ async function acquireTelegramApiSlot(env: Env, scope: TelegramRateLimitScope): 
 
   if (!response.ok) {
     throw new AppError(502, "TelegramRateLimiterFailed", "Telegram rate limiter failed");
+  }
+
+  const body = await response.json().catch(() => ({})) as { token?: unknown };
+  return {
+    scope,
+    ...(typeof body.token === "string" && body.token ? { token: body.token } : {})
+  };
+}
+
+async function releaseTelegramApiSlot(env: Env, slot: TelegramApiSlot): Promise<void> {
+  if (slot.scope !== "sendDocument" || !slot.token || !env.TELEGRAM_RATE_LIMITER) {
+    return;
+  }
+
+  const id = env.TELEGRAM_RATE_LIMITER.idFromName(TELEGRAM_RATE_LIMITER_OBJECT_NAME);
+  try {
+    await env.TELEGRAM_RATE_LIMITER.get(id).fetch("https://telegram-rate-limiter/release", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        scope: slot.scope,
+        token: slot.token
+      })
+    });
+  } catch (error) {
+    console.warn("Failed to release Telegram API rate limit slot", {
+      scope: slot.scope,
+      error: error instanceof Error ? error.message : String(error)
+    });
   }
 }
 
@@ -2291,6 +2411,32 @@ async function downloadRemoteChunk(upload: MultipartUploadRecord, chunkIndex: nu
   return chunk;
 }
 
+async function downloadAndUploadRemoteChunk(params: {
+  env: Env;
+  upload: MultipartUploadRecord;
+  chunkIndex: number;
+}) {
+  let telegramSlot: TelegramApiSlot | undefined = await acquireTelegramApiSlot(params.env, "sendDocument");
+
+  try {
+    const chunk = await downloadRemoteChunk(params.upload, params.chunkIndex);
+    const slotForUpload = telegramSlot;
+    telegramSlot = undefined;
+
+    return await uploadChunkToTelegram({
+      env: params.env,
+      upload: params.upload,
+      chunk,
+      chunkIndex: params.chunkIndex,
+      telegramSlot: slotForUpload
+    });
+  } finally {
+    if (telegramSlot) {
+      await releaseTelegramApiSlot(params.env, telegramSlot);
+    }
+  }
+}
+
 function validateRemoteChunkResponse(params: {
   response: Response;
   upload: MultipartUploadRecord;
@@ -2334,6 +2480,7 @@ async function uploadChunkToTelegram(params: {
   upload: MultipartUploadRecord;
   chunk: Blob;
   chunkIndex: number;
+  telegramSlot?: TelegramApiSlot;
 }) {
   const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
   const chatId = requireEnv(params.env, "TELEGRAM_STORAGE_CHAT_ID");
@@ -2343,7 +2490,8 @@ async function uploadChunkToTelegram(params: {
     botToken,
     chatId,
     file: params.chunk,
-    fileName
+    fileName,
+    ...(params.telegramSlot ? { telegramSlot: params.telegramSlot } : {})
   });
 
   return {
