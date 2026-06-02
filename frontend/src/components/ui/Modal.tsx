@@ -158,7 +158,7 @@ export function Modal({
 
         <div
           className={cn(
-            "min-h-0 flex-1 scroll-thin px-5 py-5 sm:px-6",
+            "min-h-0 flex-1 overflow-x-hidden scroll-thin px-5 py-5 sm:px-6",
             size === "full" ? "overflow-hidden px-4 py-4 sm:px-5 sm:py-5" : "overflow-auto",
             bodyClassName
           )}

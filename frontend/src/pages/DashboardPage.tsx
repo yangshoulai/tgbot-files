@@ -261,7 +261,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       title: "永久删除该文件索引？",
       description: (
         <>
-          将从控制台永久移除 <span className="font-mono text-foreground">{file.file_name}</span>{" "}
+          将从控制台永久移除 <span className="overflow-anywhere font-mono text-foreground">{file.file_name}</span>{" "}
           的索引和分片索引。Telegram 中的原始消息不会被删除；分片文件的已分发签名链接会失效。
         </>
       ),

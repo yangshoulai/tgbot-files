@@ -1,5 +1,5 @@
 import { ChangeEvent, FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
-import { CheckCircle2, ClipboardPaste, FilePlus2, ImageOff, ImagePlus, Layers3, Link2, Trash2, UploadCloud, X } from "lucide-react";
+import { Check, CheckCircle2, ClipboardPaste, FilePlus2, ImageOff, ImagePlus, Layers3, Link2, Pencil, Trash2, UploadCloud, X } from "lucide-react";
 import {
   ApiError,
   completeMultipartUpload,
@@ -84,6 +84,7 @@ interface QueueItem {
   chunks?: UploadChunkState[];
   retry?: MultipartRetryState;
   fileNameOverride?: string;
+  editingFileName?: boolean;
   conflict?: FileNameConflictState;
   thumbnail?: UploadThumbnailState;
 }
@@ -95,6 +96,7 @@ interface UrlUploadState {
   chunks?: UploadChunkState[];
   retry?: MultipartRetryState;
   fileNameOverride?: string;
+  editingFileName?: boolean;
   conflict?: FileNameConflictState;
   thumbnail?: UploadThumbnailState;
 }
@@ -262,6 +264,19 @@ export function UploadDialog({
   const normalizedSourceUrl = sourceUrl.trim();
   const urlPendingCount = normalizedSourceUrl && urlUpload.status !== "uploading" && urlUpload.status !== "done" ? 1 : 0;
   const pendingCount = mode === "url" ? urlPendingCount : filePendingCount;
+  const hasInvalidFileName = mode === "url"
+    ? Boolean(
+        normalizedSourceUrl &&
+        (urlUpload.editingFileName || urlUpload.conflict) &&
+        urlUpload.fileNameOverride !== undefined &&
+        urlUpload.fileNameOverride.trim().length === 0
+      )
+    : items.some((item) =>
+        (item.status === "pending" || item.status === "error") &&
+        (item.editingFileName || item.conflict) &&
+        item.fileNameOverride !== undefined &&
+        item.fileNameOverride.trim().length === 0
+      );
   const hasDone = urlUpload.status === "done" || items.some((item) => item.status === "done");
 
   useEffect(() => {
@@ -334,6 +349,20 @@ export function UploadDialog({
     );
   }
 
+  function setItemFileNameEditing(id: string, editing: boolean) {
+    setItems((current) =>
+      current.map((item) =>
+        item.id === id
+          ? {
+              ...item,
+              editingFileName: editing,
+              fileNameOverride: editing && item.fileNameOverride === undefined ? item.file.name : item.fileNameOverride
+            }
+          : item
+      )
+    );
+  }
+
   function updateUrlFileName(value: string) {
     setUrlUpload((current) => ({
       ...current,
@@ -341,6 +370,16 @@ export function UploadDialog({
       status: current.conflict ? "pending" : current.status,
       message: current.conflict ? undefined : current.message,
       progress: current.conflict ? undefined : current.progress
+    }));
+  }
+
+  function setUrlFileNameEditing(editing: boolean) {
+    setUrlUpload((current) => ({
+      ...current,
+      editingFileName: editing,
+      fileNameOverride: editing && current.fileNameOverride === undefined && normalizedSourceUrl
+        ? remoteFileLabel(normalizedSourceUrl)
+        : current.fileNameOverride
     }));
   }
 
@@ -418,7 +457,7 @@ export function UploadDialog({
         setItems((current) =>
           current.map((item) =>
             item.id === target.id
-              ? { ...item, status: "done", message: undefined, progress: undefined, retry: undefined, conflict: undefined }
+              ? { ...item, status: "done", message: undefined, progress: undefined, retry: undefined, conflict: undefined, editingFileName: false }
               : item
           )
         );
@@ -436,6 +475,7 @@ export function UploadDialog({
                   retry: conflict ? undefined : retry,
                   conflict,
                   fileNameOverride: conflict?.suggestedName ?? item.fileNameOverride,
+                  editingFileName: conflict ? true : item.editingFileName,
                   progress: retry && !conflict ? retryFailureProgress(retry, "分片上传失败，可手动重试") : undefined
                 }
               : item
@@ -832,7 +872,8 @@ export function UploadDialog({
         message: "已从 URL 上传",
         progress: undefined,
         retry: undefined,
-        conflict: undefined
+        conflict: undefined,
+        editingFileName: false
       }));
       onUploaded(1);
     } catch (uploadError) {
@@ -850,6 +891,7 @@ export function UploadDialog({
         retry: conflict ? undefined : retry,
         conflict,
         fileNameOverride: conflict?.suggestedName ?? current.fileNameOverride,
+        editingFileName: conflict ? true : current.editingFileName,
         progress: retry && !conflict ? retryFailureProgress(retry, "分片导入失败，可手动重试") : undefined
       }));
       onError(message);
@@ -913,7 +955,14 @@ export function UploadDialog({
         ? thumbnailPayload(urlUpload.thumbnail.generated)
         : undefined;
       await completeMultipartUpload(retry.uploadId, thumbnail);
-      setUrlUpload((current) => ({ ...current, status: "done", message: "已从 URL 上传", progress: undefined, retry: undefined }));
+      setUrlUpload((current) => ({
+        ...current,
+        status: "done",
+        message: "已从 URL 上传",
+        progress: undefined,
+        retry: undefined,
+        editingFileName: false
+      }));
       onUploaded(1);
     } catch (uploadError) {
       const nextRetry = uploadError instanceof MultipartChunkUploadError ? uploadError.retry : retry;
@@ -953,7 +1002,7 @@ export function UploadDialog({
       await retryLocalMultipart(target, target.retry, thumbnail);
       setItems((current) =>
         current.map((item) =>
-          item.id === id ? { ...item, status: "done", message: undefined, progress: undefined, retry: undefined } : item
+          item.id === id ? { ...item, status: "done", message: undefined, progress: undefined, retry: undefined, editingFileName: false } : item
         )
       );
       onUploaded(1);
@@ -1007,13 +1056,15 @@ export function UploadDialog({
             variant="primary"
             loading={submitting}
             leadingIcon={mode === "url" ? <Link2 size={16} /> : <FilePlus2 size={16} />}
-            disabled={pendingCount === 0}
+            disabled={pendingCount === 0 || hasInvalidFileName}
           >
             {submitting
               ? mode === "url" ? "导入中" : "上传中"
-              : pendingCount > 0
-                ? mode === "url" ? "上传 URL" : `开始上传 ${pendingCount} 个`
-                : "无待传文件"}
+              : hasInvalidFileName
+                ? "文件名不能为空"
+                : pendingCount > 0
+                  ? mode === "url" ? "上传 URL" : `开始上传 ${pendingCount} 个`
+                  : "无待传文件"}
           </Button>
         </>
       }
@@ -1080,6 +1131,7 @@ export function UploadDialog({
                     onRemove={() => removeItem(item.id)}
                     onRetry={item.retry ? () => void retryItemFailedChunks(item.id) : undefined}
                     onFileNameChange={(value) => updateItemFileName(item.id, value)}
+                    onFileNameEditingChange={(editing) => setItemFileNameEditing(item.id, editing)}
                     onThumbnailChange={(file) => void handleManualItemThumbnail(item.id, file)}
                     onThumbnailRemove={() => removeItemThumbnail(item.id)}
                     disabled={submitting}
@@ -1125,10 +1177,12 @@ export function UploadDialog({
                 progress={urlUpload.progress}
                 chunks={urlUpload.chunks}
                 fileNameOverride={urlUpload.fileNameOverride}
+                editingFileName={urlUpload.editingFileName}
                 conflict={urlUpload.conflict}
                 onClear={() => handleSourceUrlChange("")}
                 onRetry={urlUpload.retry ? () => void retryUrlMultipart(urlUpload.retry!) : undefined}
                 onFileNameChange={updateUrlFileName}
+                onFileNameEditingChange={setUrlFileNameEditing}
                 thumbnail={urlUpload.thumbnail}
                 onThumbnailChange={(file) => void handleManualUrlThumbnail(file)}
                 onThumbnailRemove={removeUrlThumbnail}
@@ -1282,6 +1336,7 @@ interface QueueRowProps {
   onRemove: () => void;
   onRetry?: () => void;
   onFileNameChange: (value: string) => void;
+  onFileNameEditingChange: (editing: boolean) => void;
   onThumbnailChange: (file: File) => void;
   onThumbnailRemove: () => void;
   disabled: boolean;
@@ -1292,11 +1347,13 @@ function QueueRow({
   onRemove,
   onRetry,
   onFileNameChange,
+  onFileNameEditingChange,
   onThumbnailChange,
   onThumbnailRemove,
   disabled
 }: QueueRowProps) {
   const status = item.status;
+  const fileName = item.fileNameOverride ?? item.file.name;
   return (
     <div className="flex flex-col gap-2 rounded-xl border border-border bg-surface px-3 py-2.5">
       <div className="flex items-center gap-3">
@@ -1305,9 +1362,15 @@ function QueueRow({
           fallback={<FileTypeIcon mimeType={item.file.type || "application/octet-stream"} fileName={item.file.name} size="sm" />}
         />
         <div className="min-w-0 flex-1">
-          <p className="truncate text-sm font-medium text-foreground" title={item.file.name}>
-            {item.file.name}
-          </p>
+          <EditableFileName
+            value={fileName}
+            originalValue={item.file.name}
+            editing={Boolean(item.editingFileName)}
+            conflict={item.conflict}
+            disabled={disabled || status === "uploading" || status === "done"}
+            onChange={onFileNameChange}
+            onEditingChange={onFileNameEditingChange}
+          />
           <p className="truncate text-xs text-muted">
             {formatBytes(item.file.size)} · 分片上传
             {thumbnailHint(item.thumbnail) ? <span> · {thumbnailHint(item.thumbnail)}</span> : null}
@@ -1342,14 +1405,6 @@ function QueueRow({
           {status === "done" ? <CheckCircle2 size={14} className="text-success" /> : <X size={14} />}
         </button>
       </div>
-      {item.conflict ? (
-        <FileNameConflictInput
-          value={item.fileNameOverride ?? ""}
-          conflict={item.conflict}
-          disabled={disabled}
-          onChange={onFileNameChange}
-        />
-      ) : null}
       {item.chunks ? <UploadChunkList chunks={item.chunks} /> : null}
     </div>
   );
@@ -1363,10 +1418,12 @@ interface UrlUploadRowProps {
   onClear: () => void;
   chunks?: UploadChunkState[];
   fileNameOverride?: string;
+  editingFileName?: boolean;
   conflict?: FileNameConflictState;
   thumbnail?: UploadThumbnailState;
   onRetry?: () => void;
   onFileNameChange: (value: string) => void;
+  onFileNameEditingChange: (editing: boolean) => void;
   onThumbnailChange: (file: File) => void;
   onThumbnailRemove: () => void;
   disabled: boolean;
@@ -1379,15 +1436,18 @@ function UrlUploadRow({
   progress,
   chunks,
   fileNameOverride,
+  editingFileName,
   conflict,
   thumbnail,
   onClear,
   onRetry,
   onFileNameChange,
+  onFileNameEditingChange,
   onThumbnailChange,
   onThumbnailRemove,
   disabled
 }: UrlUploadRowProps) {
+  const fileName = fileNameOverride ?? remoteFileLabel(url);
   return (
     <div className="flex flex-col gap-2 rounded-xl border border-border bg-surface px-3 py-2.5">
       <div className="flex items-center gap-3">
@@ -1400,9 +1460,15 @@ function UrlUploadRow({
           }
         />
         <div className="min-w-0 flex-1">
-          <p className="truncate text-sm font-medium text-foreground" title={url}>
-            {remoteFileLabel(url)}
-          </p>
+          <EditableFileName
+            value={fileName}
+            originalValue={remoteFileLabel(url)}
+            editing={Boolean(editingFileName)}
+            conflict={conflict}
+            disabled={disabled || status === "uploading" || status === "done"}
+            onChange={onFileNameChange}
+            onEditingChange={onFileNameEditingChange}
+          />
           <p className="truncate text-xs text-muted">
             {url}
             {thumbnailHint(thumbnail) ? <span> · {thumbnailHint(thumbnail)}</span> : null}
@@ -1437,14 +1503,6 @@ function UrlUploadRow({
           {status === "done" ? <CheckCircle2 size={14} className="text-success" /> : <X size={14} />}
         </button>
       </div>
-      {conflict ? (
-        <FileNameConflictInput
-          value={fileNameOverride ?? ""}
-          conflict={conflict}
-          disabled={disabled}
-          onChange={onFileNameChange}
-        />
-      ) : null}
       {chunks ? <UploadChunkList chunks={chunks} /> : null}
     </div>
   );
@@ -1545,34 +1603,144 @@ function thumbnailHint(thumbnail: UploadThumbnailState | undefined): string | un
   }
 }
 
-function FileNameConflictInput({
+function EditableFileName({
   value,
+  originalValue,
+  editing,
   conflict,
   disabled,
-  onChange
+  onChange,
+  onEditingChange
 }: {
   value: string;
-  conflict: FileNameConflictState;
+  originalValue: string;
+  editing: boolean;
+  conflict?: FileNameConflictState;
   disabled: boolean;
   onChange: (value: string) => void;
+  onEditingChange: (editing: boolean) => void;
 }) {
-  return (
-    <div className="rounded-lg border border-warning/35 bg-warning-soft/45 p-3">
-      <div className="flex flex-col gap-1.5">
-        <label className="text-xs font-medium text-warning">
-          新文件名
-        </label>
-        <Input
-          value={value}
-          disabled={disabled}
-          invalid={value.trim().length === 0}
-          placeholder={conflict.suggestedName}
-          onChange={(event) => onChange(event.target.value)}
-        />
-        <p className="text-xs leading-5 text-muted">
-          {conflict.directoryPath} 已存在 {conflict.fileName}，改名后重新上传。
-        </p>
+  const isEditing = editing || Boolean(conflict);
+  const isEmpty = value.trim().length === 0;
+  const displayValue = normalizedFileNameOverride(value) ?? originalValue;
+  const cancelValue = useRef(value);
+  const wasEditing = useRef(isEditing);
+
+  useEffect(() => {
+    if (isEditing && !wasEditing.current) {
+      cancelValue.current = value;
+    }
+    if (!isEditing) {
+      cancelValue.current = value;
+    }
+    wasEditing.current = isEditing;
+  }, [isEditing, value]);
+
+  function startEditing() {
+    if (disabled) return;
+    cancelValue.current = value;
+    onEditingChange(true);
+  }
+
+  function saveEditing() {
+    const normalized = value.trim();
+    if (!normalized) {
+      return;
+    }
+    if (normalized !== value) {
+      onChange(normalized);
+    }
+    onEditingChange(false);
+  }
+
+  function cancelEditing() {
+    if (conflict) {
+      return;
+    }
+    onChange(cancelValue.current);
+    onEditingChange(false);
+  }
+
+  if (!isEditing) {
+    return (
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span
+          className="min-w-0 truncate text-sm font-medium text-foreground"
+          title={displayValue === originalValue ? displayValue : `${displayValue}（默认：${originalValue}）`}
+        >
+          {displayValue}
+        </span>
+        {!disabled ? (
+          <button
+            type="button"
+            aria-label="编辑文件名"
+            title="编辑文件名"
+            onClick={startEditing}
+            className="grid size-6 shrink-0 place-items-center rounded-md text-subtle transition-colors hover:bg-primary-soft hover:text-primary-strong focus-visible:outline-none focus-visible:focus-ring"
+          >
+            <Pencil size={13} />
+          </button>
+        ) : null}
       </div>
+    );
+  }
+
+  const hint = conflict
+    ? `${conflict.directoryPath} 已存在 ${conflict.fileName}，请修改文件名后重新上传。`
+    : value.trim() === originalValue.trim()
+      ? "默认使用原文件名，也可以在这里修改。"
+      : "上传后将使用该文件名。";
+
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5">
+      <Input
+        value={value}
+        disabled={disabled}
+        invalid={isEmpty}
+        placeholder={conflict?.suggestedName || originalValue}
+        className="h-9 px-2 shadow-none"
+        inputClassName="text-sm font-medium"
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            saveEditing();
+          }
+          if (event.key === "Escape") {
+            event.preventDefault();
+            cancelEditing();
+          }
+        }}
+        trailingNode={
+          <span className="inline-flex shrink-0 items-center gap-1">
+            <button
+              type="button"
+              aria-label="确认文件名"
+              title="确认文件名"
+              disabled={disabled || isEmpty}
+              onClick={saveEditing}
+              className="grid size-6 place-items-center rounded-md text-success transition-colors hover:bg-success-soft disabled:pointer-events-none disabled:opacity-40 focus-visible:outline-none focus-visible:focus-ring"
+            >
+              <Check size={13} />
+            </button>
+            {!conflict ? (
+              <button
+                type="button"
+                aria-label="取消编辑文件名"
+                title="取消编辑"
+                disabled={disabled}
+                onClick={cancelEditing}
+                className="grid size-6 place-items-center rounded-md text-subtle transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-40 focus-visible:outline-none focus-visible:focus-ring"
+              >
+                <X size={13} />
+              </button>
+            ) : null}
+          </span>
+        }
+      />
+      <p className={cn("text-xs leading-5", isEmpty ? "text-danger" : conflict ? "text-warning" : "text-muted")}>
+        {isEmpty ? "文件名不能为空。" : hint}
+      </p>
     </div>
   );
 }

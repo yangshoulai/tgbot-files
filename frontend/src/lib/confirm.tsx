@@ -81,13 +81,13 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
           </>
         }
       >
-        <div className="flex items-start gap-3">
+        <div className="flex min-w-0 items-start gap-3 overflow-anywhere">
           {state?.tone === "danger" ? (
             <span className="mt-0.5 grid size-9 shrink-0 place-items-center rounded-full bg-danger-soft text-danger">
               <AlertTriangle size={18} />
             </span>
           ) : null}
-          <div className="text-sm leading-6 text-muted">{state?.description}</div>
+          <div className="min-w-0 text-sm leading-6 text-muted">{state?.description}</div>
         </div>
       </Modal>
     </ConfirmContext.Provider>
