@@ -26,9 +26,38 @@ class FakeD1 {
   readonly apiKeys: ApiKeyRecord[] = [];
   readonly multipartUploads: MultipartUploadRecord[] = [];
   readonly fileChunks: FileChunkRecord[] = [];
+  batchCalls = 0;
 
   prepare(sql: string): D1PreparedStatement {
     return new FakeD1Statement(this, sql) as unknown as D1PreparedStatement;
+  }
+
+  async batch<T = unknown>(statements: D1PreparedStatement[]): Promise<D1Result<T>[]> {
+    this.batchCalls += 1;
+    const snapshots = {
+      directories: this.directories.map((item) => ({ ...item })),
+      files: this.files.map((item) => ({ ...item })),
+      apiKeys: this.apiKeys.map((item) => ({ ...item })),
+      multipartUploads: this.multipartUploads.map((item) => ({ ...item })),
+      fileChunks: this.fileChunks.map((item) => ({ ...item }))
+    };
+    const results: D1Result<T>[] = [];
+
+    try {
+      for (const statement of statements) {
+        const result = await (statement as unknown as { run: () => Promise<D1Result<T>> }).run();
+        results.push(result);
+      }
+    } catch (error) {
+      this.directories.splice(0, this.directories.length, ...snapshots.directories);
+      this.files.splice(0, this.files.length, ...snapshots.files);
+      this.apiKeys.splice(0, this.apiKeys.length, ...snapshots.apiKeys);
+      this.multipartUploads.splice(0, this.multipartUploads.length, ...snapshots.multipartUploads);
+      this.fileChunks.splice(0, this.fileChunks.length, ...snapshots.fileChunks);
+      throw error;
+    }
+
+    return results;
   }
 }
 
@@ -47,6 +76,7 @@ class FakeD1Statement {
 
   async run(): Promise<D1Result> {
     const normalizedSql = this.sql.trim().toUpperCase();
+    let changes = 0;
 
     if (normalizedSql.startsWith("INSERT INTO FILES")) {
       const [
@@ -84,6 +114,7 @@ class FakeD1Statement {
         chunk_size: this.bindings[14] === null ? null : Number(this.bindings[14]),
         chunk_count: this.bindings[15] === null ? null : Number(this.bindings[15])
       });
+      changes = 1;
     }
 
     if (normalizedSql.startsWith("INSERT INTO MULTIPART_UPLOADS")) {
@@ -117,6 +148,7 @@ class FakeD1Statement {
         directory_path: String(this.bindings[12] || "/"),
         completed_at: null
       });
+      changes = 1;
     }
 
     if (normalizedSql.startsWith("INSERT INTO DIRECTORIES")) {
@@ -130,6 +162,7 @@ class FakeD1Statement {
         created_at: String(createdAt),
         deleted_at: null
       });
+      changes = 1;
     }
 
     if (normalizedSql.startsWith("INSERT OR REPLACE INTO FILE_CHUNKS")) {
@@ -152,6 +185,7 @@ class FakeD1Statement {
       } else {
         this.db.fileChunks.push(chunk);
       }
+      changes = 1;
     }
 
     if (normalizedSql.startsWith("INSERT INTO API_KEYS")) {
@@ -167,6 +201,7 @@ class FakeD1Statement {
         last_used_at: null,
         deleted_at: null
       });
+      changes = 1;
     }
 
     if (normalizedSql.startsWith("UPDATE FILES") && normalizedSql.includes("SET DELETED_AT")) {
@@ -334,10 +369,39 @@ class FakeD1Statement {
       const upload = this.db.multipartUploads.find((item) => item.id === id && item.completed_at === null);
       if (upload) {
         upload.completed_at = String(completedAt);
+        changes = 1;
       }
     }
 
-    return { success: true, meta: fakeD1Meta(), results: [] };
+    if (normalizedSql.startsWith("DELETE FROM FILE_CHUNKS")) {
+      const expiredBefore = String(this.bindings[0]);
+      const staleUploadIds = new Set(
+        this.db.multipartUploads
+          .filter((item) =>
+            item.completed_at === null &&
+            item.created_at < expiredBefore &&
+            !this.db.files.some((file) => file.id === item.id)
+          )
+          .map((item) => item.id)
+      );
+      const remaining = this.db.fileChunks.filter((item) => !staleUploadIds.has(item.file_id));
+      changes = this.db.fileChunks.length - remaining.length;
+      this.db.fileChunks.splice(0, this.db.fileChunks.length, ...remaining);
+    }
+
+    if (normalizedSql.startsWith("DELETE FROM MULTIPART_UPLOADS")) {
+      const expiredBefore = String(this.bindings[0]);
+      const remaining = this.db.multipartUploads.filter(
+        (item) =>
+          item.completed_at !== null ||
+          item.created_at >= expiredBefore ||
+          this.db.files.some((file) => file.id === item.id)
+      );
+      changes = this.db.multipartUploads.length - remaining.length;
+      this.db.multipartUploads.splice(0, this.db.multipartUploads.length, ...remaining);
+    }
+
+    return { success: true, meta: { ...fakeD1Meta(), changes }, results: [] };
   }
 
   async first<T = unknown>(): Promise<T | null> {
@@ -2410,6 +2474,142 @@ describe("admin file manager", () => {
     expect(body.file.storage_backend).toBe("telegram_multipart");
     expect(body.file.chunk_count).toBe(chunkCount);
     expect(db.files[0]?.file_path).toBe(body.file.file_path);
+    expect(db.multipartUploads[0]?.completed_at).not.toBeNull();
+    expect(db.batchCalls).toBe(1);
+  });
+
+  it("cleans stale incomplete multipart uploads on the scheduled trigger", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      STALE_MULTIPART_UPLOAD_TTL_HOURS: "24"
+    };
+    const uploads: MultipartUploadRecord[] = [
+      {
+        id: "stale-upload",
+        source_kind: "local",
+        source_url: null,
+        file_name: "stale.bin",
+        mime_type: "application/octet-stream",
+        size: 6,
+        chunk_size: 3,
+        chunk_count: 2,
+        remark: null,
+        uploaded_by: "admin",
+        created_at: "2026-05-31T23:59:59.000Z",
+        completed_at: null,
+        directory_id: null,
+        directory_path: "/"
+      },
+      {
+        id: "recent-upload",
+        source_kind: "local",
+        source_url: null,
+        file_name: "recent.bin",
+        mime_type: "application/octet-stream",
+        size: 3,
+        chunk_size: 3,
+        chunk_count: 1,
+        remark: null,
+        uploaded_by: "admin",
+        created_at: "2026-06-01T01:00:00.000Z",
+        completed_at: null,
+        directory_id: null,
+        directory_path: "/"
+      },
+      {
+        id: "completed-upload",
+        source_kind: "local",
+        source_url: null,
+        file_name: "done.bin",
+        mime_type: "application/octet-stream",
+        size: 3,
+        chunk_size: 3,
+        chunk_count: 1,
+        remark: null,
+        uploaded_by: "admin",
+        created_at: "2026-05-31T00:00:00.000Z",
+        completed_at: "2026-05-31T00:05:00.000Z",
+        directory_id: null,
+        directory_path: "/"
+      },
+      {
+        id: "indexed-upload",
+        source_kind: "local",
+        source_url: null,
+        file_name: "indexed.bin",
+        mime_type: "application/octet-stream",
+        size: 3,
+        chunk_size: 3,
+        chunk_count: 1,
+        remark: null,
+        uploaded_by: "admin",
+        created_at: "2026-05-31T00:00:00.000Z",
+        completed_at: null,
+        directory_id: null,
+        directory_path: "/"
+      }
+    ];
+    db.multipartUploads.push(...uploads);
+    db.files.push({
+      id: "indexed-upload",
+      file_name: "indexed.bin",
+      mime_type: "application/octet-stream",
+      size: 3,
+      md5: "multipart:chunk-indexed-upload",
+      telegram_file_id: "multipart:indexed-upload",
+      telegram_file_unique_id: null,
+      file_path: "/f/token/indexed.bin",
+      remark: null,
+      uploaded_by: "admin",
+      created_at: "2026-05-31T00:05:00.000Z",
+      deleted_at: null,
+      directory_id: null,
+      directory_path: "/",
+      storage_backend: "telegram_multipart",
+      chunk_size: 3,
+      chunk_count: 1
+    });
+    for (const upload of uploads) {
+      db.fileChunks.push({
+        file_id: upload.id,
+        chunk_index: 0,
+        size: 3,
+        md5: `chunk-${upload.id}`,
+        telegram_file_id: `tg-${upload.id}`,
+        telegram_file_unique_id: null,
+        created_at: upload.created_at
+      });
+    }
+
+    const waitUntilPromises: Promise<unknown>[] = [];
+    await worker.scheduled(
+      {
+        cron: "0 */6 * * *",
+        scheduledTime: Date.parse("2026-06-02T00:00:00.000Z")
+      } as ScheduledController,
+      adminEnv,
+      {
+        waitUntil(promise: Promise<unknown>) {
+          waitUntilPromises.push(Promise.resolve(promise));
+        },
+        passThroughOnException() {}
+      } as ExecutionContext
+    );
+    await Promise.all(waitUntilPromises);
+
+    expect(db.batchCalls).toBe(1);
+    expect(db.multipartUploads.map((item) => item.id)).toEqual([
+      "recent-upload",
+      "completed-upload",
+      "indexed-upload"
+    ]);
+    expect(db.fileChunks.map((item) => item.file_id)).toEqual([
+      "recent-upload",
+      "completed-upload",
+      "indexed-upload"
+    ]);
   });
 
   it("rejects multipart upload sessions over the limit with human-readable sizes", async () => {

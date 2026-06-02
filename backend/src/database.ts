@@ -136,6 +136,11 @@ export interface NewFileChunkRecord {
   createdAt: string;
 }
 
+export interface MultipartCleanupResult {
+  deletedUploads: number;
+  deletedChunks: number;
+}
+
 export function requireDb(env: { FILES_DB?: D1Database }): D1Database {
   if (!env.FILES_DB) {
     throw new AppError(500, "ServerMisconfigured", "Missing required D1 binding: FILES_DB");
@@ -145,7 +150,11 @@ export function requireDb(env: { FILES_DB?: D1Database }): D1Database {
 }
 
 export async function insertFileRecord(db: D1Database, record: NewFileRecord): Promise<void> {
-  await db
+  await prepareInsertFileRecord(db, record).run();
+}
+
+function prepareInsertFileRecord(db: D1Database, record: NewFileRecord): D1PreparedStatement {
+  return db
     .prepare(
       `INSERT INTO files (
         id,
@@ -184,8 +193,7 @@ export async function insertFileRecord(db: D1Database, record: NewFileRecord): P
       record.storageBackend ?? "telegram_single",
       record.chunkSize ?? null,
       record.chunkCount ?? null
-    )
-    .run();
+    );
 }
 
 export async function listFileRecords(params: {
@@ -901,10 +909,29 @@ export async function completeMultipartUploadRecord(
   id: string,
   completedAt: string
 ): Promise<void> {
-  await db
+  await prepareCompleteMultipartUploadRecord(db, id, completedAt).run();
+}
+
+function prepareCompleteMultipartUploadRecord(
+  db: D1Database,
+  id: string,
+  completedAt: string
+): D1PreparedStatement {
+  return db
     .prepare("UPDATE multipart_uploads SET completed_at = ? WHERE id = ? AND completed_at IS NULL")
-    .bind(completedAt, id)
-    .run();
+    .bind(completedAt, id);
+}
+
+export async function completeMultipartUploadWithFileRecord(params: {
+  db: D1Database;
+  file: NewFileRecord;
+  uploadId: string;
+  completedAt: string;
+}): Promise<void> {
+  await params.db.batch([
+    prepareInsertFileRecord(params.db, params.file),
+    prepareCompleteMultipartUploadRecord(params.db, params.uploadId, params.completedAt)
+  ]);
 }
 
 export async function upsertFileChunkRecord(db: D1Database, record: NewFileChunkRecord): Promise<void> {
@@ -974,6 +1001,44 @@ export async function getFileChunkRecord(
     )
     .bind(fileId, chunkIndex)
     .first<FileChunkRecord>();
+}
+
+export async function deleteStaleMultipartUploadData(
+  db: D1Database,
+  expiredBefore: string
+): Promise<MultipartCleanupResult> {
+  const [chunkResult, uploadResult] = await db.batch([
+    db
+      .prepare(
+        `DELETE FROM file_chunks
+        WHERE file_id IN (
+          SELECT multipart_uploads.id FROM multipart_uploads
+          WHERE multipart_uploads.completed_at IS NULL
+            AND multipart_uploads.created_at < ?
+            AND NOT EXISTS (
+              SELECT 1 FROM files
+              WHERE files.id = multipart_uploads.id
+            )
+        )`
+      )
+      .bind(expiredBefore),
+    db
+      .prepare(
+        `DELETE FROM multipart_uploads
+        WHERE completed_at IS NULL
+          AND created_at < ?
+          AND NOT EXISTS (
+            SELECT 1 FROM files
+            WHERE files.id = multipart_uploads.id
+          )`
+      )
+      .bind(expiredBefore)
+  ]);
+
+  return {
+    deletedChunks: Number(chunkResult?.meta.changes ?? 0),
+    deletedUploads: Number(uploadResult?.meta.changes ?? 0)
+  };
 }
 
 export async function insertApiKeyRecord(db: D1Database, record: NewApiKeyRecord): Promise<ApiKeyRecord> {

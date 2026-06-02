@@ -455,40 +455,82 @@ X-Chunk-Offset: 0`,
           ]
         },
         {
-          title: "文件与目录管理",
-          description: "控制台文件列表、目录树、元数据修改、移动与删除。",
+          title: "文件列表、过滤与全局统计",
+          description: "管理员 APP 的首页数据源：当前目录、子目录、文件分页、筛选结果和全局容量统计都由这里返回。",
           endpoints: [
             {
               method: "GET",
-              path: "/api/admin/files?q=&dir=/&page=1&limit=20",
-              title: "列出当前目录文件",
-              description: "搜索只作用于当前目录，不递归。",
+              path: "/api/admin/files?dir=/&q=&type=all&created_from=&created_to=&page=1&limit=24",
+              title: "列出当前目录文件、过滤和统计",
+              description: "返回当前目录信息、直属子目录、文件分页、全局文件数和总容量；搜索只作用于当前目录，不递归。",
               auth: "Admin Cookie",
+              request: `curl '${baseUrl}/api/admin/files?dir=/photos&q=trip&type=image&page=1&limit=24' \\
+  -H 'Cookie: admin_session=...'`,
               response: `{
   "ok": true,
-  "current_directory": { "path": "/" },
-  "directories": [],
-  "files": [],
-  "pagination": { "page": 1, "limit": 20, "total": 0 }
-}`
-            },
+  "current_directory": { "id": null, "path": "/" },
+  "directories": [
+    { "id": "dir-id", "name": "photos", "path": "/photos", "file_count": 12, "total_size": 1048576 }
+  ],
+  "search_scope": "current",
+  "files": [
+    {
+      "id": "file-id",
+      "file_name": "trip.jpg",
+      "directory_path": "/photos",
+      "url": "${baseUrl}/f/<token>/trip.jpg",
+      "download_url": "${baseUrl}/f/<token>/trip.jpg?download=1",
+      "direct_access": true,
+      "download_strategy": "direct"
+    }
+  ],
+  "pagination": { "page": 1, "limit": 24, "total": 1, "total_pages": 1 },
+  "global_stats": { "file_count": 128, "total_size": 987654321 },
+  "max_file_bytes": ${session.max_file_bytes},
+  "multipart_chunk_bytes": ${session.multipart_chunk_bytes},
+  "direct_access_max_chunks": ${session.direct_access_max_chunks}
+}`,
+              notes: [
+                "dir 默认为 /；type 支持 image、text、pdf、archive、other；created_from/created_to 使用 ISO 时间。",
+                "全局统计字段 global_stats 不受当前目录过滤影响，可用于 APP 顶部容量卡片。"
+              ]
+            }
+          ]
+        },
+        {
+          title: "文件管理",
+          description: "文件上传、重命名、备注编辑、单文件移动和软删除。删除只删除索引，不删除 Telegram 原始消息。",
+          endpoints: [
             {
               method: "POST",
               path: "/api/admin/files",
-              title: "管理员小文件上传",
+              title: "管理员小文件上传或 URL 拉取",
               description: "普通上传入口，支持 multipart file 或 JSON URL，受单文件上限约束。",
               auth: "Admin Cookie",
-              request: `FormData:
-file=@./hello.txt
-directory_path=/
-remark=可选备注`,
+              request: `# 本地文件
+curl -X POST '${baseUrl}/api/admin/files' \\
+  -H 'Cookie: admin_session=...' \\
+  -F 'file=@./hello.txt' \\
+  -F 'directory_path=/' \\
+  -F 'remark=可选备注'
+
+# URL 拉取
+{
+  "url": "https://example.com/hello.txt",
+  "directory_path": "/",
+  "remark": "从 URL 导入"
+}`,
               response: `{
   "ok": true,
   "file": {
     "id": "file-id",
-    "url": "${baseUrl}/f/<token>/hello.txt"
+    "file_name": "hello.txt",
+    "file_path": "/f/<token>/hello.txt",
+    "url": "${baseUrl}/f/<token>/hello.txt",
+    "download_url": "${baseUrl}/f/<token>/hello.txt?download=1"
   }
-}`
+}`,
+              notes: [`文件大小必须小于等于 ${maxFile}；更大的文件请使用管理员分片上传。`]
             },
             {
               method: "PATCH",
@@ -502,48 +544,165 @@ remark=可选备注`,
 }`,
               response: `{
   "ok": true,
-  "file": { "file_name": "new-name.txt" }
+  "file": {
+    "id": "file-id",
+    "file_name": "new-name.txt",
+    "remark": "新的备注",
+    "file_path": "/f/<new-token>/new-name.txt"
+  }
+}`
+            },
+            {
+              method: "PATCH",
+              path: "/api/admin/files/move",
+              title: "移动文件到目录",
+              description: "仅移动文件索引，目标目录不存在时会自动创建路径。更推荐新 APP 使用 /api/admin/entries/move 统一处理文件和目录。",
+              auth: "Admin Cookie",
+              request: `{
+  "file_ids": ["file-id-1", "file-id-2"],
+  "directory_path": "/archive"
+}`,
+              response: `{
+  "ok": true,
+  "moved": 2,
+  "directory_path": "/archive"
+}`
+            },
+            {
+              method: "DELETE",
+              path: "/api/admin/files/:id",
+              title: "删除单个文件索引",
+              description: "软删除文件索引，不删除 Telegram 原消息；已分发的签名链接仍可能继续可用。",
+              auth: "Admin Cookie",
+              response: `{
+  "ok": true
+}`
+            }
+          ]
+        },
+        {
+          title: "目录管理",
+          description: "虚拟目录的列表、创建、重命名、移动和递归删除。目录操作会同步更新子目录路径和文件 directory_path。",
+          endpoints: [
+            {
+              method: "GET",
+              path: "/api/admin/directories?parent_path=/&flat=0",
+              title: "列出目录",
+              description: "默认列出 parent_path 的直属子目录；flat=1 时返回所有未删除目录，适合目录选择器。",
+              auth: "Admin Cookie",
+              response: `{
+  "ok": true,
+  "directories": [
+    { "id": "dir-id", "parent_id": null, "name": "photos", "path": "/photos" }
+  ]
 }`
             },
             {
               method: "POST",
               path: "/api/admin/directories",
               title: "新建目录",
-              description: "虚拟目录，不影响 Telegram 原消息。",
+              description: "创建虚拟目录；同级目录重名会返回 DirectoryExists。",
               auth: "Admin Cookie",
               request: `{
   "name": "photos",
   "parent_path": "/"
+}`,
+              response: `{
+  "ok": true,
+  "directory": { "id": "dir-id", "name": "photos", "path": "/photos" }
 }`
             },
             {
               method: "PATCH",
+              path: "/api/admin/directories/:id",
+              title: "重命名目录",
+              description: "重命名目录并递归更新子目录和文件路径。",
+              auth: "Admin Cookie",
+              request: `{
+  "name": "images"
+}`,
+              response: `{
+  "ok": true,
+  "renamed_directories": 2,
+  "updated_files": 12,
+  "directory": { "id": "dir-id", "path": "/images" }
+}`
+            },
+            {
+              method: "PATCH",
+              path: "/api/admin/directories/:id/move",
+              title: "移动目录树",
+              description: "把目录移动到新的父目录下，禁止移动到自身或子目录。",
+              auth: "Admin Cookie",
+              request: `{
+  "parent_path": "/archive"
+}`,
+              response: `{
+  "ok": true,
+  "moved_directories": 2,
+  "moved_files": 12,
+  "directory": { "id": "dir-id", "path": "/archive/photos" }
+}`
+            },
+            {
+              method: "DELETE",
+              path: "/api/admin/directories/:id",
+              title: "递归删除目录树",
+              description: "软删除目录及其子目录，并软删除目录树下的文件索引。",
+              auth: "Admin Cookie",
+              response: `{
+  "ok": true,
+  "deleted_directories": 2,
+  "deleted_files": 12,
+  "directory": { "id": "dir-id", "path": "/photos" }
+}`
+            }
+          ]
+        },
+        {
+          title: "文件和目录批量操作",
+          description: "面向多选 UI 的统一操作接口，支持文件和目录混合移动、混合删除。",
+          endpoints: [
+            {
+              method: "PATCH",
               path: "/api/admin/entries/move",
               title: "移动文件和目录",
-              description: "支持文件与目录混合移动，也支持移动时新建目标目录。",
+              description: "支持文件与目录混合移动，也支持移动时自动创建目标目录。",
               auth: "Admin Cookie",
               request: `{
   "file_ids": ["file-id"],
   "directory_ids": ["directory-id"],
   "directory_path": "/archive"
+}`,
+              response: `{
+  "ok": true,
+  "moved": 3,
+  "moved_directories": 1,
+  "moved_files": 2,
+  "directory_path": "/archive"
 }`
             },
             {
-              method: "DELETE",
-              path: "/api/admin/entries",
+              method: "POST",
+              path: "/api/admin/entries/delete",
               title: "批量删除文件和目录",
-              description: "删除索引和虚拟目录，不删除 Telegram 原始消息。",
+              description: "软删除选中的文件索引和目录树；不会删除 Telegram 原始消息。",
               auth: "Admin Cookie",
               request: `{
   "file_ids": ["file-id"],
   "directory_ids": ["directory-id"]
+}`,
+              response: `{
+  "ok": true,
+  "deleted_directories": 1,
+  "deleted_files": 3
 }`
             }
           ]
         },
         {
           title: "管理员分片上传",
-          description: "控制台使用的分片上传接口。UI 可选择“小文件也使用分片上传”。URL 分片可通过 force_multipart 强制启用。",
+          description: "控制台使用的分片上传接口。UI 可选择“小文件也使用分片上传”。URL 分片可通过 force_multipart 强制启用。未完成会话会由 Worker 定时任务清理。",
           endpoints: [
             {
               method: "POST",
@@ -552,44 +711,122 @@ remark=可选备注`,
               description: "支持任意大于 0 且不超过分片上限的文件，包括小文件。",
               auth: "Admin Cookie",
               request: `{
-  "file_name": "small.txt",
-  "mime_type": "text/plain",
-  "size": 5,
-  "directory_path": "/"
+  "file_name": "backup.zip",
+  "mime_type": "application/zip",
+  "size": 5368709120,
+  "directory_path": "/backup",
+  "remark": "每日备份"
+}`,
+              response: `{
+  "ok": true,
+  "upload": {
+    "id": "upload-id",
+    "file_name": "backup.zip",
+    "chunk_size": ${session.multipart_chunk_bytes},
+    "chunk_count": 285,
+    "direct_access": false,
+    "max_multipart_file_bytes": ${session.max_multipart_file_bytes}
+  }
 }`
             },
             {
               method: "POST",
               path: "/api/admin/uploads/url/init",
               title: "初始化 URL 分片上传",
-              description: "默认小文件返回 single；传 force_multipart: true 时小文件也走分片。",
+              description: "默认小文件返回 single，APP 可随后调用 /api/admin/files 做普通 URL 上传；传 force_multipart: true 时小文件也走分片。",
               auth: "Admin Cookie",
               request: `{
-  "url": "https://example.com/small.txt",
+  "url": "https://example.com/video.mp4",
   "force_multipart": true,
-  "directory_path": "/"
-}`
+  "directory_path": "/videos",
+  "remark": "远程导入"
+}`,
+              response: `{
+  "ok": true,
+  "mode": "multipart",
+  "upload": { "id": "upload-id", "file_name": "video.mp4", "chunk_count": 42 }
+}`,
+              notes: ["远端必须支持 Range 请求，并暴露 Content-Length 或 Content-Range。"]
             },
             {
               method: "POST",
               path: "/api/admin/uploads/:uploadId/chunks/:index",
               title: "上传本地分片",
-              description: "FormData 字段名为 chunk。",
-              auth: "Admin Cookie"
+              description: "FormData 字段名为 chunk；index 从 0 开始。",
+              auth: "Admin Cookie",
+              request: `curl -X POST '${baseUrl}/api/admin/uploads/<UPLOAD_ID>/chunks/0' \\
+  -H 'Cookie: admin_session=...' \\
+  -F 'chunk=@./backup.zip.part0'`,
+              response: `{
+  "ok": true,
+  "chunk": { "chunk_index": 0, "size": ${session.multipart_chunk_bytes}, "telegram_file_id": "..." },
+  "uploaded_chunks": 1
+}`
             },
             {
               method: "POST",
               path: "/api/admin/uploads/:uploadId/url-chunks/:index",
               title: "导入 URL 分片",
-              description: "按初始化保存的 source_url 拉取 Range。",
-              auth: "Admin Cookie"
+              description: "按初始化保存的 source_url 拉取 Range，再上传到 Telegram。",
+              auth: "Admin Cookie",
+              response: `{
+  "ok": true,
+  "uploaded_chunks": 2
+}`
             },
             {
               method: "POST",
               path: "/api/admin/uploads/:uploadId/complete",
               title: "完成分片上传",
-              description: "生成最终文件索引，并按分片数量判断是否返回直链。",
-              auth: "Admin Cookie"
+              description: "校验所有分片都存在后，事务化写入最终文件索引并标记上传完成。",
+              auth: "Admin Cookie",
+              response: `{
+  "ok": true,
+  "file": {
+    "id": "upload-id",
+    "storage_backend": "telegram_multipart",
+    "chunk_count": 285,
+    "direct_access": false,
+    "download_strategy": "accelerated",
+    "url": null,
+    "download_url": null
+  }
+}`,
+              notes: ["如果缺少任意分片，会返回 409 UploadIncomplete，不会生成最终 files 记录。"]
+            }
+          ]
+        },
+        {
+          title: "下载、预览与加速下载",
+          description: "文件列表返回的 file_path/url/download_url 是管理员 APP 下载和预览的数据源；超大分片文件通过 chunk 接口并发下载后在客户端合并。",
+          endpoints: [
+            {
+              method: "GET",
+              path: "/f/:token/:filename?",
+              title: "签名链接预览或下载",
+              description: "访问文件列表返回的 file_path 或 url；download=1 强制附件下载，Range 请求可用于媒体拖动和断点读取。",
+              auth: "Signed file token",
+              request: `curl '${baseUrl}/f/<token>/hello.txt?download=1' -o hello.txt`,
+              response: `HTTP/1.1 200 OK
+Content-Type: text/plain
+Content-Disposition: attachment; filename="hello.txt"
+Accept-Ranges: bytes`,
+              notes: ["direct_access=false 的超大分片文件不提供完整文件直链，会返回 DirectAccessDisabled。"]
+            },
+            {
+              method: "GET",
+              path: "/f/:token/chunks/:index",
+              title: "签名分片下载（加速下载）",
+              description: "管理员控制台的加速下载使用该接口并发拉取分片；APP 可按 chunk_count 并发下载后按 index 合并。",
+              auth: "Signed file token",
+              request: `curl '${baseUrl}/f/<token>/chunks/0' -o part-0.bin`,
+              response: `HTTP/1.1 200 OK
+Content-Type: application/octet-stream
+Content-Length: ${session.multipart_chunk_bytes}
+X-Chunk-Index: 0
+X-Chunk-Count: 285
+X-Chunk-Offset: 0`,
+              notes: ["仅 storage_backend=telegram_multipart 的文件支持；普通单文件会返回 NotMultipartFile。"]
             }
           ]
         },
@@ -602,7 +839,13 @@ remark=可选备注`,
               path: "/api/admin/api-keys",
               title: "列出 API Keys",
               description: "列表只返回 masked key。",
-              auth: "Admin Cookie"
+              auth: "Admin Cookie",
+              response: `{
+  "ok": true,
+  "api_keys": [
+    { "id": "key-id", "name": "backup-client", "masked_key": "tgbot_••••abcd", "status": "active" }
+  ]
+}`
             },
             {
               method: "POST",
@@ -612,6 +855,10 @@ remark=可选备注`,
               auth: "Admin Cookie",
               request: `{
   "name": "backup-client"
+}`,
+              response: `{
+  "ok": true,
+  "api_key": { "id": "key-id", "name": "backup-client", "key": "tgbot_plaintext_key" }
 }`
             },
             {
@@ -619,7 +866,11 @@ remark=可选备注`,
               path: "/api/admin/api-keys/:id",
               title: "显式查看明文 Key",
               description: "用于重新复制已有 API Key。",
-              auth: "Admin Cookie"
+              auth: "Admin Cookie",
+              response: `{
+  "ok": true,
+  "api_key": { "id": "key-id", "key": "tgbot_plaintext_key" }
+}`
             },
             {
               method: "PATCH",
@@ -630,6 +881,20 @@ remark=可选备注`,
               request: `{
   "name": "backup-client",
   "status": "disabled"
+}`,
+              response: `{
+  "ok": true,
+  "api_key": { "id": "key-id", "name": "backup-client", "status": "disabled" }
+}`
+            },
+            {
+              method: "DELETE",
+              path: "/api/admin/api-keys/:id",
+              title: "删除 API Key",
+              description: "软删除 API Key，删除后外部客户端不能继续使用该 key。",
+              auth: "Admin Cookie",
+              response: `{
+  "ok": true
 }`
             }
           ]

@@ -14,6 +14,11 @@
   "observability": {
     "enabled": true
   },
+  "triggers": {
+    "crons": [
+      "0 */6 * * *"
+    ]
+  },
   "d1_databases": [
     {
       "binding": "FILES_DB",
@@ -23,6 +28,7 @@
   ],
   "vars": {
     "MAX_FILE_BYTES": "20971520",
-    "PUBLIC_BASE_URL": "https://files.yangshoulai.xyz"
+    "PUBLIC_BASE_URL": "https://files.yangshoulai.xyz",
+    "STALE_MULTIPART_UPLOAD_TTL_HOURS": "24"
   }
 }

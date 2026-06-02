@@ -7,7 +7,8 @@ import {
 } from "./admin-auth";
 import { createSignedToken, TokenError, verifySignedToken } from "./crypto";
 import {
-  completeMultipartUploadRecord,
+  completeMultipartUploadWithFileRecord,
+  deleteStaleMultipartUploadData,
   getDirectoryRecord,
   getDirectoryRecordByPath,
   getDirectoryUsageStats,
@@ -72,6 +73,7 @@ export interface Env {
   ADMIN_SESSION_SECRET?: string;
   PUBLIC_BASE_URL?: string;
   MAX_FILE_BYTES?: string;
+  STALE_MULTIPART_UPLOAD_TTL_HOURS?: string;
 }
 
 interface UploadResult {
@@ -114,6 +116,9 @@ const DIRECT_MULTIPART_ACCESS_MAX_CHUNKS = 24;
 const DIRECT_MULTIPART_ACCESS_MAX_BYTES = TELEGRAM_CHUNK_SIZE_BYTES * DIRECT_MULTIPART_ACCESS_MAX_CHUNKS;
 const MAX_TELEGRAM_MULTIPART_BYTES = 5 * 1024 * 1024 * 1024;
 const MAX_TELEGRAM_MULTIPART_CHUNKS = Math.ceil(MAX_TELEGRAM_MULTIPART_BYTES / TELEGRAM_CHUNK_SIZE_BYTES);
+const DEFAULT_STALE_MULTIPART_UPLOAD_TTL_HOURS = 24;
+const MIN_STALE_MULTIPART_UPLOAD_TTL_HOURS = 1;
+const MAX_STALE_MULTIPART_UPLOAD_TTL_HOURS = 24 * 30;
 
 const worker = {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -131,10 +136,56 @@ const worker = {
       console.error("Unexpected worker error", error);
       return errorResponse(new AppError(500, "InternalError", "Internal server error"));
     }
+  },
+
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(runScheduledCleanup(controller, env));
   }
 };
 
 export default worker;
+
+async function runScheduledCleanup(controller: ScheduledController, env: Env): Promise<void> {
+  const scheduledTime = Number.isFinite(controller.scheduledTime) ? controller.scheduledTime : Date.now();
+  const result = await cleanupStaleMultipartUploads(env, scheduledTime);
+
+  if (result.deletedUploads > 0 || result.deletedChunks > 0) {
+    console.log("Stale multipart upload cleanup completed", {
+      cron: controller.cron,
+      expired_before: result.expiredBefore,
+      deleted_uploads: result.deletedUploads,
+      deleted_chunks: result.deletedChunks
+    });
+  }
+}
+
+async function cleanupStaleMultipartUploads(
+  env: Env,
+  nowMs: number
+): Promise<{ expiredBefore: string; deletedUploads: number; deletedChunks: number }> {
+  const db = requireDb(env);
+  const ttlMs = parseStaleMultipartUploadTtlMs(env.STALE_MULTIPART_UPLOAD_TTL_HOURS);
+  const expiredBefore = new Date(nowMs - ttlMs).toISOString();
+  const result = await deleteStaleMultipartUploadData(db, expiredBefore);
+
+  return {
+    expiredBefore,
+    ...result
+  };
+}
+
+function parseStaleMultipartUploadTtlMs(value: string | undefined): number {
+  const parsed = Number(value?.trim());
+  const hours = Number.isFinite(parsed)
+    ? Math.floor(parsed)
+    : DEFAULT_STALE_MULTIPART_UPLOAD_TTL_HOURS;
+  const boundedHours = Math.min(
+    MAX_STALE_MULTIPART_UPLOAD_TTL_HOURS,
+    Math.max(MIN_STALE_MULTIPART_UPLOAD_TTL_HOURS, hours)
+  );
+
+  return boundedHours * 60 * 60 * 1000;
+}
 
 async function routeRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
@@ -1707,24 +1758,28 @@ async function completeMultipartUpload(params: {
   const publicUrl = `${baseUrl}${filePath}`;
   const md5 = multipartDigest(chunks);
 
-  await insertFileRecord(params.db, {
-    id: params.upload.id,
-    fileName: params.upload.file_name,
-    mimeType: params.upload.mime_type,
-    size: params.upload.size,
-    md5,
-    telegramFileId: `multipart:${params.upload.id}`,
-    filePath,
-    createdAt,
-    storageBackend: "telegram_multipart",
-    chunkSize: params.upload.chunk_size,
-    chunkCount: params.upload.chunk_count,
-    directoryId: params.upload.directory_id ?? null,
-    directoryPath: params.upload.directory_path ?? "/",
-    ...(params.upload.remark ? { remark: params.upload.remark } : {}),
-    ...(params.upload.uploaded_by ? { uploadedBy: params.upload.uploaded_by } : {})
+  await completeMultipartUploadWithFileRecord({
+    db: params.db,
+    uploadId: params.upload.id,
+    completedAt: createdAt,
+    file: {
+      id: params.upload.id,
+      fileName: params.upload.file_name,
+      mimeType: params.upload.mime_type,
+      size: params.upload.size,
+      md5,
+      telegramFileId: `multipart:${params.upload.id}`,
+      filePath,
+      createdAt,
+      storageBackend: "telegram_multipart",
+      chunkSize: params.upload.chunk_size,
+      chunkCount: params.upload.chunk_count,
+      directoryId: params.upload.directory_id ?? null,
+      directoryPath: params.upload.directory_path ?? "/",
+      ...(params.upload.remark ? { remark: params.upload.remark } : {}),
+      ...(params.upload.uploaded_by ? { uploadedBy: params.upload.uploaded_by } : {})
+    }
   });
-  await completeMultipartUploadRecord(params.db, params.upload.id, createdAt);
 
   return {
     id: params.upload.id,
