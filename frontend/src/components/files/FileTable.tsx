@@ -30,7 +30,7 @@ interface FileTableProps {
 }
 
 const checkboxClass =
-  "size-4 rounded border-border text-primary accent-primary focus-visible:outline-none focus-visible:focus-ring";
+  "block size-4 rounded border-border text-primary accent-primary focus-visible:outline-none focus-visible:focus-ring";
 
 function isInteractiveTarget(target: EventTarget | null): boolean {
   return target instanceof Element && Boolean(target.closest("button, a, input, select, textarea, [role='button']"));
@@ -67,15 +67,17 @@ export function FileTable({
         <table className="w-full border-collapse text-sm">
           <thead>
             <tr className="border-b border-border bg-background/60">
-              <th className="w-10 px-4 py-3 text-left font-medium text-muted">
-                <input
-                  type="checkbox"
-                  aria-label="选择当前页内容"
-                  checked={allPageSelected}
-                  disabled={files.length === 0 && directories.length === 0}
-                  onChange={(event) => onTogglePage(event.target.checked)}
-                  className={checkboxClass}
-                />
+              <th className="w-10 px-4 py-3 align-middle font-medium text-muted">
+                <div className="flex h-full items-center">
+                  <input
+                    type="checkbox"
+                    aria-label="选择当前页内容"
+                    checked={allPageSelected}
+                    disabled={files.length === 0 && directories.length === 0}
+                    onChange={(event) => onTogglePage(event.target.checked)}
+                    className={checkboxClass}
+                  />
+                </div>
               </th>
               <th className="px-4 py-3 text-left font-medium text-muted">文件</th>
               <th className="hidden px-4 py-3 text-left font-medium text-muted lg:table-cell">大小</th>
