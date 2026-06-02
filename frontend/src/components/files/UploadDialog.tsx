@@ -5,8 +5,10 @@ import {
   completeMultipartUpload,
   initMultipartUpload,
   initUrlMultipartUpload,
+  listDirectories,
   uploadMultipartChunk,
   uploadUrlMultipartChunk,
+  type DirectoryItem,
   type MultipartUpload,
   type ThumbnailUploadPayload
 } from "../../api";
@@ -18,6 +20,7 @@ import { Spinner } from "../ui/Spinner";
 import { FileTypeIcon } from "../ui/FileTypeIcon";
 import { Segmented } from "../ui/Segmented";
 import { Input } from "../ui/Input";
+import { DirectoryTreeSelect } from "./DirectoryTreeSelect";
 import { cn } from "../../lib/cn";
 import {
   canAutoGenerateThumbnail,
@@ -118,7 +121,7 @@ let counter = 0;
 const MULTIPART_UPLOAD_CONCURRENCY = 3;
 const MULTIPART_UPLOAD_MAX_ATTEMPTS = 3;
 const MULTIPART_UPLOAD_RETRY_DELAY_MS = 800;
-const FILE_NAME_CONFLICT_TOAST_MESSAGE = "当前目录已存在同名文件，请输入新的文件名";
+const FILE_NAME_CONFLICT_TOAST_MESSAGE = "上传目录已存在同名文件，请输入新的文件名";
 
 class MultipartChunkUploadError extends Error {
   constructor(
@@ -158,7 +161,15 @@ export function UploadDialog({
   const [remark, setRemark] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  const [uploadDirectoryPath, setUploadDirectoryPath] = useState(directoryPath);
+  const [directoryOptions, setDirectoryOptions] = useState<DirectoryItem[]>([]);
+  const [directoriesLoading, setDirectoriesLoading] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
+  const onErrorRef = useRef(onError);
+
+  useEffect(() => {
+    onErrorRef.current = onError;
+  }, [onError]);
 
   useEffect(() => {
     if (!open) {
@@ -175,9 +186,11 @@ export function UploadDialog({
       setRemark("");
       setSubmitting(false);
       setDragOver(false);
+      setUploadDirectoryPath(directoryPath);
       return;
     }
     setMode("file");
+    setUploadDirectoryPath(directoryPath);
     setItems((current) => {
       current.forEach((item) => revokeThumbnail(item.thumbnail?.generated));
       return initialFiles.map(makeItem);
@@ -187,7 +200,35 @@ export function UploadDialog({
       revokeThumbnail(current.thumbnail?.generated);
       return { status: "pending" };
     });
-  }, [open, initialFiles]);
+  }, [directoryPath, open, initialFiles]);
+
+  useEffect(() => {
+    if (!open) return;
+
+    let disposed = false;
+    setDirectoriesLoading(true);
+
+    listDirectories(true)
+      .then((response) => {
+        if (!disposed) {
+          setDirectoryOptions(response.directories);
+        }
+      })
+      .catch((error) => {
+        if (!disposed) {
+          onErrorRef.current(`目录列表加载失败：${errorMessage(error)}`);
+        }
+      })
+      .finally(() => {
+        if (!disposed) {
+          setDirectoriesLoading(false);
+        }
+      });
+
+    return () => {
+      disposed = true;
+    };
+  }, [open]);
 
   const addFiles = useCallback((files: File[]) => {
     if (files.length === 0) return;
@@ -504,7 +545,7 @@ export function UploadDialog({
       file_name: fileName,
       mime_type: target.file.type || "application/octet-stream",
       size: target.file.size,
-      directory_path: directoryPath,
+      directory_path: uploadDirectoryPath,
       ...(remark.trim() ? { remark: remark.trim() } : {})
     });
     const upload = init.upload;
@@ -811,7 +852,7 @@ export function UploadDialog({
       const init = await initUrlMultipartUpload(
         normalizedSourceUrl,
         remark.trim() || undefined,
-        directoryPath,
+        uploadDirectoryPath,
         true,
         fileNameOverride
       );
@@ -1044,7 +1085,7 @@ export function UploadDialog({
       open={open}
       onClose={onClose}
       title="上传文件"
-      description={`上传到 ${directoryPath}；所有文件统一按 ${formatBytes(multipartChunkBytes)} 分片上传，单文件上限 ${formatBytes(maxMultipartBytes)}，最多 ${MULTIPART_UPLOAD_CONCURRENCY} 分片并发`}
+      description={`上传到 ${uploadDirectoryPath}；所有文件统一按 ${formatBytes(multipartChunkBytes)} 分片上传，单文件上限 ${formatBytes(maxMultipartBytes)}，最多 ${MULTIPART_UPLOAD_CONCURRENCY} 分片并发`}
       size="lg"
       closeOnBackdrop={!submitting}
       closeOnEscape={!submitting}
@@ -1087,6 +1128,30 @@ export function UploadDialog({
         </div>
         <div className="rounded-xl border border-border bg-background px-3 py-2.5 text-xs leading-5 text-muted">
           本地文件和 URL 导入都会先创建上传会话，再上传或导入分片，最后统一生成文件索引。图片/视频会尝试生成缩略图；失败时不影响文件上传。
+        </div>
+
+        <div className="flex flex-col gap-1.5">
+          <div className="flex items-center justify-between gap-2">
+            <label className="text-xs font-medium text-muted">
+              上传目录
+            </label>
+            {directoriesLoading ? (
+              <span className="inline-flex items-center gap-1.5 text-xs text-muted">
+                <Spinner size={12} />
+                加载目录
+              </span>
+            ) : null}
+          </div>
+          <DirectoryTreeSelect
+            ariaLabel="选择上传目录"
+            value={uploadDirectoryPath}
+            directories={directoryOptions}
+            disabled={submitting}
+            onChange={setUploadDirectoryPath}
+          />
+          <p className="text-xs leading-5 text-muted">
+            默认使用当前文件列表目录；这里只影响本次上传，不会切换控制台当前目录。
+          </p>
         </div>
 
         {mode === "file" ? (
