@@ -17,7 +17,7 @@ const env: Env = {
   LINK_SIGNING_SECRET: "link-secret",
   MAX_FILE_BYTES: "20971520"
 };
-const directAccessMaxChunks = 24;
+const directAccessMaxChunks = 20;
 const maxMultipartFileBytes = 5 * 1024 * 1024 * 1024;
 
 class FakeD1 {
@@ -2714,7 +2714,7 @@ describe("admin file manager", () => {
     expect(body.mode).toBe("multipart");
     expect(body.upload.file_name).toBe("big-video.mp4");
     expect(body.upload.size).toBe(fileSize);
-    expect(body.upload.chunk_count).toBe(2);
+    expect(body.upload.chunk_count).toBe(3);
     expect(db.multipartUploads[0]?.source_url).toBe(sourceUrl);
     expect(db.multipartUploads[0]?.remark).toBe("大文件 URL");
   });
@@ -2950,8 +2950,8 @@ describe("admin file manager", () => {
       file_name: "big.bin",
       mime_type: "application/octet-stream",
       size: 25 * 1024 * 1024,
-      chunk_size: 18 * 1024 * 1024,
-      chunk_count: 2,
+      chunk_size: 10 * 1024 * 1024,
+      chunk_count: 3,
       remark: null,
       uploaded_by: "admin",
       created_at: "2026-06-01T00:00:00.000Z",
@@ -3320,7 +3320,7 @@ describe("admin file manager", () => {
     expect(body.details.actual_file_bytes).toBe(actualFileBytes);
     expect(body.details.max_file_size).toBe("5G");
     expect(body.details.actual_file_size).toBe("5G1B");
-    expect(body.details.chunk_size).toBe("18MB");
+    expect(body.details.chunk_size).toBe("10MB");
   });
 
   it("rejects oversized URL multipart sources with compact human-readable sizes", async () => {

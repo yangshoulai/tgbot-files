@@ -18,6 +18,9 @@ interface TelegramApiResponse<T> {
   result?: T;
   description?: string;
   error_code?: number;
+  parameters?: {
+    retry_after?: number;
+  };
 }
 
 interface TelegramMessage {
@@ -192,8 +195,13 @@ function telegramError(
   status: number,
   body: TelegramApiResponse<unknown>
 ): AppError {
-  return new AppError(status >= 400 && status < 500 ? 502 : 502, error, body.description || message, {
+  const retryAfter = body.parameters?.retry_after;
+
+  return new AppError(status === 429 ? 429 : 502, error, body.description || message, {
     telegram_status: status,
-    telegram_error_code: body.error_code
+    telegram_error_code: body.error_code,
+    ...(typeof retryAfter === "number" && Number.isSafeInteger(retryAfter) && retryAfter > 0
+      ? { telegram_retry_after_seconds: retryAfter }
+      : {})
   });
 }

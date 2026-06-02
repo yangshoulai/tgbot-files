@@ -268,8 +268,8 @@ function buildDocs(session: SessionResponse): Record<DocAudience, { title: strin
     "file_name": "backup.zip",
     "size": 5368709120,
     "storage_backend": "telegram_multipart",
-    "chunk_size": 18874368,
-    "chunk_count": 285,
+    "chunk_size": 10485760,
+    "chunk_count": 512,
     "direct_access": false,
     "download_strategy": "accelerated",
     "url": null,
@@ -301,8 +301,8 @@ function buildDocs(session: SessionResponse): Record<DocAudience, { title: strin
   "upload": {
     "id": "upload-id",
     "file_name": "backup.zip",
-    "chunk_size": 18874368,
-    "chunk_count": 285,
+    "chunk_size": 10485760,
+    "chunk_count": 512,
     "direct_access": false,
     "max_multipart_file_bytes": 5368709120
   }
@@ -324,7 +324,7 @@ function buildDocs(session: SessionResponse): Record<DocAudience, { title: strin
   "ok": true,
   "chunk": {
     "chunk_index": 0,
-    "size": 18874368,
+    "size": 10485760,
     "md5": "tg:<unique-id>",
     "telegram_file_id": "..."
   },
@@ -352,7 +352,7 @@ curl -X POST '${baseUrl}/api/v1/uploads/<UPLOAD_ID>/complete' \\
   "file": {
     "id": "upload-id",
     "storage_backend": "telegram_multipart",
-    "chunk_count": 285,
+    "chunk_count": 512,
     "thumbnail_status": "ready",
     "thumbnail_url": "${baseUrl}/f/<thumbnail-token>/backup.thumbnail.jpg",
     "direct_access": false,
@@ -426,9 +426,9 @@ curl -X POST '${baseUrl}/api/v1/uploads/<UPLOAD_ID>/complete' \\
   -o part-0.bin`,
               response: `HTTP/1.1 200 OK
 Content-Type: application/octet-stream
-Content-Length: 18874368
+Content-Length: 10485760
 X-Chunk-Index: 0
-X-Chunk-Count: 285
+X-Chunk-Count: 512
 X-Chunk-Offset: 0`,
               notes: ["普通单文件存储不支持该接口，会返回 NotMultipartFile。"]
             }
@@ -765,7 +765,7 @@ curl -X POST '${baseUrl}/api/admin/files' \\
     "id": "upload-id",
     "file_name": "backup.zip",
     "chunk_size": ${session.multipart_chunk_bytes},
-    "chunk_count": 285,
+    "chunk_count": 512,
     "direct_access": false,
     "max_multipart_file_bytes": ${session.max_multipart_file_bytes}
   }
@@ -851,7 +851,7 @@ curl -X POST '${baseUrl}/api/admin/uploads/<UPLOAD_ID>/complete' \\
   "file": {
     "id": "upload-id",
     "storage_backend": "telegram_multipart",
-    "chunk_count": 285,
+    "chunk_count": 512,
     "thumbnail_status": "ready",
     "thumbnail_url": "${baseUrl}/f/<thumbnail-token>/backup.thumbnail.jpg",
     "direct_access": false,
@@ -896,7 +896,7 @@ Accept-Ranges: bytes`,
 Content-Type: application/octet-stream
 Content-Length: ${session.multipart_chunk_bytes}
 X-Chunk-Index: 0
-X-Chunk-Count: 285
+X-Chunk-Count: 512
 X-Chunk-Offset: 0`,
               notes: ["仅 storage_backend=telegram_multipart 的文件支持；普通单文件会返回 NotMultipartFile。"]
             }

@@ -118,8 +118,8 @@ interface ChunkQueueResult {
 }
 
 let counter = 0;
-const MULTIPART_UPLOAD_CONCURRENCY = 3;
-const URL_MULTIPART_UPLOAD_CONCURRENCY = 1;
+const MULTIPART_UPLOAD_CONCURRENCY = 5;
+const URL_MULTIPART_UPLOAD_CONCURRENCY = 5;
 const MULTIPART_UPLOAD_MAX_ATTEMPTS = 3;
 const MULTIPART_UPLOAD_RETRY_DELAY_MS = 800;
 const FILE_NAME_CONFLICT_TOAST_MESSAGE = "上传目录已存在同名文件，请输入新的文件名";
@@ -798,7 +798,7 @@ export function UploadDialog({
           throw new Error(`分片 ${params.index + 1} 处理失败：${errorMessage(error)}`);
         }
 
-        await delay(retryDelayMs(attempt));
+        await delay(retryDelayMs(attempt, error));
       }
     }
   }
@@ -1089,7 +1089,7 @@ export function UploadDialog({
       open={open}
       onClose={onClose}
       title="上传文件"
-      description={`上传到 ${uploadDirectoryPath}；所有文件统一按 ${formatBytes(multipartChunkBytes)} 分片上传，单文件上限 ${formatBytes(maxMultipartBytes)}；本地最多 ${MULTIPART_UPLOAD_CONCURRENCY} 分片并发，URL 导入串行`}
+      description={`上传到 ${uploadDirectoryPath}；所有文件统一按 ${formatBytes(multipartChunkBytes)} 分片上传，单文件上限 ${formatBytes(maxMultipartBytes)}，最多 ${MULTIPART_UPLOAD_CONCURRENCY} 分片并发`}
       size="lg"
       closeOnBackdrop={!submitting}
       closeOnEscape={!submitting}
@@ -1183,7 +1183,7 @@ export function UploadDialog({
               </span>
               <p className="text-sm font-medium text-foreground">点击选择文件，或拖拽到这里</p>
               <p className="text-xs text-muted">
-                统一按 {formatBytes(multipartChunkBytes)} 分片，本地最多 {MULTIPART_UPLOAD_CONCURRENCY} 并发，URL 导入串行；每片最多 {MULTIPART_UPLOAD_MAX_ATTEMPTS} 次
+                统一按 {formatBytes(multipartChunkBytes)} 分片，最多 {MULTIPART_UPLOAD_CONCURRENCY} 并发，每片最多 {MULTIPART_UPLOAD_MAX_ATTEMPTS} 次
               </p>
               <input
                 ref={fileInput}
@@ -1297,7 +1297,15 @@ function errorMessage(error: unknown): string {
   return "上传失败";
 }
 
-function retryDelayMs(failedAttempt: number): number {
+function retryDelayMs(failedAttempt: number, error: unknown): number {
+  const retryAfterSeconds = error instanceof ApiError
+    ? Number(error.details?.telegram_retry_after_seconds)
+    : Number.NaN;
+
+  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+    return Math.min(retryAfterSeconds * 1000, 5 * 60 * 1000);
+  }
+
   return MULTIPART_UPLOAD_RETRY_DELAY_MS * failedAttempt;
 }
 

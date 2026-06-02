@@ -17,6 +17,22 @@
   "observability": {
     "enabled": true
   },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "TELEGRAM_RATE_LIMITER",
+        "class_name": "TelegramRateLimiter"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "TelegramRateLimiter"
+      ]
+    }
+  ],
   "d1_databases": [
     {
       "binding": "FILES_DB",

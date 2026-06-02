@@ -76,6 +76,7 @@ export interface Env {
   PUBLIC_BASE_URL?: string;
   MAX_FILE_BYTES?: string;
   STALE_MULTIPART_UPLOAD_TTL_HOURS?: string;
+  TELEGRAM_RATE_LIMITER?: DurableObjectNamespace;
 }
 
 interface UploadResult {
@@ -149,11 +150,14 @@ interface ParsedByteRange {
   partial: boolean;
 }
 
-const TELEGRAM_CHUNK_SIZE_BYTES = 18 * 1024 * 1024;
-const DIRECT_MULTIPART_ACCESS_MAX_CHUNKS = 24;
+const TELEGRAM_CHUNK_SIZE_BYTES = 10 * 1024 * 1024;
+const DIRECT_MULTIPART_ACCESS_MAX_CHUNKS = 20;
 const DIRECT_MULTIPART_ACCESS_MAX_BYTES = TELEGRAM_CHUNK_SIZE_BYTES * DIRECT_MULTIPART_ACCESS_MAX_CHUNKS;
 const MAX_TELEGRAM_MULTIPART_BYTES = 5 * 1024 * 1024 * 1024;
 const MAX_TELEGRAM_MULTIPART_CHUNKS = Math.ceil(MAX_TELEGRAM_MULTIPART_BYTES / TELEGRAM_CHUNK_SIZE_BYTES);
+const TELEGRAM_RATE_LIMITER_OBJECT_NAME = "telegram-api-global";
+const TELEGRAM_SEND_DOCUMENT_RATE_LIMIT_MS = 1_500;
+const TELEGRAM_GET_FILE_RATE_LIMIT_MS = 100;
 const DEFAULT_STALE_MULTIPART_UPLOAD_TTL_HOURS = 24;
 const MIN_STALE_MULTIPART_UPLOAD_TTL_HOURS = 1;
 const MAX_STALE_MULTIPART_UPLOAD_TTL_HOURS = 24 * 30;
@@ -163,6 +167,74 @@ const IMAGE_THUMBNAIL_SOURCE_MAX_BYTES = 100 * 1024 * 1024;
 const VIDEO_THUMBNAIL_SOURCE_MAX_BYTES = MAX_TELEGRAM_MULTIPART_BYTES;
 const VIDEO_THUMBNAIL_PROXY_DEFAULT_RANGE_BYTES = 2 * 1024 * 1024;
 const ALLOWED_THUMBNAIL_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+
+type TelegramRateLimitScope = "sendDocument" | "getFile";
+
+export class TelegramRateLimiter {
+  private queue: Promise<void> = Promise.resolve();
+
+  constructor(private readonly state: DurableObjectState) {}
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (request.method !== "POST" || (url.pathname !== "/acquire" && url.pathname !== "/penalize")) {
+      return new Response("Not found", { status: 404 });
+    }
+
+    const body = await readRateLimitRequestBody(request);
+    const scope = normalizeTelegramRateLimitScope(body.scope);
+
+    if (!scope) {
+      return new Response(JSON.stringify({ ok: false, error: "InvalidScope" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json; charset=utf-8" }
+      });
+    }
+
+    if (url.pathname === "/penalize") {
+      const retryAfterMs = normalizeRetryAfterMs(body.retry_after_ms);
+      await this.enqueue(() => this.penalize(scope, retryAfterMs));
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "Content-Type": "application/json; charset=utf-8" }
+      });
+    }
+
+    const result = await this.enqueue(() => this.reserve(scope));
+    if (result.waitMs > 0) {
+      await delayMs(result.waitMs);
+    }
+
+    return new Response(JSON.stringify({ ok: true, wait_ms: result.waitMs }), {
+      headers: { "Content-Type": "application/json; charset=utf-8" }
+    });
+  }
+
+  private enqueue<T>(task: () => Promise<T>): Promise<T> {
+    const next = this.queue.then(task, task);
+    this.queue = next.then(() => undefined, () => undefined);
+    return next;
+  }
+
+  private async reserve(scope: TelegramRateLimitScope): Promise<{ waitMs: number }> {
+    const now = Date.now();
+    const key = telegramRateLimitStorageKey(scope);
+    const nextAvailableAt = await this.state.storage.get<number>(key) ?? 0;
+    const waitMs = Math.max(0, nextAvailableAt - now);
+    const reservedAt = now + waitMs;
+
+    await this.state.storage.put(key, reservedAt + telegramRateLimitIntervalMs(scope));
+    return { waitMs };
+  }
+
+  private async penalize(scope: TelegramRateLimitScope, retryAfterMs: number): Promise<void> {
+    const key = telegramRateLimitStorageKey(scope);
+    const current = await this.state.storage.get<number>(key) ?? 0;
+    const penalizedUntil = Date.now() + retryAfterMs;
+
+    await this.state.storage.put(key, Math.max(current, penalizedUntil));
+  }
+}
 
 const worker = {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -229,6 +301,43 @@ function parseStaleMultipartUploadTtlMs(value: string | undefined): number {
   );
 
   return boundedHours * 60 * 60 * 1000;
+}
+
+async function readRateLimitRequestBody(request: Request): Promise<Record<string, unknown>> {
+  try {
+    const body = await request.json();
+    return typeof body === "object" && body !== null && !Array.isArray(body)
+      ? body as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizeTelegramRateLimitScope(value: unknown): TelegramRateLimitScope | undefined {
+  return value === "sendDocument" || value === "getFile" ? value : undefined;
+}
+
+function normalizeRetryAfterMs(value: unknown): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    return TELEGRAM_SEND_DOCUMENT_RATE_LIMIT_MS;
+  }
+
+  return Math.min(parsed, 5 * 60 * 1000);
+}
+
+function telegramRateLimitStorageKey(scope: TelegramRateLimitScope): string {
+  return `telegram-rate-limit:${scope}:next`;
+}
+
+function telegramRateLimitIntervalMs(scope: TelegramRateLimitScope): number {
+  return scope === "sendDocument" ? TELEGRAM_SEND_DOCUMENT_RATE_LIMIT_MS : TELEGRAM_GET_FILE_RATE_LIMIT_MS;
+}
+
+function delayMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function routeRequest(request: Request, env: Env): Promise<Response> {
@@ -1503,7 +1612,11 @@ async function downloadSignedFileUrl(params: {
   }
 
   const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
-  const telegramFileUrl = await getTelegramFileUrl({ botToken, fileId: payload.file_id });
+  const telegramFileUrl = await getRateLimitedTelegramFileUrl({
+    env: params.env,
+    botToken,
+    fileId: payload.file_id
+  });
   const telegramResponse = await fetchTelegramFile({
     fileUrl: telegramFileUrl,
     rangeHeader: null
@@ -1526,6 +1639,101 @@ async function downloadSignedFileUrl(params: {
   validateUploadFileSize(file, params.maxFileBytes);
 
   return file;
+}
+
+async function uploadRateLimitedTelegramDocument(params: {
+  env: Env;
+  botToken: string;
+  chatId: string;
+  file: Blob;
+  fileName: string;
+}): Promise<Awaited<ReturnType<typeof uploadDocumentToTelegram>>> {
+  await acquireTelegramApiSlot(params.env, "sendDocument");
+
+  try {
+    return await uploadDocumentToTelegram({
+      botToken: params.botToken,
+      chatId: params.chatId,
+      file: params.file,
+      fileName: params.fileName
+    });
+  } catch (error) {
+    await penalizeTelegramApiSlotFromError(params.env, "sendDocument", error);
+    throw error;
+  }
+}
+
+async function getRateLimitedTelegramFileUrl(params: {
+  env: Env;
+  botToken: string;
+  fileId: string;
+}): Promise<string> {
+  await acquireTelegramApiSlot(params.env, "getFile");
+
+  try {
+    return await getTelegramFileUrl({
+      botToken: params.botToken,
+      fileId: params.fileId
+    });
+  } catch (error) {
+    await penalizeTelegramApiSlotFromError(params.env, "getFile", error);
+    throw error;
+  }
+}
+
+async function acquireTelegramApiSlot(env: Env, scope: TelegramRateLimitScope): Promise<void> {
+  const limiter = env.TELEGRAM_RATE_LIMITER;
+  if (!limiter) {
+    return;
+  }
+
+  const id = limiter.idFromName(TELEGRAM_RATE_LIMITER_OBJECT_NAME);
+  const response = await limiter.get(id).fetch("https://telegram-rate-limiter/acquire", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope })
+  });
+
+  if (!response.ok) {
+    throw new AppError(502, "TelegramRateLimiterFailed", "Telegram rate limiter failed");
+  }
+}
+
+async function penalizeTelegramApiSlotFromError(
+  env: Env,
+  scope: TelegramRateLimitScope,
+  error: unknown
+): Promise<void> {
+  const retryAfterSeconds = telegramRetryAfterSeconds(error);
+  if (!retryAfterSeconds || !env.TELEGRAM_RATE_LIMITER) {
+    return;
+  }
+
+  const id = env.TELEGRAM_RATE_LIMITER.idFromName(TELEGRAM_RATE_LIMITER_OBJECT_NAME);
+  try {
+    await env.TELEGRAM_RATE_LIMITER.get(id).fetch("https://telegram-rate-limiter/penalize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        scope,
+        retry_after_ms: retryAfterSeconds * 1000
+      })
+    });
+  } catch (penaltyError) {
+    console.warn("Failed to update Telegram API rate limit penalty", {
+      scope,
+      error: penaltyError instanceof Error ? penaltyError.message : String(penaltyError)
+    });
+  }
+}
+
+function telegramRetryAfterSeconds(error: unknown): number | undefined {
+  if (!(error instanceof AppError)) {
+    return undefined;
+  }
+
+  const value = error.details?.telegram_retry_after_seconds;
+  return Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : undefined;
 }
 
 function parseContentLength(value: string | null): number | undefined {
@@ -2130,7 +2338,8 @@ async function uploadChunkToTelegram(params: {
   const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
   const chatId = requireEnv(params.env, "TELEGRAM_STORAGE_CHAT_ID");
   const fileName = chunkFileName(params.upload, params.chunkIndex);
-  const telegramDocument = await uploadDocumentToTelegram({
+  const telegramDocument = await uploadRateLimitedTelegramDocument({
+    env: params.env,
     botToken,
     chatId,
     file: params.chunk,
@@ -2289,7 +2498,8 @@ async function uploadThumbnailToTelegram(params: {
 
   const thumbnailFileName = thumbnailFileNameFor(params.originalFileName, mimeType);
   const thumbnailFile = new File([thumbnailBytes], thumbnailFileName, { type: mimeType });
-  const telegramDocument = await uploadDocumentToTelegram({
+  const telegramDocument = await uploadRateLimitedTelegramDocument({
+    env: params.env,
     botToken,
     chatId,
     file: thumbnailFile,
@@ -2415,7 +2625,8 @@ async function uploadAndRecordFile(params: {
     ? params.file
     : new File([fileBytes], fileName, { type: uploadMimeType });
 
-  const telegramDocument = await uploadDocumentToTelegram({
+  const telegramDocument = await uploadRateLimitedTelegramDocument({
+    env: params.env,
     botToken,
     chatId,
     file: uploadFile,
@@ -2558,7 +2769,7 @@ async function handleFileAccess(request: Request, env: Env): Promise<Response> {
   }
 
   const botToken = requireEnv(env, "TELEGRAM_BOT_TOKEN");
-  const telegramFileUrl = await getTelegramFileUrl({ botToken, fileId: payload.file_id });
+  const telegramFileUrl = await getRateLimitedTelegramFileUrl({ env, botToken, fileId: payload.file_id });
   const telegramResponse = await fetchTelegramFile({
     fileUrl: telegramFileUrl,
     rangeHeader
@@ -2609,7 +2820,11 @@ async function handleMultipartChunkAccess(params: {
   }
 
   const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
-  const telegramFileUrl = await getTelegramFileUrl({ botToken, fileId: chunk.telegram_file_id });
+  const telegramFileUrl = await getRateLimitedTelegramFileUrl({
+    env: params.env,
+    botToken,
+    fileId: chunk.telegram_file_id
+  });
   const telegramResponse = await fetchTelegramFile({
     fileUrl: telegramFileUrl,
     rangeHeader: range.partial ? `bytes=${range.start}-${range.end}` : null
@@ -2667,7 +2882,11 @@ async function handleMultipartChunkRecordAccess(params: {
   }
 
   const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
-  const telegramFileUrl = await getTelegramFileUrl({ botToken, fileId: chunk.telegram_file_id });
+  const telegramFileUrl = await getRateLimitedTelegramFileUrl({
+    env: params.env,
+    botToken,
+    fileId: chunk.telegram_file_id
+  });
   const telegramResponse = await fetchTelegramFile({
     fileUrl: telegramFileUrl,
     rangeHeader: null
@@ -2867,7 +3086,11 @@ function streamMultipartFile(params: {
           }
 
           const { chunk, chunkStart, chunkEnd, overlapStart, overlapEnd } = segment;
-          const telegramFileUrl = await getTelegramFileUrl({ botToken, fileId: chunk.telegram_file_id });
+          const telegramFileUrl = await getRateLimitedTelegramFileUrl({
+            env: params.env,
+            botToken,
+            fileId: chunk.telegram_file_id
+          });
           const telegramResponse = await fetchTelegramFile({
             fileUrl: telegramFileUrl,
             rangeHeader: `bytes=${overlapStart - chunkStart}-${overlapEnd - chunkStart}`

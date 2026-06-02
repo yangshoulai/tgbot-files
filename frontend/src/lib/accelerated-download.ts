@@ -1,6 +1,6 @@
 import type { FileItem } from "../api";
 
-export const DEFAULT_ACCELERATED_DOWNLOAD_CONCURRENCY = 3;
+export const DEFAULT_ACCELERATED_DOWNLOAD_CONCURRENCY = 5;
 
 type WritableData = BufferSource | Blob | string;
 
