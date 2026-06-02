@@ -1605,6 +1605,85 @@ describe("API key multipart endpoints", () => {
     expect(fetchCalls.some((call) => call.range === "bytes=0-4")).toBe(true);
   });
 
+  it("rejects URL multipart chunks that return a mismatched Content-Range before uploading to Telegram", async () => {
+    const db = new FakeD1();
+    addApiKey(db);
+    const apiEnv = envWithDb(db);
+    const sourceUrl = "https://source.example.com/small.txt";
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const inputUrl = String(input);
+      const headers = new Headers(init?.headers);
+
+      if (inputUrl === sourceUrl && init?.method === "HEAD") {
+        return new Response(null, {
+          headers: {
+            "Content-Length": "5",
+            "Content-Type": "text/plain"
+          }
+        });
+      }
+
+      if (inputUrl === sourceUrl && headers.get("Range") === "bytes=0-0") {
+        return new Response("h", {
+          status: 206,
+          headers: {
+            "Content-Range": "bytes 0-0/5",
+            "Content-Length": "1"
+          }
+        });
+      }
+
+      if (inputUrl === sourceUrl && headers.get("Range") === "bytes=0-4") {
+        return new Response("hello", {
+          status: 206,
+          headers: {
+            "Content-Length": "5",
+            "Content-Range": "bytes 1-4/5"
+          }
+        });
+      }
+
+      if (inputUrl.endsWith("/sendDocument")) {
+        throw new Error("Telegram upload should not be called for mismatched source ranges");
+      }
+
+      throw new Error(`Unexpected fetch ${inputUrl}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const initResponse = await worker.fetch(
+      new Request("https://files.example.com/api/v1/uploads/url/init", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${uploadApiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ url: sourceUrl })
+      }),
+      apiEnv
+    );
+    const initBody = await initResponse.json() as {
+      upload: { id: string };
+    };
+
+    const chunkResponse = await worker.fetch(
+      new Request(`https://files.example.com/api/v1/uploads/${initBody.upload.id}/url-chunks/0`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${uploadApiKey}` }
+      }),
+      apiEnv
+    );
+    const body = await chunkResponse.json() as {
+      error: string;
+      details: { expected_start: number; actual_start: number };
+    };
+
+    expect(chunkResponse.status).toBe(400);
+    expect(body.error).toBe("InvalidChunkRange");
+    expect(body.details.expected_start).toBe(0);
+    expect(body.details.actual_start).toBe(1);
+  });
+
   it("rejects API key chunk downloads for non-multipart files", async () => {
     const db = new FakeD1();
     addApiKey(db);
@@ -2633,6 +2712,82 @@ describe("admin file manager", () => {
     expect(body.upload.chunk_count).toBe(2);
     expect(db.multipartUploads[0]?.source_url).toBe(sourceUrl);
     expect(db.multipartUploads[0]?.remark).toBe("大文件 URL");
+  });
+
+  it("returns a thumbnail source for URL video uploads up to 5 GiB", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const cookie = await loginAndGetCookie(adminEnv);
+    const sourceUrl = "https://source.example.com/max-video.mp4";
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+
+      if (String(input) === sourceUrl && init?.method === "HEAD") {
+        return new Response(null, {
+          headers: {
+            "Content-Length": String(maxMultipartFileBytes),
+            "Content-Type": "video/mp4",
+            "Accept-Ranges": "bytes"
+          }
+        });
+      }
+
+      if (String(input) === sourceUrl && headers.get("Range") === "bytes=0-0") {
+        return new Response(new Uint8Array([0]), {
+          status: 206,
+          headers: {
+            "Content-Range": `bytes 0-0/${maxMultipartFileBytes}`,
+            "Content-Length": "1"
+          }
+        });
+      }
+
+      throw new Error(`Unexpected fetch ${String(input)}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/uploads/url/init", {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ url: sourceUrl })
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      mode: string;
+      upload: {
+        file_name: string;
+        mime_type: string;
+        size: number;
+        thumbnail_source: {
+          available: boolean;
+          kind: string;
+          mime_type: string;
+          url: string;
+        } | null;
+      };
+    };
+
+    expect(response.status).toBe(201);
+    expect(body.mode).toBe("multipart");
+    expect(body.upload.file_name).toBe("max-video.mp4");
+    expect(body.upload.mime_type).toBe("video/mp4");
+    expect(body.upload.size).toBe(maxMultipartFileBytes);
+    expect(body.upload.thumbnail_source).toMatchObject({
+      available: true,
+      kind: "video",
+      mime_type: "video/mp4"
+    });
+    expect(body.upload.thumbnail_source?.url).toContain("/api/admin/uploads/url-thumbnail-source?token=");
   });
 
   it("can force a small admin URL upload into multipart mode", async () => {

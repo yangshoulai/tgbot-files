@@ -119,6 +119,7 @@ interface ChunkQueueResult {
 
 let counter = 0;
 const MULTIPART_UPLOAD_CONCURRENCY = 3;
+const URL_MULTIPART_UPLOAD_CONCURRENCY = 1;
 const MULTIPART_UPLOAD_MAX_ATTEMPTS = 3;
 const MULTIPART_UPLOAD_RETRY_DELAY_MS = 800;
 const FILE_NAME_CONFLICT_TOAST_MESSAGE = "上传目录已存在同名文件，请输入新的文件名";
@@ -694,6 +695,7 @@ export function UploadDialog({
     completedChunks?: number[];
     taskLabel: string;
     doneLabel: string;
+    concurrency?: number;
     onChunk: (index: number) => Promise<void>;
     onProgress: (progress: ChunkProgress) => void;
     onChunkState?: (index: number, patch: Partial<UploadChunkState>) => void;
@@ -701,7 +703,7 @@ export function UploadDialog({
     const chunkIndexes = params.chunkIndexes ?? chunkRange(params.total);
     const completedSet = new Set(params.completedChunks ?? []);
     const failedChunks: number[] = [];
-    const concurrency = Math.min(MULTIPART_UPLOAD_CONCURRENCY, Math.max(1, chunkIndexes.length));
+    const concurrency = Math.min(params.concurrency ?? MULTIPART_UPLOAD_CONCURRENCY, Math.max(1, chunkIndexes.length));
     let nextIndex = 0;
 
     const suffix = concurrency > 1 ? `（${concurrency} 并发）` : "";
@@ -868,6 +870,7 @@ export function UploadDialog({
           total: upload.chunk_count,
           taskLabel: "导入分片",
           doneLabel: "已导入",
+          concurrency: URL_MULTIPART_UPLOAD_CONCURRENCY,
           onProgress: (progress) => {
             setUrlUpload((current) => ({
               ...current,
@@ -961,6 +964,7 @@ export function UploadDialog({
         completedChunks: retry.completedChunks,
         taskLabel: "重试导入分片",
         doneLabel: "已导入",
+        concurrency: URL_MULTIPART_UPLOAD_CONCURRENCY,
         onProgress: (progress) => {
           setUrlUpload((current) => ({
             ...current,
@@ -1085,7 +1089,7 @@ export function UploadDialog({
       open={open}
       onClose={onClose}
       title="上传文件"
-      description={`上传到 ${uploadDirectoryPath}；所有文件统一按 ${formatBytes(multipartChunkBytes)} 分片上传，单文件上限 ${formatBytes(maxMultipartBytes)}，最多 ${MULTIPART_UPLOAD_CONCURRENCY} 分片并发`}
+      description={`上传到 ${uploadDirectoryPath}；所有文件统一按 ${formatBytes(multipartChunkBytes)} 分片上传，单文件上限 ${formatBytes(maxMultipartBytes)}；本地最多 ${MULTIPART_UPLOAD_CONCURRENCY} 分片并发，URL 导入串行`}
       size="lg"
       closeOnBackdrop={!submitting}
       closeOnEscape={!submitting}
@@ -1179,7 +1183,7 @@ export function UploadDialog({
               </span>
               <p className="text-sm font-medium text-foreground">点击选择文件，或拖拽到这里</p>
               <p className="text-xs text-muted">
-                统一按 {formatBytes(multipartChunkBytes)} 分片，最多 {MULTIPART_UPLOAD_CONCURRENCY} 并发，每片最多 {MULTIPART_UPLOAD_MAX_ATTEMPTS} 次
+                统一按 {formatBytes(multipartChunkBytes)} 分片，本地最多 {MULTIPART_UPLOAD_CONCURRENCY} 并发，URL 导入串行；每片最多 {MULTIPART_UPLOAD_MAX_ATTEMPTS} 次
               </p>
               <input
                 ref={fileInput}

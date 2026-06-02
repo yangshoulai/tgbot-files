@@ -159,7 +159,8 @@ const MIN_STALE_MULTIPART_UPLOAD_TTL_HOURS = 1;
 const MAX_STALE_MULTIPART_UPLOAD_TTL_HOURS = 24 * 30;
 const MAX_THUMBNAIL_BYTES = 512 * 1024;
 const THUMBNAIL_SOURCE_TOKEN_TTL_SECONDS = 10 * 60;
-const THUMBNAIL_SOURCE_MAX_BYTES = 100 * 1024 * 1024;
+const IMAGE_THUMBNAIL_SOURCE_MAX_BYTES = 100 * 1024 * 1024;
+const VIDEO_THUMBNAIL_SOURCE_MAX_BYTES = MAX_TELEGRAM_MULTIPART_BYTES;
 const VIDEO_THUMBNAIL_PROXY_DEFAULT_RANGE_BYTES = 2 * 1024 * 1024;
 const ALLOWED_THUMBNAIL_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
@@ -1780,7 +1781,7 @@ async function createThumbnailSourceInfo(params: {
 }): Promise<ThumbnailSourceInfo | undefined> {
   const kind = thumbnailSourceKind(params.mimeType);
 
-  if (!kind || params.size > THUMBNAIL_SOURCE_MAX_BYTES) {
+  if (!kind || params.size > thumbnailSourceMaxBytes(kind)) {
     return undefined;
   }
 
@@ -1824,6 +1825,10 @@ function thumbnailSourceKind(mimeType: string): "image" | "video" | undefined {
   return undefined;
 }
 
+function thumbnailSourceMaxBytes(kind: "image" | "video"): number {
+  return kind === "video" ? VIDEO_THUMBNAIL_SOURCE_MAX_BYTES : IMAGE_THUMBNAIL_SOURCE_MAX_BYTES;
+}
+
 async function handleThumbnailSourceProxy(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const token = url.searchParams.get("token");
@@ -1841,7 +1846,7 @@ async function handleThumbnailSourceProxy(request: Request, env: Env): Promise<R
     throw new AppError(401, "ExpiredToken", "Thumbnail source token has expired");
   }
 
-  if (payload.size > THUMBNAIL_SOURCE_MAX_BYTES) {
+  if (payload.size > thumbnailSourceMaxBytes(payload.kind)) {
     throw new AppError(413, "ThumbnailSourceTooLarge", "Thumbnail source is too large");
   }
 
@@ -2060,13 +2065,12 @@ async function downloadRemoteChunk(upload: MultipartUploadRecord, chunkIndex: nu
   }
 
   const sourceUrl = new URL(upload.source_url);
+  const expectedSize = expectedChunkSize(upload, chunkIndex);
   const start = chunkIndex * upload.chunk_size;
-  const end = start + expectedChunkSize(upload, chunkIndex) - 1;
+  const end = start + expectedSize - 1;
   const response = await fetchRemoteRange(sourceUrl, start, end);
 
-  if (response.status !== 206) {
-    throw new AppError(400, "RangeNotSupported", "Source URL must return 206 for chunk Range requests");
-  }
+  validateRemoteChunkResponse({ response, upload, start, end, expectedSize });
 
   let chunk: Blob;
   try {
@@ -2075,8 +2079,46 @@ async function downloadRemoteChunk(upload: MultipartUploadRecord, chunkIndex: nu
     throw new AppError(502, "UrlFetchFailed", "Failed to read source URL response");
   }
 
-  validateChunkFile(chunk, expectedChunkSize(upload, chunkIndex));
+  validateChunkFile(chunk, expectedSize);
   return chunk;
+}
+
+function validateRemoteChunkResponse(params: {
+  response: Response;
+  upload: MultipartUploadRecord;
+  start: number;
+  end: number;
+  expectedSize: number;
+}): void {
+  if (params.response.status !== 206) {
+    throw new AppError(400, "RangeNotSupported", "Source URL must return 206 for chunk Range requests");
+  }
+
+  const contentRange = parseContentRange(params.response.headers.get("Content-Range"));
+  if (!contentRange) {
+    throw new AppError(400, "RangeNotSupported", "Source URL must include Content-Range for chunk Range requests");
+  }
+
+  if (contentRange.start !== params.start || contentRange.end !== params.end || contentRange.size !== params.upload.size) {
+    throw new AppError(400, "InvalidChunkRange", "Source URL returned an unexpected byte range", {
+      expected_start: params.start,
+      expected_end: params.end,
+      expected_total_bytes: params.upload.size,
+      actual_start: contentRange.start,
+      actual_end: contentRange.end,
+      actual_total_bytes: contentRange.size
+    });
+  }
+
+  const contentLength = parseContentLength(params.response.headers.get("Content-Length"));
+  if (contentLength !== undefined && contentLength !== params.expectedSize) {
+    throw new AppError(400, "InvalidChunkSize", `分片大小必须为 ${formatHumanFileSize(params.expectedSize)}（当前 ${formatHumanFileSize(contentLength)}）`, {
+      expected_chunk_bytes: params.expectedSize,
+      actual_chunk_bytes: contentLength,
+      expected_chunk_size: formatHumanFileSize(params.expectedSize),
+      actual_chunk_size: formatHumanFileSize(contentLength)
+    });
+  }
 }
 
 async function uploadChunkToTelegram(params: {
@@ -2764,21 +2806,67 @@ function streamMultipartFile(params: {
   chunks: FileChunkRecord[];
   range: ParsedByteRange;
 }): ReadableStream<Uint8Array> {
+  const segments = params.chunks
+    .map((chunk) => {
+      const chunkStart = chunk.chunk_index * params.payload.chunk_size;
+      const chunkEnd = chunkStart + chunk.size - 1;
+      const overlapStart = Math.max(params.range.start, chunkStart);
+      const overlapEnd = Math.min(params.range.end, chunkEnd);
+
+      if (overlapStart > overlapEnd) {
+        return undefined;
+      }
+
+      return {
+        chunk,
+        chunkStart,
+        chunkEnd,
+        overlapStart,
+        overlapEnd
+      };
+    })
+    .filter((segment): segment is {
+      chunk: FileChunkRecord;
+      chunkStart: number;
+      chunkEnd: number;
+      overlapStart: number;
+      overlapEnd: number;
+    } => Boolean(segment));
+
+  let botToken: string | undefined;
+  let segmentIndex = 0;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+
   return new ReadableStream<Uint8Array>({
-    async start(controller) {
+    async pull(controller) {
       try {
-        const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
+        botToken ??= requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
 
-        for (const chunk of params.chunks) {
-          const chunkStart = chunk.chunk_index * params.payload.chunk_size;
-          const chunkEnd = chunkStart + chunk.size - 1;
-          const overlapStart = Math.max(params.range.start, chunkStart);
-          const overlapEnd = Math.min(params.range.end, chunkEnd);
+        while (true) {
+          if (reader) {
+            const { done, value } = await reader.read();
+            if (done) {
+              reader.releaseLock();
+              reader = undefined;
+              segmentIndex += 1;
+              continue;
+            }
 
-          if (overlapStart > overlapEnd) {
+            if (value) {
+              controller.enqueue(value);
+              return;
+            }
+
             continue;
           }
 
+          const segment = segments[segmentIndex];
+          if (!segment) {
+            controller.close();
+            return;
+          }
+
+          const { chunk, chunkStart, chunkEnd, overlapStart, overlapEnd } = segment;
           const telegramFileUrl = await getTelegramFileUrl({ botToken, fileId: chunk.telegram_file_id });
           const telegramResponse = await fetchTelegramFile({
             fileUrl: telegramFileUrl,
@@ -2793,22 +2881,15 @@ function streamMultipartFile(params: {
             throw new AppError(502, "TelegramFileDownloadFailed", "Telegram file response did not include a body");
           }
 
-          const reader = telegramResponse.body.getReader();
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) {
-              break;
-            }
-            if (value) {
-              controller.enqueue(value);
-            }
-          }
+          reader = telegramResponse.body.getReader();
         }
-
-        controller.close();
       } catch (error) {
         controller.error(error);
       }
+    },
+    async cancel(reason) {
+      await reader?.cancel(reason);
+      reader = undefined;
     }
   });
 }
