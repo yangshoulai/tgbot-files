@@ -2007,7 +2007,7 @@ function fileNameConflictError(
   return new AppError(
     409,
     "FileNameConflict",
-    `当前目录已存在名为「${fileName}」的文件，请输入新的文件名`,
+    "当前目录已存在同名文件，请输入新的文件名",
     {
       directory_path: directoryPath,
       file_name: fileName,

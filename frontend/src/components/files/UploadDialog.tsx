@@ -118,6 +118,7 @@ let counter = 0;
 const MULTIPART_UPLOAD_CONCURRENCY = 3;
 const MULTIPART_UPLOAD_MAX_ATTEMPTS = 3;
 const MULTIPART_UPLOAD_RETRY_DELAY_MS = 800;
+const FILE_NAME_CONFLICT_TOAST_MESSAGE = "当前目录已存在同名文件，请输入新的文件名";
 
 class MultipartChunkUploadError extends Error {
   constructor(
@@ -342,7 +343,8 @@ export function UploadDialog({
               fileNameOverride: value,
               status: item.conflict ? "pending" : item.status,
               message: item.conflict ? undefined : item.message,
-              progress: item.conflict ? undefined : item.progress
+              progress: item.conflict ? undefined : item.progress,
+              conflict: undefined
             }
           : item
       )
@@ -369,7 +371,8 @@ export function UploadDialog({
       fileNameOverride: value,
       status: current.conflict ? "pending" : current.status,
       message: current.conflict ? undefined : current.message,
-      progress: current.conflict ? undefined : current.progress
+      progress: current.conflict ? undefined : current.progress,
+      conflict: undefined
     }));
   }
 
@@ -471,7 +474,7 @@ export function UploadDialog({
               ? {
                   ...item,
                   status: "error",
-                  message,
+                  message: conflict ? undefined : message,
                   retry: conflict ? undefined : retry,
                   conflict,
                   fileNameOverride: conflict?.suggestedName ?? item.fileNameOverride,
@@ -481,7 +484,7 @@ export function UploadDialog({
               : item
           )
         );
-        onError(message);
+        onError(conflict ? FILE_NAME_CONFLICT_TOAST_MESSAGE : message);
       }
     }
 
@@ -887,14 +890,14 @@ export function UploadDialog({
       setUrlUpload((current) => ({
         ...current,
         status: "error",
-        message,
+        message: conflict ? undefined : message,
         retry: conflict ? undefined : retry,
         conflict,
         fileNameOverride: conflict?.suggestedName ?? current.fileNameOverride,
         editingFileName: conflict ? true : current.editingFileName,
         progress: retry && !conflict ? retryFailureProgress(retry, "分片导入失败，可手动重试") : undefined
       }));
-      onError(message);
+      onError(conflict ? FILE_NAME_CONFLICT_TOAST_MESSAGE : message);
     } finally {
       setSubmitting(false);
     }
@@ -1620,9 +1623,11 @@ function EditableFileName({
   onChange: (value: string) => void;
   onEditingChange: (editing: boolean) => void;
 }) {
-  const isEditing = editing || Boolean(conflict);
+  const isEditing = editing;
   const isEmpty = value.trim().length === 0;
   const displayValue = normalizedFileNameOverride(value) ?? originalValue;
+  const inputRef = useRef<HTMLInputElement>(null);
+  const editorRef = useRef<HTMLDivElement>(null);
   const cancelValue = useRef(value);
   const wasEditing = useRef(isEditing);
 
@@ -1636,6 +1641,12 @@ function EditableFileName({
     wasEditing.current = isEditing;
   }, [isEditing, value]);
 
+  useEffect(() => {
+    if (!isEditing || disabled) return;
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, [disabled, isEditing]);
+
   function startEditing() {
     if (disabled) return;
     cancelValue.current = value;
@@ -1647,7 +1658,7 @@ function EditableFileName({
     if (!normalized) {
       return;
     }
-    if (normalized !== value) {
+    if (normalized !== value || conflict) {
       onChange(normalized);
     }
     onEditingChange(false);
@@ -1655,9 +1666,25 @@ function EditableFileName({
 
   function cancelEditing() {
     if (conflict) {
+      closeOnBlur();
       return;
     }
     onChange(cancelValue.current);
+    onEditingChange(false);
+  }
+
+  function closeOnBlur() {
+    const normalized = value.trim();
+
+    if (normalized) {
+      if (normalized !== value || conflict) {
+        onChange(normalized);
+      }
+      onEditingChange(false);
+      return;
+    }
+
+    onChange(conflict?.suggestedName || originalValue);
     onEditingChange(false);
   }
 
@@ -1685,62 +1712,67 @@ function EditableFileName({
     );
   }
 
-  const hint = conflict
-    ? `${conflict.directoryPath} 已存在 ${conflict.fileName}，请修改文件名后重新上传。`
-    : value.trim() === originalValue.trim()
-      ? "默认使用原文件名，也可以在这里修改。"
-      : "上传后将使用该文件名。";
-
   return (
-    <div className="flex min-w-0 flex-col gap-1.5">
-      <Input
-        value={value}
-        disabled={disabled}
-        invalid={isEmpty}
-        placeholder={conflict?.suggestedName || originalValue}
-        className="h-9 px-2 shadow-none"
-        inputClassName="text-sm font-medium"
-        onChange={(event) => onChange(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter") {
-            event.preventDefault();
-            saveEditing();
-          }
-          if (event.key === "Escape") {
-            event.preventDefault();
-            cancelEditing();
-          }
-        }}
-        trailingNode={
-          <span className="inline-flex shrink-0 items-center gap-1">
-            <button
-              type="button"
-              aria-label="确认文件名"
-              title="确认文件名"
-              disabled={disabled || isEmpty}
-              onClick={saveEditing}
-              className="grid size-6 place-items-center rounded-md text-success transition-colors hover:bg-success-soft disabled:pointer-events-none disabled:opacity-40 focus-visible:outline-none focus-visible:focus-ring"
-            >
-              <Check size={13} />
-            </button>
-            {!conflict ? (
-              <button
-                type="button"
-                aria-label="取消编辑文件名"
-                title="取消编辑"
-                disabled={disabled}
-                onClick={cancelEditing}
-                className="grid size-6 place-items-center rounded-md text-subtle transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-40 focus-visible:outline-none focus-visible:focus-ring"
-              >
-                <X size={13} />
-              </button>
-            ) : null}
-          </span>
+    <div
+      ref={editorRef}
+      className="flex min-w-0 flex-col gap-1"
+      onBlur={(event) => {
+        const nextFocus = event.relatedTarget;
+        if (nextFocus instanceof Node && event.currentTarget.contains(nextFocus)) {
+          return;
         }
-      />
-      <p className={cn("text-xs leading-5", isEmpty ? "text-danger" : conflict ? "text-warning" : "text-muted")}>
-        {isEmpty ? "文件名不能为空。" : hint}
-      </p>
+        closeOnBlur();
+      }}
+    >
+      <div
+        className={cn(
+          "flex h-8 min-w-0 max-w-full items-center gap-1 rounded-lg border bg-background px-2 transition-[border-color,box-shadow] duration-150",
+          "focus-within:border-primary focus-within:shadow-[0_0_0_3px_var(--color-primary-ring)]",
+          isEmpty ? "border-danger" : conflict ? "border-warning/45" : "border-border hover:border-border-strong"
+        )}
+      >
+        <input
+          ref={inputRef}
+          value={value}
+          disabled={disabled}
+          placeholder={conflict?.suggestedName || originalValue}
+          className="h-full min-w-0 flex-1 border-0 bg-transparent text-sm font-medium text-foreground outline-none placeholder:text-subtle disabled:opacity-60"
+          onChange={(event) => onChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              saveEditing();
+            }
+            if (event.key === "Escape") {
+              event.preventDefault();
+              cancelEditing();
+            }
+          }}
+        />
+        <button
+          type="button"
+          aria-label="确认文件名"
+          title="确认文件名"
+          disabled={disabled || isEmpty}
+          onClick={saveEditing}
+          className="grid size-6 shrink-0 place-items-center rounded-md text-success transition-colors hover:bg-success-soft disabled:pointer-events-none disabled:opacity-40 focus-visible:outline-none focus-visible:focus-ring"
+        >
+          <Check size={13} />
+        </button>
+        {!conflict ? (
+          <button
+            type="button"
+            aria-label="取消编辑文件名"
+            title="取消编辑"
+            disabled={disabled}
+            onClick={cancelEditing}
+            className="grid size-6 shrink-0 place-items-center rounded-md text-subtle transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-40 focus-visible:outline-none focus-visible:focus-ring"
+          >
+            <X size={13} />
+          </button>
+        ) : null}
+      </div>
+      {isEmpty ? <p className="text-xs leading-5 text-danger">文件名不能为空。</p> : null}
     </div>
   );
 }

@@ -105,7 +105,7 @@ function ToastCard({ item, onDismiss }: CardProps) {
       <span className={cn("mt-0.5 grid size-6 shrink-0 place-items-center rounded-full", styles.iconBg)}>
         <Icon size={14} className={styles.iconFg} />
       </span>
-      <p className="flex-1 text-sm leading-6 text-foreground">{item.text}</p>
+      <p className="min-w-0 flex-1 overflow-anywhere text-sm leading-6 text-foreground">{item.text}</p>
       <button
         type="button"
         aria-label="关闭"
