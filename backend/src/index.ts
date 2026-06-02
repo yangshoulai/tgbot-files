@@ -156,7 +156,9 @@ const DIRECT_MULTIPART_ACCESS_MAX_BYTES = TELEGRAM_CHUNK_SIZE_BYTES * DIRECT_MUL
 const MAX_TELEGRAM_MULTIPART_BYTES = 5 * 1024 * 1024 * 1024;
 const MAX_TELEGRAM_MULTIPART_CHUNKS = Math.ceil(MAX_TELEGRAM_MULTIPART_BYTES / TELEGRAM_CHUNK_SIZE_BYTES);
 const TELEGRAM_RATE_LIMITER_OBJECT_NAME = "telegram-api-global";
-const TELEGRAM_SEND_DOCUMENT_RATE_LIMIT_MS = 1_500;
+// Token bucket for sendDocument: capacity 1, refill every 1s. The upload lock below
+// still ensures only one Telegram file upload is in flight at a time.
+const TELEGRAM_SEND_DOCUMENT_RATE_LIMIT_MS = 1_000;
 const TELEGRAM_SEND_DOCUMENT_LOCK_LEASE_MS = 2 * 60 * 1000;
 const TELEGRAM_GET_FILE_RATE_LIMIT_MS = 100;
 const DEFAULT_STALE_MULTIPART_UPLOAD_TTL_HOURS = 24;
@@ -274,6 +276,7 @@ export class TelegramRateLimiter {
       telegramRateLimitLockUntilKey("sendDocument"),
       now + TELEGRAM_SEND_DOCUMENT_LOCK_LEASE_MS
     );
+    await this.state.storage.put(telegramRateLimitStorageKey("sendDocument"), now + telegramRateLimitIntervalMs("sendDocument"));
 
     return { waitMs: 0, token };
   }
@@ -308,10 +311,6 @@ export class TelegramRateLimiter {
     }
 
     await this.clearLock(scope);
-
-    const key = telegramRateLimitStorageKey(scope);
-    const current = await this.state.storage.get<number>(key) ?? 0;
-    await this.state.storage.put(key, Math.max(current, Date.now() + telegramRateLimitIntervalMs(scope)));
   }
 
   private async clearLock(scope: TelegramRateLimitScope): Promise<void> {
