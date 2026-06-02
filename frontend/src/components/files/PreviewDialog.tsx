@@ -369,7 +369,7 @@ function MarkdownPreview({
   }
 
   return (
-    <div className={(fullscreen ? "h-full" : "h-[60vh]") + " w-full overflow-auto bg-background px-5 py-5 text-sm leading-7 text-foreground scroll-thin"}>
+    <div className={(fullscreen ? "h-full" : "h-[60vh]") + " w-full overflow-auto bg-white px-5 py-5 text-sm leading-7 text-foreground scroll-thin"}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
@@ -381,8 +381,13 @@ function MarkdownPreview({
           ul: (props) => <ul {...props} className="mb-3 list-disc pl-5" />,
           ol: (props) => <ol {...props} className="mb-3 list-decimal pl-5" />,
           blockquote: (props) => <blockquote {...props} className="mb-3 border-l-4 border-border pl-3 text-muted" />,
-          code: (props) => <code {...props} className="rounded bg-primary-soft px-1.5 py-0.5 font-mono text-xs text-primary-strong" />,
-          pre: (props) => <pre {...props} className="mb-3 overflow-auto rounded-xl border border-border bg-foreground p-3 font-mono text-xs leading-6 text-white scroll-thin" />,
+          code: (props) => <code {...props} className="rounded-md bg-background px-1.5 py-0.5 font-mono text-[0.92em] text-foreground ring-1 ring-border/70" />,
+          pre: (props) => (
+            <pre
+              {...props}
+              className="mb-4 overflow-auto rounded-xl border border-border bg-[#f8fafc] p-3 font-mono text-xs leading-6 text-[#334155] shadow-card scroll-thin [&_code]:rounded-none [&_code]:bg-transparent [&_code]:p-0 [&_code]:text-xs [&_code]:text-[#334155] [&_code]:ring-0"
+            />
+          ),
           table: (props) => <table {...props} className="mb-3 w-full border-collapse text-sm" />,
           th: (props) => <th {...props} className="border border-border bg-surface px-2 py-1 text-left font-semibold" />,
           td: (props) => <td {...props} className="border border-border px-2 py-1" />
@@ -464,23 +469,23 @@ function CodePreview({
   const formattedLabel = language === "json" && content !== originalContent ? "已格式化" : "原文";
 
   return (
-    <div className={(fullscreen ? "h-full" : "h-[60vh]") + " flex w-full flex-col overflow-hidden bg-foreground text-white"}>
-      <div className="flex shrink-0 items-center justify-between gap-3 border-b border-white/10 bg-white/[0.04] px-4 py-2 text-xs text-white/70">
-        <span className="font-medium text-white">{languageLabel(language)}</span>
+    <div className={(fullscreen ? "h-full" : "h-[60vh]") + " flex w-full flex-col overflow-hidden bg-white text-[#334155]"}>
+      <div className="flex shrink-0 items-center justify-between gap-3 border-b border-border bg-background/80 px-4 py-2 text-xs text-muted">
+        <span className="font-medium text-foreground">{languageLabel(language)}</span>
         <span className="flex items-center gap-2">
           <span>{formattedLabel}</span>
-          <span className="h-1 w-1 rounded-full bg-white/30" />
+          <span className="h-1 w-1 rounded-full bg-subtle" />
           <span>{lineCountLabel}</span>
         </span>
       </div>
       <div className="min-h-0 flex-1 overflow-auto scroll-thin">
         <div className="min-w-max py-2 font-mono text-xs leading-6">
           {lines.map((line, index) => (
-            <div key={`${index}-${line}`} className="grid grid-cols-[3.75rem_1fr] hover:bg-white/[0.04]">
-              <span className="select-none border-r border-white/10 px-3 text-right text-white/35">
+            <div key={`${index}-${line}`} className="grid grid-cols-[3.75rem_1fr] hover:bg-primary-soft/35">
+              <span className="select-none border-r border-border px-3 text-right text-subtle">
                 {index + 1}
               </span>
-              <code className="whitespace-pre px-4 text-white/88">
+              <code className="whitespace-pre px-4 text-[#334155]">
                 {highlightLine(line, language)}
               </code>
             </div>
@@ -530,8 +535,8 @@ function highlightLine(line: string, language: TextLanguage): ReactNode[] {
     const [, indent, key, separator] = keyMatch;
     const consumed = `${indent}${key}${separator}`;
     nodes.push(indent);
-    nodes.push(<span key="key" className="text-sky-300">{key}</span>);
-    nodes.push(<span key="separator" className="text-white/45">{separator}</span>);
+    nodes.push(<span key="key" className="text-[#1d4ed8]">{key}</span>);
+    nodes.push(<span key="separator" className="text-[#94a3b8]">{separator}</span>);
     nodes.push(...highlightTokens(line.slice(consumed.length), language, consumed.length));
     return nodes;
   }
@@ -568,7 +573,7 @@ function highlightTokens(value: string, language: TextLanguage, offset: number):
 
 function tokenClass(token: string, language: TextLanguage): string {
   if (token.startsWith("//") || token.startsWith("#") || token.startsWith("<!--")) {
-    return "text-white/38";
+    return "text-[#64748b]";
   }
 
   if (
@@ -577,26 +582,26 @@ function tokenClass(token: string, language: TextLanguage): string {
     token.startsWith("`") ||
     (language === "html" && token.startsWith("&"))
   ) {
-    return "text-emerald-300";
+    return "text-[#047857]";
   }
 
   if (token.startsWith("<") && token.endsWith(">")) {
-    return "text-primary-soft";
+    return "text-[#0f766e]";
   }
 
   if (/^\d/.test(token)) {
-    return "text-amber-200";
+    return "text-[#b45309]";
   }
 
   if (/^(true|false|null|undefined)$/.test(token)) {
-    return "text-amber-200";
+    return "text-[#b45309]";
   }
 
   if (/^[A-Za-z_$][\w$]*$/.test(token)) {
-    return "text-violet-200";
+    return "text-[#7c3aed]";
   }
 
-  return "text-white/45";
+  return "text-[#94a3b8]";
 }
 
 function PreviewLoading() {
