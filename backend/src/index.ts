@@ -2007,7 +2007,7 @@ async function requireFileMoveNamesAvailable(params: {
 function fileNameConflictError(
   directoryPath: string,
   fileName: string,
-  source: "file" | "multipart_upload"
+  source: "file"
 ): AppError {
   return new AppError(
     409,

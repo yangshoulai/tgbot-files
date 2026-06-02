@@ -336,7 +336,12 @@ class FakeD1Statement {
     }
 
     if (normalizedSql.startsWith("DELETE FROM MULTIPART_UPLOADS")) {
-      this.deleteWhere(this.db.multipartUploads, (upload) => this.uploadMatchesDirectorySelection(upload, this.bindings));
+      if (normalizedSql.includes("WHERE ID = ?")) {
+        const id = String(this.bindings[0]);
+        this.deleteWhere(this.db.multipartUploads, (upload) => upload.id === id);
+      } else {
+        this.deleteWhere(this.db.multipartUploads, (upload) => this.uploadMatchesDirectorySelection(upload, this.bindings));
+      }
     }
 
     if (normalizedSql.startsWith("DELETE FROM DIRECTORIES")) {
@@ -381,7 +386,7 @@ class FakeD1Statement {
       }
     }
 
-    if (normalizedSql.startsWith("DELETE FROM FILE_CHUNKS")) {
+    if (normalizedSql.startsWith("DELETE FROM FILE_CHUNKS") && normalizedSql.includes("MULTIPART_UPLOADS.CREATED_AT < ?")) {
       const expiredBefore = String(this.bindings[0]);
       const staleUploadIds = new Set(
         this.db.multipartUploads
@@ -397,7 +402,7 @@ class FakeD1Statement {
       this.db.fileChunks.splice(0, this.db.fileChunks.length, ...remaining);
     }
 
-    if (normalizedSql.startsWith("DELETE FROM MULTIPART_UPLOADS")) {
+    if (normalizedSql.startsWith("DELETE FROM MULTIPART_UPLOADS") && normalizedSql.includes("CREATED_AT < ?")) {
       const expiredBefore = String(this.bindings[0]);
       const remaining = this.db.multipartUploads.filter(
         (item) =>
@@ -2930,7 +2935,7 @@ describe("admin file manager", () => {
     expect(db.multipartUploads).toHaveLength(0);
   });
 
-  it("reserves file names for incomplete multipart upload sessions", async () => {
+  it("allows restarting a multipart upload when an incomplete session has the same file name", async () => {
     const db = new FakeD1();
     const adminEnv: Env = {
       ...env,
@@ -2973,18 +2978,18 @@ describe("admin file manager", () => {
       adminEnv
     );
     const body = await response.json() as {
-      error: string;
-      details: { directory_path: string; file_name: string; source: string };
+      ok: boolean;
+      upload: { id: string; file_name: string; directory_path: string };
     };
 
-    expect(response.status).toBe(409);
-    expect(body.error).toBe("FileNameConflict");
-    expect(body.details).toMatchObject({
-      directory_path: "/incoming/big",
-      file_name: "big.bin",
-      source: "multipart_upload"
-    });
-    expect(db.multipartUploads).toHaveLength(1);
+    expect(response.status).toBe(201);
+    expect(body.ok).toBe(true);
+    expect(body.upload.file_name).toBe("big.bin");
+    expect(body.upload.directory_path).toBe("/incoming/big");
+    expect(body.upload.id).not.toBe("pending-big-upload");
+    expect(db.multipartUploads).toHaveLength(2);
+    expect(db.multipartUploads[0]?.completed_at).toBeNull();
+    expect(db.files).toHaveLength(0);
   });
 
   it("completes oversized-direct multipart uploads without returning a full file link", async () => {
@@ -3534,6 +3539,22 @@ describe("admin file manager", () => {
       telegram_file_unique_id: null,
       created_at: "2026-05-27T00:00:00.000Z"
     });
+    db.multipartUploads.push({
+      id: "file-1",
+      source_kind: "local",
+      source_url: null,
+      file_name: "report.pdf",
+      mime_type: "application/pdf",
+      size: 12,
+      chunk_size: 12,
+      chunk_count: 1,
+      remark: "季度归档资料",
+      uploaded_by: "admin",
+      created_at: "2026-05-27T00:00:00.000Z",
+      completed_at: "2026-05-27T00:01:00.000Z",
+      directory_id: null,
+      directory_path: "/"
+    });
     const cookie = await loginAndGetCookie(adminEnv);
 
     const listResponse = await worker.fetch(
@@ -3561,6 +3582,7 @@ describe("admin file manager", () => {
     expect(deleteBody.ok).toBe(true);
     expect(db.files).toHaveLength(0);
     expect(db.fileChunks).toHaveLength(0);
+    expect(db.multipartUploads).toHaveLength(0);
 
     const afterDeleteResponse = await worker.fetch(
       new Request("https://files.example.com/api/admin/files", {

@@ -81,7 +81,7 @@ export interface FileUsageStats {
 
 export interface FileNameConflictRecord {
   id: string;
-  source: "file" | "multipart_upload";
+  source: "file";
 }
 
 export type FileTypeFilter = "image" | "text" | "pdf" | "archive" | "other";
@@ -385,20 +385,7 @@ export async function findActiveFileNameConflict(params: {
     return { id: file.id, source: "file" };
   }
 
-  const upload = await params.db
-    .prepare(
-      `SELECT id
-      FROM multipart_uploads
-      WHERE completed_at IS NULL
-        AND COALESCE(directory_path, '/') = ?
-        AND file_name = ?
-        ${excludeClause}
-      LIMIT 1`
-    )
-    .bind(...bindings, ...excludeBindings)
-    .first<{ id: string }>();
-
-  return upload ? { id: upload.id, source: "multipart_upload" } : null;
+  return null;
 }
 
 export async function deleteFileRecord(db: D1Database, id: string): Promise<boolean> {
@@ -413,6 +400,7 @@ export async function deleteFileRecord(db: D1Database, id: string): Promise<bool
 
   await db.prepare("DELETE FROM file_chunks WHERE file_id = ?").bind(id).run();
   await db.prepare("DELETE FROM files WHERE id = ?").bind(id).run();
+  await db.prepare("DELETE FROM multipart_uploads WHERE id = ?").bind(id).run();
   return true;
 }
 

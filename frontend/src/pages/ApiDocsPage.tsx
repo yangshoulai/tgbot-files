@@ -250,7 +250,7 @@ function buildDocs(session: SessionResponse): Record<DocAudience, { title: strin
 }`,
               notes: [
                 `文件大小必须小于等于 ${maxFile}；推荐新客户端无论大小都使用分片上传接口。`,
-                "file_name 为可选覆盖文件名；同一目录下已有同名文件或未完成分片会话时返回 409 FileNameConflict，details.suggested_name 可用于默认改名。"
+                "file_name 为可选覆盖文件名；同一目录下已有同名文件时返回 409 FileNameConflict，details.suggested_name 可用于默认改名。"
               ]
             },
             {
@@ -308,7 +308,7 @@ function buildDocs(session: SessionResponse): Record<DocAudience, { title: strin
   }
 }`,
               notes: [
-                "同一目录下已有同名文件或未完成分片会话时返回 409 FileNameConflict，客户端应提示用户输入新的 file_name 后重新初始化。"
+                "同一目录下已有同名文件时返回 409 FileNameConflict，客户端应提示用户输入新的 file_name 后重新初始化。"
               ]
             },
             {
@@ -771,7 +771,7 @@ curl -X POST '${baseUrl}/api/admin/files' \\
   }
 }`,
               notes: [
-                "同一目录下已有同名文件或未完成分片会话时返回 409 FileNameConflict；管理员 APP 应让用户输入新 file_name 后重新初始化。"
+                "同一目录下已有同名文件时返回 409 FileNameConflict；管理员 APP 应让用户输入新 file_name 后重新初始化。"
               ]
             },
             {
