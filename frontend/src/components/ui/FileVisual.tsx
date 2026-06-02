@@ -9,6 +9,7 @@ interface FileVisualProps {
   mimeType: string;
   fileName: string;
   url?: string;
+  thumbnailUrl?: string | null;
   size?: Size;
   className?: string;
 }
@@ -25,15 +26,16 @@ const iconSizes: Record<Size, "sm" | "md" | "lg"> = {
   lg: "lg"
 };
 
-export function FileVisual({ mimeType, fileName, url, size = "md", className }: FileVisualProps) {
+export function FileVisual({ mimeType, fileName, url, thumbnailUrl, size = "md", className }: FileVisualProps) {
   const [imageFailed, setImageFailed] = useState(false);
 
   useEffect(() => {
     setImageFailed(false);
-  }, [url]);
+  }, [thumbnailUrl, url]);
 
   const kind = fileKind({ mime_type: mimeType, file_name: fileName });
-  const showImage = kind.tone === "image" && Boolean(url) && !imageFailed;
+  const visualUrl = thumbnailUrl || (kind.tone === "image" ? url : undefined);
+  const showImage = Boolean(visualUrl) && !imageFailed;
 
   return (
     <span
@@ -46,7 +48,7 @@ export function FileVisual({ mimeType, fileName, url, size = "md", className }: 
     >
       {showImage ? (
         <img
-          src={url}
+          src={visualUrl}
           alt={fileName}
           loading="lazy"
           onError={() => setImageFailed(true)}

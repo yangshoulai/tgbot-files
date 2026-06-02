@@ -112,7 +112,15 @@ class FakeD1Statement {
         directory_path: String(directoryPath || "/"),
         storage_backend: this.bindings[13] === "telegram_multipart" ? "telegram_multipart" : "telegram_single",
         chunk_size: this.bindings[14] === null ? null : Number(this.bindings[14]),
-        chunk_count: this.bindings[15] === null ? null : Number(this.bindings[15])
+        chunk_count: this.bindings[15] === null ? null : Number(this.bindings[15]),
+        thumbnail_file_id: this.bindings[16] === null ? null : String(this.bindings[16]),
+        thumbnail_file_unique_id: this.bindings[17] === null ? null : String(this.bindings[17]),
+        thumbnail_file_path: this.bindings[18] === null ? null : String(this.bindings[18]),
+        thumbnail_mime_type: this.bindings[19] === null ? null : String(this.bindings[19]),
+        thumbnail_size: this.bindings[20] === null ? null : Number(this.bindings[20]),
+        thumbnail_width: this.bindings[21] === null ? null : Number(this.bindings[21]),
+        thumbnail_height: this.bindings[22] === null ? null : Number(this.bindings[22]),
+        thumbnail_status: this.bindings[23] === "ready" || this.bindings[23] === "failed" ? this.bindings[23] : "none"
       });
       changes = 1;
     }
@@ -823,6 +831,14 @@ function fileRecord(overrides: Partial<FileRecord> = {}): FileRecord {
     storage_backend: "telegram_single",
     chunk_size: null,
     chunk_count: null,
+    thumbnail_file_id: null,
+    thumbnail_file_unique_id: null,
+    thumbnail_file_path: null,
+    thumbnail_mime_type: null,
+    thumbnail_size: null,
+    thumbnail_width: null,
+    thumbnail_height: null,
+    thumbnail_status: "none",
     ...overrides
   };
 }
@@ -1382,6 +1398,100 @@ describe("API key multipart endpoints", () => {
 
     expect(unsatisfiableResponse.status).toBe(416);
     expect(unsatisfiableResponse.headers.get("Content-Range")).toBe("bytes */5");
+  });
+
+  it("stores an optional thumbnail when completing an API multipart upload", async () => {
+    const db = new FakeD1();
+    addApiKey(db);
+    const apiEnv = envWithDb(db);
+    let sendDocumentCalls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const inputUrl = String(input);
+
+      if (inputUrl.endsWith("/sendDocument")) {
+        sendDocumentCalls += 1;
+        return jsonResponse({
+          ok: true,
+          result: {
+            document: {
+              file_id: sendDocumentCalls === 1 ? "tg-main-chunk" : "tg-thumbnail",
+              file_unique_id: sendDocumentCalls === 1 ? "unique-main-chunk" : "unique-thumbnail",
+              file_name: sendDocumentCalls === 1 ? "photo.jpg.part-1-of-1" : "photo.thumbnail.jpg",
+              mime_type: sendDocumentCalls === 1 ? "application/octet-stream" : "image/jpeg",
+              file_size: sendDocumentCalls === 1 ? 5 : 4
+            }
+          }
+        });
+      }
+
+      throw new Error(`Unexpected fetch ${inputUrl}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const initResponse = await worker.fetch(
+      new Request("https://files.example.com/api/v1/uploads/init", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${uploadApiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          file_name: "photo.jpg",
+          mime_type: "image/jpeg",
+          size: 5
+        })
+      }),
+      apiEnv
+    );
+    const initBody = await initResponse.json() as { upload: { id: string } };
+    const chunkForm = new FormData();
+    chunkForm.set("chunk", new File(["hello"], "photo.jpg.part-1", { type: "application/octet-stream" }));
+    await worker.fetch(
+      new Request(`https://files.example.com/api/v1/uploads/${initBody.upload.id}/chunks/0`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${uploadApiKey}` },
+        body: chunkForm
+      }),
+      apiEnv
+    );
+
+    const completeForm = new FormData();
+    completeForm.set("thumbnail", new File([new Uint8Array([0xff, 0xd8, 0xff, 0xd9])], "thumb.jpg", { type: "image/jpeg" }));
+    completeForm.set("thumbnail_width", "320");
+    completeForm.set("thumbnail_height", "180");
+    const completeResponse = await worker.fetch(
+      new Request(`https://files.example.com/api/v1/uploads/${initBody.upload.id}/complete`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${uploadApiKey}` },
+        body: completeForm
+      }),
+      apiEnv
+    );
+    const completeBody = await completeResponse.json() as {
+      file: {
+        thumbnail_status: string;
+        thumbnail_url: string | null;
+        thumbnail_file_id: string | null;
+        thumbnail_width: number | null;
+        thumbnail_height: number | null;
+      };
+    };
+
+    expect(completeResponse.status).toBe(200);
+    expect(sendDocumentCalls).toBe(2);
+    expect(completeBody.file.thumbnail_status).toBe("ready");
+    expect(completeBody.file.thumbnail_file_id).toBe("tg-thumbnail");
+    expect(completeBody.file.thumbnail_url).toMatch(/^https:\/\/files\.example\.com\/f\//);
+    expect(completeBody.file.thumbnail_width).toBe(320);
+    expect(completeBody.file.thumbnail_height).toBe(180);
+    expect(db.files[0]).toMatchObject({
+      thumbnail_file_id: "tg-thumbnail",
+      thumbnail_file_unique_id: "unique-thumbnail",
+      thumbnail_status: "ready",
+      thumbnail_mime_type: "image/jpeg",
+      thumbnail_width: 320,
+      thumbnail_height: 180
+    });
   });
 
   it("imports a small URL through the API key multipart URL flow", async () => {

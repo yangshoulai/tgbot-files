@@ -189,7 +189,13 @@ export function FileTable({
                 </td>
                 <td className="px-4 py-3 align-middle">
                   <div className="flex min-w-0 items-center gap-3">
-                    <FileVisual mimeType={file.mime_type} fileName={file.file_name} url={directFile ? file.file_path : undefined} size="sm" />
+                    <FileVisual
+                      mimeType={file.mime_type}
+                      fileName={file.file_name}
+                      url={directFile ? file.file_path : undefined}
+                      thumbnailUrl={file.thumbnail_url}
+                      size="sm"
+                    />
                     <div className="flex min-w-0 flex-col gap-0.5">
                       <span className="truncate text-sm font-medium text-foreground" title={file.file_name}>
                         {file.file_name}

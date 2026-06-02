@@ -31,7 +31,13 @@ export function FileDetailDialog({ file, onClose, onCopy, onAcceleratedDownload 
       size="xl"
       title={
         <span className="flex items-center gap-3">
-          <FileVisual mimeType={file.mime_type} fileName={file.file_name} url={directFile ? file.file_path : undefined} size="sm" />
+          <FileVisual
+            mimeType={file.mime_type}
+            fileName={file.file_name}
+            url={directFile ? file.file_path : undefined}
+            thumbnailUrl={file.thumbnail_url}
+            size="sm"
+          />
           <span className="min-w-0 truncate" title={file.file_name}>
             {file.file_name}
           </span>
@@ -91,6 +97,7 @@ export function FileDetailDialog({ file, onClose, onCopy, onAcceleratedDownload 
         <DetailRow label="MD5" value={isMultipart ? "分片文件不计算整文件 MD5" : file.md5} mono={!isMultipart} />
         <DetailRow label={isMultipart ? "分片记录 ID" : "Telegram ID"} value={file.telegram_file_id} mono />
         <DetailRow label="Telegram Unique ID" value={file.telegram_file_unique_id || "未记录"} mono />
+        <DetailRow label="缩略图" value={thumbnailLabel(file)} />
         <DetailRow label="上传时间" value={formatDateTime(file.created_at)} />
         <DetailRow label="上传者" value={file.uploaded_by || "接口上传"} />
         <DetailRow label="备注" value={file.remark || "无备注"} fullWidth />
@@ -98,6 +105,20 @@ export function FileDetailDialog({ file, onClose, onCopy, onAcceleratedDownload 
       </div>
     </Modal>
   );
+}
+
+function thumbnailLabel(file: FileItem): string {
+  if (file.thumbnail_status === "ready") {
+    return file.thumbnail_mime_type
+      ? `${file.thumbnail_mime_type} · ${file.thumbnail_size ? formatBytes(file.thumbnail_size) : "大小未记录"}`
+      : "已生成";
+  }
+
+  if (file.thumbnail_status === "failed") {
+    return "生成或上传失败";
+  }
+
+  return "无缩略图";
 }
 
 function DetailRow({

@@ -60,6 +60,15 @@ export interface FileItem {
   storage_backend?: "telegram_single" | "telegram_multipart";
   chunk_size?: number | null;
   chunk_count?: number | null;
+  thumbnail_file_id?: string | null;
+  thumbnail_file_unique_id?: string | null;
+  thumbnail_file_path?: string | null;
+  thumbnail_mime_type?: string | null;
+  thumbnail_size?: number | null;
+  thumbnail_width?: number | null;
+  thumbnail_height?: number | null;
+  thumbnail_status?: "none" | "ready" | "failed";
+  thumbnail_url?: string | null;
 }
 
 export interface DirectoryItem {
@@ -173,6 +182,13 @@ export interface MultipartUpload {
   direct_access?: boolean;
   direct_access_max_chunks?: number;
   direct_access_max_bytes?: number;
+  thumbnail_source?: {
+    available: boolean;
+    kind: "image" | "video";
+    url: string;
+    mime_type: string;
+    expires_at: string;
+  } | null;
 }
 
 export interface MultipartInitResponse {
@@ -406,9 +422,28 @@ export function uploadUrlMultipartChunk(uploadId: string, chunkIndex: number) {
   );
 }
 
-export function completeMultipartUpload(uploadId: string) {
+export interface ThumbnailUploadPayload {
+  blob: Blob;
+  fileName: string;
+  width?: number;
+  height?: number;
+}
+
+export function completeMultipartUpload(uploadId: string, thumbnail?: ThumbnailUploadPayload) {
+  if (!thumbnail) {
+    return requestJson<AdminUploadResponse>(`/api/admin/uploads/${encodeURIComponent(uploadId)}/complete`, {
+      method: "POST"
+    });
+  }
+
+  const form = new FormData();
+  form.set("thumbnail", thumbnail.blob, thumbnail.fileName);
+  if (thumbnail.width) form.set("thumbnail_width", String(thumbnail.width));
+  if (thumbnail.height) form.set("thumbnail_height", String(thumbnail.height));
+
   return requestJson<AdminUploadResponse>(`/api/admin/uploads/${encodeURIComponent(uploadId)}/complete`, {
-    method: "POST"
+    method: "POST",
+    body: form
   });
 }
 

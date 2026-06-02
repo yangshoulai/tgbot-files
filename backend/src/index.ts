@@ -5,7 +5,7 @@ import {
   requireAdminSessionInfo,
   validateAdminCredentials
 } from "./admin-auth";
-import { createSignedToken, TokenError, verifySignedToken } from "./crypto";
+import { createSignedPayload, createSignedToken, TokenError, verifySignedPayload, verifySignedToken } from "./crypto";
 import {
   completeMultipartUploadWithFileRecord,
   deleteStaleMultipartUploadData,
@@ -45,7 +45,8 @@ import {
   type FileChunkRecord,
   type FileRecord,
   type FileTypeFilter,
-  type MultipartUploadRecord
+  type MultipartUploadRecord,
+  type ThumbnailStatus
 } from "./database";
 import {
   AppError,
@@ -94,6 +95,7 @@ interface UploadResult {
   storageBackend: "telegram_single" | "telegram_multipart";
   chunkSize?: number | null;
   chunkCount?: number | null;
+  thumbnail?: UploadedThumbnailResult;
 }
 
 interface MultipartInitResult {
@@ -104,6 +106,41 @@ interface MultipartInitResult {
   chunkSize: number;
   chunkCount: number;
   directoryPath: string;
+  thumbnailSource?: ThumbnailSourceInfo;
+}
+
+interface ThumbnailSourceInfo {
+  available: boolean;
+  kind: "image" | "video";
+  url: string;
+  mimeType: string;
+  expiresAt: string;
+}
+
+interface ThumbnailInput {
+  file: File;
+  width?: number;
+  height?: number;
+}
+
+interface UploadedThumbnailResult {
+  status: ThumbnailStatus;
+  fileId?: string;
+  fileUniqueId?: string;
+  filePath?: string;
+  mimeType?: string;
+  size?: number;
+  width?: number;
+  height?: number;
+}
+
+interface ThumbnailSourceTokenPayload {
+  purpose: "thumbnail_source";
+  url: string;
+  mime_type: string;
+  kind: "image" | "video";
+  size: number;
+  exp: number;
 }
 
 interface ParsedByteRange {
@@ -120,6 +157,11 @@ const MAX_TELEGRAM_MULTIPART_CHUNKS = Math.ceil(MAX_TELEGRAM_MULTIPART_BYTES / T
 const DEFAULT_STALE_MULTIPART_UPLOAD_TTL_HOURS = 24;
 const MIN_STALE_MULTIPART_UPLOAD_TTL_HOURS = 1;
 const MAX_STALE_MULTIPART_UPLOAD_TTL_HOURS = 24 * 30;
+const MAX_THUMBNAIL_BYTES = 512 * 1024;
+const THUMBNAIL_SOURCE_TOKEN_TTL_SECONDS = 10 * 60;
+const THUMBNAIL_SOURCE_MAX_BYTES = 100 * 1024 * 1024;
+const VIDEO_THUMBNAIL_PROXY_DEFAULT_RANGE_BYTES = 2 * 1024 * 1024;
+const ALLOWED_THUMBNAIL_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 const worker = {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -811,7 +853,6 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
     const remark = normalizeRemark(body.remark);
     const fileNameOverride = normalizeOptionalFileName(body.file_name);
     const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
-    const forceMultipart = body.force_multipart === true;
     const directory = await ensureWritableDirectory(db, directoryPath);
 
     if (!sourceUrl) {
@@ -819,20 +860,11 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
     }
 
     const probe = await probeRemoteSourceForMultipart(sourceUrl, parseMaxFileBytes(env.MAX_FILE_BYTES), {
-      forceMultipart
+      forceMultipart: true
     });
 
     if (probe.mode === "single") {
-      return jsonResponse({
-        ok: true,
-        mode: "single",
-        max_file_bytes: parseMaxFileBytes(env.MAX_FILE_BYTES),
-        max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
-        multipart_chunk_bytes: TELEGRAM_CHUNK_SIZE_BYTES,
-        direct_access_max_chunks: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
-        direct_access_max_bytes: DIRECT_MULTIPART_ACCESS_MAX_BYTES,
-        directory_path: directoryPath
-      });
+      throw new AppError(500, "InternalError", "Forced URL multipart probe returned single mode");
     }
 
     const result = await createMultipartUpload({
@@ -847,6 +879,16 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
       directoryId: directory?.id ?? null,
       ...(remark ? { remark } : {})
     });
+    const thumbnailSource = await createThumbnailSourceInfo({
+      request,
+      env,
+      sourceUrl,
+      mimeType: probe.mimeType,
+      size: probe.size
+    });
+    if (thumbnailSource) {
+      result.thumbnailSource = thumbnailSource;
+    }
 
     return jsonResponse({
       ok: true,
@@ -906,11 +948,13 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
   const completeMatch = /^\/api\/admin\/uploads\/([^/]+)\/complete$/.exec(url.pathname);
   if (request.method === "POST" && completeMatch?.[1]) {
     const upload = await requireMultipartUpload(db, decodeURIComponent(completeMatch[1]));
+    const thumbnail = await readCompleteUploadThumbnail(request);
     const result = await completeMultipartUpload({
       request,
       env,
       db,
-      upload
+      upload,
+      ...(thumbnail ? { thumbnail } : {})
     });
 
     return jsonResponse({
@@ -919,12 +963,21 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
     });
   }
 
+  if (request.method === "GET" && url.pathname === "/api/admin/uploads/url-thumbnail-source") {
+    return handleThumbnailSourceProxy(request, env);
+  }
+
   return errorResponse(new AppError(404, "NotFound", "Admin multipart upload route not found"));
 }
 
 async function handleApiMultipartUploads(request: Request, env: Env): Promise<Response> {
-  const db = requireDb(env);
   const url = new URL(request.url);
+
+  if (request.method === "GET" && url.pathname === "/api/v1/uploads/url-thumbnail-source") {
+    return handleThumbnailSourceProxy(request, env);
+  }
+
+  const db = requireDb(env);
   await requireUploadApiKey(request, db);
 
   if (request.method === "POST" && url.pathname === "/api/v1/uploads/init") {
@@ -983,6 +1036,16 @@ async function handleApiMultipartUploads(request: Request, env: Env): Promise<Re
       directoryId: directory?.id ?? null,
       ...(remark ? { remark } : {})
     });
+    const thumbnailSource = await createThumbnailSourceInfo({
+      request,
+      env,
+      sourceUrl,
+      mimeType: probe.mimeType,
+      size: probe.size
+    });
+    if (thumbnailSource) {
+      result.thumbnailSource = thumbnailSource;
+    }
 
     return jsonResponse({
       ok: true,
@@ -1041,11 +1104,13 @@ async function handleApiMultipartUploads(request: Request, env: Env): Promise<Re
   const completeMatch = /^\/api\/v1\/uploads\/([^/]+)\/complete$/.exec(url.pathname);
   if (request.method === "POST" && completeMatch?.[1]) {
     const upload = await requireMultipartUpload(db, decodeURIComponent(completeMatch[1]));
+    const thumbnail = await readCompleteUploadThumbnail(request);
     const result = await completeMultipartUpload({
       request,
       env,
       db,
-      upload
+      upload,
+      ...(thumbnail ? { thumbnail } : {})
     });
 
     return jsonResponse({
@@ -1206,6 +1271,54 @@ async function readUrlUploadJson(request: Request, env: Env): Promise<{ file: Fi
     directoryPath,
     ...(remark ? { remark } : {})
   };
+}
+
+async function readCompleteUploadThumbnail(request: Request): Promise<ThumbnailInput | undefined> {
+  const contentType = request.headers.get("Content-Type") || "";
+
+  if (!contentType) {
+    return undefined;
+  }
+
+  if (!contentType.toLowerCase().includes("multipart/form-data")) {
+    return undefined;
+  }
+
+  const formData = await request.formData();
+  const thumbnail = formData.get("thumbnail");
+
+  if (!(thumbnail instanceof File)) {
+    return undefined;
+  }
+
+  return {
+    file: thumbnail,
+    ...optionalThumbnailDimensions(formData)
+  };
+}
+
+function optionalThumbnailDimensions(formData: FormData): Pick<ThumbnailInput, "width" | "height"> {
+  const width = optionalBoundedInteger(formData.get("thumbnail_width"), 1, 8192);
+  const height = optionalBoundedInteger(formData.get("thumbnail_height"), 1, 8192);
+
+  return {
+    ...(width ? { width } : {}),
+    ...(height ? { height } : {})
+  };
+}
+
+function optionalBoundedInteger(value: FormDataEntryValue | null, min: number, max: number): number | undefined {
+  if (typeof value !== "string" || value.trim() === "") {
+    return undefined;
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
+    return undefined;
+  }
+
+  return parsed;
 }
 
 function validateUploadFileSize(file: File, maxFileBytes: number): void {
@@ -1658,6 +1771,171 @@ async function fetchRemoteRange(sourceUrl: URL, start: number, end: number): Pro
   }
 }
 
+async function createThumbnailSourceInfo(params: {
+  request: Request;
+  env: Env;
+  sourceUrl: URL;
+  mimeType: string;
+  size: number;
+}): Promise<ThumbnailSourceInfo | undefined> {
+  const kind = thumbnailSourceKind(params.mimeType);
+
+  if (!kind || params.size > THUMBNAIL_SOURCE_MAX_BYTES) {
+    return undefined;
+  }
+
+  const expiresAtSeconds = Math.floor(Date.now() / 1000) + THUMBNAIL_SOURCE_TOKEN_TTL_SECONDS;
+  const token = await createSignedPayload(
+    {
+      purpose: "thumbnail_source",
+      url: params.sourceUrl.toString(),
+      mime_type: params.mimeType,
+      kind,
+      size: params.size,
+      exp: expiresAtSeconds
+    } satisfies ThumbnailSourceTokenPayload,
+    requireEnv(params.env, "LINK_SIGNING_SECRET")
+  );
+  const requestUrl = new URL(params.request.url);
+  const proxyPath = requestUrl.pathname.startsWith("/api/v1/")
+    ? "/api/v1/uploads/url-thumbnail-source"
+    : "/api/admin/uploads/url-thumbnail-source";
+
+  return {
+    available: true,
+    kind,
+    url: `${proxyPath}?token=${encodeURIComponent(token)}`,
+    mimeType: params.mimeType,
+    expiresAt: new Date(expiresAtSeconds * 1000).toISOString()
+  };
+}
+
+function thumbnailSourceKind(mimeType: string): "image" | "video" | undefined {
+  const normalized = mimeType.toLowerCase();
+
+  if (normalized.startsWith("image/") && normalized !== "image/svg+xml") {
+    return "image";
+  }
+
+  if (normalized.startsWith("video/")) {
+    return "video";
+  }
+
+  return undefined;
+}
+
+async function handleThumbnailSourceProxy(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const token = url.searchParams.get("token");
+
+  if (!token) {
+    throw new AppError(400, "MissingToken", "Missing thumbnail source token");
+  }
+
+  const payload = parseThumbnailSourcePayload(
+    await verifySignedPayload(token, requireEnv(env, "LINK_SIGNING_SECRET"))
+  );
+  const nowSeconds = Math.floor(Date.now() / 1000);
+
+  if (payload.exp < nowSeconds) {
+    throw new AppError(401, "ExpiredToken", "Thumbnail source token has expired");
+  }
+
+  if (payload.size > THUMBNAIL_SOURCE_MAX_BYTES) {
+    throw new AppError(413, "ThumbnailSourceTooLarge", "Thumbnail source is too large");
+  }
+
+  const sourceUrl = new URL(payload.url);
+  if (sourceUrl.protocol !== "http:" && sourceUrl.protocol !== "https:") {
+    throw new AppError(400, "InvalidThumbnailSource", "Thumbnail source URL must use HTTP or HTTPS");
+  }
+
+  const rangeHeader = thumbnailProxyRangeHeader(request, payload);
+  let response: Response;
+
+  try {
+    response = await fetch(sourceUrl.toString(), {
+      redirect: "follow",
+      headers: {
+        Accept: payload.kind === "image" ? "image/*" : "video/*",
+        ...(rangeHeader ? { Range: rangeHeader } : {})
+      }
+    });
+  } catch {
+    throw new AppError(502, "ThumbnailSourceFetchFailed", "Failed to fetch thumbnail source");
+  }
+
+  if (!response.ok && response.status !== 206) {
+    throw new AppError(
+      response.status >= 500 ? 502 : 400,
+      "ThumbnailSourceFetchFailed",
+      `Thumbnail source returned ${response.status}`,
+      { source_status: response.status }
+    );
+  }
+
+  const headers = withSecurityHeaders();
+  headers.set("Content-Type", payload.mime_type || response.headers.get("Content-Type") || "application/octet-stream");
+  headers.set("Cache-Control", "private, max-age=600");
+  copyHeader(response.headers, headers, "Content-Length");
+  copyHeader(response.headers, headers, "Content-Range");
+  copyHeader(response.headers, headers, "Accept-Ranges");
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
+
+function thumbnailProxyRangeHeader(request: Request, payload: ThumbnailSourceTokenPayload): string | undefined {
+  const requestedRange = request.headers.get("Range");
+
+  if (requestedRange) {
+    return requestedRange;
+  }
+
+  if (payload.kind === "video") {
+    const end = Math.max(0, Math.min(payload.size, VIDEO_THUMBNAIL_PROXY_DEFAULT_RANGE_BYTES) - 1);
+    return `bytes=0-${end}`;
+  }
+
+  return undefined;
+}
+
+function parseThumbnailSourcePayload(value: unknown): ThumbnailSourceTokenPayload {
+  if (!isPlainRecord(value)) {
+    throw new TokenError("Invalid thumbnail source token payload");
+  }
+
+  if (
+    value.purpose !== "thumbnail_source" ||
+    typeof value.url !== "string" ||
+    typeof value.mime_type !== "string" ||
+    (value.kind !== "image" && value.kind !== "video") ||
+    typeof value.size !== "number" ||
+    !Number.isSafeInteger(value.size) ||
+    value.size <= 0 ||
+    typeof value.exp !== "number" ||
+    !Number.isSafeInteger(value.exp)
+  ) {
+    throw new TokenError("Invalid thumbnail source token fields");
+  }
+
+  return {
+    purpose: "thumbnail_source",
+    url: value.url,
+    mime_type: value.mime_type,
+    kind: value.kind,
+    size: value.size,
+    exp: value.exp
+  };
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 async function requireMultipartUpload(
   db: D1Database,
   id: string,
@@ -1844,6 +2122,7 @@ async function completeMultipartUpload(params: {
   env: Env;
   db: D1Database;
   upload: MultipartUploadRecord;
+  thumbnail?: ThumbnailInput;
 }): Promise<UploadResult> {
   const chunks = await listFileChunkRecords(params.db, params.upload.id);
   validateCompleteChunks(params.upload, chunks);
@@ -1874,6 +2153,12 @@ async function completeMultipartUpload(params: {
   const filePath = `/f/${token}/${publicName}`;
   const publicUrl = `${baseUrl}${filePath}`;
   const md5 = multipartDigest(chunks);
+  const thumbnail = await uploadOptionalThumbnail({
+    request: params.request,
+    env: params.env,
+    originalFileName: params.upload.file_name,
+    thumbnail: params.thumbnail
+  });
 
   await completeMultipartUploadWithFileRecord({
     db: params.db,
@@ -1893,6 +2178,7 @@ async function completeMultipartUpload(params: {
       chunkCount: params.upload.chunk_count,
       directoryId: params.upload.directory_id ?? null,
       directoryPath: params.upload.directory_path ?? "/",
+      ...thumbnailFileRecordFields(thumbnail),
       ...(params.upload.remark ? { remark: params.upload.remark } : {}),
       ...(params.upload.uploaded_by ? { uploadedBy: params.upload.uploaded_by } : {})
     }
@@ -1913,7 +2199,128 @@ async function completeMultipartUpload(params: {
     directoryPath: params.upload.directory_path ?? "/",
     storageBackend: "telegram_multipart",
     chunkSize: params.upload.chunk_size,
-    chunkCount: params.upload.chunk_count
+    chunkCount: params.upload.chunk_count,
+    ...(thumbnail ? { thumbnail } : {})
+  };
+}
+
+async function uploadOptionalThumbnail(params: {
+  request: Request;
+  env: Env;
+  originalFileName: string;
+  thumbnail: ThumbnailInput | undefined;
+}): Promise<UploadedThumbnailResult | undefined> {
+  const thumbnail = params.thumbnail;
+  if (!thumbnail) {
+    return undefined;
+  }
+
+  try {
+    return await uploadThumbnailToTelegram({ ...params, thumbnail });
+  } catch (error) {
+    console.error("Thumbnail upload failed", {
+      file_name: params.originalFileName,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return { status: "failed" };
+  }
+}
+
+async function uploadThumbnailToTelegram(params: {
+  request: Request;
+  env: Env;
+  originalFileName: string;
+  thumbnail: ThumbnailInput;
+}): Promise<UploadedThumbnailResult> {
+  const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
+  const chatId = requireEnv(params.env, "TELEGRAM_STORAGE_CHAT_ID");
+  const signingSecret = requireEnv(params.env, "LINK_SIGNING_SECRET");
+  const thumbnailBytes = await params.thumbnail.file.arrayBuffer();
+
+  validateThumbnailBytes(thumbnailBytes, params.thumbnail.file.type);
+
+  const mimeType = resolveStoredMimeType({
+    bytes: thumbnailBytes,
+    fileType: params.thumbnail.file.type
+  });
+  validateThumbnailMimeType(mimeType);
+
+  const thumbnailFileName = thumbnailFileNameFor(params.originalFileName, mimeType);
+  const thumbnailFile = new File([thumbnailBytes], thumbnailFileName, { type: mimeType });
+  const telegramDocument = await uploadDocumentToTelegram({
+    botToken,
+    chatId,
+    file: thumbnailFile,
+    fileName: thumbnailFileName
+  });
+  const thumbnailSize = telegramDocument.file_size ?? thumbnailFile.size;
+  const token = await createSignedToken(
+    {
+      v: 1,
+      file_id: telegramDocument.file_id,
+      name: thumbnailFileName,
+      mime_type: mimeType,
+      size: thumbnailSize,
+      iat: Math.floor(Date.now() / 1000)
+    },
+    signingSecret
+  );
+  const filePath = `/f/${token}/${encodeURIComponent(thumbnailFileName)}`;
+
+  return {
+    status: "ready",
+    fileId: telegramDocument.file_id,
+    ...(telegramDocument.file_unique_id ? { fileUniqueId: telegramDocument.file_unique_id } : {}),
+    filePath,
+    mimeType,
+    size: thumbnailSize,
+    ...(params.thumbnail.width ? { width: params.thumbnail.width } : {}),
+    ...(params.thumbnail.height ? { height: params.thumbnail.height } : {})
+  };
+}
+
+function validateThumbnailBytes(bytes: ArrayBuffer, fileType: string): void {
+  if (bytes.byteLength <= 0) {
+    throw new AppError(400, "InvalidThumbnail", "Thumbnail must not be empty");
+  }
+
+  if (bytes.byteLength > MAX_THUMBNAIL_BYTES) {
+    throw new AppError(400, "ThumbnailTooLarge", `Thumbnail must not exceed ${formatHumanFileSize(MAX_THUMBNAIL_BYTES)}`);
+  }
+
+  if (fileType && fileType.toLowerCase().includes("svg")) {
+    throw new AppError(400, "InvalidThumbnailType", "SVG thumbnails are not allowed");
+  }
+}
+
+function validateThumbnailMimeType(mimeType: string): void {
+  if (!ALLOWED_THUMBNAIL_MIME_TYPES.has(mimeType)) {
+    throw new AppError(400, "InvalidThumbnailType", "Thumbnail must be JPEG, PNG, or WebP");
+  }
+}
+
+function thumbnailFileNameFor(originalFileName: string, mimeType: string): string {
+  const extension = extensionForMimeType(mimeType) ?? "jpg";
+  const sanitized = sanitizeFileName(originalFileName);
+  const base = sanitized.replace(/\.[^./\\]{1,12}$/i, "") || "thumbnail";
+
+  return sanitizeFileName(`${base}.thumbnail.${extension}`);
+}
+
+function thumbnailFileRecordFields(thumbnail: UploadedThumbnailResult | undefined): Partial<Parameters<typeof completeMultipartUploadWithFileRecord>[0]["file"]> {
+  if (!thumbnail) {
+    return {};
+  }
+
+  return {
+    thumbnailStatus: thumbnail.status,
+    ...(thumbnail.fileId ? { thumbnailFileId: thumbnail.fileId } : {}),
+    ...(thumbnail.fileUniqueId ? { thumbnailFileUniqueId: thumbnail.fileUniqueId } : {}),
+    ...(thumbnail.filePath ? { thumbnailFilePath: thumbnail.filePath } : {}),
+    ...(thumbnail.mimeType ? { thumbnailMimeType: thumbnail.mimeType } : {}),
+    ...(thumbnail.size ? { thumbnailSize: thumbnail.size } : {}),
+    ...(thumbnail.width ? { thumbnailWidth: thumbnail.width } : {}),
+    ...(thumbnail.height ? { thumbnailHeight: thumbnail.height } : {})
   };
 }
 
@@ -2508,6 +2915,9 @@ function serializeFileRecord(file: FileRecord, baseUrl: string): Record<string, 
   const storageBackend = fileStorageBackend(file);
   const directAccess = canDirectlyAccessFileRecord(file);
   const url = directAccess ? `${baseUrl}${file.file_path}` : null;
+  const thumbnailUrl = file.thumbnail_file_path && file.thumbnail_status === "ready"
+    ? `${baseUrl}${file.thumbnail_file_path}`
+    : null;
 
   return {
     ...file,
@@ -2519,7 +2929,16 @@ function serializeFileRecord(file: FileRecord, baseUrl: string): Record<string, 
     direct_access: directAccess,
     download_strategy: downloadStrategy(storageBackend, directAccess),
     url,
-    download_url: url ? appendDownloadParam(url) : null
+    download_url: url ? appendDownloadParam(url) : null,
+    thumbnail_status: file.thumbnail_status ?? "none",
+    thumbnail_url: thumbnailUrl,
+    thumbnail_file_id: file.thumbnail_file_id ?? null,
+    thumbnail_file_unique_id: file.thumbnail_file_unique_id ?? null,
+    thumbnail_file_path: file.thumbnail_file_path ?? null,
+    thumbnail_mime_type: file.thumbnail_mime_type ?? null,
+    thumbnail_size: file.thumbnail_size ?? null,
+    thumbnail_width: file.thumbnail_width ?? null,
+    thumbnail_height: file.thumbnail_height ?? null
   };
 }
 
@@ -2535,7 +2954,16 @@ function serializeMultipartInit(result: MultipartInitResult): Record<string, unk
     max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
     direct_access: result.chunkCount <= DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
     direct_access_max_chunks: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
-    direct_access_max_bytes: DIRECT_MULTIPART_ACCESS_MAX_BYTES
+    direct_access_max_bytes: DIRECT_MULTIPART_ACCESS_MAX_BYTES,
+    thumbnail_source: result.thumbnailSource
+      ? {
+          available: result.thumbnailSource.available,
+          kind: result.thumbnailSource.kind,
+          url: result.thumbnailSource.url,
+          mime_type: result.thumbnailSource.mimeType,
+          expires_at: result.thumbnailSource.expiresAt
+        }
+      : null
   };
 }
 
@@ -2590,6 +3018,9 @@ function serializeChunk(record: Awaited<ReturnType<typeof uploadChunkToTelegram>
 function serializeUploadedFileResult(result: UploadResult, username: string | null): Record<string, unknown> {
   const directAccess = canDirectlyAccessUploadResult(result);
   const url = directAccess ? result.publicUrl : null;
+  const thumbnailUrl = result.thumbnail?.status === "ready" && result.thumbnail.filePath
+    ? `${new URL(result.publicUrl).origin}${result.thumbnail.filePath}`
+    : null;
 
   return {
     id: result.id,
@@ -2611,7 +3042,16 @@ function serializeUploadedFileResult(result: UploadResult, username: string | nu
     chunk_size: result.storageBackend === "telegram_multipart" ? result.chunkSize ?? null : null,
     chunk_count: result.storageBackend === "telegram_multipart" ? result.chunkCount ?? null : null,
     direct_access: directAccess,
-    download_strategy: downloadStrategy(result.storageBackend, directAccess)
+    download_strategy: downloadStrategy(result.storageBackend, directAccess),
+    thumbnail_status: result.thumbnail?.status ?? "none",
+    thumbnail_url: thumbnailUrl,
+    thumbnail_file_id: result.thumbnail?.fileId ?? null,
+    thumbnail_file_unique_id: result.thumbnail?.fileUniqueId ?? null,
+    thumbnail_file_path: result.thumbnail?.filePath ?? null,
+    thumbnail_mime_type: result.thumbnail?.mimeType ?? null,
+    thumbnail_size: result.thumbnail?.size ?? null,
+    thumbnail_width: result.thumbnail?.width ?? null,
+    thumbnail_height: result.thumbnail?.height ?? null
   };
 }
 

@@ -222,17 +222,17 @@ function buildDocs(session: SessionResponse): Record<DocAudience, { title: strin
   return {
     "api-key": {
       title: "API Key 接口",
-      description: `API Key 接口面向外部脚本和自动化客户端，所有请求都使用 Authorization: Bearer <API_KEY>。普通小文件上传上限为 ${maxFile}，分片上传上限为 ${maxMultipart}。`,
+      description: `API Key 接口面向外部脚本和自动化客户端，所有请求都使用 Authorization: Bearer <API_KEY>。推荐统一使用分片上传流程，小文件通常只有 1 个分片；旧版 /api/v1/files 仍保留兼容。`,
       sections: [
         {
           title: "基础与文件信息",
-          description: "用于小文件快速上传、查询文件元数据，并获取分片下载所需的 chunk_size / chunk_count。",
+          description: "保留旧版小文件上传入口，并提供文件元数据查询。新客户端建议优先使用分片上传。",
           endpoints: [
             {
               method: "POST",
               path: "/api/v1/files",
-              title: "上传小文件",
-              description: "旧版兼容接口，只用于普通小文件上传或小文件 URL 拉取。",
+              title: "上传小文件（旧版兼容）",
+              description: "旧版兼容接口，暂时保持现状；新客户端建议使用 /api/v1/uploads/* 分片流程。",
               auth: "Bearer API Key",
               request: `curl -X POST '${baseUrl}/api/v1/files' \\
   -H 'Authorization: Bearer <API_KEY>' \\
@@ -249,7 +249,7 @@ function buildDocs(session: SessionResponse): Record<DocAudience, { title: strin
   "mime_type": "text/plain"
 }`,
               notes: [
-                `文件大小必须小于等于 ${maxFile}；更大的文件请使用分片上传接口。`,
+                `文件大小必须小于等于 ${maxFile}；推荐新客户端无论大小都使用分片上传接口。`,
                 "file_name 为可选覆盖文件名；同一目录下已有同名文件或未完成分片会话时返回 409 FileNameConflict，details.suggested_name 可用于默认改名。"
               ]
             },
@@ -280,8 +280,8 @@ function buildDocs(session: SessionResponse): Record<DocAudience, { title: strin
           ]
         },
         {
-          title: "客户端分片上传",
-          description: `本地文件按 ${chunkSize} 分片上传。小于 ${maxFile} 的文件也可以使用该流程，此时通常只有 1 个分片。`,
+          title: "客户端统一分片上传",
+          description: `本地文件统一按 ${chunkSize} 分片上传。小文件通常只有 1 个分片；complete 阶段可选附带 thumbnail 缩略图。`,
           endpoints: [
             {
               method: "POST",
@@ -336,23 +336,33 @@ function buildDocs(session: SessionResponse): Record<DocAudience, { title: strin
               method: "POST",
               path: "/api/v1/uploads/:uploadId/complete",
               title: "完成分片上传",
-              description: "校验所有分片都已上传后写入文件索引。",
+              description: "校验所有分片都已上传后写入文件索引；可选上传一张 JPEG/PNG/WebP 缩略图。",
               auth: "Bearer API Key",
               request: `curl -X POST '${baseUrl}/api/v1/uploads/<UPLOAD_ID>/complete' \\
-  -H 'Authorization: Bearer <API_KEY>'`,
+  -H 'Authorization: Bearer <API_KEY>'
+
+# 可选：带缩略图
+curl -X POST '${baseUrl}/api/v1/uploads/<UPLOAD_ID>/complete' \\
+  -H 'Authorization: Bearer <API_KEY>' \\
+  -F 'thumbnail=@./thumbnail.jpg' \\
+  -F 'thumbnail_width=320' \\
+  -F 'thumbnail_height=180'`,
               response: `{
   "ok": true,
   "file": {
     "id": "upload-id",
     "storage_backend": "telegram_multipart",
     "chunk_count": 285,
+    "thumbnail_status": "ready",
+    "thumbnail_url": "${baseUrl}/f/<thumbnail-token>/backup.thumbnail.jpg",
     "direct_access": false,
     "url": null,
     "download_url": null
   }
 }`,
               notes: [
-                "完成阶段使用事务写入最终文件索引并标记上传完成；如果目标文件名已被占用，会返回 409 FileNameConflict。"
+                "完成阶段使用事务写入最终文件索引并标记上传完成；如果目标文件名已被占用，会返回 409 FileNameConflict。",
+                "thumbnail 为可选字段，最大 512 KB，仅允许 image/jpeg、image/png、image/webp；缩略图上传失败不会阻塞主文件完成。"
               ]
             }
           ]
@@ -365,7 +375,7 @@ function buildDocs(session: SessionResponse): Record<DocAudience, { title: strin
               method: "POST",
               path: "/api/v1/uploads/url/init",
               title: "初始化 URL 分片上传",
-              description: "API Key URL 上传固定走分片流程，包括小文件。",
+              description: "API Key URL 上传固定走分片流程，包括小文件；图片/视频 URL 可能返回 thumbnail_source 供客户端自行生成缩略图。",
               auth: "Bearer API Key",
               request: `{
   "url": "https://example.com/video.mp4",
@@ -376,15 +386,22 @@ function buildDocs(session: SessionResponse): Record<DocAudience, { title: strin
               response: `{
   "ok": true,
   "mode": "multipart",
-    "upload": {
-      "id": "upload-id",
+  "upload": {
+    "id": "upload-id",
     "file_name": "video-copy.mp4",
-    "chunk_count": 42
+    "chunk_count": 42,
+    "thumbnail_source": {
+      "available": true,
+      "kind": "video",
+      "url": "/api/v1/uploads/url-thumbnail-source?token=...",
+      "mime_type": "video/mp4"
+    }
   }
 }`,
               notes: [
                 "file_name 为可选覆盖文件名；同名冲突时返回 409 FileNameConflict。",
-                "远端必须支持 Range 请求，并暴露 Content-Length 或 Content-Range。"
+                "远端必须支持 Range 请求，并暴露 Content-Length 或 Content-Range。",
+                "thumbnail_source 是短期签名同源媒体入口；客户端可用 img/video + canvas 生成 thumbnail，再在 complete 阶段上传。"
               ]
             },
             {
@@ -727,7 +744,7 @@ curl -X POST '${baseUrl}/api/admin/files' \\
         },
         {
           title: "管理员分片上传",
-          description: "控制台使用的分片上传接口。UI 可选择“小文件也使用分片上传”。URL 分片可通过 force_multipart 强制启用。未完成会话会由 Worker 定时任务清理。",
+          description: "控制台统一使用的分片上传接口。本地文件和 URL 导入无论大小都走 init → chunks/url-chunks → complete 流程；未完成会话会由 Worker 定时任务清理。",
           endpoints: [
             {
               method: "POST",
@@ -761,19 +778,27 @@ curl -X POST '${baseUrl}/api/admin/files' \\
               method: "POST",
               path: "/api/admin/uploads/url/init",
               title: "初始化 URL 分片上传",
-              description: "默认小文件返回 single，APP 可随后调用 /api/admin/files 做普通 URL 上传；传 force_multipart: true 时小文件也走分片。",
+              description: "管理员 URL 上传固定走分片流程，包括小文件；图片/视频 URL 可能返回 thumbnail_source。",
               auth: "Admin Cookie",
               request: `{
   "url": "https://example.com/video.mp4",
   "file_name": "video-copy.mp4",
-  "force_multipart": true,
   "directory_path": "/videos",
   "remark": "远程导入"
 }`,
               response: `{
   "ok": true,
   "mode": "multipart",
-  "upload": { "id": "upload-id", "file_name": "video-copy.mp4", "chunk_count": 42 }
+  "upload": {
+    "id": "upload-id",
+    "file_name": "video-copy.mp4",
+    "chunk_count": 42,
+    "thumbnail_source": {
+      "available": true,
+      "kind": "video",
+      "url": "/api/admin/uploads/url-thumbnail-source?token=..."
+    }
+  }
 }`,
               notes: [
                 "file_name 为可选覆盖文件名；同名冲突时返回 409 FileNameConflict。",
@@ -810,14 +835,25 @@ curl -X POST '${baseUrl}/api/admin/files' \\
               method: "POST",
               path: "/api/admin/uploads/:uploadId/complete",
               title: "完成分片上传",
-              description: "校验所有分片都存在后，事务化写入最终文件索引并标记上传完成。",
+              description: "校验所有分片都存在后，事务化写入最终文件索引并标记上传完成；可选附带缩略图。",
               auth: "Admin Cookie",
+              request: `curl -X POST '${baseUrl}/api/admin/uploads/<UPLOAD_ID>/complete' \\
+  -H 'Cookie: admin_session=...'
+
+# 可选：带缩略图
+curl -X POST '${baseUrl}/api/admin/uploads/<UPLOAD_ID>/complete' \\
+  -H 'Cookie: admin_session=...' \\
+  -F 'thumbnail=@./thumbnail.jpg' \\
+  -F 'thumbnail_width=320' \\
+  -F 'thumbnail_height=180'`,
               response: `{
   "ok": true,
   "file": {
     "id": "upload-id",
     "storage_backend": "telegram_multipart",
     "chunk_count": 285,
+    "thumbnail_status": "ready",
+    "thumbnail_url": "${baseUrl}/f/<thumbnail-token>/backup.thumbnail.jpg",
     "direct_access": false,
     "download_strategy": "accelerated",
     "url": null,
@@ -826,7 +862,8 @@ curl -X POST '${baseUrl}/api/admin/files' \\
 }`,
               notes: [
                 "如果缺少任意分片，会返回 409 UploadIncomplete，不会生成最终 files 记录。",
-                "如果分片上传期间目标目录下出现同名文件，完成阶段会返回 409 FileNameConflict，事务不会写入最终 files 记录。"
+                "如果分片上传期间目标目录下出现同名文件，完成阶段会返回 409 FileNameConflict，事务不会写入最终 files 记录。",
+                "thumbnail 为可选字段，最大 512 KB，仅允许 image/jpeg、image/png、image/webp；缩略图上传失败不会阻塞主文件完成。"
               ]
             }
           ]

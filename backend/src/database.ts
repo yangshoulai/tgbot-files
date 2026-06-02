@@ -30,7 +30,17 @@ export interface FileRecord {
   storage_backend?: StorageBackend;
   chunk_size?: number | null;
   chunk_count?: number | null;
+  thumbnail_file_id?: string | null;
+  thumbnail_file_unique_id?: string | null;
+  thumbnail_file_path?: string | null;
+  thumbnail_mime_type?: string | null;
+  thumbnail_size?: number | null;
+  thumbnail_width?: number | null;
+  thumbnail_height?: number | null;
+  thumbnail_status?: ThumbnailStatus;
 }
+
+export type ThumbnailStatus = "none" | "ready" | "failed";
 
 export interface NewFileRecord {
   id: string;
@@ -49,6 +59,14 @@ export interface NewFileRecord {
   storageBackend?: StorageBackend;
   chunkSize?: number;
   chunkCount?: number;
+  thumbnailFileId?: string;
+  thumbnailFileUniqueId?: string;
+  thumbnailFilePath?: string;
+  thumbnailMimeType?: string;
+  thumbnailSize?: number;
+  thumbnailWidth?: number;
+  thumbnailHeight?: number;
+  thumbnailStatus?: ThumbnailStatus;
 }
 
 export interface FileListResult {
@@ -178,8 +196,16 @@ function prepareInsertFileRecord(db: D1Database, record: NewFileRecord): D1Prepa
         deleted_at,
         storage_backend,
         chunk_size,
-        chunk_count
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
+        chunk_count,
+        thumbnail_file_id,
+        thumbnail_file_unique_id,
+        thumbnail_file_path,
+        thumbnail_mime_type,
+        thumbnail_size,
+        thumbnail_width,
+        thumbnail_height,
+        thumbnail_status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       record.id,
@@ -197,7 +223,15 @@ function prepareInsertFileRecord(db: D1Database, record: NewFileRecord): D1Prepa
       record.directoryPath ?? "/",
       record.storageBackend ?? "telegram_single",
       record.chunkSize ?? null,
-      record.chunkCount ?? null
+      record.chunkCount ?? null,
+      record.thumbnailFileId ?? null,
+      record.thumbnailFileUniqueId ?? null,
+      record.thumbnailFilePath ?? null,
+      record.thumbnailMimeType ?? null,
+      record.thumbnailSize ?? null,
+      record.thumbnailWidth ?? null,
+      record.thumbnailHeight ?? null,
+      record.thumbnailStatus ?? (record.thumbnailFileId ? "ready" : "none")
     );
 }
 
@@ -266,7 +300,15 @@ export async function listFileRecords(params: {
         COALESCE(directory_path, '/') AS directory_path,
         COALESCE(storage_backend, 'telegram_single') AS storage_backend,
         chunk_size,
-        chunk_count
+        chunk_count,
+        thumbnail_file_id,
+        thumbnail_file_unique_id,
+        thumbnail_file_path,
+        thumbnail_mime_type,
+        thumbnail_size,
+        thumbnail_width,
+        thumbnail_height,
+        COALESCE(thumbnail_status, 'none') AS thumbnail_status
       FROM files
       WHERE ${whereClause}
       ORDER BY created_at DESC
@@ -301,7 +343,15 @@ export async function getFileRecord(db: D1Database, id: string): Promise<FileRec
         COALESCE(directory_path, '/') AS directory_path,
         COALESCE(storage_backend, 'telegram_single') AS storage_backend,
         chunk_size,
-        chunk_count
+        chunk_count,
+        thumbnail_file_id,
+        thumbnail_file_unique_id,
+        thumbnail_file_path,
+        thumbnail_mime_type,
+        thumbnail_size,
+        thumbnail_width,
+        thumbnail_height,
+        COALESCE(thumbnail_status, 'none') AS thumbnail_status
       FROM files
       WHERE id = ? AND deleted_at IS NULL`
     )

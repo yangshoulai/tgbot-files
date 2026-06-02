@@ -1,14 +1,14 @@
-import { ChangeEvent, FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { CheckCircle2, ClipboardPaste, FilePlus2, Layers3, Link2, Trash2, UploadCloud, X } from "lucide-react";
+import { ChangeEvent, FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { CheckCircle2, ClipboardPaste, FilePlus2, ImageOff, ImagePlus, Layers3, Link2, Trash2, UploadCloud, X } from "lucide-react";
 import {
   ApiError,
   completeMultipartUpload,
   initMultipartUpload,
   initUrlMultipartUpload,
-  uploadFile,
-  uploadFileFromUrl,
   uploadMultipartChunk,
-  uploadUrlMultipartChunk
+  uploadUrlMultipartChunk,
+  type MultipartUpload,
+  type ThumbnailUploadPayload
 } from "../../api";
 import { formatBytes, formatCompactBytes } from "../../utils";
 import { Modal } from "../ui/Modal";
@@ -19,6 +19,13 @@ import { FileTypeIcon } from "../ui/FileTypeIcon";
 import { Segmented } from "../ui/Segmented";
 import { Input } from "../ui/Input";
 import { cn } from "../../lib/cn";
+import {
+  canAutoGenerateThumbnail,
+  generateThumbnailFromFile,
+  generateThumbnailFromRemoteSource,
+  revokeThumbnail,
+  type GeneratedThumbnail
+} from "../../lib/thumbnail";
 
 interface UploadDialogProps {
   open: boolean;
@@ -78,6 +85,7 @@ interface QueueItem {
   retry?: MultipartRetryState;
   fileNameOverride?: string;
   conflict?: FileNameConflictState;
+  thumbnail?: UploadThumbnailState;
 }
 
 interface UrlUploadState {
@@ -88,6 +96,15 @@ interface UrlUploadState {
   retry?: MultipartRetryState;
   fileNameOverride?: string;
   conflict?: FileNameConflictState;
+  thumbnail?: UploadThumbnailState;
+}
+
+type UploadThumbnailStatus = "idle" | "generating" | "ready" | "failed" | "removed";
+
+interface UploadThumbnailState {
+  status: UploadThumbnailStatus;
+  generated?: GeneratedThumbnail;
+  message?: string;
 }
 
 interface ChunkQueueResult {
@@ -112,7 +129,12 @@ class MultipartChunkUploadError extends Error {
 
 function makeItem(file: File): QueueItem {
   counter += 1;
-  return { id: `${Date.now()}-${counter}`, file, status: "pending" };
+  return {
+    id: `${Date.now()}-${counter}`,
+    file,
+    status: "pending",
+    thumbnail: canAutoGenerateThumbnail(file) ? { status: "idle" } : undefined
+  };
 }
 
 export function UploadDialog({
@@ -131,28 +153,37 @@ export function UploadDialog({
   const [sourceUrl, setSourceUrl] = useState("");
   const [urlUpload, setUrlUpload] = useState<UrlUploadState>({ status: "pending" });
   const [remark, setRemark] = useState("");
-  const [forceMultipart, setForceMultipart] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!open) {
+      setItems((current) => {
+        current.forEach((item) => revokeThumbnail(item.thumbnail?.generated));
+        return [];
+      });
+      setUrlUpload((current) => {
+        revokeThumbnail(current.thumbnail?.generated);
+        return { status: "pending" };
+      });
       setMode("file");
-      setItems([]);
       setSourceUrl("");
-      setUrlUpload({ status: "pending" });
       setRemark("");
-      setForceMultipart(false);
       setSubmitting(false);
       setDragOver(false);
       return;
     }
     setMode("file");
-    setItems(initialFiles.map(makeItem));
+    setItems((current) => {
+      current.forEach((item) => revokeThumbnail(item.thumbnail?.generated));
+      return initialFiles.map(makeItem);
+    });
     setSourceUrl("");
-    setUrlUpload({ status: "pending" });
-    setForceMultipart(false);
+    setUrlUpload((current) => {
+      revokeThumbnail(current.thumbnail?.generated);
+      return { status: "pending" };
+    });
   }, [open, initialFiles]);
 
   const addFiles = useCallback((files: File[]) => {
@@ -169,7 +200,62 @@ export function UploadDialog({
   };
 
   const removeItem = (id: string) => {
-    setItems((current) => current.filter((item) => item.id !== id));
+    setItems((current) => {
+      const target = current.find((item) => item.id === id);
+      revokeThumbnail(target?.thumbnail?.generated);
+      return current.filter((item) => item.id !== id);
+    });
+  };
+
+  const updateItemThumbnail = (id: string, thumbnail: UploadThumbnailState | undefined) => {
+    setItems((current) =>
+      current.map((item) => {
+        if (item.id !== id) return item;
+        revokeThumbnail(item.thumbnail?.generated);
+        return { ...item, thumbnail };
+      })
+    );
+  };
+
+  const handleManualItemThumbnail = async (id: string, file: File) => {
+    updateItemThumbnail(id, { status: "generating", message: "正在处理手动缩略图" });
+    try {
+      const thumbnail = await generateThumbnailFromFile(file, "manual");
+      updateItemThumbnail(id, { status: "ready", generated: thumbnail });
+    } catch (error) {
+      updateItemThumbnail(id, {
+        status: "failed",
+        message: error instanceof Error ? error.message : "手动缩略图处理失败"
+      });
+    }
+  };
+
+  const removeItemThumbnail = (id: string) => {
+    updateItemThumbnail(id, { status: "removed", message: "已移除缩略图" });
+  };
+
+  const updateUrlThumbnail = (thumbnail: UploadThumbnailState | undefined) => {
+    setUrlUpload((current) => {
+      revokeThumbnail(current.thumbnail?.generated);
+      return { ...current, thumbnail };
+    });
+  };
+
+  const handleManualUrlThumbnail = async (file: File) => {
+    updateUrlThumbnail({ status: "generating", message: "正在处理手动缩略图" });
+    try {
+      const thumbnail = await generateThumbnailFromFile(file, "manual");
+      updateUrlThumbnail({ status: "ready", generated: thumbnail });
+    } catch (error) {
+      updateUrlThumbnail({
+        status: "failed",
+        message: error instanceof Error ? error.message : "手动缩略图处理失败"
+      });
+    }
+  };
+
+  const removeUrlThumbnail = () => {
+    updateUrlThumbnail({ status: "removed", message: "已移除缩略图" });
   };
 
   const filePendingCount = items.filter((item) => item.status === "pending" || item.status === "error").length;
@@ -178,6 +264,47 @@ export function UploadDialog({
   const pendingCount = mode === "url" ? urlPendingCount : filePendingCount;
   const hasDone = urlUpload.status === "done" || items.some((item) => item.status === "done");
 
+  useEffect(() => {
+    if (!open) return;
+
+    const target = items.find((item) => item.thumbnail?.status === "idle");
+    if (!target) return;
+
+    setItems((current) =>
+      current.map((item) =>
+        item.id === target.id
+          ? { ...item, thumbnail: { status: "generating", message: "正在生成缩略图" } }
+          : item
+      )
+    );
+
+    void generateThumbnailFromFile(target.file)
+      .then((thumbnail) => {
+        setItems((current) =>
+          current.map((item) => {
+            if (item.id !== target.id) return item;
+            revokeThumbnail(item.thumbnail?.generated);
+            return { ...item, thumbnail: { status: "ready", generated: thumbnail } };
+          })
+        );
+      })
+      .catch((error) => {
+        setItems((current) =>
+          current.map((item) =>
+            item.id === target.id
+              ? {
+                  ...item,
+                  thumbnail: {
+                    status: "failed",
+                    message: error instanceof Error ? error.message : "缩略图生成失败"
+                  }
+                }
+              : item
+          )
+        );
+      });
+  }, [items, open]);
+
   function handleModeChange(nextMode: UploadMode) {
     if (submitting || mode === nextMode) return;
     setMode(nextMode);
@@ -185,7 +312,10 @@ export function UploadDialog({
 
   function handleSourceUrlChange(value: string) {
     setSourceUrl(value);
-    setUrlUpload({ status: "pending" });
+    setUrlUpload((current) => {
+      revokeThumbnail(current.thumbnail?.generated);
+      return { status: "pending" };
+    });
   }
 
   function updateItemFileName(id: string, value: string) {
@@ -282,16 +412,8 @@ export function UploadDialog({
 
       try {
         const fileName = effectiveFileName(target);
-        if (forceMultipart || target.file.size > maxBytes) {
-          await uploadLocalMultipart(target, fileName);
-        } else {
-          const form = new FormData();
-          form.set("file", fileForUpload(target, fileName));
-          form.set("file_name", fileName);
-          form.set("directory_path", directoryPath);
-          if (remark.trim()) form.set("remark", remark.trim());
-          await uploadFile(form);
-        }
+        const thumbnail = await resolveLocalThumbnailForUpload(target);
+        await uploadLocalMultipart(target, fileName, thumbnail);
         successCount += 1;
         setItems((current) =>
           current.map((item) =>
@@ -329,9 +451,9 @@ export function UploadDialog({
     }
   }
 
-  async function uploadLocalMultipart(target: QueueItem, fileName: string) {
+  async function uploadLocalMultipart(target: QueueItem, fileName: string, thumbnail?: ThumbnailUploadPayload) {
     if (target.retry?.kind === "local") {
-      await retryLocalMultipart(target, target.retry);
+      await retryLocalMultipart(target, target.retry, thumbnail);
       return;
     }
 
@@ -386,10 +508,60 @@ export function UploadDialog({
       total: upload.chunk_count,
       label: upload.direct_access === false ? "正在生成文件索引" : "正在生成访问链接"
     });
-    await completeMultipartUpload(upload.id);
+    await completeMultipartUpload(upload.id, thumbnail);
   }
 
-  async function retryLocalMultipart(target: QueueItem, retry: MultipartRetryState) {
+  async function resolveLocalThumbnailForUpload(target: QueueItem): Promise<ThumbnailUploadPayload | undefined> {
+    if (target.thumbnail?.status === "ready" && target.thumbnail.generated) {
+      return thumbnailPayload(target.thumbnail.generated);
+    }
+
+    if (target.thumbnail?.status === "removed" || !canAutoGenerateThumbnail(target.file)) {
+      return undefined;
+    }
+
+    try {
+      updateItemThumbnail(target.id, { status: "generating", message: "正在生成缩略图" });
+      const generated = await generateThumbnailFromFile(target.file);
+      updateItemThumbnail(target.id, { status: "ready", generated });
+      return thumbnailPayload(generated);
+    } catch (error) {
+      updateItemThumbnail(target.id, {
+        status: "failed",
+        message: error instanceof Error ? error.message : "缩略图生成失败"
+      });
+      return undefined;
+    }
+  }
+
+  async function resolveUrlThumbnailForUpload(source: MultipartUpload["thumbnail_source"] | undefined): Promise<ThumbnailUploadPayload | undefined> {
+    if (urlUpload.thumbnail?.status === "ready" && urlUpload.thumbnail.generated) {
+      return thumbnailPayload(urlUpload.thumbnail.generated);
+    }
+
+    if (urlUpload.thumbnail?.status === "removed" || !source?.available) {
+      return undefined;
+    }
+
+    try {
+      updateUrlThumbnail({ status: "generating", message: "正在生成 URL 缩略图" });
+      const generated = await generateThumbnailFromRemoteSource({
+        kind: source.kind,
+        url: source.url,
+        mime_type: source.mime_type
+      }, remoteFileLabel(normalizedSourceUrl));
+      updateUrlThumbnail({ status: "ready", generated });
+      return thumbnailPayload(generated);
+    } catch (error) {
+      updateUrlThumbnail({
+        status: "failed",
+        message: error instanceof Error ? error.message : "URL 缩略图生成失败"
+      });
+      return undefined;
+    }
+  }
+
+  async function retryLocalMultipart(target: QueueItem, retry: MultipartRetryState, thumbnail?: ThumbnailUploadPayload) {
     setItems((current) =>
       current.map((item) =>
         item.id === target.id
@@ -429,7 +601,7 @@ export function UploadDialog({
       total: retry.chunkCount,
       label: retry.directAccess === false ? "正在生成文件索引" : "正在生成访问链接"
     });
-    await completeMultipartUpload(retry.uploadId);
+    await completeMultipartUpload(retry.uploadId, thumbnail);
   }
 
   async function runConcurrentChunks(params: {
@@ -597,11 +769,12 @@ export function UploadDialog({
         normalizedSourceUrl,
         remark.trim() || undefined,
         directoryPath,
-        forceMultipart,
+        true,
         fileNameOverride
       );
       if (init.mode === "multipart" && init.upload) {
         const upload = init.upload;
+        const thumbnail = await resolveUrlThumbnailForUpload(upload.thumbnail_source);
         setUrlUpload((current) => ({
           ...current,
           status: "uploading",
@@ -649,14 +822,9 @@ export function UploadDialog({
             label: upload.direct_access === false ? "正在生成文件索引" : "正在生成访问链接"
           }
         }));
-        await completeMultipartUpload(upload.id);
+        await completeMultipartUpload(upload.id, thumbnail);
       } else {
-        setUrlUpload((current) => ({
-          ...current,
-          status: "uploading",
-          progress: { completed: 0, total: 1, label: "拉取远程文件" }
-        }));
-        await uploadFileFromUrl(normalizedSourceUrl, remark.trim() || undefined, directoryPath, fileNameOverride);
+        throw new ApiError(500, "URL 上传初始化未返回分片会话", "InvalidUploadMode");
       }
       setUrlUpload((current) => ({
         ...current,
@@ -741,7 +909,10 @@ export function UploadDialog({
           label: retry.directAccess === false ? "正在生成文件索引" : "正在生成访问链接"
         }
       }));
-      await completeMultipartUpload(retry.uploadId);
+      const thumbnail = urlUpload.thumbnail?.status === "ready" && urlUpload.thumbnail.generated
+        ? thumbnailPayload(urlUpload.thumbnail.generated)
+        : undefined;
+      await completeMultipartUpload(retry.uploadId, thumbnail);
       setUrlUpload((current) => ({ ...current, status: "done", message: "已从 URL 上传", progress: undefined, retry: undefined }));
       onUploaded(1);
     } catch (uploadError) {
@@ -778,7 +949,8 @@ export function UploadDialog({
     );
 
     try {
-      await retryLocalMultipart(target, target.retry);
+      const thumbnail = await resolveLocalThumbnailForUpload(target);
+      await retryLocalMultipart(target, target.retry, thumbnail);
       setItems((current) =>
         current.map((item) =>
           item.id === id ? { ...item, status: "done", message: undefined, progress: undefined, retry: undefined } : item
@@ -820,7 +992,7 @@ export function UploadDialog({
       open={open}
       onClose={onClose}
       title="上传文件"
-      description={`上传到 ${directoryPath}；单文件 ${formatBytes(maxBytes)} 内直传，大文件分片上限 ${formatBytes(maxMultipartBytes)}，最多 ${MULTIPART_UPLOAD_CONCURRENCY} 分片并发，每片最多 ${MULTIPART_UPLOAD_MAX_ATTEMPTS} 次尝试`}
+      description={`上传到 ${directoryPath}；所有文件统一按 ${formatBytes(multipartChunkBytes)} 分片上传，单文件上限 ${formatBytes(maxMultipartBytes)}，最多 ${MULTIPART_UPLOAD_CONCURRENCY} 分片并发`}
       size="lg"
       closeOnBackdrop={!submitting}
       closeOnEscape={!submitting}
@@ -857,23 +1029,11 @@ export function UploadDialog({
               { value: "url", label: "URL 链接", icon: <Link2 size={15} /> }
             ]}
           />
-          <span className="hidden text-xs text-muted sm:inline">分片上限 {formatBytes(maxMultipartBytes)}</span>
+          <span className="hidden text-xs text-muted sm:inline">统一分片上传</span>
         </div>
-        <label className="flex items-start gap-2 rounded-xl border border-border bg-background px-3 py-2.5 text-sm text-foreground">
-          <input
-            type="checkbox"
-            checked={forceMultipart}
-            disabled={submitting}
-            onChange={(event) => setForceMultipart(event.target.checked)}
-            className="mt-0.5 size-4 rounded border-border text-primary accent-primary focus-visible:outline-none focus-visible:focus-ring"
-          />
-          <span className="flex flex-col gap-0.5">
-            <span className="font-medium">小文件也使用分片上传</span>
-            <span className="text-xs leading-5 text-muted">
-              开启后本地文件和 URL 导入都会走分片流程；分片最多 {MULTIPART_UPLOAD_CONCURRENCY} 个并发，每片失败自动重试，URL 分片要求远端支持 Range。
-            </span>
-          </span>
-        </label>
+        <div className="rounded-xl border border-border bg-background px-3 py-2.5 text-xs leading-5 text-muted">
+          本地文件和 URL 导入都会先创建上传会话，再上传或导入分片，最后统一生成文件索引。图片/视频会尝试生成缩略图；失败时不影响文件上传。
+        </div>
 
         {mode === "file" ? (
           <>
@@ -900,7 +1060,7 @@ export function UploadDialog({
               </span>
               <p className="text-sm font-medium text-foreground">点击选择文件，或拖拽到这里</p>
               <p className="text-xs text-muted">
-                {formatBytes(maxBytes)} 内直传；超过后按 {formatBytes(multipartChunkBytes)} 分片，最多 {MULTIPART_UPLOAD_CONCURRENCY} 并发，每片最多 {MULTIPART_UPLOAD_MAX_ATTEMPTS} 次
+                统一按 {formatBytes(multipartChunkBytes)} 分片，最多 {MULTIPART_UPLOAD_CONCURRENCY} 并发，每片最多 {MULTIPART_UPLOAD_MAX_ATTEMPTS} 次
               </p>
               <input
                 ref={fileInput}
@@ -917,11 +1077,11 @@ export function UploadDialog({
                   <QueueRow
                     key={item.id}
                     item={item}
-                    directMaxBytes={maxBytes}
-                    forceMultipart={forceMultipart}
                     onRemove={() => removeItem(item.id)}
                     onRetry={item.retry ? () => void retryItemFailedChunks(item.id) : undefined}
                     onFileNameChange={(value) => updateItemFileName(item.id, value)}
+                    onThumbnailChange={(file) => void handleManualItemThumbnail(item.id, file)}
+                    onThumbnailRemove={() => removeItemThumbnail(item.id)}
                     disabled={submitting}
                   />
                 ))}
@@ -953,9 +1113,7 @@ export function UploadDialog({
                 }}
               />
               <p className="text-xs leading-5 text-muted">
-                {forceMultipart ? "当前将强制使用分片导入；" : `小文件直接拉取；超过 ${formatBytes(maxBytes)} 时`}
-                要求远端支持 Range，并按
-                {" "}{formatBytes(multipartChunkBytes)} 分片导入，最多 {MULTIPART_UPLOAD_CONCURRENCY} 并发，每片最多 {MULTIPART_UPLOAD_MAX_ATTEMPTS} 次。
+                URL 导入统一要求远端支持 Range，并按 {formatBytes(multipartChunkBytes)} 分片导入；图片/视频 URL 会尝试通过同源代理生成缩略图。
               </p>
             </div>
 
@@ -971,6 +1129,9 @@ export function UploadDialog({
                 onClear={() => handleSourceUrlChange("")}
                 onRetry={urlUpload.retry ? () => void retryUrlMultipart(urlUpload.retry!) : undefined}
                 onFileNameChange={updateUrlFileName}
+                thumbnail={urlUpload.thumbnail}
+                onThumbnailChange={(file) => void handleManualUrlThumbnail(file)}
+                onThumbnailRemove={removeUrlThumbnail}
                 disabled={submitting}
               />
             ) : null}
@@ -1027,15 +1188,13 @@ function normalizedFileNameOverride(value: string | undefined): string | undefin
   return normalized || undefined;
 }
 
-function fileForUpload(item: QueueItem, fileName: string): File {
-  if (fileName === item.file.name) {
-    return item.file;
-  }
-
-  return new File([item.file], fileName, {
-    type: item.file.type || "application/octet-stream",
-    lastModified: item.file.lastModified
-  });
+function thumbnailPayload(thumbnail: GeneratedThumbnail): ThumbnailUploadPayload {
+  return {
+    blob: thumbnail.blob,
+    fileName: thumbnail.fileName,
+    ...(thumbnail.width ? { width: thumbnail.width } : {}),
+    ...(thumbnail.height ? { height: thumbnail.height } : {})
+  };
 }
 
 function fileNameConflictFromError(error: unknown): FileNameConflictState | undefined {
@@ -1120,31 +1279,48 @@ function expectedUploadChunkSize(size: number, chunkSize: number, chunkCount: nu
 
 interface QueueRowProps {
   item: QueueItem;
-  directMaxBytes: number;
-  forceMultipart: boolean;
   onRemove: () => void;
   onRetry?: () => void;
   onFileNameChange: (value: string) => void;
+  onThumbnailChange: (file: File) => void;
+  onThumbnailRemove: () => void;
   disabled: boolean;
 }
 
-function QueueRow({ item, directMaxBytes, forceMultipart, onRemove, onRetry, onFileNameChange, disabled }: QueueRowProps) {
+function QueueRow({
+  item,
+  onRemove,
+  onRetry,
+  onFileNameChange,
+  onThumbnailChange,
+  onThumbnailRemove,
+  disabled
+}: QueueRowProps) {
   const status = item.status;
   return (
     <div className="flex flex-col gap-2 rounded-xl border border-border bg-surface px-3 py-2.5">
       <div className="flex items-center gap-3">
-        <FileTypeIcon mimeType={item.file.type || "application/octet-stream"} fileName={item.file.name} size="sm" />
+        <UploadThumbnailVisual
+          thumbnail={item.thumbnail}
+          fallback={<FileTypeIcon mimeType={item.file.type || "application/octet-stream"} fileName={item.file.name} size="sm" />}
+        />
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-medium text-foreground" title={item.file.name}>
             {item.file.name}
           </p>
           <p className="truncate text-xs text-muted">
-            {formatBytes(item.file.size)}
-            {forceMultipart || item.file.size > directMaxBytes ? <span> · 分片上传</span> : null}
+            {formatBytes(item.file.size)} · 分片上传
+            {thumbnailHint(item.thumbnail) ? <span> · {thumbnailHint(item.thumbnail)}</span> : null}
             {item.message ? <span className="text-danger"> · {item.message}</span> : null}
           </p>
           {item.progress ? <ProgressBar progress={item.progress} /> : null}
         </div>
+        <ThumbnailPicker
+          disabled={disabled || status === "uploading"}
+          onChange={onThumbnailChange}
+          onRemove={onThumbnailRemove}
+          hasThumbnail={item.thumbnail?.status === "ready"}
+        />
         {onRetry ? (
           <button
             type="button"
@@ -1188,8 +1364,11 @@ interface UrlUploadRowProps {
   chunks?: UploadChunkState[];
   fileNameOverride?: string;
   conflict?: FileNameConflictState;
+  thumbnail?: UploadThumbnailState;
   onRetry?: () => void;
   onFileNameChange: (value: string) => void;
+  onThumbnailChange: (file: File) => void;
+  onThumbnailRemove: () => void;
   disabled: boolean;
 }
 
@@ -1201,27 +1380,42 @@ function UrlUploadRow({
   chunks,
   fileNameOverride,
   conflict,
+  thumbnail,
   onClear,
   onRetry,
   onFileNameChange,
+  onThumbnailChange,
+  onThumbnailRemove,
   disabled
 }: UrlUploadRowProps) {
   return (
     <div className="flex flex-col gap-2 rounded-xl border border-border bg-surface px-3 py-2.5">
       <div className="flex items-center gap-3">
-        <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-primary-soft text-primary-strong">
-          <Link2 size={16} />
-        </span>
+        <UploadThumbnailVisual
+          thumbnail={thumbnail}
+          fallback={
+            <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-primary-soft text-primary-strong">
+              <Link2 size={16} />
+            </span>
+          }
+        />
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-medium text-foreground" title={url}>
             {remoteFileLabel(url)}
           </p>
           <p className="truncate text-xs text-muted">
             {url}
+            {thumbnailHint(thumbnail) ? <span> · {thumbnailHint(thumbnail)}</span> : null}
             {message ? <span className={status === "error" ? "text-danger" : "text-success"}> · {message}</span> : null}
           </p>
           {progress ? <ProgressBar progress={progress} /> : null}
         </div>
+        <ThumbnailPicker
+          disabled={disabled || status === "uploading"}
+          onChange={onThumbnailChange}
+          onRemove={onThumbnailRemove}
+          hasThumbnail={thumbnail?.status === "ready"}
+        />
         {onRetry ? (
           <button
             type="button"
@@ -1254,6 +1448,101 @@ function UrlUploadRow({
       {chunks ? <UploadChunkList chunks={chunks} /> : null}
     </div>
   );
+}
+
+function UploadThumbnailVisual({
+  thumbnail,
+  fallback
+}: {
+  thumbnail?: UploadThumbnailState;
+  fallback: ReactNode;
+}) {
+  if (thumbnail?.status === "ready" && thumbnail.generated) {
+    return (
+      <span className="grid size-10 shrink-0 place-items-center overflow-hidden rounded-xl bg-background ring-1 ring-border">
+        <img
+          src={thumbnail.generated.objectUrl}
+          alt="缩略图"
+          className="h-full w-full object-cover"
+        />
+      </span>
+    );
+  }
+
+  if (thumbnail?.status === "generating") {
+    return (
+      <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-primary-soft text-primary-strong ring-1 ring-primary/15">
+        <Spinner size={16} />
+      </span>
+    );
+  }
+
+  return <>{fallback}</>;
+}
+
+function ThumbnailPicker({
+  disabled,
+  onChange,
+  onRemove,
+  hasThumbnail
+}: {
+  disabled: boolean;
+  onChange: (file: File) => void;
+  onRemove: () => void;
+  hasThumbnail: boolean;
+}) {
+  return (
+    <span className="hidden shrink-0 items-center gap-1 sm:inline-flex">
+      <label
+        className={cn(
+          "grid size-7 cursor-pointer place-items-center rounded-md text-subtle transition-colors hover:bg-primary-soft hover:text-primary-strong",
+          disabled && "pointer-events-none opacity-40"
+        )}
+        title={hasThumbnail ? "更换缩略图" : "选择缩略图"}
+      >
+        <ImagePlus size={14} />
+        <input
+          type="file"
+          accept="image/jpeg,image/png,image/webp"
+          className="sr-only"
+          disabled={disabled}
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (file) onChange(file);
+            event.currentTarget.value = "";
+          }}
+        />
+      </label>
+      {hasThumbnail ? (
+        <button
+          type="button"
+          className="grid size-7 place-items-center rounded-md text-subtle transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-40"
+          disabled={disabled}
+          title="移除缩略图"
+          onClick={onRemove}
+        >
+          <ImageOff size={14} />
+        </button>
+      ) : null}
+    </span>
+  );
+}
+
+function thumbnailHint(thumbnail: UploadThumbnailState | undefined): string | undefined {
+  if (!thumbnail) return undefined;
+
+  switch (thumbnail.status) {
+    case "generating":
+      return thumbnail.message || "正在生成缩略图";
+    case "ready":
+      return thumbnail.generated?.source === "manual" ? "手动缩略图" : "已生成缩略图";
+    case "failed":
+      return thumbnail.message || "缩略图失败";
+    case "removed":
+      return "不使用缩略图";
+    default:
+      return undefined;
+  }
 }
 
 function FileNameConflictInput({
