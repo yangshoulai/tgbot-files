@@ -11,6 +11,8 @@ export interface SessionResponse {
     files_db: boolean;
     telegram_bot_token: boolean;
     telegram_storage_chat_id: boolean;
+    telegram_channels: boolean;
+    tg_channel_secret: boolean;
     link_signing_secret: boolean;
     admin_username: boolean;
     admin_password: boolean;
@@ -20,6 +22,8 @@ export interface SessionResponse {
     files_db: string;
     telegram_bot_token: string;
     telegram_storage_chat_id: string;
+    telegram_channels: string;
+    tg_channel_secret: string;
     link_signing_secret: string;
     admin_username: string;
     admin_password: string;
@@ -46,6 +50,7 @@ export interface FileItem {
   md5: string;
   telegram_file_id: string;
   telegram_file_unique_id: string | null;
+  telegram_channel_id?: string;
   file_path: string;
   remark: string | null;
   uploaded_by: string | null;
@@ -214,8 +219,38 @@ export interface MultipartChunkResponse {
     size: number;
     md5: string;
     telegram_file_id: string;
+    telegram_channel_id?: string;
   };
   uploaded_chunks: number;
+}
+
+export interface TelegramChannelItem {
+  id: string;
+  name: string;
+  masked_bot_token: string;
+  chat_id: string;
+  status: "active" | "disabled";
+  is_default: boolean;
+  configured: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TelegramChannelListResponse {
+  ok: boolean;
+  channels: TelegramChannelItem[];
+}
+
+export interface TelegramChannelWriteResponse {
+  ok: boolean;
+  channel?: TelegramChannelItem | null;
+}
+
+export interface TelegramChannelInput {
+  name?: string;
+  bot_token?: string;
+  chat_id?: string;
+  status?: "active" | "disabled";
 }
 
 export interface ApiKeyItem {
@@ -548,6 +583,36 @@ export function deleteEntries(params: { file_ids?: string[]; directory_ids?: str
       "Content-Type": "application/json"
     },
     body: JSON.stringify(params)
+  });
+}
+
+export function listTelegramChannels() {
+  return requestJson<TelegramChannelListResponse>("/api/admin/telegram-channels");
+}
+
+export function createTelegramChannel(body: Required<Pick<TelegramChannelInput, "name" | "bot_token" | "chat_id">> & { status?: "active" | "disabled" }) {
+  return requestJson<TelegramChannelWriteResponse>("/api/admin/telegram-channels", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+}
+
+export function updateTelegramChannel(id: string, body: TelegramChannelInput) {
+  return requestJson<TelegramChannelWriteResponse>(`/api/admin/telegram-channels/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+}
+
+export function deleteTelegramChannel(id: string) {
+  return requestJson<{ ok: boolean }>(`/api/admin/telegram-channels/${encodeURIComponent(id)}`, {
+    method: "DELETE"
   });
 }
 

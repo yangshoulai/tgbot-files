@@ -10,7 +10,9 @@ interface ConfigPanelProps {
 const ITEMS: Array<{ key: keyof SessionResponse["config"]; label: string; hint?: string }> = [
   { key: "files_db", label: "D1 数据库", hint: "存储文件索引与 API keys" },
   { key: "telegram_bot_token", label: "Telegram Bot Token", hint: "调用 Bot API 的鉴权" },
-  { key: "telegram_storage_chat_id", label: "Telegram 存储会话", hint: "存放原始文件的群/频道" },
+  { key: "telegram_storage_chat_id", label: "Telegram 存储会话", hint: "兼容旧链接的环境变量回退" },
+  { key: "telegram_channels", label: "TG 渠道配置", hint: "设置页管理多个 bot-chat 渠道" },
+  { key: "tg_channel_secret", label: "TG 渠道加密密钥", hint: "加密存储 Bot Token" },
   { key: "link_signing_secret", label: "签名密钥", hint: "用于生成 /f/:token 的 HMAC" },
   { key: "admin_username", label: "管理员用户名" },
   { key: "admin_password", label: "管理员密码" },

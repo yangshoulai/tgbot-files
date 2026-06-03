@@ -19,15 +19,20 @@ import {
   getFileRecord,
   getGlobalFileUsageStats,
   getMultipartUploadRecord,
+  getTelegramChannelRecord,
+  getTelegramChannelUsage,
   insertDirectoryRecord,
   insertApiKeyRecord,
   insertFileRecord,
   insertMultipartUploadRecord,
+  insertTelegramChannelRecord,
+  listActiveTelegramChannelRecords,
   listAllDirectoryRecords,
   listDirectoryChildren,
   listFileChunkRecords,
   listApiKeyRecords,
   listFileRecords,
+  listTelegramChannelRecords,
   moveFileRecords,
   moveDirectoryTree,
   renameDirectoryTree,
@@ -38,7 +43,9 @@ import {
   touchApiKeyRecord,
   updateApiKeyRecord,
   updateFileRecordMetadata,
+  updateTelegramChannelRecord,
   upsertFileChunkRecord,
+  deleteTelegramChannelRecord,
   type ApiKeyRecord,
   type ApiKeyStatus,
   type DirectoryRecord,
@@ -46,6 +53,8 @@ import {
   type FileRecord,
   type FileTypeFilter,
   type MultipartUploadRecord,
+  type TelegramChannelRecord,
+  type TelegramChannelStatus,
   type ThumbnailStatus
 } from "./database";
 import {
@@ -76,6 +85,7 @@ export interface Env {
   PUBLIC_BASE_URL?: string;
   MAX_FILE_BYTES?: string;
   STALE_MULTIPART_UPLOAD_TTL_HOURS?: string;
+  TG_CHANNEL_SECRET?: string;
   TELEGRAM_RATE_LIMITER?: DurableObjectNamespace;
 }
 
@@ -94,6 +104,7 @@ interface UploadResult {
   directoryId?: string | null;
   directoryPath: string;
   storageBackend: "telegram_single" | "telegram_multipart";
+  telegramChannelId?: string;
   chunkSize?: number | null;
   chunkCount?: number | null;
   thumbnail?: UploadedThumbnailResult;
@@ -128,6 +139,7 @@ interface UploadedThumbnailResult {
   status: ThumbnailStatus;
   fileId?: string;
   fileUniqueId?: string;
+  telegramChannelId?: string;
   filePath?: string;
   mimeType?: string;
   size?: number;
@@ -176,6 +188,31 @@ type TelegramRateLimitScope = "sendDocument" | "getFile";
 interface TelegramApiSlot {
   scope: TelegramRateLimitScope;
   token?: string;
+  channelId?: string;
+}
+
+interface TelegramStorageChannel {
+  id: string;
+  name: string;
+  botToken: string;
+  chatId: string;
+  status: TelegramChannelStatus;
+  isDefault: boolean;
+}
+
+interface TelegramUploadSlot extends TelegramApiSlot {
+  scope: "sendDocument";
+  token: string;
+  channelId: string;
+  botToken: string;
+  chatId: string;
+}
+
+interface TelegramChannelFormInput {
+  name: string;
+  botToken?: string;
+  chatId: string;
+  status: TelegramChannelStatus;
 }
 
 export class TelegramRateLimiter {
@@ -205,7 +242,8 @@ export class TelegramRateLimiter {
 
     if (url.pathname === "/penalize") {
       const retryAfterMs = normalizeRetryAfterMs(body.retry_after_ms);
-      await this.enqueue(() => this.penalize(scope, retryAfterMs));
+      const channelId = normalizeTelegramRateLimitChannelId(body.channel_id);
+      await this.enqueue(() => this.penalize(scope, channelId, retryAfterMs));
       return new Response(JSON.stringify({ ok: true }), {
         headers: { "Content-Type": "application/json; charset=utf-8" }
       });
@@ -213,21 +251,29 @@ export class TelegramRateLimiter {
 
     if (url.pathname === "/release") {
       const token = typeof body.token === "string" ? body.token : "";
-      await this.enqueue(() => this.release(scope, token));
+      const channelId = normalizeTelegramRateLimitChannelId(body.channel_id);
+      await this.enqueue(() => this.release(scope, channelId, token));
       return new Response(JSON.stringify({ ok: true }), {
         headers: { "Content-Type": "application/json; charset=utf-8" }
       });
     }
 
+    const channelIds = normalizeTelegramRateLimitChannelIds(body.channel_ids, body.channel_id);
+    const preferredChannelId = normalizeOptionalTelegramRateLimitChannelId(body.preferred_channel_id);
     const result = scope === "sendDocument"
-      ? await this.acquireSendDocument()
-      : await this.enqueue(() => this.reserve(scope));
+      ? await this.acquireSendDocument(channelIds, preferredChannelId)
+      : await this.enqueue(() => this.reserve(scope, channelIds[0] ?? "default"));
 
     if (!result.token && result.waitMs > 0) {
       await delayMs(result.waitMs);
     }
 
-    return new Response(JSON.stringify({ ok: true, wait_ms: result.waitMs, token: result.token }), {
+    return new Response(JSON.stringify({
+      ok: true,
+      wait_ms: result.waitMs,
+      token: result.token,
+      channel_id: result.channelId
+    }), {
       headers: { "Content-Type": "application/json; charset=utf-8" }
     });
   }
@@ -238,13 +284,16 @@ export class TelegramRateLimiter {
     return next;
   }
 
-  private async acquireSendDocument(): Promise<{ waitMs: number; token: string }> {
+  private async acquireSendDocument(
+    channelIds: string[],
+    preferredChannelId?: string
+  ): Promise<{ waitMs: number; token: string; channelId: string }> {
     let totalWaitMs = 0;
 
     while (true) {
-      const result = await this.enqueue(() => this.tryAcquireSendDocument());
-      if (result.token) {
-        return { waitMs: totalWaitMs, token: result.token };
+      const result = await this.enqueue(() => this.tryAcquireSendDocument(channelIds, preferredChannelId));
+      if (result.token && result.channelId) {
+        return { waitMs: totalWaitMs, token: result.token, channelId: result.channelId };
       }
 
       totalWaitMs += result.waitMs;
@@ -252,70 +301,96 @@ export class TelegramRateLimiter {
     }
   }
 
-  private async tryAcquireSendDocument(): Promise<{ waitMs: number; token?: string }> {
+  private async tryAcquireSendDocument(
+    channelIds: string[],
+    preferredChannelId?: string
+  ): Promise<{ waitMs: number; token?: string; channelId?: string }> {
     const now = Date.now();
-    const nextAvailableAt = await this.state.storage.get<number>(telegramRateLimitStorageKey("sendDocument")) ?? 0;
-    const lockToken = await this.state.storage.get<string>(telegramRateLimitLockTokenKey("sendDocument"));
-    const lockedUntil = await this.state.storage.get<number>(telegramRateLimitLockUntilKey("sendDocument")) ?? 0;
+    const states = await Promise.all(channelIds.map(async (channelId, index) => {
+      const nextAvailableAt = await this.state.storage.get<number>(telegramRateLimitStorageKey("sendDocument", channelId)) ?? 0;
+      const lockToken = await this.state.storage.get<string>(telegramRateLimitLockTokenKey("sendDocument", channelId));
+      const lockedUntil = await this.state.storage.get<number>(telegramRateLimitLockUntilKey("sendDocument", channelId)) ?? 0;
 
-    if (lockToken && lockedUntil > now) {
-      return { waitMs: Math.max(250, Math.min(1_000, lockedUntil - now)) };
+      if (lockToken && lockedUntil <= now) {
+        await this.clearLock("sendDocument", channelId);
+      }
+
+      const activeLockedUntil = lockToken && lockedUntil > now ? lockedUntil : 0;
+      return {
+        channelId,
+        index,
+        readyAt: Math.max(nextAvailableAt, activeLockedUntil)
+      };
+    }));
+
+    states.sort((left, right) => {
+      const readyDiff = left.readyAt - right.readyAt;
+      if (readyDiff !== 0) return readyDiff;
+      if (preferredChannelId) {
+        if (left.channelId === preferredChannelId) return -1;
+        if (right.channelId === preferredChannelId) return 1;
+      }
+      return left.index - right.index;
+    });
+
+    const selected = states[0];
+    if (!selected) {
+      return { waitMs: TELEGRAM_SEND_DOCUMENT_RATE_LIMIT_MS };
     }
 
-    if (lockToken) {
-      await this.clearLock("sendDocument");
-    }
-
-    if (nextAvailableAt > now) {
-      return { waitMs: Math.max(250, Math.min(1_000, nextAvailableAt - now)) };
+    if (selected.readyAt > now) {
+      return { waitMs: Math.max(250, Math.min(1_000, selected.readyAt - now)) };
     }
 
     const token = crypto.randomUUID();
-    await this.state.storage.put(telegramRateLimitLockTokenKey("sendDocument"), token);
+    await this.state.storage.put(telegramRateLimitLockTokenKey("sendDocument", selected.channelId), token);
     await this.state.storage.put(
-      telegramRateLimitLockUntilKey("sendDocument"),
+      telegramRateLimitLockUntilKey("sendDocument", selected.channelId),
       now + TELEGRAM_SEND_DOCUMENT_LOCK_LEASE_MS
     );
-    await this.state.storage.put(telegramRateLimitStorageKey("sendDocument"), now + telegramRateLimitIntervalMs("sendDocument"));
+    await this.state.storage.put(
+      telegramRateLimitStorageKey("sendDocument", selected.channelId),
+      now + telegramRateLimitIntervalMs("sendDocument")
+    );
 
-    return { waitMs: 0, token };
+    return { waitMs: 0, token, channelId: selected.channelId };
   }
 
-  private async reserve(scope: TelegramRateLimitScope): Promise<{ waitMs: number; token?: string }> {
+  private async reserve(scope: TelegramRateLimitScope, channelId: string): Promise<{ waitMs: number; token?: string; channelId: string }> {
     const now = Date.now();
-    const key = telegramRateLimitStorageKey(scope);
+    const key = telegramRateLimitStorageKey(scope, channelId);
     const nextAvailableAt = await this.state.storage.get<number>(key) ?? 0;
     const waitMs = Math.max(0, nextAvailableAt - now);
     const reservedAt = now + waitMs;
 
     await this.state.storage.put(key, reservedAt + telegramRateLimitIntervalMs(scope));
-    return { waitMs };
+    return { waitMs, channelId };
   }
 
-  private async penalize(scope: TelegramRateLimitScope, retryAfterMs: number): Promise<void> {
-    const key = telegramRateLimitStorageKey(scope);
+  private async penalize(scope: TelegramRateLimitScope, channelId: string, retryAfterMs: number): Promise<void> {
+    const key = telegramRateLimitStorageKey(scope, channelId);
     const current = await this.state.storage.get<number>(key) ?? 0;
     const penalizedUntil = Date.now() + retryAfterMs;
 
     await this.state.storage.put(key, Math.max(current, penalizedUntil));
   }
 
-  private async release(scope: TelegramRateLimitScope, token: string): Promise<void> {
+  private async release(scope: TelegramRateLimitScope, channelId: string, token: string): Promise<void> {
     if (scope !== "sendDocument" || !token) {
       return;
     }
 
-    const currentToken = await this.state.storage.get<string>(telegramRateLimitLockTokenKey(scope));
+    const currentToken = await this.state.storage.get<string>(telegramRateLimitLockTokenKey(scope, channelId));
     if (currentToken !== token) {
       return;
     }
 
-    await this.clearLock(scope);
+    await this.clearLock(scope, channelId);
   }
 
-  private async clearLock(scope: TelegramRateLimitScope): Promise<void> {
-    await this.state.storage.delete(telegramRateLimitLockTokenKey(scope));
-    await this.state.storage.delete(telegramRateLimitLockUntilKey(scope));
+  private async clearLock(scope: TelegramRateLimitScope, channelId: string): Promise<void> {
+    await this.state.storage.delete(telegramRateLimitLockTokenKey(scope, channelId));
+    await this.state.storage.delete(telegramRateLimitLockUntilKey(scope, channelId));
   }
 }
 
@@ -411,16 +486,45 @@ function normalizeRetryAfterMs(value: unknown): number {
   return Math.min(parsed, 5 * 60 * 1000);
 }
 
-function telegramRateLimitStorageKey(scope: TelegramRateLimitScope): string {
-  return `telegram-rate-limit:${scope}:next`;
+function normalizeTelegramRateLimitChannelId(value: unknown): string {
+  return normalizeOptionalTelegramRateLimitChannelId(value) ?? "default";
 }
 
-function telegramRateLimitLockTokenKey(scope: TelegramRateLimitScope): string {
-  return `telegram-rate-limit:${scope}:lock-token`;
+function normalizeOptionalTelegramRateLimitChannelId(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : undefined;
 }
 
-function telegramRateLimitLockUntilKey(scope: TelegramRateLimitScope): string {
-  return `telegram-rate-limit:${scope}:locked-until`;
+function normalizeTelegramRateLimitChannelIds(value: unknown, fallback: unknown): string[] {
+  const values = Array.isArray(value) ? value : [fallback];
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  for (const item of values) {
+    const channelId = normalizeOptionalTelegramRateLimitChannelId(item);
+    if (channelId && !seen.has(channelId)) {
+      seen.add(channelId);
+      result.push(channelId);
+    }
+  }
+
+  return result.length > 0 ? result : ["default"];
+}
+
+function telegramRateLimitStorageKey(scope: TelegramRateLimitScope, channelId = "default"): string {
+  return `telegram-rate-limit:${scope}:${channelId}:next`;
+}
+
+function telegramRateLimitLockTokenKey(scope: TelegramRateLimitScope, channelId = "default"): string {
+  return `telegram-rate-limit:${scope}:${channelId}:lock-token`;
+}
+
+function telegramRateLimitLockUntilKey(scope: TelegramRateLimitScope, channelId = "default"): string {
+  return `telegram-rate-limit:${scope}:${channelId}:locked-until`;
 }
 
 function telegramRateLimitIntervalMs(scope: TelegramRateLimitScope): number {
@@ -482,6 +586,10 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
     return handleAuthenticatedAdminRequest(request, env, (username) =>
       handleAdminFiles(request, env, username)
     );
+  }
+
+  if (url.pathname === "/api/admin/telegram-channels" || url.pathname.startsWith("/api/admin/telegram-channels/")) {
+    return handleAuthenticatedAdminRequest(request, env, () => handleAdminTelegramChannels(request, env));
   }
 
   if (url.pathname === "/api/admin/api-keys" || url.pathname.startsWith("/api/admin/api-keys/")) {
@@ -641,6 +749,8 @@ async function handleAdminSession(request: Request, env: Env, username: string):
       files_db: Boolean(env.FILES_DB),
       telegram_bot_token: hasEnvValue(env.TELEGRAM_BOT_TOKEN),
       telegram_storage_chat_id: hasEnvValue(env.TELEGRAM_STORAGE_CHAT_ID),
+      telegram_channels: Boolean(env.FILES_DB),
+      tg_channel_secret: hasEnvValue(env.TG_CHANNEL_SECRET || env.LINK_SIGNING_SECRET),
       link_signing_secret: hasEnvValue(env.LINK_SIGNING_SECRET),
       admin_username: hasEnvValue(env.ADMIN_USERNAME),
       admin_password: hasEnvValue(env.ADMIN_PASSWORD),
@@ -650,6 +760,8 @@ async function handleAdminSession(request: Request, env: Env, username: string):
       files_db: env.FILES_DB ? "已绑定" : "未绑定",
       telegram_bot_token: maskSecret(env.TELEGRAM_BOT_TOKEN),
       telegram_storage_chat_id: env.TELEGRAM_STORAGE_CHAT_ID?.trim() || "未配置",
+      telegram_channels: env.FILES_DB ? "设置页可配置" : "需要 D1 数据库",
+      tg_channel_secret: env.TG_CHANNEL_SECRET?.trim() ? maskSecret(env.TG_CHANNEL_SECRET) : "未单独配置，使用签名密钥",
       link_signing_secret: maskSecret(env.LINK_SIGNING_SECRET),
       admin_username: env.ADMIN_USERNAME?.trim() || "未配置",
       admin_password: maskSecret(env.ADMIN_PASSWORD),
@@ -1113,6 +1225,7 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
     validateChunkFile(chunk, expectedSize);
     const record = await uploadChunkToTelegram({
       env,
+      db,
       upload,
       chunk,
       chunkIndex
@@ -1132,6 +1245,7 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
     const chunkIndex = normalizeChunkIndex(urlChunkMatch[2], upload);
     const record = await downloadAndUploadRemoteChunk({
       env,
+      db,
       upload,
       chunkIndex
     });
@@ -1267,6 +1381,7 @@ async function handleApiMultipartUploads(request: Request, env: Env): Promise<Re
     validateChunkFile(chunk, expectedChunkSize(upload, chunkIndex));
     const record = await uploadChunkToTelegram({
       env,
+      db,
       upload,
       chunk,
       chunkIndex
@@ -1286,6 +1401,7 @@ async function handleApiMultipartUploads(request: Request, env: Env): Promise<Re
     const chunkIndex = normalizeChunkIndex(urlChunkMatch[2], upload);
     const record = await downloadAndUploadRemoteChunk({
       env,
+      db,
       upload,
       chunkIndex
     });
@@ -1393,6 +1509,215 @@ async function handleAdminApiKeys(request: Request, env: Env): Promise<Response>
   }
 
   return errorResponse(new AppError(405, "MethodNotAllowed", "Unsupported API key method"));
+}
+
+async function handleAdminTelegramChannels(request: Request, env: Env): Promise<Response> {
+  const db = requireDb(env);
+  const url = new URL(request.url);
+
+  if (request.method === "GET" && url.pathname === "/api/admin/telegram-channels") {
+    const records = await listTelegramChannelRecords(db);
+    return jsonResponse({
+      ok: true,
+      channels: await Promise.all(records.map((record) => serializeTelegramChannelRecord(record, env)))
+    });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/admin/telegram-channels") {
+    const body = await readJsonObject(request);
+    const input = normalizeTelegramChannelForm(body, { creating: true });
+    const now = new Date().toISOString();
+    const botToken = input.botToken ?? "";
+    const botTokenHash = await telegramChannelTokenHash(botToken);
+
+    await requireTelegramChannelUnique(db, {
+      name: input.name,
+      botTokenHash,
+      chatId: input.chatId
+    });
+
+    await insertTelegramChannelRecord(db, {
+      id: crypto.randomUUID(),
+      name: input.name,
+      botTokenEncrypted: await encryptTelegramBotToken(botToken, env),
+      botTokenHash,
+      chatId: input.chatId,
+      status: input.status,
+      createdAt: now,
+      updatedAt: now
+    });
+
+    const records = await listTelegramChannelRecords(db);
+    const created = records.find((record) => record.name === input.name && record.chat_id === input.chatId);
+
+    return jsonResponse({
+      ok: true,
+      channel: created ? await serializeTelegramChannelRecord(created, env) : null
+    }, 201);
+  }
+
+  const match = /^\/api\/admin\/telegram-channels\/([^/]+)$/.exec(url.pathname);
+  const id = match?.[1] ? decodeURIComponent(match[1]) : "";
+
+  if (!id) {
+    return errorResponse(new AppError(404, "NotFound", "Admin Telegram channel route not found"));
+  }
+
+  const existing = await getTelegramChannelRecord(db, id);
+  if (!existing) {
+    throw new AppError(404, "NotFound", "Telegram channel not found");
+  }
+
+  if (request.method === "PATCH") {
+    const body = await readJsonObject(request);
+    const input = normalizeTelegramChannelForm(body, { creating: false, existing });
+    const nextBotTokenEncrypted = input.botToken
+      ? await encryptTelegramBotToken(input.botToken, env)
+      : existing.bot_token_encrypted;
+    const nextBotTokenHash = input.botToken
+      ? await telegramChannelTokenHash(input.botToken)
+      : existing.bot_token_hash;
+
+    if (!nextBotTokenEncrypted || !nextBotTokenHash) {
+      throw new AppError(400, "InvalidBody", "bot_token is required before this Telegram channel can be saved");
+    }
+
+    await requireTelegramChannelUnique(db, {
+      name: input.name,
+      botTokenHash: nextBotTokenHash,
+      chatId: input.chatId,
+      excludeId: id
+    });
+
+    const updated = await updateTelegramChannelRecord(db, {
+      id,
+      name: existing.is_default === 1 ? "default" : input.name,
+      botTokenEncrypted: nextBotTokenEncrypted,
+      botTokenHash: nextBotTokenHash,
+      chatId: input.chatId,
+      status: input.status,
+      updatedAt: new Date().toISOString()
+    });
+
+    if (!updated) {
+      throw new AppError(404, "NotFound", "Telegram channel not found");
+    }
+
+    return jsonResponse({ ok: true, channel: await serializeTelegramChannelRecord(updated, env) });
+  }
+
+  if (request.method === "DELETE") {
+    if (existing.is_default === 1 || existing.id === "default") {
+      throw new AppError(400, "DefaultChannelProtected", "default Telegram channel cannot be deleted");
+    }
+
+    const usage = await getTelegramChannelUsage(db, id);
+    if (usage.files > 0 || usage.chunks > 0) {
+      throw new AppError(409, "TelegramChannelInUse", "Telegram channel is still referenced by files or chunks", {
+        files: usage.files,
+        chunks: usage.chunks
+      });
+    }
+
+    const deleted = await deleteTelegramChannelRecord(db, id);
+    if (!deleted) {
+      throw new AppError(404, "NotFound", "Telegram channel not found");
+    }
+
+    return jsonResponse({ ok: true });
+  }
+
+  return errorResponse(new AppError(405, "MethodNotAllowed", "Unsupported Telegram channel method"));
+}
+
+function normalizeTelegramChannelForm(
+  body: Record<string, unknown>,
+  options: { creating: boolean; existing?: TelegramChannelRecord }
+): TelegramChannelFormInput {
+  const existing = options.existing;
+  const name = existing?.is_default === 1
+    ? "default"
+    : normalizeName(body.name ?? existing?.name, "Telegram channel name");
+  const botTokenValue = body.bot_token === undefined ? undefined : body.bot_token;
+  const botToken = normalizeTelegramBotToken(botTokenValue, options.creating);
+  const chatId = normalizeTelegramChatId(body.chat_id ?? existing?.chat_id);
+  const status = body.status === undefined
+    ? existing?.status ?? "active"
+    : normalizeTelegramChannelStatus(body.status);
+
+  return {
+    name,
+    ...(botToken ? { botToken } : {}),
+    chatId,
+    status
+  };
+}
+
+function normalizeTelegramBotToken(value: unknown, required: boolean): string | undefined {
+  if (typeof value !== "string") {
+    if (required) {
+      throw new AppError(400, "InvalidBody", "bot_token is required");
+    }
+    return undefined;
+  }
+
+  const normalized = value.trim();
+  if (!normalized) {
+    if (required) {
+      throw new AppError(400, "InvalidBody", "bot_token is required");
+    }
+    return undefined;
+  }
+
+  if (!/^\d+:[A-Za-z0-9_-]{20,}$/.test(normalized)) {
+    throw new AppError(400, "InvalidBody", "bot_token format is invalid");
+  }
+
+  return normalized;
+}
+
+function normalizeTelegramChatId(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new AppError(400, "InvalidBody", "chat_id is required");
+  }
+
+  const normalized = value.trim();
+  if (!normalized) {
+    throw new AppError(400, "InvalidBody", "chat_id is required");
+  }
+
+  return normalized.slice(0, 128);
+}
+
+function normalizeTelegramChannelStatus(value: unknown): TelegramChannelStatus {
+  if (value === "active" || value === "disabled") {
+    return value;
+  }
+
+  throw new AppError(400, "InvalidBody", "Telegram channel status must be active or disabled");
+}
+
+async function requireTelegramChannelUnique(paramsDb: D1Database, params: {
+  name: string;
+  botTokenHash: string;
+  chatId: string;
+  excludeId?: string;
+}): Promise<void> {
+  const records = await listTelegramChannelRecords(paramsDb);
+  const conflict = records.find((record) =>
+    record.id !== params.excludeId &&
+    (record.name === params.name || (record.bot_token_hash === params.botTokenHash && record.chat_id === params.chatId))
+  );
+
+  if (!conflict) {
+    return;
+  }
+
+  if (conflict.name === params.name) {
+    throw new AppError(409, "TelegramChannelNameConflict", "Telegram channel name already exists");
+  }
+
+  throw new AppError(409, "TelegramChannelTargetConflict", "Telegram bot token and chat_id channel already exists");
 }
 
 async function readUploadInput(request: Request, env: Env): Promise<{ file: File; remark?: string; directoryPath: string }> {
@@ -1734,10 +2059,8 @@ async function uploadRateLimitedTelegramDocument(params: {
   chatId: string;
   file: Blob;
   fileName: string;
-  telegramSlot?: TelegramApiSlot;
+  telegramSlot: TelegramApiSlot;
 }): Promise<Awaited<ReturnType<typeof uploadDocumentToTelegram>>> {
-  const slot = params.telegramSlot ?? await acquireTelegramApiSlot(params.env, "sendDocument");
-
   try {
     return await uploadDocumentToTelegram({
       botToken: params.botToken,
@@ -1746,19 +2069,55 @@ async function uploadRateLimitedTelegramDocument(params: {
       fileName: params.fileName
     });
   } catch (error) {
-    await penalizeTelegramApiSlotFromError(params.env, "sendDocument", error);
+    await penalizeTelegramApiSlotFromError(params.env, "sendDocument", params.telegramSlot.channelId, error);
     throw error;
   } finally {
-    await releaseTelegramApiSlot(params.env, slot);
+    await releaseTelegramApiSlot(params.env, params.telegramSlot);
   }
+}
+
+async function uploadTelegramDocumentWithChannel(params: {
+  env: Env;
+  db?: D1Database;
+  file: Blob;
+  fileName: string;
+  preferredChannelId?: string;
+  preferredChannelIndex?: number;
+  telegramSlot?: TelegramUploadSlot;
+}): Promise<{ telegramDocument: Awaited<ReturnType<typeof uploadDocumentToTelegram>>; channel: TelegramStorageChannel }> {
+  const slot = params.telegramSlot ?? await acquireTelegramUploadSlot(params.env, params.db, {
+    ...(params.preferredChannelId ? { preferredChannelId: params.preferredChannelId } : {}),
+    ...(params.preferredChannelIndex !== undefined ? { preferredChannelIndex: params.preferredChannelIndex } : {})
+  });
+  const telegramDocument = await uploadRateLimitedTelegramDocument({
+    env: params.env,
+    botToken: slot.botToken,
+    chatId: slot.chatId,
+    file: params.file,
+    fileName: params.fileName,
+    telegramSlot: slot
+  });
+
+  return {
+    telegramDocument,
+    channel: {
+      id: slot.channelId,
+      name: slot.channelId,
+      botToken: slot.botToken,
+      chatId: slot.chatId,
+      status: "active",
+      isDefault: slot.channelId === "default"
+    }
+  };
 }
 
 async function getRateLimitedTelegramFileUrl(params: {
   env: Env;
   botToken: string;
   fileId: string;
+  channelId?: string;
 }): Promise<string> {
-  await acquireTelegramApiSlot(params.env, "getFile");
+  await acquireTelegramApiSlot(params.env, "getFile", params.channelId);
 
   try {
     return await getTelegramFileUrl({
@@ -1766,31 +2125,75 @@ async function getRateLimitedTelegramFileUrl(params: {
       fileId: params.fileId
     });
   } catch (error) {
-    await penalizeTelegramApiSlotFromError(params.env, "getFile", error);
+    await penalizeTelegramApiSlotFromError(params.env, "getFile", params.channelId, error);
     throw error;
   }
 }
 
-async function acquireTelegramApiSlot(env: Env, scope: TelegramRateLimitScope): Promise<TelegramApiSlot> {
+async function acquireTelegramUploadSlot(
+  env: Env,
+  db: D1Database | undefined,
+  options: { preferredChannelId?: string; preferredChannelIndex?: number } = {}
+): Promise<TelegramUploadSlot> {
+  const channels = await listUploadTelegramChannels(env, db);
+  const channelIds = channels.map((channel) => channel.id);
+  const preferredByIndex = Number.isSafeInteger(options.preferredChannelIndex) && channels.length > 0
+    ? channels[Math.abs(Number(options.preferredChannelIndex)) % channels.length]?.id
+    : undefined;
+  const preferredChannelId = options.preferredChannelId ?? preferredByIndex;
+  const slot = await acquireTelegramApiSlot(env, "sendDocument", undefined, channelIds, preferredChannelId);
+  const selectedChannel = channels.find((channel) => channel.id === slot.channelId) ?? channels[0];
+
+  if (!selectedChannel || !slot.token) {
+    throw new AppError(502, "TelegramRateLimiterFailed", "Telegram rate limiter did not return an upload channel");
+  }
+
+  return {
+    scope: "sendDocument",
+    token: slot.token,
+    channelId: selectedChannel.id,
+    botToken: selectedChannel.botToken,
+    chatId: selectedChannel.chatId
+  };
+}
+
+async function acquireTelegramApiSlot(
+  env: Env,
+  scope: TelegramRateLimitScope,
+  channelId?: string,
+  channelIds?: string[],
+  preferredChannelId?: string
+): Promise<TelegramApiSlot> {
+  const normalizedChannelId = normalizeTelegramChannelId(channelId);
   const limiter = env.TELEGRAM_RATE_LIMITER;
   if (!limiter) {
-    return { scope };
+    return {
+      scope,
+      channelId: normalizedChannelId,
+      ...(scope === "sendDocument" ? { token: crypto.randomUUID() } : {})
+    };
   }
 
   const id = limiter.idFromName(TELEGRAM_RATE_LIMITER_OBJECT_NAME);
   const response = await limiter.get(id).fetch("https://telegram-rate-limiter/acquire", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ scope })
+    body: JSON.stringify({
+      scope,
+      channel_id: normalizedChannelId,
+      ...(channelIds ? { channel_ids: channelIds } : {}),
+      ...(preferredChannelId ? { preferred_channel_id: preferredChannelId } : {})
+    })
   });
 
   if (!response.ok) {
     throw new AppError(502, "TelegramRateLimiterFailed", "Telegram rate limiter failed");
   }
 
-  const body = await response.json().catch(() => ({})) as { token?: unknown };
+  const body = await response.json().catch(() => ({})) as { token?: unknown; channel_id?: unknown };
   return {
     scope,
+    channelId: typeof body.channel_id === "string" && body.channel_id ? body.channel_id : normalizedChannelId,
     ...(typeof body.token === "string" && body.token ? { token: body.token } : {})
   };
 }
@@ -1807,12 +2210,14 @@ async function releaseTelegramApiSlot(env: Env, slot: TelegramApiSlot): Promise<
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         scope: slot.scope,
+        channel_id: slot.channelId ?? "default",
         token: slot.token
       })
     });
   } catch (error) {
     console.warn("Failed to release Telegram API rate limit slot", {
       scope: slot.scope,
+      channel_id: slot.channelId,
       error: error instanceof Error ? error.message : String(error)
     });
   }
@@ -1821,6 +2226,7 @@ async function releaseTelegramApiSlot(env: Env, slot: TelegramApiSlot): Promise<
 async function penalizeTelegramApiSlotFromError(
   env: Env,
   scope: TelegramRateLimitScope,
+  channelId: string | undefined,
   error: unknown
 ): Promise<void> {
   const retryAfterSeconds = telegramRetryAfterSeconds(error);
@@ -1835,12 +2241,14 @@ async function penalizeTelegramApiSlotFromError(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         scope,
+        channel_id: channelId ?? "default",
         retry_after_ms: retryAfterSeconds * 1000
       })
     });
   } catch (penaltyError) {
     console.warn("Failed to update Telegram API rate limit penalty", {
       scope,
+      channel_id: channelId,
       error: penaltyError instanceof Error ? penaltyError.message : String(penaltyError)
     });
   }
@@ -1853,6 +2261,203 @@ function telegramRetryAfterSeconds(error: unknown): number | undefined {
 
   const value = error.details?.telegram_retry_after_seconds;
   return Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : undefined;
+}
+
+function channelCryptoSecret(env: Env): string {
+  return requireEnv({ LINK_SIGNING_SECRET: env.TG_CHANNEL_SECRET || env.LINK_SIGNING_SECRET }, "LINK_SIGNING_SECRET");
+}
+
+async function telegramChannelTokenHash(botToken: string): Promise<string> {
+  return base64UrlEncodeLocal(new Uint8Array(await crypto.subtle.digest("SHA-256", toArrayBufferLocal(textEncodeLocal(botToken)))));
+}
+
+async function encryptTelegramBotToken(botToken: string, env: Env): Promise<string> {
+  if (!botToken) {
+    return "";
+  }
+
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await importTelegramChannelAesKey(env);
+  const cipher = new Uint8Array(await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: toArrayBufferLocal(iv) },
+    key,
+    toArrayBufferLocal(textEncodeLocal(botToken))
+  ));
+
+  return `v1.${base64UrlEncodeLocal(iv)}.${base64UrlEncodeLocal(cipher)}`;
+}
+
+async function decryptTelegramBotToken(encrypted: string, env: Env): Promise<string> {
+  if (!encrypted) {
+    return "";
+  }
+
+  const [version, ivPart, cipherPart, extra] = encrypted.split(".");
+  if (version !== "v1" || !ivPart || !cipherPart || extra !== undefined) {
+    throw new AppError(500, "InvalidTelegramChannelSecret", "Telegram channel bot token cannot be decrypted");
+  }
+
+  try {
+    const key = await importTelegramChannelAesKey(env);
+    const plain = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: toArrayBufferLocal(base64UrlDecodeLocal(ivPart)) },
+      key,
+      toArrayBufferLocal(base64UrlDecodeLocal(cipherPart))
+    );
+    return new TextDecoder().decode(plain);
+  } catch {
+    throw new AppError(500, "InvalidTelegramChannelSecret", "Telegram channel bot token cannot be decrypted");
+  }
+}
+
+async function importTelegramChannelAesKey(env: Env): Promise<CryptoKey> {
+  const digest = await crypto.subtle.digest("SHA-256", toArrayBufferLocal(textEncodeLocal(channelCryptoSecret(env))));
+  return crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+
+function textEncodeLocal(value: string): Uint8Array {
+  return new TextEncoder().encode(value);
+}
+
+function toArrayBufferLocal(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+function base64UrlEncodeLocal(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64UrlDecodeLocal(value: string): Uint8Array {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) {
+    throw new AppError(500, "InvalidTelegramChannelSecret", "Invalid base64url secret data");
+  }
+
+  const paddingLength = (4 - (value.length % 4)) % 4;
+  const base64 = value.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat(paddingLength);
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+function normalizeTelegramChannelId(value: string | null | undefined): string {
+  const normalized = value?.trim();
+  return normalized || "default";
+}
+
+function isTelegramChannelConfigured(record: TelegramChannelRecord): boolean {
+  return Boolean(record.bot_token_encrypted && record.chat_id.trim());
+}
+
+async function materializeTelegramChannel(record: TelegramChannelRecord, env: Env): Promise<TelegramStorageChannel | null> {
+  if (!isTelegramChannelConfigured(record)) {
+    return null;
+  }
+
+  return {
+    id: record.id,
+    name: record.name,
+    botToken: await decryptTelegramBotToken(record.bot_token_encrypted, env),
+    chatId: record.chat_id,
+    status: record.status,
+    isDefault: record.is_default === 1
+  };
+}
+
+function defaultEnvTelegramChannel(env: Env): TelegramStorageChannel | null {
+  const botToken = env.TELEGRAM_BOT_TOKEN?.trim();
+  const chatId = env.TELEGRAM_STORAGE_CHAT_ID?.trim();
+
+  if (!botToken || !chatId) {
+    return null;
+  }
+
+  return {
+    id: "default",
+    name: "default",
+    botToken,
+    chatId,
+    status: "active",
+    isDefault: true
+  };
+}
+
+async function resolveTelegramChannel(env: Env, db: D1Database | undefined, channelId: string | null | undefined): Promise<TelegramStorageChannel> {
+  const normalizedChannelId = normalizeTelegramChannelId(channelId);
+
+  if (db) {
+    const record = await getTelegramChannelRecord(db, normalizedChannelId);
+    if (record) {
+      const materialized = await materializeTelegramChannel(record, env);
+      if (materialized) {
+        return materialized;
+      }
+    }
+  }
+
+  if (normalizedChannelId === "default") {
+    const fallback = defaultEnvTelegramChannel(env);
+    if (fallback) {
+      return fallback;
+    }
+  }
+
+  throw new AppError(500, "TelegramChannelNotConfigured", `Telegram channel '${normalizedChannelId}' is not configured`);
+}
+
+async function listUploadTelegramChannels(env: Env, db: D1Database | undefined): Promise<TelegramStorageChannel[]> {
+  const channels: TelegramStorageChannel[] = [];
+
+  if (db) {
+    const records = await listActiveTelegramChannelRecords(db);
+    for (const record of records) {
+      const materialized = await materializeTelegramChannel(record, env);
+      if (materialized) {
+        channels.push(materialized);
+      } else if (record.id === "default") {
+        const fallback = defaultEnvTelegramChannel(env);
+        if (fallback) {
+          channels.push(fallback);
+        }
+      }
+    }
+  }
+
+  if (channels.length === 0) {
+    const fallback = defaultEnvTelegramChannel(env);
+    if (fallback) {
+      channels.push(fallback);
+    }
+  }
+
+  if (channels.length === 0) {
+    throw new AppError(500, "TelegramChannelNotConfigured", "At least one active Telegram channel must be configured");
+  }
+
+  return channels;
+}
+
+async function serializeTelegramChannelRecord(record: TelegramChannelRecord, env: Env): Promise<Record<string, unknown>> {
+  const botToken = record.bot_token_encrypted ? await decryptTelegramBotToken(record.bot_token_encrypted, env) : "";
+
+  return {
+    id: record.id,
+    name: record.name,
+    chat_id: record.chat_id,
+    masked_bot_token: maskSecret(botToken),
+    configured: Boolean(botToken && record.chat_id.trim()),
+    status: record.status,
+    is_default: record.is_default === 1,
+    created_at: record.created_at,
+    updated_at: record.updated_at
+  };
 }
 
 function parseContentLength(value: string | null): number | undefined {
@@ -2412,10 +3017,13 @@ async function downloadRemoteChunk(upload: MultipartUploadRecord, chunkIndex: nu
 
 async function downloadAndUploadRemoteChunk(params: {
   env: Env;
+  db: D1Database;
   upload: MultipartUploadRecord;
   chunkIndex: number;
 }) {
-  let telegramSlot: TelegramApiSlot | undefined = await acquireTelegramApiSlot(params.env, "sendDocument");
+  let telegramSlot: TelegramUploadSlot | undefined = await acquireTelegramUploadSlot(params.env, params.db, {
+    preferredChannelIndex: params.chunkIndex
+  });
 
   try {
     const chunk = await downloadRemoteChunk(params.upload, params.chunkIndex);
@@ -2424,6 +3032,7 @@ async function downloadAndUploadRemoteChunk(params: {
 
     return await uploadChunkToTelegram({
       env: params.env,
+      db: params.db,
       upload: params.upload,
       chunk,
       chunkIndex: params.chunkIndex,
@@ -2476,20 +3085,19 @@ function validateRemoteChunkResponse(params: {
 
 async function uploadChunkToTelegram(params: {
   env: Env;
+  db: D1Database;
   upload: MultipartUploadRecord;
   chunk: Blob;
   chunkIndex: number;
-  telegramSlot?: TelegramApiSlot;
+  telegramSlot?: TelegramUploadSlot;
 }) {
-  const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
-  const chatId = requireEnv(params.env, "TELEGRAM_STORAGE_CHAT_ID");
   const fileName = chunkFileName(params.upload, params.chunkIndex);
-  const telegramDocument = await uploadRateLimitedTelegramDocument({
+  const { telegramDocument, channel } = await uploadTelegramDocumentWithChannel({
     env: params.env,
-    botToken,
-    chatId,
+    db: params.db,
     file: params.chunk,
     fileName,
+    preferredChannelIndex: params.chunkIndex,
     ...(params.telegramSlot ? { telegramSlot: params.telegramSlot } : {})
   });
 
@@ -2499,9 +3107,13 @@ async function uploadChunkToTelegram(params: {
     size: telegramDocument.file_size ?? params.chunk.size,
     md5: chunkDigest(params.upload, params.chunkIndex, telegramDocument.file_unique_id),
     telegramFileId: telegramDocument.file_id,
+    telegramChannelId: channel.id,
     ...(telegramDocument.file_unique_id ? { telegramFileUniqueId: telegramDocument.file_unique_id } : {}),
     createdAt: new Date().toISOString()
   };
+}
+function preferredChunkChannelId(_upload: MultipartUploadRecord, _chunkIndex: number): string | undefined {
+  return undefined;
 }
 
 function chunkFileName(upload: MultipartUploadRecord, chunkIndex: number): string {
@@ -2554,6 +3166,7 @@ async function completeMultipartUpload(params: {
   const thumbnail = await uploadOptionalThumbnail({
     request: params.request,
     env: params.env,
+    db: params.db,
     originalFileName: params.upload.file_name,
     thumbnail: params.thumbnail
   });
@@ -2569,6 +3182,7 @@ async function completeMultipartUpload(params: {
       size: params.upload.size,
       md5,
       telegramFileId: `multipart:${params.upload.id}`,
+      telegramChannelId: chunks[0]?.telegram_channel_id ?? "default",
       filePath,
       createdAt,
       storageBackend: "telegram_multipart",
@@ -2591,6 +3205,7 @@ async function completeMultipartUpload(params: {
     filePath,
     publicUrl,
     telegramFileId: `multipart:${params.upload.id}`,
+    telegramChannelId: chunks[0]?.telegram_channel_id ?? "default",
     ...(params.upload.remark ? { remark: params.upload.remark } : {}),
     createdAt,
     directoryId: params.upload.directory_id ?? null,
@@ -2605,6 +3220,7 @@ async function completeMultipartUpload(params: {
 async function uploadOptionalThumbnail(params: {
   request: Request;
   env: Env;
+  db: D1Database;
   originalFileName: string;
   thumbnail: ThumbnailInput | undefined;
 }): Promise<UploadedThumbnailResult | undefined> {
@@ -2627,11 +3243,10 @@ async function uploadOptionalThumbnail(params: {
 async function uploadThumbnailToTelegram(params: {
   request: Request;
   env: Env;
+  db: D1Database;
   originalFileName: string;
   thumbnail: ThumbnailInput;
 }): Promise<UploadedThumbnailResult> {
-  const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
-  const chatId = requireEnv(params.env, "TELEGRAM_STORAGE_CHAT_ID");
   const signingSecret = requireEnv(params.env, "LINK_SIGNING_SECRET");
   const thumbnailBytes = await params.thumbnail.file.arrayBuffer();
 
@@ -2645,17 +3260,17 @@ async function uploadThumbnailToTelegram(params: {
 
   const thumbnailFileName = thumbnailFileNameFor(params.originalFileName, mimeType);
   const thumbnailFile = new File([thumbnailBytes], thumbnailFileName, { type: mimeType });
-  const telegramDocument = await uploadRateLimitedTelegramDocument({
+  const { telegramDocument, channel } = await uploadTelegramDocumentWithChannel({
     env: params.env,
-    botToken,
-    chatId,
+    db: params.db,
     file: thumbnailFile,
     fileName: thumbnailFileName
   });
   const thumbnailSize = telegramDocument.file_size ?? thumbnailFile.size;
   const token = await createSignedToken(
     {
-      v: 1,
+      v: 3,
+      channel_id: channel.id,
       file_id: telegramDocument.file_id,
       name: thumbnailFileName,
       mime_type: mimeType,
@@ -2669,6 +3284,7 @@ async function uploadThumbnailToTelegram(params: {
   return {
     status: "ready",
     fileId: telegramDocument.file_id,
+    telegramChannelId: channel.id,
     ...(telegramDocument.file_unique_id ? { fileUniqueId: telegramDocument.file_unique_id } : {}),
     filePath,
     mimeType,
@@ -2758,9 +3374,8 @@ async function uploadAndRecordFile(params: {
   directoryId?: string | null;
   directoryPath?: string;
 }): Promise<UploadResult> {
-  const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
-  const chatId = requireEnv(params.env, "TELEGRAM_STORAGE_CHAT_ID");
   const signingSecret = requireEnv(params.env, "LINK_SIGNING_SECRET");
+  const id = crypto.randomUUID();
   const fileName = sanitizeFileName(params.file.name);
   const fileBytes = await params.file.arrayBuffer();
   const md5 = md5Hex(fileBytes);
@@ -2772,10 +3387,9 @@ async function uploadAndRecordFile(params: {
     ? params.file
     : new File([fileBytes], fileName, { type: uploadMimeType });
 
-  const telegramDocument = await uploadRateLimitedTelegramDocument({
+  const { telegramDocument, channel } = await uploadTelegramDocumentWithChannel({
     env: params.env,
-    botToken,
-    chatId,
+    ...(params.db ? { db: params.db } : {}),
     file: uploadFile,
     fileName
   });
@@ -2789,7 +3403,8 @@ async function uploadAndRecordFile(params: {
   const createdAt = new Date().toISOString();
   const token = await createSignedToken(
     {
-      v: 1,
+      v: 3,
+      channel_id: channel.id,
       file_id: telegramDocument.file_id,
       name: storedName,
       mime_type: mimeType,
@@ -2799,7 +3414,6 @@ async function uploadAndRecordFile(params: {
     signingSecret
   );
 
-  const id = crypto.randomUUID();
   const baseUrl = getPublicBaseUrl(params.request, params.env);
   const publicName = encodeURIComponent(storedName);
   const filePath = `/f/${token}/${publicName}`;
@@ -2818,6 +3432,7 @@ async function uploadAndRecordFile(params: {
       size: fileSize,
       md5,
       telegramFileId: telegramDocument.file_id,
+      telegramChannelId: channel.id,
       filePath,
       createdAt,
       directoryId: params.directoryId ?? null,
@@ -2837,6 +3452,7 @@ async function uploadAndRecordFile(params: {
     filePath,
     publicUrl,
     telegramFileId: telegramDocument.file_id,
+    telegramChannelId: channel.id,
     ...(telegramDocument.file_unique_id ? { telegramFileUniqueId: telegramDocument.file_unique_id } : {}),
     ...(params.remark ? { remark: params.remark } : {}),
     createdAt,
@@ -2868,7 +3484,8 @@ async function createFilePathForRecord(record: FileRecord, fileName: string, env
       )
     : await createSignedToken(
         {
-          v: 1,
+          v: 3,
+          channel_id: normalizeTelegramChannelId(record.telegram_channel_id),
           file_id: record.telegram_file_id,
           name: fileName,
           mime_type: record.mime_type,
@@ -2915,8 +3532,14 @@ async function handleFileAccess(request: Request, env: Env): Promise<Response> {
     });
   }
 
-  const botToken = requireEnv(env, "TELEGRAM_BOT_TOKEN");
-  const telegramFileUrl = await getRateLimitedTelegramFileUrl({ env, botToken, fileId: payload.file_id });
+  const db = env.FILES_DB;
+  const channel = await resolveTelegramChannel(env, db, payload.v === 3 ? payload.channel_id : "default");
+  const telegramFileUrl = await getRateLimitedTelegramFileUrl({
+    env,
+    botToken: channel.botToken,
+    channelId: channel.id,
+    fileId: payload.file_id
+  });
   const telegramResponse = await fetchTelegramFile({
     fileUrl: telegramFileUrl,
     rangeHeader
@@ -2966,10 +3589,11 @@ async function handleMultipartChunkAccess(params: {
     return rangeNotSatisfiableResponse(chunk.size);
   }
 
-  const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
+  const channel = await resolveTelegramChannel(params.env, db, chunk.telegram_channel_id);
   const telegramFileUrl = await getRateLimitedTelegramFileUrl({
     env: params.env,
-    botToken,
+    botToken: channel.botToken,
+    channelId: channel.id,
     fileId: chunk.telegram_file_id
   });
   const telegramResponse = await fetchTelegramFile({
@@ -3028,10 +3652,11 @@ async function handleMultipartChunkRecordAccess(params: {
     throw new AppError(404, "FileChunkNotFound", "Multipart file chunk was not found");
   }
 
-  const botToken = requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
+  const channel = await resolveTelegramChannel(params.env, db, chunk.telegram_channel_id);
   const telegramFileUrl = await getRateLimitedTelegramFileUrl({
     env: params.env,
-    botToken,
+    botToken: channel.botToken,
+    channelId: channel.id,
     fileId: chunk.telegram_file_id
   });
   const telegramResponse = await fetchTelegramFile({
@@ -3199,15 +3824,12 @@ function streamMultipartFile(params: {
       overlapEnd: number;
     } => Boolean(segment));
 
-  let botToken: string | undefined;
   let segmentIndex = 0;
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
-        botToken ??= requireEnv(params.env, "TELEGRAM_BOT_TOKEN");
-
         while (true) {
           if (reader) {
             const { done, value } = await reader.read();
@@ -3233,9 +3855,11 @@ function streamMultipartFile(params: {
           }
 
           const { chunk, chunkStart, chunkEnd, overlapStart, overlapEnd } = segment;
+          const channel = await resolveTelegramChannel(params.env, params.env.FILES_DB, chunk.telegram_channel_id);
           const telegramFileUrl = await getRateLimitedTelegramFileUrl({
             env: params.env,
-            botToken,
+            botToken: channel.botToken,
+            channelId: channel.id,
             fileId: chunk.telegram_file_id
           });
           const telegramResponse = await fetchTelegramFile({
@@ -3383,6 +4007,7 @@ function serializeFileRecord(file: FileRecord, baseUrl: string): Record<string, 
     download_url: url ? appendDownloadParam(url) : null,
     thumbnail_status: file.thumbnail_status ?? "none",
     thumbnail_url: thumbnailUrl,
+    telegram_channel_id: file.telegram_channel_id ?? "default",
     thumbnail_file_id: file.thumbnail_file_id ?? null,
     thumbnail_file_unique_id: file.thumbnail_file_unique_id ?? null,
     thumbnail_file_path: file.thumbnail_file_path ?? null,
@@ -3462,7 +4087,8 @@ function serializeChunk(record: Awaited<ReturnType<typeof uploadChunkToTelegram>
     chunk_index: record.chunkIndex,
     size: record.size,
     md5: record.md5,
-    telegram_file_id: record.telegramFileId
+    telegram_file_id: record.telegramFileId,
+    telegram_channel_id: record.telegramChannelId ?? "default"
   };
 }
 
@@ -3481,6 +4107,7 @@ function serializeUploadedFileResult(result: UploadResult, username: string | nu
     md5: result.md5,
     telegram_file_id: result.telegramFileId,
     telegram_file_unique_id: result.telegramFileUniqueId ?? null,
+    telegram_channel_id: result.telegramChannelId ?? "default",
     file_path: result.filePath,
     remark: result.remark ?? null,
     url,

@@ -20,6 +20,7 @@ export interface FileRecord {
   md5: string;
   telegram_file_id: string;
   telegram_file_unique_id: string | null;
+  telegram_channel_id?: string;
   file_path: string;
   remark: string | null;
   uploaded_by: string | null;
@@ -50,6 +51,7 @@ export interface NewFileRecord {
   md5: string;
   telegramFileId: string;
   telegramFileUniqueId?: string;
+  telegramChannelId?: string;
   filePath: string;
   remark?: string;
   uploadedBy?: string;
@@ -120,6 +122,7 @@ export interface MultipartUploadRecord {
   created_at: string;
   completed_at: string | null;
   directory_id?: string | null;
+  telegram_channel_group?: string;
   directory_path?: string;
 }
 
@@ -137,6 +140,7 @@ export interface NewMultipartUploadRecord {
   createdAt: string;
   directoryId?: string | null;
   directoryPath?: string;
+  telegramChannelGroup?: string;
 }
 
 export interface FileChunkRecord {
@@ -146,6 +150,7 @@ export interface FileChunkRecord {
   md5: string;
   telegram_file_id: string;
   telegram_file_unique_id: string | null;
+  telegram_channel_id?: string;
   created_at: string;
 }
 
@@ -156,7 +161,49 @@ export interface NewFileChunkRecord {
   md5: string;
   telegramFileId: string;
   telegramFileUniqueId?: string;
+  telegramChannelId?: string;
   createdAt: string;
+}
+
+export type TelegramChannelStatus = "active" | "disabled";
+
+export interface TelegramChannelRecord {
+  id: string;
+  name: string;
+  bot_token_encrypted: string;
+  bot_token_hash: string;
+  chat_id: string;
+  status: TelegramChannelStatus;
+  is_default: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NewTelegramChannelRecord {
+  id: string;
+  name: string;
+  botTokenEncrypted: string;
+  botTokenHash: string;
+  chatId: string;
+  status?: TelegramChannelStatus;
+  isDefault?: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface UpdateTelegramChannelRecord {
+  id: string;
+  name: string;
+  botTokenEncrypted: string;
+  botTokenHash: string;
+  chatId: string;
+  status: TelegramChannelStatus;
+  updatedAt: string;
+}
+
+export interface TelegramChannelUsage {
+  files: number;
+  chunks: number;
 }
 
 export interface MultipartCleanupResult {
@@ -187,6 +234,7 @@ function prepareInsertFileRecord(db: D1Database, record: NewFileRecord): D1Prepa
         md5,
         telegram_file_id,
         telegram_file_unique_id,
+        telegram_channel_id,
         file_path,
         remark,
         uploaded_by,
@@ -205,7 +253,7 @@ function prepareInsertFileRecord(db: D1Database, record: NewFileRecord): D1Prepa
         thumbnail_width,
         thumbnail_height,
         thumbnail_status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       record.id,
@@ -215,6 +263,7 @@ function prepareInsertFileRecord(db: D1Database, record: NewFileRecord): D1Prepa
       record.md5,
       record.telegramFileId,
       record.telegramFileUniqueId ?? null,
+      record.telegramChannelId ?? "default",
       record.filePath,
       record.remark ?? null,
       record.uploadedBy ?? null,
@@ -291,6 +340,7 @@ export async function listFileRecords(params: {
         md5,
         telegram_file_id,
         telegram_file_unique_id,
+        telegram_channel_id,
         file_path,
         remark,
         uploaded_by,
@@ -334,6 +384,7 @@ export async function getFileRecord(db: D1Database, id: string): Promise<FileRec
         md5,
         telegram_file_id,
         telegram_file_unique_id,
+        telegram_channel_id,
         file_path,
         remark,
         uploaded_by,
@@ -926,8 +977,9 @@ export async function insertMultipartUploadRecord(
         created_at,
         directory_id,
         directory_path,
+        telegram_channel_group,
         completed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
     )
     .bind(
       record.id,
@@ -942,7 +994,8 @@ export async function insertMultipartUploadRecord(
       record.uploadedBy ?? null,
       record.createdAt,
       record.directoryId ?? null,
-      record.directoryPath ?? "/"
+      record.directoryPath ?? "/",
+      record.telegramChannelGroup ?? "default"
     )
     .run();
 
@@ -960,6 +1013,7 @@ export async function insertMultipartUploadRecord(
     created_at: record.createdAt,
     directory_id: record.directoryId ?? null,
     directory_path: record.directoryPath ?? "/",
+    telegram_channel_group: record.telegramChannelGroup ?? "default",
     completed_at: null
   };
 }
@@ -981,6 +1035,7 @@ export async function getMultipartUploadRecord(db: D1Database, id: string): Prom
         created_at,
         directory_id,
         COALESCE(directory_path, '/') AS directory_path,
+        COALESCE(telegram_channel_group, 'default') AS telegram_channel_group,
         completed_at
       FROM multipart_uploads
       WHERE id = ? AND completed_at IS NULL`
@@ -1029,8 +1084,9 @@ export async function upsertFileChunkRecord(db: D1Database, record: NewFileChunk
         md5,
         telegram_file_id,
         telegram_file_unique_id,
+        telegram_channel_id,
         created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       record.fileId,
@@ -1039,6 +1095,7 @@ export async function upsertFileChunkRecord(db: D1Database, record: NewFileChunk
       record.md5,
       record.telegramFileId,
       record.telegramFileUniqueId ?? null,
+      record.telegramChannelId ?? "default",
       record.createdAt
     )
     .run();
@@ -1054,6 +1111,7 @@ export async function listFileChunkRecords(db: D1Database, fileId: string): Prom
         md5,
         telegram_file_id,
         telegram_file_unique_id,
+        COALESCE(telegram_channel_id, 'default') AS telegram_channel_id,
         created_at
       FROM file_chunks
       WHERE file_id = ?
@@ -1079,6 +1137,7 @@ export async function getFileChunkRecord(
         md5,
         telegram_file_id,
         telegram_file_unique_id,
+        COALESCE(telegram_channel_id, 'default') AS telegram_channel_id,
         created_at
       FROM file_chunks
       WHERE file_id = ? AND chunk_index = ?
@@ -1086,6 +1145,145 @@ export async function getFileChunkRecord(
     )
     .bind(fileId, chunkIndex)
     .first<FileChunkRecord>();
+}
+
+export async function listTelegramChannelRecords(db: D1Database): Promise<TelegramChannelRecord[]> {
+  const result = await db
+    .prepare(
+      `SELECT
+        id,
+        name,
+        bot_token_encrypted,
+        bot_token_hash,
+        chat_id,
+        status,
+        is_default,
+        created_at,
+        updated_at
+      FROM telegram_channels
+      ORDER BY is_default DESC, created_at ASC`
+    )
+    .all<TelegramChannelRecord>();
+
+  return result.results ?? [];
+}
+
+export async function listActiveTelegramChannelRecords(db: D1Database): Promise<TelegramChannelRecord[]> {
+  const result = await db
+    .prepare(
+      `SELECT
+        id,
+        name,
+        bot_token_encrypted,
+        bot_token_hash,
+        chat_id,
+        status,
+        is_default,
+        created_at,
+        updated_at
+      FROM telegram_channels
+      WHERE status = 'active'
+      ORDER BY is_default DESC, created_at ASC`
+    )
+    .all<TelegramChannelRecord>();
+
+  return result.results ?? [];
+}
+
+export async function getTelegramChannelRecord(db: D1Database, id: string): Promise<TelegramChannelRecord | null> {
+  return db
+    .prepare(
+      `SELECT
+        id,
+        name,
+        bot_token_encrypted,
+        bot_token_hash,
+        chat_id,
+        status,
+        is_default,
+        created_at,
+        updated_at
+      FROM telegram_channels
+      WHERE id = ?
+      LIMIT 1`
+    )
+    .bind(id)
+    .first<TelegramChannelRecord>();
+}
+
+export async function insertTelegramChannelRecord(db: D1Database, record: NewTelegramChannelRecord): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO telegram_channels (
+        id,
+        name,
+        bot_token_encrypted,
+        bot_token_hash,
+        chat_id,
+        status,
+        is_default,
+        created_at,
+        updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      record.id,
+      record.name,
+      record.botTokenEncrypted,
+      record.botTokenHash,
+      record.chatId,
+      record.status ?? "active",
+      record.isDefault ? 1 : 0,
+      record.createdAt,
+      record.updatedAt
+    )
+    .run();
+}
+
+export async function updateTelegramChannelRecord(db: D1Database, record: UpdateTelegramChannelRecord): Promise<TelegramChannelRecord | null> {
+  const result = await db
+    .prepare(
+      `UPDATE telegram_channels
+      SET name = ?, bot_token_encrypted = ?, bot_token_hash = ?, chat_id = ?, status = ?, updated_at = ?
+      WHERE id = ?`
+    )
+    .bind(
+      record.name,
+      record.botTokenEncrypted,
+      record.botTokenHash,
+      record.chatId,
+      record.status,
+      record.updatedAt,
+      record.id
+    )
+    .run();
+
+  if ((result.meta as { changes?: number }).changes === 0) {
+    return null;
+  }
+
+  return getTelegramChannelRecord(db, record.id);
+}
+
+export async function deleteTelegramChannelRecord(db: D1Database, id: string): Promise<boolean> {
+  const result = await db.prepare("DELETE FROM telegram_channels WHERE id = ? AND is_default = 0").bind(id).run();
+  return ((result.meta as { changes?: number }).changes ?? 0) > 0;
+}
+
+export async function getTelegramChannelUsage(db: D1Database, id: string): Promise<TelegramChannelUsage> {
+  const files = await db
+    .prepare("SELECT COUNT(*) AS total FROM files WHERE COALESCE(telegram_channel_id, 'default') = ?")
+    .bind(id)
+    .first<{ total: number }>();
+  const chunks = await db
+    .prepare("SELECT COUNT(*) AS total FROM file_chunks WHERE COALESCE(telegram_channel_id, 'default') = ?")
+    .bind(id)
+    .first<{ total: number }>();
+
+  return {
+    files: files?.total ?? 0,
+    chunks: chunks?.total ?? 0
+  };
 }
 
 export async function deleteStaleMultipartUploadData(

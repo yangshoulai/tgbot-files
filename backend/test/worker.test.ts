@@ -7,7 +7,8 @@ import type {
   DirectoryRecord,
   FileChunkRecord,
   FileRecord,
-  MultipartUploadRecord
+  MultipartUploadRecord,
+  TelegramChannelRecord
 } from "../src/database";
 
 const uploadApiKey = "upload-secret";
@@ -24,6 +25,7 @@ class FakeD1 {
   readonly directories: DirectoryRecord[] = [];
   readonly files: FileRecord[] = [];
   readonly apiKeys: ApiKeyRecord[] = [];
+  readonly telegramChannels: TelegramChannelRecord[] = [];
   readonly multipartUploads: MultipartUploadRecord[] = [];
   readonly fileChunks: FileChunkRecord[] = [];
   batchCalls = 0;
@@ -38,6 +40,7 @@ class FakeD1 {
       directories: this.directories.map((item) => ({ ...item })),
       files: this.files.map((item) => ({ ...item })),
       apiKeys: this.apiKeys.map((item) => ({ ...item })),
+      telegramChannels: this.telegramChannels.map((item) => ({ ...item })),
       multipartUploads: this.multipartUploads.map((item) => ({ ...item })),
       fileChunks: this.fileChunks.map((item) => ({ ...item }))
     };
@@ -52,6 +55,7 @@ class FakeD1 {
       this.directories.splice(0, this.directories.length, ...snapshots.directories);
       this.files.splice(0, this.files.length, ...snapshots.files);
       this.apiKeys.splice(0, this.apiKeys.length, ...snapshots.apiKeys);
+      this.telegramChannels.splice(0, this.telegramChannels.length, ...snapshots.telegramChannels);
       this.multipartUploads.splice(0, this.multipartUploads.length, ...snapshots.multipartUploads);
       this.fileChunks.splice(0, this.fileChunks.length, ...snapshots.fileChunks);
       throw error;
@@ -87,6 +91,7 @@ class FakeD1Statement {
         md5,
         telegramFileId,
         telegramFileUniqueId,
+        telegramChannelId,
         filePath,
         remark,
         uploadedBy,
@@ -103,6 +108,7 @@ class FakeD1Statement {
         md5: String(md5),
         telegram_file_id: String(telegramFileId),
         telegram_file_unique_id: telegramFileUniqueId === null ? null : String(telegramFileUniqueId),
+        telegram_channel_id: String(telegramChannelId || "default"),
         file_path: String(filePath),
         remark: remark === null ? null : String(remark),
         uploaded_by: uploadedBy === null ? null : String(uploadedBy),
@@ -110,17 +116,17 @@ class FakeD1Statement {
         deleted_at: null,
         directory_id: directoryId === null ? null : String(directoryId),
         directory_path: String(directoryPath || "/"),
-        storage_backend: this.bindings[13] === "telegram_multipart" ? "telegram_multipart" : "telegram_single",
-        chunk_size: this.bindings[14] === null ? null : Number(this.bindings[14]),
-        chunk_count: this.bindings[15] === null ? null : Number(this.bindings[15]),
-        thumbnail_file_id: this.bindings[16] === null ? null : String(this.bindings[16]),
-        thumbnail_file_unique_id: this.bindings[17] === null ? null : String(this.bindings[17]),
-        thumbnail_file_path: this.bindings[18] === null ? null : String(this.bindings[18]),
-        thumbnail_mime_type: this.bindings[19] === null ? null : String(this.bindings[19]),
-        thumbnail_size: this.bindings[20] === null ? null : Number(this.bindings[20]),
-        thumbnail_width: this.bindings[21] === null ? null : Number(this.bindings[21]),
-        thumbnail_height: this.bindings[22] === null ? null : Number(this.bindings[22]),
-        thumbnail_status: this.bindings[23] === "ready" || this.bindings[23] === "failed" ? this.bindings[23] : "none"
+        storage_backend: this.bindings[14] === "telegram_multipart" ? "telegram_multipart" : "telegram_single",
+        chunk_size: this.bindings[15] === null ? null : Number(this.bindings[15]),
+        chunk_count: this.bindings[16] === null ? null : Number(this.bindings[16]),
+        thumbnail_file_id: this.bindings[17] === null ? null : String(this.bindings[17]),
+        thumbnail_file_unique_id: this.bindings[18] === null ? null : String(this.bindings[18]),
+        thumbnail_file_path: this.bindings[19] === null ? null : String(this.bindings[19]),
+        thumbnail_mime_type: this.bindings[20] === null ? null : String(this.bindings[20]),
+        thumbnail_size: this.bindings[21] === null ? null : Number(this.bindings[21]),
+        thumbnail_width: this.bindings[22] === null ? null : Number(this.bindings[22]),
+        thumbnail_height: this.bindings[23] === null ? null : Number(this.bindings[23]),
+        thumbnail_status: this.bindings[24] === "ready" || this.bindings[24] === "failed" ? this.bindings[24] : "none"
       });
       changes = 1;
     }
@@ -154,6 +160,7 @@ class FakeD1Statement {
         created_at: String(createdAt),
         directory_id: this.bindings[11] === null ? null : String(this.bindings[11]),
         directory_path: String(this.bindings[12] || "/"),
+        telegram_channel_group: String(this.bindings[13] || "default"),
         completed_at: null
       });
       changes = 1;
@@ -174,7 +181,7 @@ class FakeD1Statement {
     }
 
     if (normalizedSql.startsWith("INSERT OR REPLACE INTO FILE_CHUNKS")) {
-      const [fileId, chunkIndex, size, md5, telegramFileId, telegramFileUniqueId, createdAt] = this.bindings;
+      const [fileId, chunkIndex, size, md5, telegramFileId, telegramFileUniqueId, telegramChannelId, createdAt] = this.bindings;
       const existingIndex = this.db.fileChunks.findIndex((item) =>
         item.file_id === fileId && item.chunk_index === chunkIndex
       );
@@ -185,6 +192,7 @@ class FakeD1Statement {
         md5: String(md5),
         telegram_file_id: String(telegramFileId),
         telegram_file_unique_id: telegramFileUniqueId === null ? null : String(telegramFileUniqueId),
+        telegram_channel_id: String(telegramChannelId || "default"),
         created_at: String(createdAt)
       };
 
@@ -194,6 +202,44 @@ class FakeD1Statement {
         this.db.fileChunks.push(chunk);
       }
       changes = 1;
+    }
+
+    if (normalizedSql.startsWith("INSERT INTO TELEGRAM_CHANNELS")) {
+      const [id, name, botTokenEncrypted, botTokenHash, chatId, status, isDefault, createdAt, updatedAt] = this.bindings;
+
+      this.db.telegramChannels.push({
+        id: String(id),
+        name: String(name),
+        bot_token_encrypted: String(botTokenEncrypted),
+        bot_token_hash: String(botTokenHash),
+        chat_id: String(chatId),
+        status: status === "disabled" ? "disabled" : "active",
+        is_default: Number(isDefault),
+        created_at: String(createdAt),
+        updated_at: String(updatedAt)
+      });
+      changes = 1;
+    }
+
+    if (normalizedSql.startsWith("UPDATE TELEGRAM_CHANNELS")) {
+      const [name, botTokenEncrypted, botTokenHash, chatId, status, updatedAt, id] = this.bindings;
+      const channel = this.db.telegramChannels.find((item) => item.id === id);
+      if (channel) {
+        channel.name = String(name);
+        channel.bot_token_encrypted = String(botTokenEncrypted);
+        channel.bot_token_hash = String(botTokenHash);
+        channel.chat_id = String(chatId);
+        channel.status = status === "disabled" ? "disabled" : "active";
+        channel.updated_at = String(updatedAt);
+        changes = 1;
+      }
+    }
+
+    if (normalizedSql.startsWith("DELETE FROM TELEGRAM_CHANNELS")) {
+      const id = String(this.bindings[0]);
+      const before = this.db.telegramChannels.length;
+      this.deleteWhere(this.db.telegramChannels, (channel) => channel.id === id && channel.is_default !== 1);
+      changes = before - this.db.telegramChannels.length;
     }
 
     if (normalizedSql.startsWith("INSERT INTO API_KEYS")) {
@@ -447,6 +493,20 @@ class FakeD1Statement {
         } as T;
       }
 
+      if (normalizedSql.includes("FROM FILE_CHUNKS") && normalizedSql.includes("TELEGRAM_CHANNEL_ID")) {
+        const channelId = this.bindings[0];
+        return {
+          total: this.db.fileChunks.filter((item) => (item.telegram_channel_id ?? "default") === channelId).length
+        } as T;
+      }
+
+      if (normalizedSql.includes("FROM FILES") && normalizedSql.includes("TELEGRAM_CHANNEL_ID")) {
+        const channelId = this.bindings[0];
+        return {
+          total: this.db.files.filter((item) => (item.telegram_channel_id ?? "default") === channelId).length
+        } as T;
+      }
+
       if (normalizedSql.includes("FROM DIRECTORIES")) {
         return { total: this.visibleDirectories().length } as T;
       }
@@ -502,6 +562,12 @@ class FakeD1Statement {
       return (directory ?? null) as T | null;
     }
 
+    if (normalizedSql.includes("FROM TELEGRAM_CHANNELS")) {
+      const id = this.bindings[0];
+      const channel = this.db.telegramChannels.find((item) => item.id === id);
+      return (channel ?? null) as T | null;
+    }
+
     if (normalizedSql.includes("FROM API_KEYS")) {
       const apiKey = this.matchingApiKey(normalizedSql);
       return (apiKey ?? null) as T | null;
@@ -512,6 +578,17 @@ class FakeD1Statement {
 
   async all<T = unknown>(): Promise<D1Result<T>> {
     const normalizedSql = this.sql.trim().toUpperCase();
+    if (normalizedSql.includes("FROM TELEGRAM_CHANNELS")) {
+      const results = normalizedSql.includes("WHERE STATUS = 'ACTIVE'")
+        ? this.db.telegramChannels.filter((item) => item.status === "active")
+        : this.db.telegramChannels;
+      return {
+        success: true,
+        meta: fakeD1Meta(),
+        results: results.slice().sort((left, right) => right.is_default - left.is_default || left.created_at.localeCompare(right.created_at)) as T[]
+      };
+    }
+
     if (normalizedSql.includes("FROM API_KEYS")) {
       return {
         success: true,
@@ -826,6 +903,7 @@ function fileRecord(overrides: Partial<FileRecord> = {}): FileRecord {
     md5: "md5-existing",
     telegram_file_id: "tg-existing",
     telegram_file_unique_id: null,
+    telegram_channel_id: "default",
     file_path: "/f/token/hello.txt",
     remark: null,
     uploaded_by: "admin",
@@ -3767,7 +3845,8 @@ describe("admin file manager", () => {
     expect(renameBody.file.url).toBe(`https://cdn.example.com${renameBody.file.file_path}`);
     expect(renameBody.file.download_url).toBe(`${renameBody.file.url}?download=1`);
     expect(payload).toMatchObject({
-      v: 1,
+      v: 3,
+      channel_id: "default",
       file_id: "tg-edit",
       name: "new name.txt",
       mime_type: "text/plain",
