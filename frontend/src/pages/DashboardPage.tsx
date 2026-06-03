@@ -687,10 +687,14 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         chunkIndex,
         signal: controller.signal,
         onProgress: (progress) => {
-          updateAcceleratedChunk(task.file.id, chunkIndex, (chunk) => ({
-            ...chunk,
-            downloadedBytes: progress.downloadedBytes
-          }));
+          updateAcceleratedChunk(task.file.id, chunkIndex, (chunk) =>
+            chunk.downloadedBytes === progress.downloadedBytes
+              ? chunk
+              : {
+                  ...chunk,
+                  downloadedBytes: progress.downloadedBytes
+                }
+          );
         }
       });
 
@@ -887,10 +891,20 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         return current;
       }
 
-      return {
-        ...current,
-        chunks: current.chunks.map((chunk) => (chunk.index === chunkIndex ? updater(chunk) : chunk))
-      };
+      let changed = false;
+      const chunks = current.chunks.map((chunk) => {
+        if (chunk.index !== chunkIndex) {
+          return chunk;
+        }
+
+        const nextChunk = updater(chunk);
+        if (nextChunk !== chunk) {
+          changed = true;
+        }
+        return nextChunk;
+      });
+
+      return changed ? { ...current, chunks } : current;
     });
   }
 
@@ -900,12 +914,14 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         return current;
       }
 
-      if (task.running.size > 0 || task.queue.length > 0) {
-        return { ...current, status: "downloading" };
-      }
+      const nextStatus = task.running.size > 0 || task.queue.length > 0
+        ? "downloading"
+        : task.failed.size > 0
+          ? "partial_failed"
+          : current.status;
 
-      if (task.failed.size > 0) {
-        return { ...current, status: "partial_failed" };
+      if (nextStatus !== current.status) {
+        return { ...current, status: nextStatus };
       }
 
       return current;

@@ -1,6 +1,7 @@
 import type { FileItem } from "../api";
 
 export const DEFAULT_ACCELERATED_DOWNLOAD_CONCURRENCY = 5;
+const PROGRESS_REPORT_MIN_INTERVAL_MS = 200;
 
 type WritableData = BufferSource | Blob | string;
 
@@ -109,6 +110,27 @@ export async function downloadMultipartChunk({
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let downloadedBytes = 0;
+  let lastReportedAt = Date.now();
+
+  function reportProgress(force = false) {
+    if (!onProgress) {
+      return;
+    }
+
+    const now = Date.now();
+    const elapsedSinceLastReport = now - lastReportedAt;
+
+    if (
+      !force &&
+      downloadedBytes !== expectedSize &&
+      elapsedSinceLastReport < PROGRESS_REPORT_MIN_INTERVAL_MS
+    ) {
+      return;
+    }
+
+    lastReportedAt = now;
+    onProgress({ chunkIndex, downloadedBytes, totalBytes: expectedSize });
+  }
 
   while (true) {
     const { done, value } = await reader.read();
@@ -122,9 +144,10 @@ export async function downloadMultipartChunk({
 
     chunks.push(value);
     downloadedBytes += value.byteLength;
-    onProgress?.({ chunkIndex, downloadedBytes, totalBytes: expectedSize });
+    reportProgress();
   }
 
+  reportProgress(true);
   validateChunkSize(downloadedBytes, expectedSize, chunkIndex);
   return concatChunks(chunks, downloadedBytes);
 }

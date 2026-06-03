@@ -1,3 +1,4 @@
+import { memo } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -142,7 +143,7 @@ export function AcceleratedDownloadDialog({
           <div className="max-h-[38vh] overflow-auto scroll-thin p-2">
             <div className="grid grid-cols-1 gap-2">
               {state.chunks.map((chunk) => (
-                <ChunkRow
+                <MemoizedChunkRow
                   key={chunk.index}
                   chunk={chunk}
                   totalChunks={state.chunks.length}
@@ -160,6 +161,11 @@ export function AcceleratedDownloadDialog({
     </Modal>
   );
 }
+
+const MemoizedChunkRow = memo(
+  ChunkRow,
+  (previous, next) => previous.chunk === next.chunk && previous.totalChunks === next.totalChunks
+);
 
 function ChunkRow({
   chunk,
