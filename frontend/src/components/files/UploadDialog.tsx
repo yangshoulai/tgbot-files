@@ -2098,6 +2098,7 @@ function ConflictResolutionActions({
         <button
           type="button"
           onClick={onRename}
+          onPointerDown={(event) => event.preventDefault()}
           title={`重命名为 ${conflict.suggestedName}`}
           disabled={disabled || !onRename}
           className="min-w-0 max-w-full rounded-md border border-warning/35 bg-surface px-2.5 py-1 font-medium text-warning transition-colors hover:bg-warning-soft disabled:pointer-events-none disabled:opacity-50"
@@ -2107,6 +2108,7 @@ function ConflictResolutionActions({
         <button
           type="button"
           onClick={onOverwrite}
+          onPointerDown={(event) => event.preventDefault()}
           title={`覆盖 ${conflict.fileName}`}
           disabled={disabled || !onOverwrite}
           className="rounded-md border border-danger/30 px-2.5 py-1 font-medium text-danger transition-colors hover:bg-danger-soft disabled:pointer-events-none disabled:opacity-50"
