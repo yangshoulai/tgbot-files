@@ -781,24 +781,26 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
   const url = new URL(request.url);
 
   if (request.method === "GET" && url.pathname === "/api/admin/files") {
+    const listAll = url.searchParams.get("all") === "1" || url.searchParams.get("limit") === "all";
     const page = parsePositiveInteger(url.searchParams.get("page"), 1, 1, 100000);
-    const limit = parsePositiveInteger(url.searchParams.get("limit"), 24, 1, 100);
+    const limit = parsePositiveInteger(url.searchParams.get("limit"), 24, 1, 100000);
     const type = normalizeFileTypeFilter(url.searchParams.get("type"));
     const createdFrom = normalizeDateTimeParam(url.searchParams.get("created_from"), "created_from");
     const createdTo = normalizeDateTimeParam(url.searchParams.get("created_to"), "created_to");
     const directoryPath = normalizeDirectoryPath(url.searchParams.get("dir") || "/");
     const currentDirectory = await requireReadableDirectory(db, directoryPath);
     const normalizedQuery = url.searchParams.get("q") || "";
-    const result = await listFileRecords({
+    const queryParams = {
       db,
       query: normalizedQuery,
       directoryPath,
       ...(type ? { type } : {}),
       ...(createdFrom ? { createdFrom } : {}),
-      ...(createdTo ? { createdTo } : {}),
-      page,
-      limit
-    });
+      ...(createdTo ? { createdTo } : {})
+    };
+    const result = listAll
+      ? await listFileRecords(queryParams)
+      : await listFileRecords({ ...queryParams, page, limit });
     const [directories, globalStats] = await Promise.all([
       listDirectoryChildren(db, directoryPath),
       getGlobalFileUsageStats(db)
@@ -814,10 +816,10 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
       search_scope: "current",
       files,
       pagination: {
-        page,
-        limit,
+        page: listAll ? 1 : page,
+        limit: listAll ? result.total : limit,
         total: result.total,
-        total_pages: Math.max(1, Math.ceil(result.total / limit))
+        total_pages: listAll ? 1 : Math.max(1, Math.ceil(result.total / limit))
       },
       global_stats: globalStats,
       max_file_bytes: parseMaxFileBytes(env.MAX_FILE_BYTES),
@@ -4661,6 +4663,7 @@ function normalizeFileTypeFilter(value: string | null): FileTypeFilter | undefin
 
   if (
     value === "image" ||
+    value === "video" ||
     value === "text" ||
     value === "pdf" ||
     value === "archive" ||

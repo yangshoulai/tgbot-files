@@ -644,13 +644,16 @@ class FakeD1Statement {
     }
 
     const files = this.visibleFiles();
-    const limit = Number(this.bindings.at(-2));
-    const offset = Number(this.bindings.at(-1));
+    const hasPagination = this.sql.toUpperCase().includes("LIMIT ? OFFSET ?");
+    const limit = hasPagination ? Number(this.bindings.at(-2)) : Number.NaN;
+    const offset = hasPagination ? Number(this.bindings.at(-1)) : 0;
 
     return {
       success: true,
       meta: fakeD1Meta(),
-      results: files.slice(offset || 0, Number.isFinite(limit) ? (offset || 0) + limit : undefined) as T[]
+      results: hasPagination
+        ? files.slice(offset || 0, Number.isFinite(limit) ? (offset || 0) + limit : undefined) as T[]
+        : files as T[]
     };
   }
 
@@ -712,16 +715,21 @@ class FakeD1Statement {
       const mime = file.mime_type.toLowerCase();
       const name = file.file_name.toLowerCase();
       const isImage = mime.startsWith("image/");
+      const isVideo = mime.startsWith("video/") || /\.(mp4|m4v|mov|webm|ogv)$/i.test(name);
       const isPdf = mime === "application/pdf" || name.endsWith(".pdf");
       const isArchive = /\.(zip|rar|7z|tar|gz)$/i.test(name);
       const isText = mime.startsWith("text/") || /\.(json|xml|ya?ml|md|markdown|log)$/i.test(name);
 
       if (normalizedSql.includes("NOT (LOWER(MIME_TYPE) LIKE 'IMAGE/%'")) {
-        return !(isImage || isText || isPdf || isArchive);
+        return !(isImage || isVideo || isText || isPdf || isArchive);
       }
 
       if (normalizedSql.includes("LOWER(MIME_TYPE) LIKE 'IMAGE/%'")) {
         return isImage;
+      }
+
+      if (normalizedSql.includes("LOWER(MIME_TYPE) LIKE 'VIDEO/%'")) {
+        return isVideo;
       }
 
       if (normalizedSql.includes("LOWER(MIME_TYPE) = 'APPLICATION/PDF'")) {
@@ -3783,6 +3791,20 @@ describe("admin file manager", () => {
         deleted_at: null
       },
       {
+        id: "file-video",
+        file_name: "clip.mp4",
+        mime_type: "video/mp4",
+        size: 50,
+        md5: "video-md5",
+        telegram_file_id: "tg-video",
+        telegram_file_unique_id: null,
+        file_path: "/f/token/clip.mp4",
+        remark: null,
+        uploaded_by: "admin",
+        created_at: "2026-05-29T02:00:00.000Z",
+        deleted_at: null
+      },
+      {
         id: "file-pdf",
         file_name: "report.pdf",
         mime_type: "application/pdf",
@@ -3832,6 +3854,37 @@ describe("admin file manager", () => {
     const imageBody = await imageResponse.json() as { files: Array<{ id: string }>; pagination: { total: number } };
     expect(imageBody.pagination.total).toBe(1);
     expect(imageBody.files[0]?.id).toBe("file-image");
+
+    const videoResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/files?type=video", {
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const videoBody = await videoResponse.json() as { files: Array<{ id: string }>; pagination: { total: number } };
+    expect(videoBody.pagination.total).toBe(1);
+    expect(videoBody.files[0]?.id).toBe("file-video");
+
+    const limitedResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/files?limit=2", {
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const limitedBody = await limitedResponse.json() as { files: Array<{ id: string }>; pagination: { total: number } };
+    expect(limitedBody.pagination.total).toBe(5);
+    expect(limitedBody.files).toHaveLength(2);
+
+    const allResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/files?all=1&limit=2", {
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const allBody = await allResponse.json() as { files: Array<{ id: string }>; pagination: { total: number; total_pages: number } };
+    expect(allBody.pagination.total).toBe(5);
+    expect(allBody.pagination.total_pages).toBe(1);
+    expect(allBody.files).toHaveLength(5);
 
     const dateResponse = await worker.fetch(
       new Request("https://files.example.com/api/admin/files?created_from=2026-05-28T00%3A00%3A00.000Z&type=text", {

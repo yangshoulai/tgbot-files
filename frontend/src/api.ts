@@ -368,19 +368,30 @@ export function logout() {
 
 export function listFiles(params: {
   q: string;
-  page: number;
-  limit: number;
+  page?: number;
+  limit?: number | "all";
   dir?: string;
-  type?: "all" | "image" | "text" | "pdf" | "archive" | "other";
+  all?: boolean;
+  type?: "all" | "image" | "video" | "text" | "pdf" | "archive" | "other";
   created_from?: string;
   created_to?: string;
 }) {
   const search = new URLSearchParams({
     q: params.q,
-    page: String(params.page),
-    limit: String(params.limit),
     dir: params.dir || "/"
   });
+
+  if (params.page !== undefined) {
+    search.set("page", String(params.page));
+  }
+
+  if (params.limit !== undefined) {
+    search.set("limit", String(params.limit));
+  }
+
+  if (params.all) {
+    search.set("all", "1");
+  }
 
   if (params.type && params.type !== "all") {
     search.set("type", params.type);

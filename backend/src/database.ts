@@ -86,7 +86,7 @@ export interface FileNameConflictRecord {
   source: "file";
 }
 
-export type FileTypeFilter = "image" | "text" | "pdf" | "archive" | "other";
+export type FileTypeFilter = "image" | "video" | "text" | "pdf" | "archive" | "other";
 
 export type ApiKeyStatus = "active" | "disabled";
 
@@ -291,8 +291,8 @@ export async function listFileRecords(params: {
   createdFrom?: string;
   createdTo?: string;
   directoryPath?: string;
-  page: number;
-  limit: number;
+  page?: number;
+  limit?: number;
 }): Promise<FileListResult> {
   const whereParts = ["deleted_at IS NULL"];
   const bindings: Array<number | string> = [];
@@ -329,7 +329,10 @@ export async function listFileRecords(params: {
     .prepare(`SELECT COUNT(*) AS total FROM files WHERE ${whereClause}`)
     .bind(...bindings)
     .first<{ total: number }>();
-  const offset = (params.page - 1) * params.limit;
+  const paginationClause = params.limit ? "LIMIT ? OFFSET ?" : "";
+  const paginationBindings = params.limit
+    ? [params.limit, ((params.page ?? 1) - 1) * params.limit]
+    : [];
   const result = await params.db
     .prepare(
       `SELECT
@@ -362,9 +365,9 @@ export async function listFileRecords(params: {
       FROM files
       WHERE ${whereClause}
       ORDER BY created_at DESC
-      LIMIT ? OFFSET ?`
+      ${paginationClause}`
     )
-    .bind(...bindings, params.limit, offset)
+    .bind(...bindings, ...paginationBindings)
     .all<FileRecord>();
 
   return {
@@ -1509,6 +1512,14 @@ function parentPathForDirectory(path: string): string {
 
 function fileTypeWhereClause(type: FileTypeFilter): string {
   const image = "LOWER(mime_type) LIKE 'image/%'";
+  const video = [
+    "LOWER(mime_type) LIKE 'video/%'",
+    "LOWER(file_name) LIKE '%.mp4'",
+    "LOWER(file_name) LIKE '%.m4v'",
+    "LOWER(file_name) LIKE '%.mov'",
+    "LOWER(file_name) LIKE '%.webm'",
+    "LOWER(file_name) LIKE '%.ogv'"
+  ].join(" OR ");
   const text = [
     "LOWER(mime_type) LIKE 'text/%'",
     "LOWER(mime_type) IN ('application/json', 'application/xml', 'application/yaml', 'application/x-yaml')",
@@ -1533,6 +1544,8 @@ function fileTypeWhereClause(type: FileTypeFilter): string {
   switch (type) {
     case "image":
       return `(${image})`;
+    case "video":
+      return `(${video})`;
     case "text":
       return `(${text})`;
     case "pdf":
@@ -1540,6 +1553,6 @@ function fileTypeWhereClause(type: FileTypeFilter): string {
     case "archive":
       return `(${archive})`;
     case "other":
-      return `NOT (${image} OR ${text} OR ${pdf} OR ${archive})`;
+      return `NOT (${image} OR ${video} OR ${text} OR ${pdf} OR ${archive})`;
   }
 }

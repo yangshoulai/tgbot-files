@@ -1,11 +1,28 @@
-import { Copy, Download, Eye, Folder, FolderInput, FolderOpen, Info, Pencil, Trash2, Zap } from "lucide-react";
+import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
+  Copy,
+  Download,
+  Eye,
+  Folder,
+  FolderInput,
+  FolderOpen,
+  Info,
+  Pencil,
+  Trash2,
+  Zap
+} from "lucide-react";
 import type { DirectoryItem, FileItem } from "../../api";
 import { canUseAcceleratedDownload } from "../../lib/accelerated-download";
-import { canPreviewThroughAvailableAccess, fileAccessLabel, hasDirectFileAccess } from "../../lib/file-access";
-import { formatBytes, formatDateTime } from "../../utils";
+import { canPreviewThroughAvailableAccess, hasDirectFileAccess } from "../../lib/file-access";
+import { fileKind, formatBytes, formatDateTime } from "../../utils";
 import { FileVisual } from "../ui/FileVisual";
 import { IconButton } from "../ui/IconButton";
 import { EmptyState } from "../ui/EmptyState";
+
+type FileSortKey = "name" | "size" | "created_at" | "type";
+type SortDirection = "asc" | "desc";
 
 interface FileTableProps {
   directories: DirectoryItem[];
@@ -13,6 +30,9 @@ interface FileTableProps {
   selectedFileIds: Set<string>;
   selectedDirectoryIds: Set<string>;
   allPageSelected: boolean;
+  sortKey: FileSortKey;
+  sortDirection: SortDirection;
+  onSort: (key: FileSortKey) => void;
   onOpenDirectory: (directory: DirectoryItem) => void;
   onRenameDirectory: (directory: DirectoryItem) => void;
   onMoveDirectory: (directory: DirectoryItem) => void;
@@ -36,12 +56,49 @@ function isInteractiveTarget(target: EventTarget | null): boolean {
   return target instanceof Element && Boolean(target.closest("button, a, input, select, textarea, [role='button']"));
 }
 
+function SortHeader({
+  label,
+  sortId,
+  activeSort,
+  direction,
+  onSort,
+  className
+}: {
+  label: string;
+  sortId: FileSortKey;
+  activeSort: FileSortKey;
+  direction: SortDirection;
+  onSort: (key: FileSortKey) => void;
+  className?: string;
+}) {
+  const active = activeSort === sortId;
+  const Icon = active ? (direction === "asc" ? ArrowUp : ArrowDown) : ArrowUpDown;
+  const nextDirection = active && direction === "asc" ? "降序" : "升序";
+
+  return (
+    <th className={className}>
+      <button
+        type="button"
+        aria-label={`按${label}${nextDirection}排序`}
+        onClick={() => onSort(sortId)}
+        className="inline-flex items-center gap-1.5 rounded-md text-left font-medium text-muted transition-colors hover:text-foreground focus-visible:outline-none focus-visible:focus-ring"
+      >
+        <span>{label}</span>
+        <Icon size={14} className={active ? "text-primary" : "text-subtle"} />
+      </button>
+    </th>
+  );
+}
+
 export function FileTable({
   directories,
   files,
   selectedFileIds,
   selectedDirectoryIds,
   allPageSelected,
+  sortKey,
+  sortDirection,
+  onSort,
   onOpenDirectory,
   onRenameDirectory,
   onMoveDirectory,
@@ -79,9 +136,30 @@ export function FileTable({
                   />
                 </div>
               </th>
-              <th className="px-4 py-3 text-left font-medium text-muted">文件</th>
-              <th className="hidden px-4 py-3 text-left font-medium text-muted lg:table-cell">大小</th>
-              <th className="hidden px-4 py-3 text-left font-medium text-muted md:table-cell">上传时间</th>
+              <SortHeader
+                label="文件"
+                sortId="name"
+                activeSort={sortKey}
+                direction={sortDirection}
+                onSort={onSort}
+                className="px-4 py-3 text-left font-medium text-muted"
+              />
+              <SortHeader
+                label="大小"
+                sortId="size"
+                activeSort={sortKey}
+                direction={sortDirection}
+                onSort={onSort}
+                className="hidden px-4 py-3 text-left font-medium text-muted lg:table-cell"
+              />
+              <SortHeader
+                label="上传时间"
+                sortId="created_at"
+                activeSort={sortKey}
+                direction={sortDirection}
+                onSort={onSort}
+                className="hidden px-4 py-3 text-left font-medium text-muted md:table-cell"
+              />
               <th className="px-4 py-3 text-right font-medium text-muted">操作</th>
             </tr>
           </thead>
@@ -174,6 +252,8 @@ export function FileTable({
             {files.map((file) => {
               const directFile = hasDirectFileAccess(file) ? file : null;
               const canPreviewFile = canPreviewThroughAvailableAccess(file);
+              const kind = fileKind(file);
+              const mimeLabel = file.mime_type || "未知 MIME";
 
               return (
               <tr
@@ -203,10 +283,10 @@ export function FileTable({
                         {file.file_name}
                       </span>
                       <span className="truncate text-xs text-muted lg:hidden">
-                        {formatBytes(file.size)} · {fileAccessLabel(file)}
+                        {kind.label} · {mimeLabel} · {formatBytes(file.size)}
                       </span>
                       <span className="hidden truncate text-xs text-muted lg:inline">
-                        {file.mime_type} · {fileAccessLabel(file)}
+                        {kind.label} · {mimeLabel}
                       </span>
                     </div>
                   </div>

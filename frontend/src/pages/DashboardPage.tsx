@@ -1,10 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, ChevronRight, FolderInput, FolderPlus, Pencil, RefreshCw, Search, Trash2 } from "lucide-react";
+import { ArrowUp, ArrowUpDown, ChevronRight, FolderInput, FolderPlus, Pencil, RefreshCw, Search, Trash2 } from "lucide-react";
 import {
   ApiError,
   DirectoryItem,
   FileItem,
-  Pagination as PaginationType,
   SessionResponse,
   createDirectory,
   deleteEntries,
@@ -17,7 +16,7 @@ import {
   renameDirectory,
   updateFileMetadata
 } from "../api";
-import { dateInputToIso, formatBytes, sumFileSize } from "../utils";
+import { fileKind, formatBytes, sumFileSize } from "../utils";
 import { useToast } from "../lib/toast";
 import { useConfirm } from "../lib/confirm";
 import { Input } from "../components/ui/Input";
@@ -28,7 +27,6 @@ import { Textarea } from "../components/ui/Textarea";
 import { Spinner } from "../components/ui/Spinner";
 import { MetricsRow, Metric } from "../components/files/MetricsRow";
 import { FileTable } from "../components/files/FileTable";
-import { Pagination } from "../components/files/Pagination";
 import { PreviewDialog } from "../components/files/PreviewDialog";
 import { FileDetailDialog } from "../components/files/FileDetailDialog";
 import { DirectoryTreeSelect } from "../components/files/DirectoryTreeSelect";
@@ -52,7 +50,9 @@ import {
 } from "../lib/accelerated-download";
 import { hasDirectFileAccess } from "../lib/file-access";
 
-type FileTypeFilter = "all" | "image" | "text" | "pdf" | "archive" | "other";
+type FileTypeFilter = "all" | "image" | "video" | "text" | "pdf" | "archive" | "other";
+type FileSortKey = "name" | "size" | "created_at" | "type";
+type SortDirection = "asc" | "desc";
 
 interface DashboardPageProps {
   session: SessionResponse;
@@ -66,16 +66,24 @@ function errorMessage(error: unknown): string {
   return "请求失败";
 }
 
-const INITIAL_LIMIT = 20;
-const INITIAL_PAGINATION: PaginationType = { page: 1, limit: INITIAL_LIMIT, total: 0, total_pages: 1 };
 const FILE_TYPE_OPTIONS: Array<{ value: FileTypeFilter; label: string }> = [
   { value: "all", label: "全部类型" },
   { value: "image", label: "图片" },
+  { value: "video", label: "视频" },
   { value: "text", label: "文本" },
   { value: "pdf", label: "PDF" },
   { value: "archive", label: "压缩包" },
   { value: "other", label: "其他" }
 ];
+
+const FILE_SORT_OPTIONS: Array<{ value: FileSortKey; label: string }> = [
+  { value: "created_at", label: "上传时间" },
+  { value: "name", label: "文件名" },
+  { value: "size", label: "文件大小" },
+  { value: "type", label: "文件类型" }
+];
+
+const collator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
 
 interface AcceleratedDownloadTask {
   file: MultipartDownloadFile;
@@ -112,6 +120,25 @@ function directoryBreadcrumbs(path: string): Array<{ label: string; path: string
   return breadcrumbs;
 }
 
+function compareFileItems(left: FileItem, right: FileItem, sortKey: FileSortKey, direction: SortDirection): number {
+  const modifier = direction === "asc" ? 1 : -1;
+
+  switch (sortKey) {
+    case "name":
+      return modifier * collator.compare(left.file_name, right.file_name);
+    case "size":
+      return modifier * ((left.size || 0) - (right.size || 0));
+    case "type": {
+      const leftType = `${fileKind(left).label} ${left.mime_type || ""}`;
+      const rightType = `${fileKind(right).label} ${right.mime_type || ""}`;
+      return modifier * collator.compare(leftType, rightType);
+    }
+    case "created_at":
+    default:
+      return modifier * (Date.parse(left.created_at) - Date.parse(right.created_at));
+  }
+}
+
 function FileListBusyOverlay({ label }: { label: string }) {
   return (
     <div className="absolute inset-0 z-10 grid place-items-center rounded-2xl bg-surface/75 px-4 backdrop-blur-[2px] animate-fade-in">
@@ -142,12 +169,10 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   const [directoryOptions, setDirectoryOptions] = useState<DirectoryItem[]>([]);
   const [globalStats, setGlobalStats] = useState({ file_count: 0, total_size: 0 });
   const [currentDirPath, setCurrentDirPath] = useState("/");
-  const [pagination, setPagination] = useState<PaginationType>(INITIAL_PAGINATION);
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState<FileTypeFilter>("all");
-  const [uploadedFrom, setUploadedFrom] = useState("");
-  const [uploadedTo, setUploadedTo] = useState("");
-  const [limit, setLimit] = useState(INITIAL_LIMIT);
+  const [sortKey, setSortKey] = useState<FileSortKey>("created_at");
+  const [sortDirection, setSortDirection] = useState<SortDirection>("desc");
   const [loading, setLoading] = useState(false);
   const [operationLabel, setOperationLabel] = useState<string | null>(null);
   const [previewFile, setPreviewFile] = useState<FileItem | null>(null);
@@ -181,21 +206,17 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   const isListBusy = Boolean(listBusyLabel);
 
   const loadFiles = useCallback(
-    async (nextPage: number) => {
+    async () => {
       setLoading(true);
       try {
         const response = await listFiles({
           q: query,
-          page: nextPage,
-          limit,
           dir: currentDirPath,
           type: typeFilter,
-          created_from: dateInputToIso(uploadedFrom, "start"),
-          created_to: dateInputToIso(uploadedTo, "end")
+          all: true
         });
         setDirectories(response.directories);
         setFiles(response.files);
-        setPagination(response.pagination);
         setGlobalStats(response.global_stats);
       } catch (error) {
         toast.danger(errorMessage(error));
@@ -203,7 +224,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         setLoading(false);
       }
     },
-    [currentDirPath, limit, query, toast, typeFilter, uploadedFrom, uploadedTo]
+    [currentDirPath, query, toast, typeFilter]
   );
 
   const loadDirectoryOptions = useCallback(async () => {
@@ -216,7 +237,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   }, [toast]);
 
   useEffect(() => {
-    void loadFiles(1);
+    void loadFiles();
   }, [loadFiles]);
 
   useEffect(() => {
@@ -229,7 +250,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
 
   useEffect(() => {
     if (uploadVersion > 0) {
-      void loadFiles(1);
+      void loadFiles();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [uploadVersion]);
@@ -257,11 +278,11 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     return [
       {
         label: "目录文件",
-        value: String(pagination.total),
-        hint: `${currentDirPath} · ${pagination.page} / ${pagination.total_pages} 页`
+        value: String(files.length),
+        hint: `${currentDirPath} · 已加载全部文件`
       },
       {
-        label: "当前页占用",
+        label: "当前目录占用",
         value: formatBytes(recursiveTotalSize),
         hint: `${directories.length} 个子目录 · ${recursiveFileCount} 个文件（含子目录）`
       },
@@ -277,7 +298,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         hint: "Telegram Bot API"
       }
     ];
-  }, [currentDirPath, directories.length, files, globalStats, pagination.page, pagination.total, pagination.total_pages, session.config]);
+  }, [currentDirPath, directories.length, files, globalStats, session.config]);
 
   async function onDelete(file: FileItem) {
     const ok = await confirm({
@@ -304,8 +325,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         next.delete(file.id);
         return next;
       });
-      const targetPage = files.length === 1 && pagination.page > 1 ? pagination.page - 1 : pagination.page;
-      await loadFiles(targetPage);
+      await loadFiles();
     } catch (error) {
       toast.danger(errorMessage(error));
     } finally {
@@ -343,9 +363,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       if (detailFile && targetFiles.some((file) => file.id === detailFile.id)) setDetailFile(null);
       setSelectedFileIds(new Set());
       setSelectedDirectoryIds(new Set());
-      const allVisibleSelected = targetFiles.length === files.length && targetDirectories.length === directories.length;
-      const targetPage = allVisibleSelected && pagination.page > 1 ? pagination.page - 1 : pagination.page;
-      await loadFiles(targetPage);
+      await loadFiles();
     } catch (error) {
       toast.danger(errorMessage(error));
     } finally {
@@ -367,7 +385,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       setCreateDirOpen(false);
       setNewDirName("");
       setCreateDirParentPath("/");
-      await Promise.all([loadFiles(pagination.page), loadDirectoryOptions()]);
+      await Promise.all([loadFiles(), loadDirectoryOptions()]);
     } catch (error) {
       toast.danger(errorMessage(error));
     } finally {
@@ -398,7 +416,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         next.delete(directory.id);
         return next;
       });
-      await Promise.all([loadFiles(pagination.page), loadDirectoryOptions()]);
+      await Promise.all([loadFiles(), loadDirectoryOptions()]);
     } catch (error) {
       toast.danger(errorMessage(error));
     } finally {
@@ -425,7 +443,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       const result = await renameDirectory(renamingDirectory.id, name);
       toast.success(`已重命名 ${result.renamed_directories} 个目录、更新 ${result.updated_files} 个文件索引`);
       setRenamingDirectory(null);
-      await Promise.all([loadFiles(pagination.page), loadDirectoryOptions()]);
+      await Promise.all([loadFiles(), loadDirectoryOptions()]);
     } catch (error) {
       toast.danger(errorMessage(error));
     } finally {
@@ -459,7 +477,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         next.delete(result.directory.id);
         return next;
       });
-      await Promise.all([loadFiles(pagination.page), loadDirectoryOptions()]);
+      await Promise.all([loadFiles(), loadDirectoryOptions()]);
     } catch (error) {
       toast.danger(errorMessage(error));
     } finally {
@@ -509,7 +527,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       if (detailFile?.id === updated.id) setDetailFile(updated);
       setEditingFile(null);
       toast.success(updated.file_path !== editingFile.file_path ? "文件信息已保存，链接已更新" : "文件信息已保存");
-      await loadFiles(pagination.page);
+      await loadFiles();
     } catch (error) {
       toast.danger(errorMessage(error));
     } finally {
@@ -549,7 +567,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       setMoveDirectoryIds([]);
       setSelectedFileIds(new Set());
       setSelectedDirectoryIds(new Set());
-      await Promise.all([loadFiles(pagination.page), loadDirectoryOptions()]);
+      await Promise.all([loadFiles(), loadDirectoryOptions()]);
     } catch (error) {
       toast.danger(errorMessage(error));
     } finally {
@@ -962,10 +980,34 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     });
   }
 
+  const sortedFiles = useMemo(
+    () => [...files].sort((left, right) => compareFileItems(left, right, sortKey, sortDirection)),
+    [files, sortDirection, sortKey]
+  );
+
+  function changeSort(nextKey: FileSortKey) {
+    if (nextKey === sortKey) {
+      setSortDirection((current) => (current === "asc" ? "desc" : "asc"));
+      return;
+    }
+
+    setSortKey(nextKey);
+    setSortDirection(nextKey === "created_at" ? "desc" : "asc");
+  }
+
+  function selectSortKey(nextKey: FileSortKey) {
+    if (nextKey === sortKey) {
+      return;
+    }
+
+    setSortKey(nextKey);
+    setSortDirection(nextKey === "created_at" ? "desc" : "asc");
+  }
+
   function togglePage(selected: boolean) {
     setSelectedFileIds((current) => {
       const next = new Set(current);
-      for (const file of files) {
+      for (const file of sortedFiles) {
         if (selected) next.add(file.id);
         else next.delete(file.id);
       }
@@ -981,12 +1023,12 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     });
   }
 
-  const visibleEntryCount = files.length + directories.length;
+  const visibleEntryCount = sortedFiles.length + directories.length;
   const selectedFileCount = files.filter((file) => selectedFileIds.has(file.id)).length;
   const selectedDirectoryCount = directories.filter((directory) => selectedDirectoryIds.has(directory.id)).length;
   const selectedCount = selectedFileCount + selectedDirectoryCount;
   const allPageSelected = visibleEntryCount > 0 &&
-    files.every((file) => selectedFileIds.has(file.id)) &&
+    sortedFiles.every((file) => selectedFileIds.has(file.id)) &&
     directories.every((directory) => selectedDirectoryIds.has(directory.id));
   const directoryMoveTargets = useMemo(() => {
     if (!movingDirectory) {
@@ -1067,7 +1109,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
           ) : null}
         </div>
 
-        <div className="grid grid-cols-1 gap-2 xl:grid-cols-[minmax(240px,1fr)_220px_145px_145px_145px_auto] xl:items-center">
+        <div className="grid grid-cols-1 gap-2 xl:grid-cols-[minmax(240px,1fr)_220px_145px_145px_110px_auto] xl:items-center">
           <Input
             placeholder="搜索文件名、备注"
             leadingIcon={<Search size={15} />}
@@ -1093,24 +1135,34 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
               </option>
             ))}
           </select>
-          <Input
-            type="date"
-            aria-label="上传开始时间"
-            value={uploadedFrom}
-            onChange={(event) => setUploadedFrom(event.target.value)}
-          />
-          <Input
-            type="date"
-            aria-label="上传结束时间"
-            value={uploadedTo}
-            onChange={(event) => setUploadedTo(event.target.value)}
-          />
+          <select
+            aria-label="排序字段"
+            value={sortKey}
+            onChange={(event) => selectSortKey(event.target.value as FileSortKey)}
+            className="h-11 rounded-lg border border-border bg-surface px-3 text-sm text-foreground shadow-card outline-none transition-colors hover:border-border-strong focus:border-primary focus:shadow-[0_0_0_4px_var(--color-primary-ring)]"
+          >
+            {FILE_SORT_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+          <Button
+            variant="secondary"
+            className="h-11"
+            leadingIcon={<ArrowUpDown size={15} />}
+            disabled={isListBusy}
+            onClick={() => setSortDirection((current) => (current === "asc" ? "desc" : "asc"))}
+            aria-label={`切换为${sortDirection === "asc" ? "降序" : "升序"}`}
+          >
+            {sortDirection === "asc" ? "升序" : "降序"}
+          </Button>
           <div className="flex items-center justify-end">
             <IconButton
               variant="default"
               label="刷新"
               disabled={isListBusy}
-              onClick={() => void loadFiles(pagination.page)}
+              onClick={() => void loadFiles()}
             >
               {isListBusy ? <Spinner size={16} /> : <RefreshCw size={16} />}
             </IconButton>
@@ -1160,10 +1212,13 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
           >
             <FileTable
               directories={directories}
-              files={files}
+              files={sortedFiles}
               selectedFileIds={selectedFileIds}
               selectedDirectoryIds={selectedDirectoryIds}
               allPageSelected={allPageSelected}
+              sortKey={sortKey}
+              sortDirection={sortDirection}
+              onSort={changeSort}
               onOpenDirectory={(directory) => goToDirectory(directory.path)}
               onRenameDirectory={openRenameDirectoryDialog}
               onMoveDirectory={openMoveDirectoryDialog}
@@ -1178,12 +1233,6 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
               onCopy={onCopy}
               onAcceleratedDownload={(file) => void onAcceleratedDownload(file)}
               onDelete={onDelete}
-            />
-
-            <Pagination
-              pagination={pagination}
-              onPage={(page) => void loadFiles(page)}
-              onLimitChange={(nextLimit) => setLimit(nextLimit)}
             />
           </div>
           {listBusyLabel ? <FileListBusyOverlay label={listBusyLabel} /> : null}
