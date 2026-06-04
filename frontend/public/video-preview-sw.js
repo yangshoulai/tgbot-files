@@ -6,7 +6,10 @@ const MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024;
 const TARGET_CACHE_BYTES = Math.floor(1.8 * 1024 * 1024 * 1024);
 const RESPONSE_WINDOW_BYTES = 2 * 1024 * 1024;
 const PREFETCH_CHUNKS = 3;
+const CONTINUOUS_PREFETCH_RATIOS = [0, 0.25, 0.5, 0.75];
+const CONTINUOUS_PREFETCH_SESSION_TTL_MS = 12_000;
 const fullChunkLoads = new Map();
+const continuousPrefetchSessions = new Map();
 
 self.addEventListener("install", (event) => {
   event.waitUntil(self.skipWaiting());
@@ -24,6 +27,23 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("message", (event) => {
   if (event.data?.type === "SKIP_WAITING") {
     event.waitUntil(self.skipWaiting());
+    return;
+  }
+
+  if (event.data?.type === "VIDEO_PREVIEW_CACHE_START") {
+    const metadata = normalizePreviewMetadata(event.data.metadata);
+    const sessionId = normalizeSessionId(event.data.sessionId);
+    if (metadata && sessionId) {
+      event.waitUntil(startContinuousPreviewCache(sessionId, metadata));
+    }
+    return;
+  }
+
+  if (event.data?.type === "VIDEO_PREVIEW_CACHE_STOP") {
+    const sessionId = normalizeSessionId(event.data.sessionId);
+    if (sessionId) {
+      stopContinuousPreviewCache(sessionId);
+    }
   }
 });
 
@@ -108,6 +128,56 @@ function parsePreviewMetadata(url) {
     chunkCount,
     mimeType
   };
+}
+
+function normalizePreviewMetadata(value) {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+
+  const fileId = typeof value.fileId === "string" ? value.fileId : "";
+  const token = typeof value.token === "string" ? value.token : "";
+  const size = Number(value.size);
+  const chunkSize = Number(value.chunkSize);
+  const chunkCount = Number(value.chunkCount);
+  const mimeType = typeof value.mimeType === "string" && value.mimeType ? value.mimeType : "application/octet-stream";
+
+  if (
+    !fileId ||
+    !token ||
+    !Number.isSafeInteger(size) ||
+    size <= 0 ||
+    !Number.isSafeInteger(chunkSize) ||
+    chunkSize <= 0 ||
+    !Number.isSafeInteger(chunkCount) ||
+    chunkCount <= 0
+  ) {
+    return null;
+  }
+
+  return {
+    fileId,
+    token,
+    size,
+    chunkSize,
+    chunkCount,
+    mimeType
+  };
+}
+
+function normalizeSessionId(value) {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function previewMetadataKey(metadata) {
+  return [
+    metadata.fileId,
+    metadata.token,
+    metadata.size,
+    metadata.chunkSize,
+    metadata.chunkCount,
+    metadata.mimeType
+  ].join(":");
 }
 
 function parseRange(rangeHeader, size) {
@@ -401,6 +471,107 @@ async function prefetchChunks(metadata, startIndex, count) {
       return;
     }
   }
+}
+
+function startContinuousPreviewCache(sessionId, metadata) {
+  const metadataKey = previewMetadataKey(metadata);
+  const existing = continuousPrefetchSessions.get(sessionId);
+
+  if (existing && existing.metadataKey === metadataKey) {
+    existing.lastHeartbeat = Date.now();
+    existing.active = true;
+    if (existing.completed) {
+      scheduleContinuousPrefetchExpiry(existing);
+      return Promise.resolve();
+    }
+    return existing.task || Promise.resolve();
+  }
+
+  if (existing) {
+    existing.active = false;
+  }
+
+  const session = {
+    sessionId,
+    metadata,
+    metadataKey,
+    active: true,
+    completed: false,
+    lastHeartbeat: Date.now(),
+    lanes: createContinuousPrefetchLanes(metadata.chunkCount),
+    task: null
+  };
+  continuousPrefetchSessions.set(sessionId, session);
+
+  session.task = Promise
+    .allSettled(session.lanes.map((lane) => runContinuousPrefetchLane(session, lane)))
+    .then(() => {
+      if (continuousPrefetchSessions.get(sessionId) === session) {
+        const completed = session.lanes.every((lane) => lane.cursor >= lane.endExclusive);
+        if (session.active && completed) {
+          session.completed = true;
+          session.task = null;
+          scheduleContinuousPrefetchExpiry(session);
+        } else {
+          continuousPrefetchSessions.delete(sessionId);
+        }
+      }
+    });
+
+  return session.task;
+}
+
+function stopContinuousPreviewCache(sessionId) {
+  const session = continuousPrefetchSessions.get(sessionId);
+  if (!session) {
+    return;
+  }
+
+  session.active = false;
+  continuousPrefetchSessions.delete(sessionId);
+}
+
+function createContinuousPrefetchLanes(chunkCount) {
+  const starts = Array
+    .from(new Set(CONTINUOUS_PREFETCH_RATIOS.map((ratio) => Math.min(chunkCount - 1, Math.floor(chunkCount * ratio)))))
+    .sort((left, right) => left - right);
+
+  return starts.map((start, index) => ({
+    start,
+    cursor: start,
+    endExclusive: starts[index + 1] ?? chunkCount
+  }));
+}
+
+async function runContinuousPrefetchLane(session, lane) {
+  while (isContinuousPrefetchSessionActive(session) && lane.cursor < lane.endExclusive) {
+    const chunkIndex = lane.cursor;
+
+    try {
+      await getChunkBytes(session.metadata, chunkIndex);
+      lane.cursor = chunkIndex + 1;
+    } catch (error) {
+      warnPreviewCacheError(`continuous prefetch chunk ${chunkIndex}`, error);
+      return;
+    }
+  }
+}
+
+function isContinuousPrefetchSessionActive(session) {
+  return session.active &&
+    continuousPrefetchSessions.get(session.sessionId) === session &&
+    Date.now() - session.lastHeartbeat <= CONTINUOUS_PREFETCH_SESSION_TTL_MS;
+}
+
+function scheduleContinuousPrefetchExpiry(session) {
+  setTimeout(() => {
+    if (
+      continuousPrefetchSessions.get(session.sessionId) === session &&
+      Date.now() - session.lastHeartbeat > CONTINUOUS_PREFETCH_SESSION_TTL_MS
+    ) {
+      continuousPrefetchSessions.delete(session.sessionId);
+    }
+  }, CONTINUOUS_PREFETCH_SESSION_TTL_MS + 1_000);
 }
 
 function chunkCacheKey(fileId, chunkIndex) {

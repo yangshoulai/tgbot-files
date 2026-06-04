@@ -1,9 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { RotateCcw } from "lucide-react";
 import type { FileItem } from "../../../api";
 import { canUseAcceleratedDownload, extractSignedFileToken } from "../../../lib/accelerated-download";
 import { hasDirectFileAccess } from "../../../lib/file-access";
-import { buildChunkedVideoPreviewUrl } from "../../../lib/video-preview";
+import {
+  VIDEO_PREVIEW_CACHE_HEARTBEAT_MS,
+  buildChunkedVideoPreviewMetadata,
+  buildChunkedVideoPreviewUrl,
+  startChunkedVideoPreviewCacheSession,
+  stopChunkedVideoPreviewCacheSession
+} from "../../../lib/video-preview";
 import {
   ensureVideoPreviewServiceWorker,
   isVideoPreviewServiceWorkerControlling
@@ -26,6 +32,7 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
   const videoRef = useRef<HTMLVideoElement>(null);
   const frameRef = useRef<HTMLDivElement>(null);
   const controlsHideTimerRef = useRef<number | null>(null);
+  const previewCacheSessionIdRef = useRef(`video-preview-${file.id}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   const [ratio, setRatio] = useState({ label: "16:9", value: 16 / 9 });
   const [controlsVisible, setControlsVisible] = useState(true);
   const [controlsDensity, setControlsDensity] = useState<MediaControlsDensity>("regular");
@@ -39,7 +46,11 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
   const signedFileToken = canUseMultipartPreview ? extractSignedFileToken(file.file_path) : null;
   const serviceWorkerReady = serviceWorkerState.status === "controlled";
   const requiresChunkedPreview = !directAccessAvailable && canUseMultipartPreview && Boolean(signedFileToken);
-  const chunkedPreviewUrl = serviceWorkerReady ? buildChunkedVideoPreviewUrl(file) : null;
+  const chunkedPreviewMetadata = useMemo(
+    () => serviceWorkerReady ? buildChunkedVideoPreviewMetadata(file) : null,
+    [file.chunk_count, file.chunk_size, file.file_path, file.id, file.mime_type, file.size, file.storage_backend, serviceWorkerReady]
+  );
+  const chunkedPreviewUrl = chunkedPreviewMetadata ? buildChunkedVideoPreviewUrl(file, chunkedPreviewMetadata) : null;
   const videoSrc = chunkedPreviewUrl ?? (directFile ? file.file_path : null);
   const poster = file.thumbnail_url || undefined;
 
@@ -161,6 +172,23 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
       navigator.serviceWorker.removeEventListener("controllerchange", refresh);
     };
   }, [refreshServiceWorker, requiresChunkedPreview]);
+
+  useEffect(() => {
+    if (!chunkedPreviewMetadata || !chunkedPreviewUrl) return;
+
+    const sessionId = previewCacheSessionIdRef.current;
+    const keepAlivePreviewCache = () => {
+      startChunkedVideoPreviewCacheSession(sessionId, chunkedPreviewMetadata);
+    };
+
+    keepAlivePreviewCache();
+    const heartbeatId = window.setInterval(keepAlivePreviewCache, VIDEO_PREVIEW_CACHE_HEARTBEAT_MS);
+
+    return () => {
+      window.clearInterval(heartbeatId);
+      stopChunkedVideoPreviewCacheSession(sessionId);
+    };
+  }, [chunkedPreviewMetadata, chunkedPreviewUrl]);
 
   if (!videoSrc) {
     return (
