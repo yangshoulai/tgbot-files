@@ -10,6 +10,7 @@ import {
   uploadMultipartChunk,
   uploadUrlMultipartChunk,
   type DirectoryItem,
+  type FileNameConflictAction,
   type MultipartUpload,
   type ThumbnailUploadPayload
 } from "../../api";
@@ -69,6 +70,7 @@ interface MultipartRetryState {
   chunkSize: number;
   chunkCount: number;
   directAccess: boolean;
+  conflictAction: FileNameConflictAction;
   completedChunks: number[];
   failedChunks: number[];
 }
@@ -90,6 +92,7 @@ interface QueueItem {
   fileNameOverride?: string;
   editingFileName?: boolean;
   conflict?: FileNameConflictState;
+  conflictAction?: FileNameConflictAction;
   thumbnail?: UploadThumbnailState;
 }
 
@@ -102,6 +105,7 @@ interface UrlUploadState {
   fileNameOverride?: string;
   editingFileName?: boolean;
   conflict?: FileNameConflictState;
+  conflictAction?: FileNameConflictAction;
   thumbnail?: UploadThumbnailState;
 }
 
@@ -134,7 +138,7 @@ const MULTIPART_UPLOAD_MAX_ATTEMPTS = 3;
 const MULTIPART_UPLOAD_RETRY_DELAY_MS = 800;
 const LOCAL_CHUNK_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 const URL_CHUNK_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
-const FILE_NAME_CONFLICT_TOAST_MESSAGE = "上传目录已存在同名文件，请输入新的文件名";
+const FILE_NAME_CONFLICT_TOAST_MESSAGE = "上传目录已存在同名文件，请选择覆盖或改名上传";
 
 class MultipartChunkUploadError extends Error {
   constructor(
@@ -329,6 +333,9 @@ export function UploadDialog({
   const normalizedSourceUrl = sourceUrl.trim();
   const urlPendingCount = normalizedSourceUrl && urlUpload.status !== "uploading" && urlUpload.status !== "done" ? 1 : 0;
   const pendingCount = mode === "url" ? urlPendingCount : filePendingCount;
+  const hasUnresolvedConflict = mode === "url"
+    ? Boolean(urlUpload.conflict)
+    : items.some((item) => (item.status === "pending" || item.status === "error") && Boolean(item.conflict));
   const hasInvalidFileName = mode === "url"
     ? Boolean(
         normalizedSourceUrl &&
@@ -408,7 +415,8 @@ export function UploadDialog({
               status: item.conflict ? "pending" : item.status,
               message: item.conflict ? undefined : item.message,
               progress: item.conflict ? undefined : item.progress,
-              conflict: undefined
+              conflict: undefined,
+              conflictAction: "error"
             }
           : item
       )
@@ -436,8 +444,49 @@ export function UploadDialog({
       status: current.conflict ? "pending" : current.status,
       message: current.conflict ? undefined : current.message,
       progress: current.conflict ? undefined : current.progress,
-      conflict: undefined
+      conflict: undefined,
+      conflictAction: "error"
     }));
+  }
+
+  function resolveItemConflict(id: string, action: FileNameConflictAction) {
+    setItems((current) =>
+      current.map((item) => {
+        if (item.id !== id || !item.conflict) return item;
+
+        const fileName = action === "overwrite" ? item.conflict.fileName : item.conflict.suggestedName;
+        return {
+          ...item,
+          status: "pending",
+          message: action === "overwrite" ? "将覆盖当前目录中的同名文件索引" : undefined,
+          progress: undefined,
+          retry: undefined,
+          fileNameOverride: fileName,
+          editingFileName: false,
+          conflict: undefined,
+          conflictAction: action
+        };
+      })
+    );
+  }
+
+  function resolveUrlConflict(action: FileNameConflictAction) {
+    setUrlUpload((current) => {
+      if (!current.conflict) return current;
+
+      const fileName = action === "overwrite" ? current.conflict.fileName : current.conflict.suggestedName;
+      return {
+        ...current,
+        status: "pending",
+        message: action === "overwrite" ? "将覆盖当前目录中的同名文件索引" : undefined,
+        progress: undefined,
+        retry: undefined,
+        fileNameOverride: fileName,
+        editingFileName: false,
+        conflict: undefined,
+        conflictAction: action
+      };
+    });
   }
 
   function setUrlFileNameEditing(editing: boolean) {
@@ -588,7 +637,16 @@ export function UploadDialog({
         setItems((current) =>
           current.map((item) =>
             item.id === target.id
-              ? { ...item, status: "done", message: undefined, progress: undefined, retry: undefined, conflict: undefined, editingFileName: false }
+              ? {
+                  ...item,
+                  status: "done",
+                  message: undefined,
+                  progress: undefined,
+                  retry: undefined,
+                  conflict: undefined,
+                  conflictAction: "error",
+                  editingFileName: false
+                }
               : item
           )
         );
@@ -607,6 +665,7 @@ export function UploadDialog({
                   retry: conflict ? undefined : retry,
                   conflict,
                   fileNameOverride: conflict?.suggestedName ?? item.fileNameOverride,
+                  conflictAction: "error",
                   editingFileName: conflict ? true : item.editingFileName,
                   progress: retry && !conflict
                     ? retryFailureProgress(retry, stopped ? "已停止，可重试未完成分片" : "分片上传失败，可手动重试")
@@ -643,11 +702,13 @@ export function UploadDialog({
       return;
     }
 
+    const conflictAction = target.conflictAction ?? "error";
     const init = await initMultipartUpload({
       file_name: fileName,
       mime_type: target.file.type || "application/octet-stream",
       size: target.file.size,
       directory_path: uploadDirectoryPath,
+      ...(conflictAction !== "error" ? { on_conflict: conflictAction } : {}),
       ...(remark.trim() ? { remark: remark.trim() } : {})
     }, task.abortController.signal);
     const upload = init.upload;
@@ -683,6 +744,7 @@ export function UploadDialog({
         chunkSize: upload.chunk_size,
         chunkCount: upload.chunk_count,
         directAccess: upload.direct_access !== false,
+        conflictAction,
         completedChunks: result.completedChunks,
         failedChunks: result.failedChunks
       });
@@ -705,6 +767,7 @@ export function UploadDialog({
       chunkSize: upload.chunk_size,
       chunkCount: upload.chunk_count,
       directAccess: upload.direct_access !== false,
+      conflictAction,
       thumbnail,
       task,
       timeoutMs: LOCAL_CHUNK_REQUEST_TIMEOUT_MS
@@ -1009,13 +1072,14 @@ export function UploadDialog({
       chunkSize: params.chunkSize,
       chunkCount: params.chunkCount,
       directAccess: params.directAccess,
+      conflictAction: params.conflictAction,
       completedChunks: chunkRange(params.chunkCount),
       failedChunks: []
     };
 
     try {
       await runAbortableUploadRequest(params.task, params.timeoutMs, (signal) =>
-        completeMultipartUpload(params.uploadId, params.thumbnail, signal)
+        completeMultipartUpload(params.uploadId, params.thumbnail, signal, params.conflictAction)
       );
     } catch (error) {
       if (params.task.cancelled || isAbortError(error)) {
@@ -1099,12 +1163,14 @@ export function UploadDialog({
 
     try {
       const fileNameOverride = normalizedFileNameOverride(urlUpload.fileNameOverride);
+      const conflictAction = urlUpload.conflictAction ?? "error";
       const init = await initUrlMultipartUpload(
         normalizedSourceUrl,
         remark.trim() || undefined,
         uploadDirectoryPath,
         true,
         fileNameOverride,
+        conflictAction,
         task.abortController.signal
       );
       if (init.mode === "multipart" && init.upload) {
@@ -1143,6 +1209,7 @@ export function UploadDialog({
             chunkSize: upload.chunk_size,
             chunkCount: upload.chunk_count,
             directAccess: upload.direct_access !== false,
+            conflictAction,
             completedChunks: result.completedChunks,
             failedChunks: result.failedChunks
           });
@@ -1169,6 +1236,7 @@ export function UploadDialog({
           chunkSize: upload.chunk_size,
           chunkCount: upload.chunk_count,
           directAccess: upload.direct_access !== false,
+          conflictAction,
           thumbnail,
           task,
           timeoutMs: URL_CHUNK_REQUEST_TIMEOUT_MS
@@ -1183,6 +1251,7 @@ export function UploadDialog({
         progress: undefined,
         retry: undefined,
         conflict: undefined,
+        conflictAction: "error",
         editingFileName: false
       }));
       onUploaded(1);
@@ -1204,6 +1273,7 @@ export function UploadDialog({
         retry: conflict ? undefined : retry,
         conflict,
         fileNameOverride: conflict?.suggestedName ?? current.fileNameOverride,
+        conflictAction: "error",
         editingFileName: conflict ? true : current.editingFileName,
         progress: retry && !conflict
           ? retryFailureProgress(retry, stopped ? "已停止，可重试未完成分片" : "分片导入失败，可手动重试")
@@ -1291,6 +1361,7 @@ export function UploadDialog({
         message: "已从 URL 上传",
         progress: undefined,
         retry: undefined,
+        conflictAction: "error",
         editingFileName: false
       }));
       onUploaded(1);
@@ -1337,7 +1408,17 @@ export function UploadDialog({
       await retryLocalMultipart(target, target.retry, thumbnail, task);
       setItems((current) =>
         current.map((item) =>
-          item.id === id ? { ...item, status: "done", message: undefined, progress: undefined, retry: undefined, editingFileName: false } : item
+          item.id === id
+            ? {
+                ...item,
+                status: "done",
+                message: undefined,
+                progress: undefined,
+                retry: undefined,
+                conflictAction: "error",
+                editingFileName: false
+              }
+            : item
         )
       );
       onUploaded(1);
@@ -1409,12 +1490,14 @@ export function UploadDialog({
             variant="primary"
             loading={submitting}
             leadingIcon={mode === "url" ? <Link2 size={16} /> : <FilePlus2 size={16} />}
-            disabled={pendingCount === 0 || hasInvalidFileName}
+            disabled={pendingCount === 0 || hasInvalidFileName || hasUnresolvedConflict}
           >
             {submitting
               ? mode === "url" ? "导入中" : "上传中"
               : hasInvalidFileName
                 ? "文件名不能为空"
+                : hasUnresolvedConflict
+                  ? "请选择处理方式"
                 : pendingCount > 0
                   ? mode === "url" ? "上传 URL" : `开始上传 ${pendingCount} 个`
                   : "无待传文件"}
@@ -1511,6 +1594,8 @@ export function UploadDialog({
                     stopping={stopRequested && activeUploadKind === "local" && activeUploadItemId === item.id}
                     onFileNameChange={(value) => updateItemFileName(item.id, value)}
                     onFileNameEditingChange={(editing) => setItemFileNameEditing(item.id, editing)}
+                    onRenameConflict={item.conflict ? () => resolveItemConflict(item.id, "error") : undefined}
+                    onOverwriteConflict={item.conflict ? () => resolveItemConflict(item.id, "overwrite") : undefined}
                     onThumbnailChange={(file) => void handleManualItemThumbnail(item.id, file)}
                     onThumbnailRemove={() => removeItemThumbnail(item.id)}
                     disabled={submitting}
@@ -1564,6 +1649,8 @@ export function UploadDialog({
                 stopping={stopRequested && activeUploadKind === "url"}
                 onFileNameChange={updateUrlFileName}
                 onFileNameEditingChange={setUrlFileNameEditing}
+                onRenameConflict={urlUpload.conflict ? () => resolveUrlConflict("error") : undefined}
+                onOverwriteConflict={urlUpload.conflict ? () => resolveUrlConflict("overwrite") : undefined}
                 thumbnail={urlUpload.thumbnail}
                 onThumbnailChange={(file) => void handleManualUrlThumbnail(file)}
                 onThumbnailRemove={removeUrlThumbnail}
@@ -1765,6 +1852,8 @@ interface QueueRowProps {
   stopping?: boolean;
   onFileNameChange: (value: string) => void;
   onFileNameEditingChange: (editing: boolean) => void;
+  onRenameConflict?: () => void;
+  onOverwriteConflict?: () => void;
   onThumbnailChange: (file: File) => void;
   onThumbnailRemove: () => void;
   disabled: boolean;
@@ -1778,6 +1867,8 @@ function QueueRow({
   stopping,
   onFileNameChange,
   onFileNameEditingChange,
+  onRenameConflict,
+  onOverwriteConflict,
   onThumbnailChange,
   onThumbnailRemove,
   disabled
@@ -1807,6 +1898,12 @@ function QueueRow({
             {item.message ? <span className="text-danger"> · {item.message}</span> : null}
           </p>
           {item.progress ? <ProgressBar progress={item.progress} /> : null}
+          <ConflictResolutionActions
+            conflict={item.conflict}
+            disabled={disabled}
+            onRename={onRenameConflict}
+            onOverwrite={onOverwriteConflict}
+          />
         </div>
         <ThumbnailPicker
           disabled={disabled || status === "uploading"}
@@ -1866,6 +1963,8 @@ interface UrlUploadRowProps {
   stopping?: boolean;
   onFileNameChange: (value: string) => void;
   onFileNameEditingChange: (editing: boolean) => void;
+  onRenameConflict?: () => void;
+  onOverwriteConflict?: () => void;
   onThumbnailChange: (file: File) => void;
   onThumbnailRemove: () => void;
   disabled: boolean;
@@ -1887,6 +1986,8 @@ function UrlUploadRow({
   stopping,
   onFileNameChange,
   onFileNameEditingChange,
+  onRenameConflict,
+  onOverwriteConflict,
   onThumbnailChange,
   onThumbnailRemove,
   disabled
@@ -1919,6 +2020,12 @@ function UrlUploadRow({
             {message ? <span className={status === "error" ? "text-danger" : "text-success"}> · {message}</span> : null}
           </p>
           {progress ? <ProgressBar progress={progress} /> : null}
+          <ConflictResolutionActions
+            conflict={conflict}
+            disabled={disabled}
+            onRename={onRenameConflict}
+            onOverwrite={onOverwriteConflict}
+          />
         </div>
         <ThumbnailPicker
           disabled={disabled || status === "uploading"}
@@ -1958,6 +2065,49 @@ function UrlUploadRow({
         </button>
       </div>
       {chunks ? <UploadChunkList chunks={chunks} /> : null}
+    </div>
+  );
+}
+
+function ConflictResolutionActions({
+  conflict,
+  disabled,
+  onRename,
+  onOverwrite
+}: {
+  conflict?: FileNameConflictState;
+  disabled: boolean;
+  onRename?: () => void;
+  onOverwrite?: () => void;
+}) {
+  if (!conflict) {
+    return null;
+  }
+
+  return (
+    <div className="mt-2 flex flex-col gap-2 rounded-lg border border-warning/35 bg-warning-soft/50 px-2.5 py-2 text-xs leading-5 text-warning sm:flex-row sm:items-center sm:justify-between">
+      <span className="min-w-0">
+        当前目录 <span className="font-semibold">{conflict.directoryPath}</span> 已存在{" "}
+        <span className="font-semibold">{conflict.fileName}</span>
+      </span>
+      <span className="flex shrink-0 flex-wrap gap-1.5">
+        <button
+          type="button"
+          onClick={onRename}
+          disabled={disabled || !onRename}
+          className="rounded-md border border-warning/35 bg-surface px-2.5 py-1 font-medium text-warning transition-colors hover:bg-warning-soft disabled:pointer-events-none disabled:opacity-50"
+        >
+          重命名为 {conflict.suggestedName}
+        </button>
+        <button
+          type="button"
+          onClick={onOverwrite}
+          disabled={disabled || !onOverwrite}
+          className="rounded-md border border-danger/30 px-2.5 py-1 font-medium text-danger transition-colors hover:bg-danger-soft disabled:pointer-events-none disabled:opacity-50"
+        >
+          覆盖原文件
+        </button>
+      </span>
     </div>
   );
 }

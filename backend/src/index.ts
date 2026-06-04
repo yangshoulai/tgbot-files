@@ -23,7 +23,7 @@ import {
   getTelegramChannelUsage,
   insertDirectoryRecord,
   insertApiKeyRecord,
-  insertFileRecord,
+  insertFileRecordWithConflictAction,
   insertMultipartUploadRecord,
   insertTelegramChannelRecord,
   listActiveTelegramChannelRecords,
@@ -50,6 +50,7 @@ import {
   type ApiKeyStatus,
   type DirectoryRecord,
   type FileChunkRecord,
+  type FileNameConflictAction,
   type FileRecord,
   type FileTypeFilter,
   type MultipartUploadRecord,
@@ -617,12 +618,13 @@ async function handleApiFiles(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
 
   if (request.method === "POST" && url.pathname === "/api/v1/files") {
-    const { file, directoryPath } = await readUploadInput(request, env);
+    const { file, directoryPath, conflictAction } = await readUploadInput(request, env);
     const directory = await ensureWritableDirectory(db, directoryPath);
-    await requireFileNameAvailable({
+    await requireFileNameWritable({
       db,
       directoryPath,
-      fileName: sanitizeFileName(file.name)
+      fileName: sanitizeFileName(file.name),
+      conflictAction
     });
     const result = await uploadAndRecordFile({
       request,
@@ -630,7 +632,8 @@ async function handleApiFiles(request: Request, env: Env): Promise<Response> {
       file,
       db,
       directoryPath,
-      directoryId: directory?.id ?? null
+      directoryId: directory?.id ?? null,
+      conflictAction
     });
 
     return jsonResponse({
@@ -831,12 +834,13 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
   }
 
   if (request.method === "POST" && url.pathname === "/api/admin/files") {
-    const { file: formFile, remark, directoryPath } = await readUploadInput(request, env);
+    const { file: formFile, remark, directoryPath, conflictAction } = await readUploadInput(request, env);
     const directory = await ensureWritableDirectory(db, directoryPath);
-    await requireFileNameAvailable({
+    await requireFileNameWritable({
       db,
       directoryPath,
-      fileName: sanitizeFileName(formFile.name)
+      fileName: sanitizeFileName(formFile.name),
+      conflictAction
     });
     const result = await uploadAndRecordFile({
       request,
@@ -846,6 +850,7 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
       uploadedBy: username,
       directoryPath,
       directoryId: directory?.id ?? null,
+      conflictAction,
       ...(remark ? { remark } : {})
     });
 
@@ -1143,6 +1148,7 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
     const size = positiveIntegerField(body.size, "size");
     const remark = normalizeRemark(body.remark);
     const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
+    const conflictAction = normalizeFileNameConflictAction(body.on_conflict);
     const directory = await ensureWritableDirectory(db, directoryPath);
     const result = await createMultipartUpload({
       db,
@@ -1153,6 +1159,7 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
       uploadedBy: username,
       directoryPath,
       directoryId: directory?.id ?? null,
+      conflictAction,
       ...(remark ? { remark } : {})
     });
 
@@ -1168,6 +1175,7 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
     const remark = normalizeRemark(body.remark);
     const fileNameOverride = normalizeOptionalFileName(body.file_name);
     const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
+    const conflictAction = normalizeFileNameConflictAction(body.on_conflict);
     const directory = await ensureWritableDirectory(db, directoryPath);
 
     if (!sourceUrl) {
@@ -1192,6 +1200,7 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
       uploadedBy: username,
       directoryPath,
       directoryId: directory?.id ?? null,
+      conflictAction,
       ...(remark ? { remark } : {})
     });
     const thumbnailSource = await createThumbnailSourceInfo({
@@ -1277,11 +1286,13 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
   if (request.method === "POST" && completeMatch?.[1]) {
     const upload = await requireMultipartUpload(db, decodeURIComponent(completeMatch[1]));
     const thumbnail = await readCompleteUploadThumbnail(request);
+    const conflictAction = normalizeFileNameConflictAction(url.searchParams.get("on_conflict"));
     const result = await completeMultipartUpload({
       request,
       env,
       db,
       upload,
+      conflictAction,
       ...(thumbnail ? { thumbnail } : {})
     });
 
@@ -1315,6 +1326,7 @@ async function handleApiMultipartUploads(request: Request, env: Env): Promise<Re
     const size = positiveIntegerField(body.size, "size");
     const remark = normalizeRemark(body.remark);
     const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
+    const conflictAction = normalizeFileNameConflictAction(body.on_conflict);
     const directory = await ensureWritableDirectory(db, directoryPath);
     const result = await createMultipartUpload({
       db,
@@ -1324,6 +1336,7 @@ async function handleApiMultipartUploads(request: Request, env: Env): Promise<Re
       size,
       directoryPath,
       directoryId: directory?.id ?? null,
+      conflictAction,
       ...(remark ? { remark } : {})
     });
 
@@ -1339,6 +1352,7 @@ async function handleApiMultipartUploads(request: Request, env: Env): Promise<Re
     const remark = normalizeRemark(body.remark);
     const fileNameOverride = normalizeOptionalFileName(body.file_name);
     const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
+    const conflictAction = normalizeFileNameConflictAction(body.on_conflict);
     const directory = await ensureWritableDirectory(db, directoryPath);
 
     if (!sourceUrl) {
@@ -1362,6 +1376,7 @@ async function handleApiMultipartUploads(request: Request, env: Env): Promise<Re
       size: probe.size,
       directoryPath,
       directoryId: directory?.id ?? null,
+      conflictAction,
       ...(remark ? { remark } : {})
     });
     const thumbnailSource = await createThumbnailSourceInfo({
@@ -1433,11 +1448,13 @@ async function handleApiMultipartUploads(request: Request, env: Env): Promise<Re
   if (request.method === "POST" && completeMatch?.[1]) {
     const upload = await requireMultipartUpload(db, decodeURIComponent(completeMatch[1]));
     const thumbnail = await readCompleteUploadThumbnail(request);
+    const conflictAction = normalizeFileNameConflictAction(url.searchParams.get("on_conflict"));
     const result = await completeMultipartUpload({
       request,
       env,
       db,
       upload,
+      conflictAction,
       ...(thumbnail ? { thumbnail } : {})
     });
 
@@ -1735,7 +1752,12 @@ async function requireTelegramChannelUnique(paramsDb: D1Database, params: {
   throw new AppError(409, "TelegramChannelTargetConflict", "Telegram bot token and chat_id channel already exists");
 }
 
-async function readUploadInput(request: Request, env: Env): Promise<{ file: File; remark?: string; directoryPath: string }> {
+async function readUploadInput(request: Request, env: Env): Promise<{
+  file: File;
+  remark?: string;
+  directoryPath: string;
+  conflictAction: FileNameConflictAction;
+}> {
   const contentType = request.headers.get("Content-Type") || "";
   const normalizedContentType = contentType.toLowerCase();
 
@@ -1753,6 +1775,7 @@ async function readUploadInput(request: Request, env: Env): Promise<{ file: File
   const fileNameOverride = normalizeOptionalFileName(formData.get("file_name"));
   const remark = normalizeRemark(formData.get("remark"));
   const directoryPath = normalizeDirectoryPath(formData.get("directory_path") ?? formData.get("dir") ?? "/");
+  const conflictAction = normalizeFileNameConflictAction(formData.get("on_conflict"));
 
   if (formFile instanceof File) {
     validateUploadFileSize(formFile, maxFileBytes);
@@ -1761,6 +1784,7 @@ async function readUploadInput(request: Request, env: Env): Promise<{ file: File
     return {
       file,
       directoryPath,
+      conflictAction,
       ...(remark ? { remark } : {})
     };
   }
@@ -1777,6 +1801,7 @@ async function readUploadInput(request: Request, env: Env): Promise<{ file: File
     return {
       file,
       directoryPath,
+      conflictAction,
       ...(remark ? { remark } : {})
     };
   }
@@ -1784,11 +1809,17 @@ async function readUploadInput(request: Request, env: Env): Promise<{ file: File
   throw new AppError(400, "MissingFile", "Multipart field 'file' is required");
 }
 
-async function readUrlUploadJson(request: Request, env: Env): Promise<{ file: File; remark?: string; directoryPath: string }> {
+async function readUrlUploadJson(request: Request, env: Env): Promise<{
+  file: File;
+  remark?: string;
+  directoryPath: string;
+  conflictAction: FileNameConflictAction;
+}> {
   const maxFileBytes = parseMaxFileBytes(env.MAX_FILE_BYTES);
   const body = await readJsonObject(request);
   const sourceUrl = normalizeSourceUrl(body.url);
   const fileNameOverride = normalizeOptionalFileName(body.file_name);
+  const conflictAction = normalizeFileNameConflictAction(body.on_conflict);
 
   if (!sourceUrl) {
     throw new AppError(400, "MissingUrl", "JSON field 'url' is required");
@@ -1806,6 +1837,7 @@ async function readUrlUploadJson(request: Request, env: Env): Promise<{ file: Fi
   return {
     file,
     directoryPath,
+    conflictAction,
     ...(remark ? { remark } : {})
   };
 }
@@ -2571,12 +2603,14 @@ async function createMultipartUpload(params: {
   remark?: string;
   directoryId?: string | null;
   directoryPath: string;
+  conflictAction?: FileNameConflictAction;
 }): Promise<MultipartInitResult> {
   validateMultipartFileSize(params.size);
-  await requireFileNameAvailable({
+  await requireFileNameWritable({
     db: params.db,
     directoryPath: params.directoryPath,
-    fileName: params.fileName
+    fileName: params.fileName,
+    conflictAction: params.conflictAction ?? "error"
   });
   const chunkCount = Math.ceil(params.size / TELEGRAM_CHUNK_SIZE_BYTES);
   const createdAt = new Date().toISOString();
@@ -2929,6 +2963,20 @@ async function requireFileNameAvailable(params: {
   }
 }
 
+async function requireFileNameWritable(params: {
+  db: D1Database;
+  directoryPath: string;
+  fileName: string;
+  conflictAction: FileNameConflictAction;
+  excludeId?: string;
+}): Promise<void> {
+  if (params.conflictAction === "overwrite") {
+    return;
+  }
+
+  await requireFileNameAvailable(params);
+}
+
 async function requireFileMoveNamesAvailable(params: {
   db: D1Database;
   files: FileRecord[];
@@ -2967,6 +3015,27 @@ function fileNameConflictError(
       source
     }
   );
+}
+
+function normalizeFileNameConflictAction(value: unknown): FileNameConflictAction {
+  if (value === undefined || value === null || value === "") {
+    return "error";
+  }
+
+  if (typeof value !== "string") {
+    throw new AppError(400, "InvalidBody", "on_conflict must be error or overwrite");
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "" || normalized === "error") {
+    return "error";
+  }
+
+  if (normalized === "overwrite") {
+    return "overwrite";
+  }
+
+  throw new AppError(400, "InvalidBody", "on_conflict must be error or overwrite");
 }
 
 function suggestAlternativeFileName(fileName: string): string {
@@ -3147,15 +3216,17 @@ async function completeMultipartUpload(params: {
   env: Env;
   db: D1Database;
   upload: MultipartUploadRecord;
+  conflictAction?: FileNameConflictAction;
   thumbnail?: ThumbnailInput;
 }): Promise<UploadResult> {
   const chunks = await listFileChunkRecords(params.db, params.upload.id);
   validateCompleteChunks(params.upload, chunks);
-  await requireFileNameAvailable({
+  await requireFileNameWritable({
     db: params.db,
     directoryPath: params.upload.directory_path ?? "/",
     fileName: params.upload.file_name,
-    excludeId: params.upload.id
+    excludeId: params.upload.id,
+    conflictAction: params.conflictAction ?? "error"
   });
 
   const signingSecret = requireEnv(params.env, "LINK_SIGNING_SECRET");
@@ -3190,6 +3261,7 @@ async function completeMultipartUpload(params: {
     db: params.db,
     uploadId: params.upload.id,
     completedAt: createdAt,
+    conflictAction: params.conflictAction ?? "error",
     file: {
       id: params.upload.id,
       fileName: params.upload.file_name,
@@ -3388,6 +3460,7 @@ async function uploadAndRecordFile(params: {
   remark?: string;
   directoryId?: string | null;
   directoryPath?: string;
+  conflictAction?: FileNameConflictAction;
 }): Promise<UploadResult> {
   const signingSecret = requireEnv(params.env, "LINK_SIGNING_SECRET");
   const id = crypto.randomUUID();
@@ -3435,26 +3508,32 @@ async function uploadAndRecordFile(params: {
   const publicUrl = `${baseUrl}${filePath}`;
 
   if (params.db) {
-    await requireFileNameAvailable({
+    const conflictAction = params.conflictAction ?? "error";
+    await requireFileNameWritable({
       db: params.db,
       directoryPath: params.directoryPath ?? "/",
-      fileName: storedName
-    });
-    await insertFileRecord(params.db, {
-      id,
       fileName: storedName,
-      mimeType,
-      size: fileSize,
-      md5,
-      telegramFileId: telegramDocument.file_id,
-      telegramChannelId: channel.id,
-      filePath,
-      createdAt,
-      directoryId: params.directoryId ?? null,
-      directoryPath: params.directoryPath ?? "/",
-      ...(params.remark ? { remark: params.remark } : {}),
-      ...(telegramDocument.file_unique_id ? { telegramFileUniqueId: telegramDocument.file_unique_id } : {}),
-      ...(params.uploadedBy ? { uploadedBy: params.uploadedBy } : {})
+      conflictAction
+    });
+    await insertFileRecordWithConflictAction({
+      db: params.db,
+      conflictAction,
+      record: {
+        id,
+        fileName: storedName,
+        mimeType,
+        size: fileSize,
+        md5,
+        telegramFileId: telegramDocument.file_id,
+        telegramChannelId: channel.id,
+        filePath,
+        createdAt,
+        directoryId: params.directoryId ?? null,
+        directoryPath: params.directoryPath ?? "/",
+        ...(params.remark ? { remark: params.remark } : {}),
+        ...(telegramDocument.file_unique_id ? { telegramFileUniqueId: telegramDocument.file_unique_id } : {}),
+        ...(params.uploadedBy ? { uploadedBy: params.uploadedBy } : {})
+      }
     });
   }
 

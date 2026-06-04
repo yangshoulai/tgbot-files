@@ -362,7 +362,9 @@ class FakeD1Statement {
     }
 
     if (normalizedSql.startsWith("DELETE FROM FILE_CHUNKS")) {
-      const fileIds = normalizedSql.includes("WHERE FILE_ID = ?")
+      const fileIds = normalizedSql.includes("FILE_NAME = ?")
+        ? new Set(this.matchingActiveFileNameRecords().map((file) => file.id))
+        : normalizedSql.includes("WHERE FILE_ID = ?")
         ? new Set([String(this.bindings[0])])
         : new Set(
             this.db.files
@@ -376,6 +378,9 @@ class FakeD1Statement {
       if (normalizedSql.includes("WHERE ID = ?")) {
         const id = String(this.bindings[0]);
         this.deleteWhere(this.db.files, (file) => file.id === id);
+      } else if (normalizedSql.includes("FILE_NAME = ?")) {
+        const matches = new Set(this.matchingActiveFileNameRecords().map((file) => file.id));
+        this.deleteWhere(this.db.files, (file) => matches.has(file.id));
       } else {
         this.deleteWhere(this.db.files, (file) => this.fileMatchesDirectorySelection(file, this.bindings));
       }
@@ -385,6 +390,9 @@ class FakeD1Statement {
       if (normalizedSql.includes("WHERE ID = ?")) {
         const id = String(this.bindings[0]);
         this.deleteWhere(this.db.multipartUploads, (upload) => upload.id === id);
+      } else if (normalizedSql.includes("FILE_NAME = ?")) {
+        const matches = new Set(this.matchingActiveFileNameRecords().map((file) => file.id));
+        this.deleteWhere(this.db.multipartUploads, (upload) => matches.has(upload.id));
       } else {
         this.deleteWhere(this.db.multipartUploads, (upload) => this.uploadMatchesDirectorySelection(upload, this.bindings));
       }
@@ -857,9 +865,13 @@ class FakeD1Statement {
   }
 
   private matchingFileNameConflict(): FileRecord | undefined {
+    return this.matchingActiveFileNameRecords()[0];
+  }
+
+  private matchingActiveFileNameRecords(): FileRecord[] {
     const [directoryPath, fileName, excludeId] = this.bindings;
 
-    return this.db.files.find((item) =>
+    return this.db.files.filter((item) =>
       item.deleted_at === null &&
       (item.directory_path ?? "/") === directoryPath &&
       item.file_name === fileName &&
@@ -2742,6 +2754,93 @@ describe("admin file manager", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
+  it("overwrites an existing admin URL upload when requested", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      PUBLIC_BASE_URL: "https://cdn.example.com",
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    db.files.push(fileRecord({
+      id: "existing-report",
+      file_name: "report.pdf",
+      mime_type: "application/pdf",
+      file_path: "/f/old/report.pdf",
+      directory_path: "/imports",
+      telegram_file_id: "tg-old-report"
+    }));
+    db.fileChunks.push({
+      file_id: "existing-report",
+      chunk_index: 0,
+      size: 4,
+      md5: "old-chunk",
+      telegram_file_id: "tg-old-chunk",
+      telegram_file_unique_id: null,
+      created_at: "2026-06-01T00:00:01.000Z"
+    });
+    const cookie = await loginAndGetCookie(adminEnv);
+    const sourceUrl = "https://source.example.com/report.pdf";
+    const pdfBytes = new Uint8Array([0x25, 0x50, 0x44, 0x46]);
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === sourceUrl) {
+        return new Response(pdfBytes, {
+          headers: {
+            "Content-Type": "application/pdf",
+            "Content-Disposition": "attachment; filename=\"report.pdf\"",
+            "Content-Length": String(pdfBytes.byteLength)
+          }
+        });
+      }
+
+      return jsonResponse({
+        ok: true,
+        result: {
+          document: {
+            file_id: "tg-new-report",
+            file_unique_id: "tg-new-report-unique",
+            file_name: "report.pdf",
+            mime_type: "application/pdf",
+            file_size: pdfBytes.byteLength
+          }
+        }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/files", {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          url: sourceUrl,
+          directory_path: "/imports",
+          on_conflict: "overwrite"
+        })
+      }),
+      adminEnv
+    );
+    const body = await response.json() as { ok: boolean; file: { file_name: string; telegram_file_id: string; directory_path: string } };
+
+    expect(response.status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.file).toMatchObject({
+      file_name: "report.pdf",
+      telegram_file_id: "tg-new-report",
+      directory_path: "/imports"
+    });
+    expect(db.files).toHaveLength(1);
+    expect(db.files[0]?.id).not.toBe("existing-report");
+    expect(db.files[0]?.telegram_file_id).toBe("tg-new-report");
+    expect(db.fileChunks).toHaveLength(0);
+    expect(db.batchCalls).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("initializes a range-based URL multipart upload", async () => {
     const db = new FakeD1();
     const adminEnv: Env = {
@@ -3298,6 +3397,85 @@ describe("admin file manager", () => {
     expect(db.files).toHaveLength(1);
     expect(db.multipartUploads[0]?.completed_at).toBeNull();
     expect(db.batchCalls).toBe(0);
+  });
+
+  it("overwrites a file claimed during multipart upload when requested", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    db.files.push(fileRecord({
+      id: "existing-race-file",
+      file_name: "race.bin",
+      directory_path: "/race",
+      telegram_file_id: "tg-old-race"
+    }));
+    db.multipartUploads.push({
+      id: "upload-race",
+      source_kind: "local",
+      source_url: null,
+      file_name: "race.bin",
+      mime_type: "application/octet-stream",
+      size: 6,
+      chunk_size: 3,
+      chunk_count: 2,
+      remark: null,
+      uploaded_by: "admin",
+      created_at: "2026-06-01T00:00:00.000Z",
+      completed_at: null,
+      directory_id: null,
+      directory_path: "/race"
+    });
+    db.fileChunks.push(
+      {
+        file_id: "upload-race",
+        chunk_index: 0,
+        size: 3,
+        md5: "chunk-0",
+        telegram_file_id: "tg-chunk-0",
+        telegram_file_unique_id: null,
+        created_at: "2026-06-01T00:00:01.000Z"
+      },
+      {
+        file_id: "upload-race",
+        chunk_index: 1,
+        size: 3,
+        md5: "chunk-1",
+        telegram_file_id: "tg-chunk-1",
+        telegram_file_unique_id: null,
+        created_at: "2026-06-01T00:00:02.000Z"
+      }
+    );
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/uploads/upload-race/complete?on_conflict=overwrite", {
+        method: "POST",
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      ok: boolean;
+      file: { id: string; file_name: string; storage_backend: string; directory_path: string };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.file).toMatchObject({
+      id: "upload-race",
+      file_name: "race.bin",
+      storage_backend: "telegram_multipart",
+      directory_path: "/race"
+    });
+    expect(db.files).toHaveLength(1);
+    expect(db.files[0]?.id).toBe("upload-race");
+    expect(db.files[0]?.telegram_file_id).toBe("multipart:upload-race");
+    expect(db.multipartUploads.find((item) => item.id === "upload-race")?.completed_at).not.toBeNull();
+    expect(db.batchCalls).toBe(1);
   });
 
   it("cleans stale incomplete multipart uploads on the scheduled trigger", async () => {

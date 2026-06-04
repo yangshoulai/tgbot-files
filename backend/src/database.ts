@@ -86,6 +86,8 @@ export interface FileNameConflictRecord {
   source: "file";
 }
 
+export type FileNameConflictAction = "error" | "overwrite";
+
 export type FileTypeFilter = "image" | "video" | "text" | "pdf" | "archive" | "other";
 
 export type ApiKeyStatus = "active" | "disabled";
@@ -221,6 +223,27 @@ export function requireDb(env: { FILES_DB?: D1Database }): D1Database {
 
 export async function insertFileRecord(db: D1Database, record: NewFileRecord): Promise<void> {
   await prepareInsertFileRecord(db, record).run();
+}
+
+export async function insertFileRecordWithConflictAction(params: {
+  db: D1Database;
+  record: NewFileRecord;
+  conflictAction: FileNameConflictAction;
+}): Promise<void> {
+  if (params.conflictAction === "overwrite") {
+    await params.db.batch([
+      ...prepareDeleteActiveFileRecordsByName(
+        params.db,
+        params.record.directoryPath ?? "/",
+        params.record.fileName,
+        params.record.id
+      ),
+      prepareInsertFileRecord(params.db, params.record)
+    ]);
+    return;
+  }
+
+  await insertFileRecord(params.db, params.record);
 }
 
 function prepareInsertFileRecord(db: D1Database, record: NewFileRecord): D1PreparedStatement {
@@ -1070,11 +1093,47 @@ export async function completeMultipartUploadWithFileRecord(params: {
   file: NewFileRecord;
   uploadId: string;
   completedAt: string;
+  conflictAction?: FileNameConflictAction;
 }): Promise<void> {
   await params.db.batch([
+    ...(params.conflictAction === "overwrite"
+      ? prepareDeleteActiveFileRecordsByName(
+          params.db,
+          params.file.directoryPath ?? "/",
+          params.file.fileName,
+          params.file.id
+        )
+      : []),
     prepareInsertFileRecord(params.db, params.file),
     prepareCompleteMultipartUploadRecord(params.db, params.uploadId, params.completedAt)
   ]);
+}
+
+function prepareDeleteActiveFileRecordsByName(
+  db: D1Database,
+  directoryPath: string,
+  fileName: string,
+  excludeId?: string
+): D1PreparedStatement[] {
+  const whereClause = [
+    "deleted_at IS NULL",
+    "COALESCE(directory_path, '/') = ?",
+    "file_name = ?",
+    ...(excludeId ? ["id <> ?"] : [])
+  ].join(" AND ");
+  const bindings = excludeId ? [directoryPath, fileName, excludeId] : [directoryPath, fileName];
+
+  return [
+    db
+      .prepare(`DELETE FROM file_chunks WHERE file_id IN (SELECT id FROM files WHERE ${whereClause})`)
+      .bind(...bindings),
+    db
+      .prepare(`DELETE FROM multipart_uploads WHERE id IN (SELECT id FROM files WHERE ${whereClause})`)
+      .bind(...bindings),
+    db
+      .prepare(`DELETE FROM files WHERE ${whereClause}`)
+      .bind(...bindings)
+  ];
 }
 
 export async function upsertFileChunkRecord(db: D1Database, record: NewFileChunkRecord): Promise<void> {

@@ -119,6 +119,8 @@ export interface AdminUploadResponse {
   file: FileItem;
 }
 
+export type FileNameConflictAction = "error" | "overwrite";
+
 export interface FileUpdateResponse {
   ok: boolean;
   file: FileItem;
@@ -408,14 +410,24 @@ export function listFiles(params: {
   return requestJson<FileListResponse>(`/api/admin/files?${search.toString()}`);
 }
 
-export function uploadFile(formData: FormData) {
+export function uploadFile(formData: FormData, conflictAction?: FileNameConflictAction) {
+  if (conflictAction && conflictAction !== "error") {
+    formData.set("on_conflict", conflictAction);
+  }
+
   return requestJson<AdminUploadResponse>("/api/admin/files", {
     method: "POST",
     body: formData
   });
 }
 
-export function uploadFileFromUrl(url: string, remark?: string, directoryPath = "/", fileName?: string) {
+export function uploadFileFromUrl(
+  url: string,
+  remark?: string,
+  directoryPath = "/",
+  fileName?: string,
+  conflictAction?: FileNameConflictAction
+) {
   return requestJson<AdminUploadResponse>("/api/admin/files", {
     method: "POST",
     headers: {
@@ -425,6 +437,7 @@ export function uploadFileFromUrl(url: string, remark?: string, directoryPath = 
       url,
       directory_path: directoryPath,
       ...(fileName ? { file_name: fileName } : {}),
+      ...(conflictAction && conflictAction !== "error" ? { on_conflict: conflictAction } : {}),
       ...(remark ? { remark } : {})
     })
   });
@@ -436,6 +449,7 @@ export function initMultipartUpload(params: {
   size: number;
   remark?: string;
   directory_path?: string;
+  on_conflict?: FileNameConflictAction;
 }, signal?: AbortSignal) {
   return requestJson<MultipartInitResponse>("/api/admin/uploads/init", {
     method: "POST",
@@ -463,6 +477,7 @@ export function initUrlMultipartUpload(
   directoryPath = "/",
   forceMultipart = false,
   fileName?: string,
+  conflictAction?: FileNameConflictAction,
   signal?: AbortSignal
 ) {
   return requestJson<UrlMultipartInitResponse>("/api/admin/uploads/url/init", {
@@ -476,6 +491,7 @@ export function initUrlMultipartUpload(
       directory_path: directoryPath,
       ...(forceMultipart ? { force_multipart: true } : {}),
       ...(fileName ? { file_name: fileName } : {}),
+      ...(conflictAction && conflictAction !== "error" ? { on_conflict: conflictAction } : {}),
       ...(remark ? { remark } : {})
     })
   });
@@ -502,9 +518,18 @@ export interface ThumbnailUploadPayload {
   height?: number;
 }
 
-export function completeMultipartUpload(uploadId: string, thumbnail?: ThumbnailUploadPayload, signal?: AbortSignal) {
+export function completeMultipartUpload(
+  uploadId: string,
+  thumbnail?: ThumbnailUploadPayload,
+  signal?: AbortSignal,
+  conflictAction?: FileNameConflictAction
+) {
+  const path = `/api/admin/uploads/${encodeURIComponent(uploadId)}/complete${
+    conflictAction && conflictAction !== "error" ? `?on_conflict=${encodeURIComponent(conflictAction)}` : ""
+  }`;
+
   if (!thumbnail) {
-    return requestJson<AdminUploadResponse>(`/api/admin/uploads/${encodeURIComponent(uploadId)}/complete`, {
+    return requestJson<AdminUploadResponse>(path, {
       method: "POST",
       signal
     });
@@ -515,7 +540,7 @@ export function completeMultipartUpload(uploadId: string, thumbnail?: ThumbnailU
   if (thumbnail.width) form.set("thumbnail_width", String(thumbnail.width));
   if (thumbnail.height) form.set("thumbnail_height", String(thumbnail.height));
 
-  return requestJson<AdminUploadResponse>(`/api/admin/uploads/${encodeURIComponent(uploadId)}/complete`, {
+  return requestJson<AdminUploadResponse>(path, {
     method: "POST",
     signal,
     body: form
