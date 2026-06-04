@@ -8,8 +8,11 @@ const RESPONSE_WINDOW_BYTES = 2 * 1024 * 1024;
 const PREFETCH_CHUNKS = 3;
 const CONTINUOUS_PREFETCH_RATIOS = [0, 0.25, 0.5, 0.75];
 const CONTINUOUS_PREFETCH_SESSION_TTL_MS = 12_000;
+const HOT_CHUNK_CACHE_MAX_BYTES = 160 * 1024 * 1024;
 const fullChunkLoads = new Map();
 const continuousPrefetchSessions = new Map();
+const hotChunkCache = new Map();
+let hotChunkCacheBytes = 0;
 
 self.addEventListener("install", (event) => {
   event.waitUntil(self.skipWaiting());
@@ -284,15 +287,44 @@ function collectRangeSegments(metadata, range) {
 }
 
 async function openChunkRangeSource(metadata, segment) {
-  const cached = await getCachedChunkBytes(metadata, segment.chunkIndex);
+  const cached = getHotChunkBytes(metadata, segment.chunkIndex);
   if (cached) {
     return {
       bytes: new Uint8Array(cached, segment.start, segment.endExclusive - segment.start)
     };
   }
 
+  const cachedSource = await openCachedChunkRangeSource(metadata, segment);
+  if (cachedSource) {
+    return cachedSource;
+  }
+
   const stream = await fetchChunkByteRange(metadata, segment);
   return { stream };
+}
+
+async function openCachedChunkRangeSource(metadata, segment) {
+  const expectedSize = expectedChunkSize(metadata, segment.chunkIndex);
+  const cached = await getCachedChunkResponse(metadata, segment.chunkIndex);
+  if (!cached) {
+    return null;
+  }
+
+  if (!cached.body) {
+    const bytes = await cached.arrayBuffer();
+    if (bytes.byteLength !== expectedSize) {
+      await deleteChunk(chunkCacheKey(metadata.fileId, segment.chunkIndex));
+      return null;
+    }
+    putHotChunkBytes(metadata, segment.chunkIndex, bytes);
+    return {
+      bytes: new Uint8Array(bytes, segment.start, segment.endExclusive - segment.start)
+    };
+  }
+
+  return {
+    stream: sliceReadableStream(cached.body, segment.start, segment.endExclusive)
+  };
 }
 
 async function fetchChunkByteRange(metadata, segment) {
@@ -350,7 +382,84 @@ async function pipeRangeSource(source, controller) {
   }
 }
 
+function sliceReadableStream(stream, start, endExclusive) {
+  return new ReadableStream({
+    async start(controller) {
+      const reader = stream.getReader();
+      let offset = 0;
+
+      try {
+        while (offset < endExclusive) {
+          const { done, value } = await reader.read();
+          if (done) {
+            break;
+          }
+
+          if (!value) {
+            continue;
+          }
+
+          const chunkStart = offset;
+          const chunkEnd = chunkStart + value.byteLength;
+          offset = chunkEnd;
+
+          if (chunkEnd <= start) {
+            continue;
+          }
+
+          const sliceStart = Math.max(0, start - chunkStart);
+          const sliceEnd = Math.min(value.byteLength, endExclusive - chunkStart);
+          if (sliceEnd > sliceStart) {
+            controller.enqueue(value.subarray(sliceStart, sliceEnd));
+          }
+        }
+
+        controller.close();
+      } catch (error) {
+        controller.error(error);
+      } finally {
+        await reader.cancel().catch(() => undefined);
+        reader.releaseLock();
+      }
+    }
+  });
+}
+
 async function getCachedChunkBytes(metadata, chunkIndex) {
+  if (chunkIndex < 0 || chunkIndex >= metadata.chunkCount) {
+    throw new Error("Chunk index is out of range");
+  }
+
+  const hotBytes = getHotChunkBytes(metadata, chunkIndex);
+  if (hotBytes) {
+    return hotBytes;
+  }
+
+  try {
+    const cacheKey = chunkCacheKey(metadata.fileId, chunkIndex);
+    const cached = await getCachedChunkResponse(metadata, chunkIndex);
+
+    if (!cached) {
+      return null;
+    }
+
+    const bytes = await cached.arrayBuffer();
+    const expectedSize = expectedChunkSize(metadata, chunkIndex);
+    if (bytes.byteLength !== expectedSize) {
+      await deleteChunk(cacheKey);
+      return null;
+    }
+
+    putHotChunkBytes(metadata, chunkIndex, bytes);
+
+    return bytes;
+  } catch (error) {
+    warnPreviewCacheError(`read chunk ${chunkIndex}`, error);
+    return null;
+  }
+}
+
+async function getCachedChunkResponse(metadata, chunkIndex) {
   if (chunkIndex < 0 || chunkIndex >= metadata.chunkCount) {
     throw new Error("Chunk index is out of range");
   }
@@ -364,28 +473,38 @@ async function getCachedChunkBytes(metadata, chunkIndex) {
       return null;
     }
 
-    const bytes = await cached.arrayBuffer();
     const expectedSize = expectedChunkSize(metadata, chunkIndex);
-    if (bytes.byteLength !== expectedSize) {
+    const cachedSize = cachedChunkContentLength(cached);
+    if (cachedSize !== null && cachedSize !== expectedSize) {
       await deleteChunk(cacheKey);
       return null;
     }
 
-    const now = Date.now();
-    await putChunkMetadata({
-      cacheKey,
-      fileId: metadata.fileId,
-      chunkIndex,
-      size: bytes.byteLength,
-      createdAt: now,
-      lastAccessed: now
-    }, true);
-
-    return bytes;
+    touchChunkMetadata(metadata, chunkIndex, expectedSize, cacheKey);
+    return cached;
   } catch (error) {
-    warnPreviewCacheError(`read chunk ${chunkIndex}`, error);
+    warnPreviewCacheError(`match chunk ${chunkIndex}`, error);
     return null;
   }
+}
+
+function cachedChunkContentLength(response) {
+  const value = Number(response.headers.get("Content-Length"));
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function touchChunkMetadata(metadata, chunkIndex, size, cacheKey = chunkCacheKey(metadata.fileId, chunkIndex)) {
+  const now = Date.now();
+  void putChunkMetadata({
+    cacheKey,
+    fileId: metadata.fileId,
+    chunkIndex,
+    size,
+    createdAt: now,
+    lastAccessed: now
+  }, true).catch((error) => {
+    warnPreviewCacheError(`touch chunk ${chunkIndex}`, error);
+  });
 }
 
 async function getChunkBytes(metadata, chunkIndex) {
@@ -428,6 +547,8 @@ async function fetchAndCacheChunkBytes(metadata, chunkIndex) {
     throw new Error(`分片 ${chunkIndex + 1} 大小不匹配`);
   }
 
+  putHotChunkBytes(metadata, chunkIndex, bytes);
+
   try {
     const cache = await caches.open(CACHE_NAME);
     const cacheKey = chunkCacheKey(metadata.fileId, chunkIndex);
@@ -466,11 +587,24 @@ function expectedChunkSize(metadata, chunkIndex) {
 async function prefetchChunks(metadata, startIndex, count) {
   for (let index = startIndex; index < Math.min(metadata.chunkCount, startIndex + count); index += 1) {
     try {
-      await getChunkBytes(metadata, index);
+      await ensureChunkCached(metadata, index);
     } catch {
       return;
     }
   }
+}
+
+async function ensureChunkCached(metadata, chunkIndex) {
+  if (getHotChunkBytes(metadata, chunkIndex)) {
+    return;
+  }
+
+  const cached = await getCachedChunkResponse(metadata, chunkIndex);
+  if (cached) {
+    return;
+  }
+
+  await getChunkBytes(metadata, chunkIndex);
 }
 
 function startContinuousPreviewCache(sessionId, metadata) {
@@ -548,7 +682,7 @@ async function runContinuousPrefetchLane(session, lane) {
     const chunkIndex = lane.cursor;
 
     try {
-      await getChunkBytes(session.metadata, chunkIndex);
+      await ensureChunkCached(session.metadata, chunkIndex);
       lane.cursor = chunkIndex + 1;
     } catch (error) {
       warnPreviewCacheError(`continuous prefetch chunk ${chunkIndex}`, error);
@@ -572,6 +706,61 @@ function scheduleContinuousPrefetchExpiry(session) {
       continuousPrefetchSessions.delete(session.sessionId);
     }
   }, CONTINUOUS_PREFETCH_SESSION_TTL_MS + 1_000);
+}
+
+function getHotChunkBytes(metadata, chunkIndex) {
+  const cacheKey = chunkCacheKey(metadata.fileId, chunkIndex);
+  const entry = hotChunkCache.get(cacheKey);
+  if (!entry) {
+    return null;
+  }
+
+  const expectedSize = expectedChunkSize(metadata, chunkIndex);
+  if (entry.bytes.byteLength !== expectedSize) {
+    deleteHotChunk(cacheKey);
+    return null;
+  }
+
+  entry.lastAccessed = Date.now();
+  hotChunkCache.delete(cacheKey);
+  hotChunkCache.set(cacheKey, entry);
+  return entry.bytes;
+}
+
+function putHotChunkBytes(metadata, chunkIndex, bytes) {
+  if (!bytes || bytes.byteLength <= 0 || bytes.byteLength > HOT_CHUNK_CACHE_MAX_BYTES) {
+    return;
+  }
+
+  const cacheKey = chunkCacheKey(metadata.fileId, chunkIndex);
+  deleteHotChunk(cacheKey);
+  hotChunkCache.set(cacheKey, {
+    bytes,
+    size: bytes.byteLength,
+    lastAccessed: Date.now()
+  });
+  hotChunkCacheBytes += bytes.byteLength;
+  pruneHotChunkCache();
+}
+
+function pruneHotChunkCache() {
+  while (hotChunkCacheBytes > HOT_CHUNK_CACHE_MAX_BYTES) {
+    const oldestKey = hotChunkCache.keys().next().value;
+    if (!oldestKey) {
+      hotChunkCacheBytes = 0;
+      return;
+    }
+    deleteHotChunk(oldestKey);
+  }
+}
+
+function deleteHotChunk(cacheKey) {
+  const entry = hotChunkCache.get(cacheKey);
+  if (!entry) {
+    return;
+  }
+  hotChunkCache.delete(cacheKey);
+  hotChunkCacheBytes -= safeSize(entry.size);
 }
 
 function chunkCacheKey(fileId, chunkIndex) {
@@ -600,6 +789,7 @@ async function cleanupPreviewCache(incomingBytes = 0) {
 }
 
 async function deleteChunk(cacheKey) {
+  deleteHotChunk(cacheKey);
   const cache = await caches.open(CACHE_NAME);
   await cache.delete(cacheKey);
   await deleteChunkMetadata(cacheKey);

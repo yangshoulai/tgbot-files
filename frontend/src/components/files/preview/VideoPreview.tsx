@@ -27,11 +27,13 @@ interface VideoPreviewProps {
 
 const VIDEO_PREVIEW_TIMEOUT_MS = 30_000;
 const VIDEO_CONTROLS_HIDE_DELAY_MS = 1_800;
+const VIDEO_LOADING_INDICATOR_DELAY_MS = 360;
 
 export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPreviewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const frameRef = useRef<HTMLDivElement>(null);
   const controlsHideTimerRef = useRef<number | null>(null);
+  const loadingTimerRef = useRef<number | null>(null);
   const previewCacheSessionIdRef = useRef(`video-preview-${file.id}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   const [ratio, setRatio] = useState({ label: "16:9", value: 16 / 9 });
   const [controlsVisible, setControlsVisible] = useState(true);
@@ -107,17 +109,51 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
     }, delay);
   }, [clearControlsHideTimer]);
 
+  const clearLoadingTimer = useCallback(() => {
+    if (loadingTimerRef.current === null) return;
+    window.clearTimeout(loadingTimerRef.current);
+    loadingTimerRef.current = null;
+  }, []);
+
+  const showLoading = useCallback((immediate = false) => {
+    clearLoadingTimer();
+
+    if (immediate) {
+      setLoading(true);
+      return;
+    }
+
+    loadingTimerRef.current = window.setTimeout(() => {
+      setLoading(true);
+      loadingTimerRef.current = null;
+    }, VIDEO_LOADING_INDICATOR_DELAY_MS);
+  }, [clearLoadingTimer]);
+
+  const hideLoading = useCallback(() => {
+    clearLoadingTimer();
+    setLoading(false);
+  }, [clearLoadingTimer]);
+
   useEffect(() => {
-    setLoading(Boolean(videoSrc));
+    if (videoSrc) {
+      showLoading(true);
+    } else {
+      hideLoading();
+    }
     setFailed(false);
-  }, [videoSrc, file.id]);
+  }, [file.id, hideLoading, showLoading, videoSrc]);
 
   useEffect(() => {
     setControlsVisible(true);
     clearControlsHideTimer();
   }, [clearControlsHideTimer, file.id]);
 
-  useEffect(() => clearControlsHideTimer, [clearControlsHideTimer]);
+  useEffect(() => {
+    return () => {
+      clearControlsHideTimer();
+      clearLoadingTimer();
+    };
+  }, [clearControlsHideTimer, clearLoadingTimer]);
 
   useEffect(() => {
     const frame = frameRef.current;
@@ -252,29 +288,29 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
           playsInline
           preload="metadata"
           className="h-full w-full bg-black object-contain"
-          onLoadStart={() => setLoading(true)}
-          onWaiting={() => setLoading(true)}
-          onSeeking={() => setLoading(true)}
+          onLoadStart={() => showLoading(true)}
+          onWaiting={() => showLoading()}
+          onSeeking={() => showLoading()}
           onLoadedData={() => {
-            setLoading(false);
+            hideLoading();
             setFailed(false);
           }}
           onCanPlay={() => {
-            setLoading(false);
+            hideLoading();
             setFailed(false);
           }}
           onPlaying={() => {
-            setLoading(false);
+            hideLoading();
             setFailed(false);
           }}
           onSeeked={(event) => {
             if (event.currentTarget.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-              setLoading(false);
+              hideLoading();
               setFailed(false);
             }
           }}
           onError={() => {
-            setLoading(false);
+            hideLoading();
             setFailed(true);
           }}
           onLoadedMetadata={(event) => {
