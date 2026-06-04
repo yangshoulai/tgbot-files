@@ -1285,15 +1285,14 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
   const completeMatch = /^\/api\/admin\/uploads\/([^/]+)\/complete$/.exec(url.pathname);
   if (request.method === "POST" && completeMatch?.[1]) {
     const upload = await requireMultipartUpload(db, decodeURIComponent(completeMatch[1]));
-    const thumbnail = await readCompleteUploadThumbnail(request);
-    const conflictAction = normalizeFileNameConflictAction(url.searchParams.get("on_conflict"));
+    const completeInput = await readCompleteUploadInput(request, url.searchParams);
     const result = await completeMultipartUpload({
       request,
       env,
       db,
       upload,
-      conflictAction,
-      ...(thumbnail ? { thumbnail } : {})
+      conflictAction: completeInput.conflictAction,
+      ...(completeInput.thumbnail ? { thumbnail: completeInput.thumbnail } : {})
     });
 
     return jsonResponse({
@@ -1447,15 +1446,14 @@ async function handleApiMultipartUploads(request: Request, env: Env): Promise<Re
   const completeMatch = /^\/api\/v1\/uploads\/([^/]+)\/complete$/.exec(url.pathname);
   if (request.method === "POST" && completeMatch?.[1]) {
     const upload = await requireMultipartUpload(db, decodeURIComponent(completeMatch[1]));
-    const thumbnail = await readCompleteUploadThumbnail(request);
-    const conflictAction = normalizeFileNameConflictAction(url.searchParams.get("on_conflict"));
+    const completeInput = await readCompleteUploadInput(request, url.searchParams);
     const result = await completeMultipartUpload({
       request,
       env,
       db,
       upload,
-      conflictAction,
-      ...(thumbnail ? { thumbnail } : {})
+      conflictAction: completeInput.conflictAction,
+      ...(completeInput.thumbnail ? { thumbnail: completeInput.thumbnail } : {})
     });
 
     return jsonResponse({
@@ -1842,27 +1840,42 @@ async function readUrlUploadJson(request: Request, env: Env): Promise<{
   };
 }
 
-async function readCompleteUploadThumbnail(request: Request): Promise<ThumbnailInput | undefined> {
+async function readCompleteUploadInput(
+  request: Request,
+  searchParams: URLSearchParams
+): Promise<{ thumbnail?: ThumbnailInput; conflictAction: FileNameConflictAction }> {
+  const queryConflictAction = searchParams.get("on_conflict");
   const contentType = request.headers.get("Content-Type") || "";
+  const normalizedContentType = contentType.toLowerCase();
 
   if (!contentType) {
-    return undefined;
+    return { conflictAction: normalizeFileNameConflictAction(queryConflictAction) };
   }
 
-  if (!contentType.toLowerCase().includes("multipart/form-data")) {
-    return undefined;
+  if (normalizedContentType.includes("application/json")) {
+    const body = await request.json() as unknown;
+    const bodyConflictAction = isPlainRecord(body) ? body.on_conflict : undefined;
+    return { conflictAction: normalizeFileNameConflictAction(bodyConflictAction ?? queryConflictAction) };
+  }
+
+  if (!normalizedContentType.includes("multipart/form-data")) {
+    return { conflictAction: normalizeFileNameConflictAction(queryConflictAction) };
   }
 
   const formData = await request.formData();
+  const conflictAction = normalizeFileNameConflictAction(formData.get("on_conflict") ?? queryConflictAction);
   const thumbnail = formData.get("thumbnail");
 
   if (!(thumbnail instanceof File)) {
-    return undefined;
+    return { conflictAction };
   }
 
   return {
-    file: thumbnail,
-    ...optionalThumbnailDimensions(formData)
+    conflictAction,
+    thumbnail: {
+      file: thumbnail,
+      ...optionalThumbnailDimensions(formData)
+    }
   };
 }
 

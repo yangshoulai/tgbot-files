@@ -524,18 +524,27 @@ export function completeMultipartUpload(
   signal?: AbortSignal,
   conflictAction?: FileNameConflictAction
 ) {
-  const path = `/api/admin/uploads/${encodeURIComponent(uploadId)}/complete${
-    conflictAction && conflictAction !== "error" ? `?on_conflict=${encodeURIComponent(conflictAction)}` : ""
-  }`;
+  const path = `/api/admin/uploads/${encodeURIComponent(uploadId)}/complete`;
 
   if (!thumbnail) {
     return requestJson<AdminUploadResponse>(path, {
       method: "POST",
-      signal
+      signal,
+      ...(conflictAction && conflictAction !== "error"
+        ? {
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ on_conflict: conflictAction })
+          }
+        : {})
     });
   }
 
   const form = new FormData();
+  if (conflictAction && conflictAction !== "error") {
+    form.set("on_conflict", conflictAction);
+  }
   form.set("thumbnail", thumbnail.blob, thumbnail.fileName);
   if (thumbnail.width) form.set("thumbnail_width", String(thumbnail.width));
   if (thumbnail.height) form.set("thumbnail_height", String(thumbnail.height));

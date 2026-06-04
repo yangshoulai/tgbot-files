@@ -1,6 +1,6 @@
 import type { ThumbnailUploadPayload } from "../api";
 
-export type ThumbnailKind = "image" | "video";
+export type ThumbnailKind = "image" | "video" | "audio";
 
 export interface GeneratedThumbnail extends ThumbnailUploadPayload {
   objectUrl: string;
@@ -8,7 +8,7 @@ export interface GeneratedThumbnail extends ThumbnailUploadPayload {
 }
 
 export interface RemoteThumbnailSource {
-  kind: ThumbnailKind;
+  kind: "image" | "video";
   url: string;
   mime_type?: string;
 }
@@ -20,6 +20,8 @@ const VIDEO_FRAME_WAIT_TIMEOUT_MS = 800;
 const VIDEO_BLANK_VARIANCE_THRESHOLD = 4;
 const VIDEO_BLANK_WHITE_LUMA = 246;
 const VIDEO_BLANK_BLACK_LUMA = 10;
+const AUDIO_METADATA_SCAN_BYTES = 16 * 1024 * 1024;
+const ID3_MAX_TAG_BYTES = 32 * 1024 * 1024;
 
 export function canAutoGenerateThumbnail(file: File): boolean {
   return thumbnailKindForFile(file) !== null;
@@ -35,6 +37,10 @@ export function thumbnailKindForFile(file: Pick<File, "type" | "name">): Thumbna
 
   if (mime.startsWith("video/") || /\.(mp4|m4v|mov|webm|ogv)$/i.test(name)) {
     return "video";
+  }
+
+  if (mime.startsWith("audio/") || /\.(mp3|m4a|m4b|aac|flac)$/i.test(name)) {
+    return "audio";
   }
 
   if (/\.(jpg|jpeg|png|webp|gif|bmp|avif)$/i.test(name)) {
@@ -59,6 +65,10 @@ export async function generateThumbnailFromFile(file: File, source: "auto" | "ma
       URL.revokeObjectURL(objectUrl);
       throw error;
     }
+  }
+
+  if (kind === "audio") {
+    return renderAudioCoverThumbnail(file, source);
   }
 
   throw new Error("该文件类型不支持自动生成缩略图");
@@ -149,6 +159,16 @@ async function renderVideoThumbnail(
       URL.revokeObjectURL(sourceUrl);
     }
   }
+}
+
+async function renderAudioCoverThumbnail(file: File, generatedSource: "auto" | "manual"): Promise<GeneratedThumbnail> {
+  const cover = await extractAudioCover(file);
+
+  if (!cover) {
+    throw new Error("未找到音频内嵌封面，请手动选择缩略图");
+  }
+
+  return renderImageThumbnail(cover, generatedSource, file.name);
 }
 
 function loadImage(src: string): Promise<HTMLImageElement> {
@@ -346,6 +366,252 @@ function isProbablyBlankVideoFrame(canvas: HTMLCanvasElement): boolean {
     (lumaAverage > VIDEO_BLANK_WHITE_LUMA || lumaAverage < VIDEO_BLANK_BLACK_LUMA);
 }
 
+async function extractAudioCover(file: File): Promise<Blob | undefined> {
+  return await extractId3Cover(file) ??
+    await extractFlacCover(file) ??
+    await extractMp4Cover(file);
+}
+
+async function extractId3Cover(file: File): Promise<Blob | undefined> {
+  if (file.size < 10) return undefined;
+
+  const header = await readFileBytes(file, 0, 10);
+  if (bytesToAscii(header, 0, 3) !== "ID3") {
+    return undefined;
+  }
+
+  const majorVersion = header[3] ?? 0;
+  if (majorVersion < 2 || majorVersion > 4) {
+    return undefined;
+  }
+
+  const tagSize = synchsafeInteger(header, 6);
+  if (tagSize <= 0) return undefined;
+
+  const bytesToRead = Math.min(file.size, 10 + Math.min(tagSize, ID3_MAX_TAG_BYTES));
+  const tag = await readFileBytes(file, 0, bytesToRead);
+  let body = tag.subarray(10, Math.min(tag.length, 10 + tagSize));
+  const flags = header[5] ?? 0;
+
+  if ((flags & 0x80) !== 0) {
+    body = removeId3Unsynchronisation(body);
+  }
+
+  let offset = 0;
+  if ((flags & 0x40) !== 0) {
+    if (majorVersion === 3 && body.length >= 4) {
+      offset += 4 + uint32(body, 0);
+    } else if (majorVersion === 4 && body.length >= 4) {
+      offset += synchsafeInteger(body, 0);
+    }
+  }
+
+  return majorVersion === 2
+    ? extractId3v22CoverFrame(body, offset)
+    : extractId3v23Or24CoverFrame(body, offset, majorVersion);
+}
+
+function extractId3v22CoverFrame(body: Uint8Array, offset: number): Blob | undefined {
+  while (offset + 6 <= body.length) {
+    const frameId = bytesToAscii(body, offset, 3);
+    const frameSize = uint24(body, offset + 3);
+
+    offset += 6;
+    if (!frameId.trim() || frameSize <= 0 || offset + frameSize > body.length) {
+      break;
+    }
+
+    if (frameId === "PIC") {
+      const frame = body.subarray(offset, offset + frameSize);
+      const cover = parseId3v22PicFrame(frame);
+      if (cover) return cover;
+    }
+
+    offset += frameSize;
+  }
+
+  return undefined;
+}
+
+function extractId3v23Or24CoverFrame(body: Uint8Array, offset: number, version: number): Blob | undefined {
+  while (offset + 10 <= body.length) {
+    const frameId = bytesToAscii(body, offset, 4);
+    const frameSize = version === 4 ? synchsafeInteger(body, offset + 4) : uint32(body, offset + 4);
+
+    offset += 10;
+    if (!frameId.trim() || frameSize <= 0 || offset + frameSize > body.length) {
+      break;
+    }
+
+    if (frameId === "APIC") {
+      const frame = body.subarray(offset, offset + frameSize);
+      const cover = parseId3ApicFrame(frame);
+      if (cover) return cover;
+    }
+
+    offset += frameSize;
+  }
+
+  return undefined;
+}
+
+function parseId3ApicFrame(frame: Uint8Array): Blob | undefined {
+  if (frame.length < 4) return undefined;
+
+  const encoding = frame[0] ?? 0;
+  const mimeEnd = frame.indexOf(0, 1);
+  if (mimeEnd < 0 || mimeEnd + 2 >= frame.length) {
+    return undefined;
+  }
+
+  const rawMime = bytesToLatin1(frame.subarray(1, mimeEnd));
+  let offset = mimeEnd + 2;
+  const descriptionEnd = findEncodedTextTerminator(frame, offset, encoding);
+  offset = Math.min(frame.length, descriptionEnd + textTerminatorLength(encoding));
+
+  return imageBlobFromBytes(frame.subarray(offset), normalizeEmbeddedImageMime(rawMime));
+}
+
+function parseId3v22PicFrame(frame: Uint8Array): Blob | undefined {
+  if (frame.length < 6) return undefined;
+
+  const encoding = frame[0] ?? 0;
+  const imageFormat = bytesToAscii(frame, 1, 3);
+  let offset = 5;
+  const descriptionEnd = findEncodedTextTerminator(frame, offset, encoding);
+  offset = Math.min(frame.length, descriptionEnd + textTerminatorLength(encoding));
+
+  return imageBlobFromBytes(frame.subarray(offset), normalizeEmbeddedImageMime(imageFormat));
+}
+
+async function extractFlacCover(file: File): Promise<Blob | undefined> {
+  const bytes = await readFileBytes(file, 0, Math.min(file.size, AUDIO_METADATA_SCAN_BYTES));
+  if (bytesToAscii(bytes, 0, 4) !== "fLaC") {
+    return undefined;
+  }
+
+  let offset = 4;
+  while (offset + 4 <= bytes.length) {
+    const blockHeader = bytes[offset] ?? 0;
+    const isLastBlock = (blockHeader & 0x80) !== 0;
+    const blockType = blockHeader & 0x7f;
+    const blockSize = uint24(bytes, offset + 1);
+    const blockStart = offset + 4;
+    const blockEnd = blockStart + blockSize;
+
+    if (blockSize <= 0 || blockEnd > bytes.length) {
+      break;
+    }
+
+    if (blockType === 6) {
+      const cover = parseFlacPictureBlock(bytes.subarray(blockStart, blockEnd));
+      if (cover) return cover;
+    }
+
+    offset = blockEnd;
+    if (isLastBlock) break;
+  }
+
+  return undefined;
+}
+
+function parseFlacPictureBlock(block: Uint8Array): Blob | undefined {
+  let offset = 0;
+  if (block.length < 32) return undefined;
+
+  offset += 4;
+  const mimeLength = uint32(block, offset);
+  offset += 4;
+  if (mimeLength <= 0 || offset + mimeLength + 24 > block.length) {
+    return undefined;
+  }
+
+  const mime = bytesToUtf8(block.subarray(offset, offset + mimeLength));
+  offset += mimeLength;
+  const descriptionLength = uint32(block, offset);
+  offset += 4 + descriptionLength;
+  if (offset + 20 > block.length) {
+    return undefined;
+  }
+
+  offset += 16;
+  const imageLength = uint32(block, offset);
+  offset += 4;
+  if (imageLength <= 0 || offset + imageLength > block.length) {
+    return undefined;
+  }
+
+  return imageBlobFromBytes(block.subarray(offset, offset + imageLength), normalizeEmbeddedImageMime(mime));
+}
+
+async function extractMp4Cover(file: File): Promise<Blob | undefined> {
+  const ranges: Array<{ start: number; end: number }> = [
+    { start: 0, end: Math.min(file.size, AUDIO_METADATA_SCAN_BYTES) }
+  ];
+
+  if (file.size > AUDIO_METADATA_SCAN_BYTES) {
+    ranges.push({
+      start: Math.max(0, file.size - AUDIO_METADATA_SCAN_BYTES),
+      end: file.size
+    });
+  }
+
+  for (const range of ranges) {
+    const bytes = await readFileBytes(file, range.start, range.end);
+    const cover = extractMp4CoverFromBytes(bytes);
+    if (cover) return cover;
+  }
+
+  return undefined;
+}
+
+function extractMp4CoverFromBytes(bytes: Uint8Array): Blob | undefined {
+  for (let typeOffset = 4; typeOffset + 4 <= bytes.length; typeOffset += 1) {
+    if (bytesToAscii(bytes, typeOffset, 4) !== "covr") {
+      continue;
+    }
+
+    const coverBoxStart = typeOffset - 4;
+    const coverBoxSize = uint32(bytes, coverBoxStart);
+    const coverBoxEnd = coverBoxSize > 8
+      ? Math.min(bytes.length, coverBoxStart + coverBoxSize)
+      : bytes.length;
+    let offset = typeOffset + 4;
+
+    while (offset + 16 <= coverBoxEnd) {
+      const atomSize = uint32(bytes, offset);
+      const atomType = bytesToAscii(bytes, offset + 4, 4);
+      if (atomSize < 16 || offset + atomSize > coverBoxEnd) {
+        break;
+      }
+
+      if (atomType === "data") {
+        const dataType = uint32(bytes, offset + 8) & 0xffffff;
+        const explicitMime = mp4CoverMimeType(dataType);
+        return imageBlobFromBytes(bytes.subarray(offset + 16, offset + atomSize), explicitMime);
+      }
+
+      offset += atomSize;
+    }
+  }
+
+  return undefined;
+}
+
+function imageBlobFromBytes(bytes: Uint8Array, mimeType?: string): Blob | undefined {
+  if (bytes.length <= 0) {
+    return undefined;
+  }
+
+  const detectedMime = imageMimeTypeFromMagic(bytes);
+  const type = detectedMime ?? mimeType;
+  if (!type?.startsWith("image/")) {
+    return undefined;
+  }
+
+  return new Blob([arrayBufferFromBytes(bytes)], { type });
+}
+
 async function canvasToGeneratedThumbnail(
   canvas: HTMLCanvasElement,
   sourceFileName: string,
@@ -384,4 +650,142 @@ function thumbnailFileName(fileName: string): string {
   const normalized = fileName.split(/[\\/]/).pop() || "thumbnail";
   const base = normalized.replace(/\.[^./\\]{1,12}$/i, "") || "thumbnail";
   return `${base}.thumbnail.jpg`;
+}
+
+function readFileBytes(file: File, start: number, end: number): Promise<Uint8Array> {
+  return file.slice(start, end).arrayBuffer().then((buffer) => new Uint8Array(buffer));
+}
+
+function arrayBufferFromBytes(bytes: Uint8Array): ArrayBuffer {
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return copy.buffer;
+}
+
+function bytesToAscii(bytes: Uint8Array, offset: number, length: number): string {
+  let value = "";
+  for (let index = offset; index < offset + length && index < bytes.length; index += 1) {
+    value += String.fromCharCode(bytes[index] ?? 0);
+  }
+  return value;
+}
+
+function bytesToLatin1(bytes: Uint8Array): string {
+  let value = "";
+  for (const byte of bytes) {
+    value += String.fromCharCode(byte);
+  }
+  return value;
+}
+
+function bytesToUtf8(bytes: Uint8Array): string {
+  try {
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return bytesToLatin1(bytes);
+  }
+}
+
+function uint24(bytes: Uint8Array, offset: number): number {
+  return ((bytes[offset] ?? 0) << 16) |
+    ((bytes[offset + 1] ?? 0) << 8) |
+    (bytes[offset + 2] ?? 0);
+}
+
+function uint32(bytes: Uint8Array, offset: number): number {
+  return (((bytes[offset] ?? 0) << 24) >>> 0) |
+    ((bytes[offset + 1] ?? 0) << 16) |
+    ((bytes[offset + 2] ?? 0) << 8) |
+    (bytes[offset + 3] ?? 0);
+}
+
+function synchsafeInteger(bytes: Uint8Array, offset: number): number {
+  return ((bytes[offset] ?? 0) << 21) |
+    ((bytes[offset + 1] ?? 0) << 14) |
+    ((bytes[offset + 2] ?? 0) << 7) |
+    (bytes[offset + 3] ?? 0);
+}
+
+function removeId3Unsynchronisation(bytes: Uint8Array): Uint8Array {
+  const output: number[] = [];
+
+  for (let index = 0; index < bytes.length; index += 1) {
+    const byte = bytes[index] ?? 0;
+    output.push(byte);
+    if (byte === 0xff && bytes[index + 1] === 0x00) {
+      index += 1;
+    }
+  }
+
+  return new Uint8Array(output);
+}
+
+function findEncodedTextTerminator(bytes: Uint8Array, offset: number, encoding: number): number {
+  if (textTerminatorLength(encoding) === 2) {
+    for (let index = offset; index + 1 < bytes.length; index += 1) {
+      if (bytes[index] === 0 && bytes[index + 1] === 0) {
+        return index;
+      }
+    }
+    return bytes.length;
+  }
+
+  const end = bytes.indexOf(0, offset);
+  return end < 0 ? bytes.length : end;
+}
+
+function textTerminatorLength(encoding: number): 1 | 2 {
+  return encoding === 1 || encoding === 2 ? 2 : 1;
+}
+
+function normalizeEmbeddedImageMime(value: string): string | undefined {
+  const normalized = value.trim().toLowerCase();
+
+  if (!normalized || normalized === "-->") return undefined;
+  if (normalized === "jpg" || normalized === "jpeg" || normalized === "image/jpg") return "image/jpeg";
+  if (normalized === "png") return "image/png";
+  if (normalized === "webp") return "image/webp";
+  if (normalized === "gif") return "image/gif";
+  if (normalized.startsWith("image/")) return normalized;
+
+  return undefined;
+}
+
+function mp4CoverMimeType(dataType: number): string | undefined {
+  if (dataType === 13) return "image/jpeg";
+  if (dataType === 14) return "image/png";
+  if (dataType === 27) return "image/bmp";
+  return undefined;
+}
+
+function imageMimeTypeFromMagic(bytes: Uint8Array): string | undefined {
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return "image/jpeg";
+  }
+
+  if (
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47
+  ) {
+    return "image/png";
+  }
+
+  if (
+    bytesToAscii(bytes, 0, 4) === "RIFF" &&
+    bytesToAscii(bytes, 8, 4) === "WEBP"
+  ) {
+    return "image/webp";
+  }
+
+  if (bytesToAscii(bytes, 0, 3) === "GIF") {
+    return "image/gif";
+  }
+
+  if (bytesToAscii(bytes, 0, 2) === "BM") {
+    return "image/bmp";
+  }
+
+  return undefined;
 }

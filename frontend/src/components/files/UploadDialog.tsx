@@ -1877,7 +1877,7 @@ function QueueRow({
   const fileName = item.fileNameOverride ?? item.file.name;
   return (
     <div className="flex flex-col gap-2 rounded-xl border border-border bg-surface px-3 py-2.5">
-      <div className="flex items-center gap-3">
+      <div className="flex items-start gap-3">
         <UploadThumbnailVisual
           thumbnail={item.thumbnail}
           fallback={<FileTypeIcon mimeType={item.file.type || "application/octet-stream"} fileName={item.file.name} size="sm" />}
@@ -1995,7 +1995,7 @@ function UrlUploadRow({
   const fileName = fileNameOverride ?? remoteFileLabel(url);
   return (
     <div className="flex flex-col gap-2 rounded-xl border border-border bg-surface px-3 py-2.5">
-      <div className="flex items-center gap-3">
+      <div className="flex items-start gap-3">
         <UploadThumbnailVisual
           thumbnail={thumbnail}
           fallback={
@@ -2085,23 +2085,29 @@ function ConflictResolutionActions({
   }
 
   return (
-    <div className="mt-2 flex flex-col gap-2 rounded-lg border border-warning/35 bg-warning-soft/50 px-2.5 py-2 text-xs leading-5 text-warning sm:flex-row sm:items-center sm:justify-between">
-      <span className="min-w-0">
-        当前目录 <span className="font-semibold">{conflict.directoryPath}</span> 已存在{" "}
-        <span className="font-semibold">{conflict.fileName}</span>
-      </span>
-      <span className="flex shrink-0 flex-wrap gap-1.5">
+    <div className="mt-2 flex min-w-0 flex-col gap-2 rounded-lg border border-warning/35 bg-warning-soft/50 px-2.5 py-2 text-xs leading-5 text-warning">
+      <div className="min-w-0 space-y-0.5">
+        <p className="font-medium">当前目录已存在同名文件</p>
+        <p className="break-all text-warning/90">
+          <span className="font-semibold">{conflict.directoryPath}</span>
+          {conflict.directoryPath.endsWith("/") ? "" : "/"}
+          <span className="font-semibold">{conflict.fileName}</span>
+        </p>
+      </div>
+      <span className="flex min-w-0 flex-wrap gap-1.5">
         <button
           type="button"
           onClick={onRename}
+          title={`重命名为 ${conflict.suggestedName}`}
           disabled={disabled || !onRename}
-          className="rounded-md border border-warning/35 bg-surface px-2.5 py-1 font-medium text-warning transition-colors hover:bg-warning-soft disabled:pointer-events-none disabled:opacity-50"
+          className="min-w-0 max-w-full rounded-md border border-warning/35 bg-surface px-2.5 py-1 font-medium text-warning transition-colors hover:bg-warning-soft disabled:pointer-events-none disabled:opacity-50"
         >
-          重命名为 {conflict.suggestedName}
+          <span className="block max-w-full truncate">重命名为 {conflict.suggestedName}</span>
         </button>
         <button
           type="button"
           onClick={onOverwrite}
+          title={`覆盖 ${conflict.fileName}`}
           disabled={disabled || !onOverwrite}
           className="rounded-md border border-danger/30 px-2.5 py-1 font-medium text-danger transition-colors hover:bg-danger-soft disabled:pointer-events-none disabled:opacity-50"
         >

@@ -3452,9 +3452,13 @@ describe("admin file manager", () => {
     const cookie = await loginAndGetCookie(adminEnv);
 
     const response = await worker.fetch(
-      new Request("https://files.example.com/api/admin/uploads/upload-race/complete?on_conflict=overwrite", {
+      new Request("https://files.example.com/api/admin/uploads/upload-race/complete", {
         method: "POST",
-        headers: { Cookie: cookie }
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ on_conflict: "overwrite" })
       }),
       adminEnv
     );
