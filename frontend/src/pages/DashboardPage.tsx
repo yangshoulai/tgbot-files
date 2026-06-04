@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, ArrowUpDown, ChevronRight, FolderInput, FolderPlus, Pencil, RefreshCw, Search, Trash2 } from "lucide-react";
+import { ArrowUp, ChevronRight, FolderInput, FolderPlus, Pencil, RefreshCw, Search, Trash2 } from "lucide-react";
 import {
   ApiError,
   DirectoryItem,
@@ -76,13 +76,6 @@ const FILE_TYPE_OPTIONS: Array<{ value: FileTypeFilter; label: string }> = [
   { value: "other", label: "其他" }
 ];
 
-const FILE_SORT_OPTIONS: Array<{ value: FileSortKey; label: string }> = [
-  { value: "created_at", label: "上传时间" },
-  { value: "name", label: "文件名" },
-  { value: "size", label: "文件大小" },
-  { value: "type", label: "文件类型" }
-];
-
 const collator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
 
 interface AcceleratedDownloadTask {
@@ -137,6 +130,38 @@ function compareFileItems(left: FileItem, right: FileItem, sortKey: FileSortKey,
     default:
       return modifier * (Date.parse(left.created_at) - Date.parse(right.created_at));
   }
+}
+
+function compareDirectoryItems(
+  left: DirectoryItem,
+  right: DirectoryItem,
+  sortKey: FileSortKey,
+  direction: SortDirection
+): number {
+  const modifier = direction === "asc" ? 1 : -1;
+  let result = 0;
+
+  switch (sortKey) {
+    case "size":
+      result = (left.total_size || 0) - (right.total_size || 0);
+      break;
+    case "created_at":
+      result = Date.parse(left.created_at) - Date.parse(right.created_at);
+      break;
+    case "type":
+      result = collator.compare("文件夹", "文件夹");
+      break;
+    case "name":
+    default:
+      result = collator.compare(left.name, right.name);
+      break;
+  }
+
+  if (result === 0) {
+    result = collator.compare(left.name, right.name);
+  }
+
+  return modifier * result;
 }
 
 function FileListBusyOverlay({ label }: { label: string }) {
@@ -984,19 +1009,14 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     () => [...files].sort((left, right) => compareFileItems(left, right, sortKey, sortDirection)),
     [files, sortDirection, sortKey]
   );
+  const sortedDirectories = useMemo(
+    () => [...directories].sort((left, right) => compareDirectoryItems(left, right, sortKey, sortDirection)),
+    [directories, sortDirection, sortKey]
+  );
 
   function changeSort(nextKey: FileSortKey) {
     if (nextKey === sortKey) {
       setSortDirection((current) => (current === "asc" ? "desc" : "asc"));
-      return;
-    }
-
-    setSortKey(nextKey);
-    setSortDirection(nextKey === "created_at" ? "desc" : "asc");
-  }
-
-  function selectSortKey(nextKey: FileSortKey) {
-    if (nextKey === sortKey) {
       return;
     }
 
@@ -1015,7 +1035,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     });
     setSelectedDirectoryIds((current) => {
       const next = new Set(current);
-      for (const directory of directories) {
+      for (const directory of sortedDirectories) {
         if (selected) next.add(directory.id);
         else next.delete(directory.id);
       }
@@ -1023,13 +1043,13 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     });
   }
 
-  const visibleEntryCount = sortedFiles.length + directories.length;
+  const visibleEntryCount = sortedFiles.length + sortedDirectories.length;
   const selectedFileCount = files.filter((file) => selectedFileIds.has(file.id)).length;
   const selectedDirectoryCount = directories.filter((directory) => selectedDirectoryIds.has(directory.id)).length;
   const selectedCount = selectedFileCount + selectedDirectoryCount;
   const allPageSelected = visibleEntryCount > 0 &&
     sortedFiles.every((file) => selectedFileIds.has(file.id)) &&
-    directories.every((directory) => selectedDirectoryIds.has(directory.id));
+    sortedDirectories.every((directory) => selectedDirectoryIds.has(directory.id));
   const directoryMoveTargets = useMemo(() => {
     if (!movingDirectory) {
       return directoryOptions;
@@ -1056,60 +1076,60 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
 
   return (
     <div className="flex flex-col gap-5">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <p className="text-xs font-medium uppercase tracking-wide text-muted">控制台</p>
-          <h1 className="mt-1 text-2xl font-semibold text-foreground sm:text-3xl">文件管理</h1>
-          <p className="mt-1 text-sm text-muted">上传、检索、预览与分发存储在 Telegram 中的文件。</p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <Button
-            variant="secondary"
-            leadingIcon={<ArrowUp size={16} />}
-            disabled={currentDirPath === "/" || isListBusy}
-            onClick={() => goToDirectory(parentDirectoryPath(currentDirPath))}
-          >
-            返回上级
-          </Button>
-          <Button
-            variant="primary"
-            leadingIcon={<FolderPlus size={16} />}
-            disabled={isListBusy}
-            onClick={() => {
-              setCreateDirParentPath("/");
-              setCreateDirOpen(true);
-            }}
-          >
-            新建目录
-          </Button>
-        </div>
+      <div>
+        <p className="text-xs font-medium uppercase tracking-wide text-muted">控制台</p>
+        <h1 className="mt-1 text-2xl font-semibold text-foreground sm:text-3xl">文件管理</h1>
+        <p className="mt-1 text-sm text-muted">上传、检索、预览与分发存储在 Telegram 中的文件。</p>
       </div>
 
       <MetricsRow metrics={metrics} />
 
       <div className="flex flex-col gap-3 rounded-2xl border border-border bg-surface p-3 shadow-card sm:p-4">
-        <div className="flex flex-wrap items-center gap-1 rounded-xl border border-border bg-background/60 px-3 py-2">
-          {directoryBreadcrumbs(currentDirPath).map((item, index, array) => (
-            <div key={item.path} className="flex items-center gap-1">
-              <button
-                type="button"
-                disabled={isListBusy}
-                onClick={() => goToDirectory(item.path)}
-                className="rounded-md px-2 py-1 text-sm font-medium text-foreground transition-colors hover:bg-primary-soft hover:text-primary-strong focus-visible:outline-none focus-visible:focus-ring disabled:pointer-events-none disabled:opacity-50"
-              >
-                {item.label}
-              </button>
-              {index < array.length - 1 ? <ChevronRight size={14} className="text-subtle" /> : null}
-            </div>
-          ))}
-          {query.trim() ? (
-            <span className="ml-auto rounded-full bg-primary-soft px-2 py-1 text-xs font-medium text-primary-strong">
-              当前目录内搜索
-            </span>
-          ) : null}
+        <div className="flex items-center gap-2 rounded-xl border border-border bg-background/60 px-3 py-2">
+          <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto scroll-thin">
+            {directoryBreadcrumbs(currentDirPath).map((item, index, array) => (
+              <div key={item.path} className="flex shrink-0 items-center gap-1">
+                <button
+                  type="button"
+                  disabled={isListBusy}
+                  onClick={() => goToDirectory(item.path)}
+                  className="rounded-md px-2 py-1 text-sm font-medium text-foreground transition-colors hover:bg-primary-soft hover:text-primary-strong focus-visible:outline-none focus-visible:focus-ring disabled:pointer-events-none disabled:opacity-50"
+                >
+                  {item.label}
+                </button>
+                {index < array.length - 1 ? <ChevronRight size={14} className="text-subtle" /> : null}
+              </div>
+            ))}
+            {query.trim() ? (
+              <span className="shrink-0 rounded-full bg-primary-soft px-2 py-1 text-xs font-medium text-primary-strong">
+                当前目录内搜索
+              </span>
+            ) : null}
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <Button
+              variant="secondary"
+              leadingIcon={<ArrowUp size={16} />}
+              disabled={currentDirPath === "/" || isListBusy}
+              onClick={() => goToDirectory(parentDirectoryPath(currentDirPath))}
+            >
+              返回上级
+            </Button>
+            <Button
+              variant="primary"
+              leadingIcon={<FolderPlus size={16} />}
+              disabled={isListBusy}
+              onClick={() => {
+                setCreateDirParentPath(currentDirPath);
+                setCreateDirOpen(true);
+              }}
+            >
+              新建目录
+            </Button>
+          </div>
         </div>
 
-        <div className="grid grid-cols-1 gap-2 xl:grid-cols-[minmax(240px,1fr)_220px_145px_145px_110px_auto] xl:items-center">
+        <div className="grid grid-cols-1 gap-2 lg:grid-cols-[minmax(240px,1fr)_220px_145px_auto] lg:items-center">
           <Input
             placeholder="搜索文件名、备注"
             leadingIcon={<Search size={15} />}
@@ -1135,28 +1155,6 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
               </option>
             ))}
           </select>
-          <select
-            aria-label="排序字段"
-            value={sortKey}
-            onChange={(event) => selectSortKey(event.target.value as FileSortKey)}
-            className="h-11 rounded-lg border border-border bg-surface px-3 text-sm text-foreground shadow-card outline-none transition-colors hover:border-border-strong focus:border-primary focus:shadow-[0_0_0_4px_var(--color-primary-ring)]"
-          >
-            {FILE_SORT_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-          <Button
-            variant="secondary"
-            className="h-11"
-            leadingIcon={<ArrowUpDown size={15} />}
-            disabled={isListBusy}
-            onClick={() => setSortDirection((current) => (current === "asc" ? "desc" : "asc"))}
-            aria-label={`切换为${sortDirection === "asc" ? "降序" : "升序"}`}
-          >
-            {sortDirection === "asc" ? "升序" : "降序"}
-          </Button>
           <div className="flex items-center justify-end">
             <IconButton
               variant="default"
@@ -1211,7 +1209,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
             }
           >
             <FileTable
-              directories={directories}
+              directories={sortedDirectories}
               files={sortedFiles}
               selectedFileIds={selectedFileIds}
               selectedDirectoryIds={selectedDirectoryIds}
