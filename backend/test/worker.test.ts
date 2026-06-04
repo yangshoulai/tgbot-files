@@ -3070,6 +3070,79 @@ describe("admin file manager", () => {
     expect(db.files).toHaveLength(0);
   });
 
+  it("reports uploaded and missing chunks for an incomplete admin multipart upload", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const upload: MultipartUploadRecord = {
+      id: "upload-status",
+      source_kind: "url",
+      source_url: "https://source.example.com/movie.mp4",
+      file_name: "movie.mp4",
+      mime_type: "video/mp4",
+      size: 40,
+      chunk_size: 10,
+      chunk_count: 4,
+      remark: null,
+      uploaded_by: "admin",
+      created_at: "2026-06-01T00:00:00.000Z",
+      completed_at: null,
+      directory_id: null,
+      directory_path: "/imports"
+    };
+    db.multipartUploads.push(upload);
+    db.fileChunks.push(
+      {
+        file_id: upload.id,
+        chunk_index: 0,
+        size: 10,
+        md5: "chunk-0",
+        telegram_file_id: "tg-0",
+        telegram_file_unique_id: null,
+        created_at: "2026-06-01T00:00:00.000Z"
+      },
+      {
+        file_id: upload.id,
+        chunk_index: 2,
+        size: 10,
+        md5: "chunk-2",
+        telegram_file_id: "tg-2",
+        telegram_file_unique_id: null,
+        created_at: "2026-06-01T00:00:00.000Z"
+      }
+    );
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const response = await worker.fetch(
+      new Request(`https://files.example.com/api/admin/uploads/${upload.id}/status`, {
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      ok: boolean;
+      upload: { id: string; source_kind: string; chunk_count: number; direct_access: boolean; directory_path: string };
+      uploaded_chunks: number[];
+      missing_chunks: number[];
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.upload).toMatchObject({
+      id: upload.id,
+      source_kind: "url",
+      chunk_count: 4,
+      direct_access: true,
+      directory_path: "/imports"
+    });
+    expect(body.uploaded_chunks).toEqual([0, 2]);
+    expect(body.missing_chunks).toEqual([1, 3]);
+  });
+
   it("completes oversized-direct multipart uploads without returning a full file link", async () => {
     const db = new FakeD1();
     const adminEnv: Env = {

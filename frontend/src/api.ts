@@ -177,6 +177,7 @@ export interface EntryDeleteResponse {
 
 export interface MultipartUpload {
   id: string;
+  source_kind?: "local" | "url";
   file_name: string;
   mime_type: string;
   size: number;
@@ -222,6 +223,15 @@ export interface MultipartChunkResponse {
     telegram_channel_id?: string;
   };
   uploaded_chunks: number;
+}
+
+export interface MultipartUploadStatusResponse {
+  ok: boolean;
+  upload: MultipartUpload & {
+    source_kind: "local" | "url";
+  };
+  uploaded_chunks: number[];
+  missing_chunks: number[];
 }
 
 export interface TelegramChannelItem {
@@ -415,9 +425,10 @@ export function initMultipartUpload(params: {
   size: number;
   remark?: string;
   directory_path?: string;
-}) {
+}, signal?: AbortSignal) {
   return requestJson<MultipartInitResponse>("/api/admin/uploads/init", {
     method: "POST",
+    signal,
     headers: {
       "Content-Type": "application/json"
     },
@@ -425,18 +436,27 @@ export function initMultipartUpload(params: {
   });
 }
 
-export function uploadMultipartChunk(uploadId: string, chunkIndex: number, chunk: Blob) {
+export function uploadMultipartChunk(uploadId: string, chunkIndex: number, chunk: Blob, signal?: AbortSignal) {
   const form = new FormData();
   form.set("chunk", chunk);
   return requestJson<MultipartChunkResponse>(`/api/admin/uploads/${encodeURIComponent(uploadId)}/chunks/${chunkIndex}`, {
     method: "POST",
+    signal,
     body: form
   });
 }
 
-export function initUrlMultipartUpload(url: string, remark?: string, directoryPath = "/", forceMultipart = false, fileName?: string) {
+export function initUrlMultipartUpload(
+  url: string,
+  remark?: string,
+  directoryPath = "/",
+  forceMultipart = false,
+  fileName?: string,
+  signal?: AbortSignal
+) {
   return requestJson<UrlMultipartInitResponse>("/api/admin/uploads/url/init", {
     method: "POST",
+    signal,
     headers: {
       "Content-Type": "application/json"
     },
@@ -450,10 +470,17 @@ export function initUrlMultipartUpload(url: string, remark?: string, directoryPa
   });
 }
 
-export function uploadUrlMultipartChunk(uploadId: string, chunkIndex: number) {
+export function uploadUrlMultipartChunk(uploadId: string, chunkIndex: number, signal?: AbortSignal) {
   return requestJson<MultipartChunkResponse>(
     `/api/admin/uploads/${encodeURIComponent(uploadId)}/url-chunks/${chunkIndex}`,
-    { method: "POST" }
+    { method: "POST", signal }
+  );
+}
+
+export function getMultipartUploadStatus(uploadId: string, signal?: AbortSignal) {
+  return requestJson<MultipartUploadStatusResponse>(
+    `/api/admin/uploads/${encodeURIComponent(uploadId)}/status`,
+    { signal }
   );
 }
 
@@ -464,10 +491,11 @@ export interface ThumbnailUploadPayload {
   height?: number;
 }
 
-export function completeMultipartUpload(uploadId: string, thumbnail?: ThumbnailUploadPayload) {
+export function completeMultipartUpload(uploadId: string, thumbnail?: ThumbnailUploadPayload, signal?: AbortSignal) {
   if (!thumbnail) {
     return requestJson<AdminUploadResponse>(`/api/admin/uploads/${encodeURIComponent(uploadId)}/complete`, {
-      method: "POST"
+      method: "POST",
+      signal
     });
   }
 
@@ -478,6 +506,7 @@ export function completeMultipartUpload(uploadId: string, thumbnail?: ThumbnailU
 
   return requestJson<AdminUploadResponse>(`/api/admin/uploads/${encodeURIComponent(uploadId)}/complete`, {
     method: "POST",
+    signal,
     body: form
   });
 }

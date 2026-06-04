@@ -3,6 +3,7 @@ import { Check, CheckCircle2, ClipboardPaste, FilePlus2, ImageOff, ImagePlus, La
 import {
   ApiError,
   completeMultipartUpload,
+  getMultipartUploadStatus,
   initMultipartUpload,
   initUrlMultipartUpload,
   listDirectories,
@@ -115,6 +116,15 @@ interface UploadThumbnailState {
 interface ChunkQueueResult {
   completedChunks: number[];
   failedChunks: number[];
+  cancelled: boolean;
+}
+
+interface UploadAbortContext {
+  kind: "local" | "url";
+  itemId?: string;
+  abortController: AbortController;
+  controllers: Set<AbortController>;
+  cancelled: boolean;
 }
 
 let counter = 0;
@@ -122,12 +132,15 @@ const MULTIPART_UPLOAD_CONCURRENCY = 5;
 const URL_MULTIPART_UPLOAD_CONCURRENCY = 5;
 const MULTIPART_UPLOAD_MAX_ATTEMPTS = 3;
 const MULTIPART_UPLOAD_RETRY_DELAY_MS = 800;
+const LOCAL_CHUNK_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
+const URL_CHUNK_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
 const FILE_NAME_CONFLICT_TOAST_MESSAGE = "上传目录已存在同名文件，请输入新的文件名";
 
 class MultipartChunkUploadError extends Error {
   constructor(
     message: string,
-    public readonly retry: MultipartRetryState
+    public readonly retry: MultipartRetryState,
+    public readonly stopped = false
   ) {
     super(message);
     this.name = "MultipartChunkUploadError";
@@ -167,6 +180,10 @@ export function UploadDialog({
   const [directoriesLoading, setDirectoriesLoading] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const onErrorRef = useRef(onError);
+  const activeUploadRef = useRef<UploadAbortContext | null>(null);
+  const [activeUploadKind, setActiveUploadKind] = useState<"local" | "url" | null>(null);
+  const [activeUploadItemId, setActiveUploadItemId] = useState<string | null>(null);
+  const [stopRequested, setStopRequested] = useState(false);
 
   useEffect(() => {
     onErrorRef.current = onError;
@@ -174,6 +191,11 @@ export function UploadDialog({
 
   useEffect(() => {
     if (!open) {
+      abortUploadTask(activeUploadRef.current);
+      activeUploadRef.current = null;
+      setActiveUploadKind(null);
+      setActiveUploadItemId(null);
+      setStopRequested(false);
       setItems((current) => {
         current.forEach((item) => revokeThumbnail(item.thumbnail?.generated));
         return [];
@@ -452,6 +474,69 @@ export function UploadDialog({
     return undefined;
   }
 
+  function startUploadTask(kind: "local" | "url", itemId?: string): UploadAbortContext {
+    abortUploadTask(activeUploadRef.current);
+
+    const task: UploadAbortContext = {
+      kind,
+      ...(itemId ? { itemId } : {}),
+      abortController: new AbortController(),
+      controllers: new Set(),
+      cancelled: false
+    };
+
+    activeUploadRef.current = task;
+    setActiveUploadKind(kind);
+    setActiveUploadItemId(itemId ?? null);
+    setStopRequested(false);
+    return task;
+  }
+
+  function finishUploadTask(task: UploadAbortContext) {
+    if (activeUploadRef.current !== task) {
+      return;
+    }
+
+    activeUploadRef.current = null;
+    setActiveUploadKind(null);
+    setActiveUploadItemId(null);
+    setStopRequested(false);
+  }
+
+  function stopCurrentUpload() {
+    const task = activeUploadRef.current;
+    if (!task || task.cancelled) {
+      return;
+    }
+
+    task.cancelled = true;
+    setStopRequested(true);
+    abortUploadTask(task);
+
+    if (task.kind === "local" && task.itemId) {
+      updateItemProgress(task.itemId, {
+        completed: currentItemCompletedChunks(task.itemId),
+        total: currentItemChunkCount(task.itemId),
+        label: "正在停止上传，保留已完成分片"
+      });
+    } else if (task.kind === "url") {
+      setUrlUpload((current) => ({
+        ...current,
+        progress: current.progress
+          ? { ...current.progress, label: "正在停止导入，保留已完成分片" }
+          : { completed: 0, total: 1, label: "正在停止导入" }
+      }));
+    }
+  }
+
+  function currentItemCompletedChunks(id: string): number {
+    return items.find((item) => item.id === id)?.chunks?.filter((chunk) => chunk.status === "completed").length ?? 0;
+  }
+
+  function currentItemChunkCount(id: string): number {
+    return items.find((item) => item.id === id)?.chunks?.length ?? 1;
+  }
+
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
     if (submitting) return;
@@ -494,10 +579,11 @@ export function UploadDialog({
         )
       );
 
+      const task = startUploadTask("local", target.id);
       try {
         const fileName = effectiveFileName(target);
         const thumbnail = await resolveLocalThumbnailForUpload(target);
-        await uploadLocalMultipart(target, fileName, thumbnail);
+        await uploadLocalMultipart(target, fileName, thumbnail, task);
         successCount += 1;
         setItems((current) =>
           current.map((item) =>
@@ -508,8 +594,9 @@ export function UploadDialog({
         );
       } catch (error) {
         const retry = error instanceof MultipartChunkUploadError ? error.retry : undefined;
+        const stopped = (error instanceof MultipartChunkUploadError && error.stopped) || task.cancelled || isAbortError(error);
         const conflict = fileNameConflictFromError(error);
-        const message = error instanceof ApiError ? error.message : error instanceof Error ? error.message : "上传失败";
+        const message = stopped ? "已停止" : error instanceof ApiError ? error.message : error instanceof Error ? error.message : "上传失败";
         setItems((current) =>
           current.map((item) =>
             item.id === target.id
@@ -521,12 +608,21 @@ export function UploadDialog({
                   conflict,
                   fileNameOverride: conflict?.suggestedName ?? item.fileNameOverride,
                   editingFileName: conflict ? true : item.editingFileName,
-                  progress: retry && !conflict ? retryFailureProgress(retry, "分片上传失败，可手动重试") : undefined
+                  progress: retry && !conflict
+                    ? retryFailureProgress(retry, stopped ? "已停止，可重试未完成分片" : "分片上传失败，可手动重试")
+                    : undefined
                 }
               : item
           )
         );
-        onError(conflict ? FILE_NAME_CONFLICT_TOAST_MESSAGE : message);
+        if (!stopped) {
+          onError(conflict ? FILE_NAME_CONFLICT_TOAST_MESSAGE : message);
+        }
+        if (stopped) {
+          break;
+        }
+      } finally {
+        finishUploadTask(task);
       }
     }
 
@@ -536,9 +632,14 @@ export function UploadDialog({
     }
   }
 
-  async function uploadLocalMultipart(target: QueueItem, fileName: string, thumbnail?: ThumbnailUploadPayload) {
+  async function uploadLocalMultipart(
+    target: QueueItem,
+    fileName: string,
+    thumbnail: ThumbnailUploadPayload | undefined,
+    task: UploadAbortContext
+  ) {
     if (target.retry?.kind === "local") {
-      await retryLocalMultipart(target, target.retry, thumbnail);
+      await retryLocalMultipart(target, target.retry, thumbnail, task);
       return;
     }
 
@@ -548,7 +649,7 @@ export function UploadDialog({
       size: target.file.size,
       directory_path: uploadDirectoryPath,
       ...(remark.trim() ? { remark: remark.trim() } : {})
-    });
+    }, task.abortController.signal);
     const upload = init.upload;
 
     setItems((current) =>
@@ -563,28 +664,32 @@ export function UploadDialog({
       total: upload.chunk_count,
       taskLabel: "上传分片",
       doneLabel: "已上传",
+      task,
+      requestTimeoutMs: LOCAL_CHUNK_REQUEST_TIMEOUT_MS,
       onProgress: (progress) => updateItemProgress(target.id, progress),
       onChunkState: (index, patch) => updateItemChunk(target.id, index, patch),
-      onChunk: async (index) => {
+      onChunk: async (index, signal) => {
         const start = index * upload.chunk_size;
         const end = Math.min(target.file.size, start + upload.chunk_size);
-        await uploadMultipartChunk(upload.id, index, target.file.slice(start, end));
+        await uploadMultipartChunk(upload.id, index, target.file.slice(start, end), signal);
       }
     });
 
-    if (result.failedChunks.length > 0) {
+    if (result.failedChunks.length > 0 || result.cancelled) {
+      const retry = await refreshMultipartRetryState({
+        kind: "local",
+        uploadId: upload.id,
+        size: upload.size,
+        chunkSize: upload.chunk_size,
+        chunkCount: upload.chunk_count,
+        directAccess: upload.direct_access !== false,
+        completedChunks: result.completedChunks,
+        failedChunks: result.failedChunks
+      });
       throw new MultipartChunkUploadError(
-        `有 ${result.failedChunks.length} 个分片上传失败，可手动重试`,
-        {
-          kind: "local",
-          uploadId: upload.id,
-          size: upload.size,
-          chunkSize: upload.chunk_size,
-          chunkCount: upload.chunk_count,
-          directAccess: upload.direct_access !== false,
-          completedChunks: result.completedChunks,
-          failedChunks: result.failedChunks
-        }
+        result.cancelled ? "已停止，可重试未完成分片" : `有 ${result.failedChunks.length} 个分片上传失败，可手动重试`,
+        retry,
+        result.cancelled
       );
     }
 
@@ -593,7 +698,17 @@ export function UploadDialog({
       total: upload.chunk_count,
       label: upload.direct_access === false ? "正在生成文件索引" : "正在生成访问链接"
     });
-    await completeMultipartUpload(upload.id, thumbnail);
+    await completeUploadOrRetryLater({
+      kind: "local",
+      uploadId: upload.id,
+      size: upload.size,
+      chunkSize: upload.chunk_size,
+      chunkCount: upload.chunk_count,
+      directAccess: upload.direct_access !== false,
+      thumbnail,
+      task,
+      timeoutMs: LOCAL_CHUNK_REQUEST_TIMEOUT_MS
+    });
   }
 
   async function resolveLocalThumbnailForUpload(target: QueueItem): Promise<ThumbnailUploadPayload | undefined> {
@@ -646,47 +761,62 @@ export function UploadDialog({
     }
   }
 
-  async function retryLocalMultipart(target: QueueItem, retry: MultipartRetryState, thumbnail?: ThumbnailUploadPayload) {
+  async function retryLocalMultipart(
+    target: QueueItem,
+    retry: MultipartRetryState,
+    thumbnail: ThumbnailUploadPayload | undefined,
+    task: UploadAbortContext
+  ) {
+    const syncedRetry = await refreshMultipartRetryState(retry);
     setItems((current) =>
       current.map((item) =>
         item.id === target.id
-          ? { ...item, chunks: prepareRetryChunks(item.chunks, retry) }
+          ? { ...item, chunks: prepareRetryChunks(item.chunks, syncedRetry), retry: syncedRetry }
           : item
       )
     );
 
     const result = await runConcurrentChunks({
-      total: retry.chunkCount,
-      chunkIndexes: retry.failedChunks,
-      completedChunks: retry.completedChunks,
+      total: syncedRetry.chunkCount,
+      chunkIndexes: syncedRetry.failedChunks,
+      completedChunks: syncedRetry.completedChunks,
       taskLabel: "重试上传分片",
       doneLabel: "已上传",
+      task,
+      requestTimeoutMs: LOCAL_CHUNK_REQUEST_TIMEOUT_MS,
       onProgress: (progress) => updateItemProgress(target.id, progress),
       onChunkState: (index, patch) => updateItemChunk(target.id, index, patch),
-      onChunk: async (index) => {
-        const start = index * retry.chunkSize;
-        const end = Math.min(target.file.size, start + retry.chunkSize);
-        await uploadMultipartChunk(retry.uploadId, index, target.file.slice(start, end));
+      onChunk: async (index, signal) => {
+        const start = index * syncedRetry.chunkSize;
+        const end = Math.min(target.file.size, start + syncedRetry.chunkSize);
+        await uploadMultipartChunk(syncedRetry.uploadId, index, target.file.slice(start, end), signal);
       }
     });
 
-    if (result.failedChunks.length > 0) {
+    if (result.failedChunks.length > 0 || result.cancelled) {
+      const nextRetry = await refreshMultipartRetryState({
+        ...syncedRetry,
+        completedChunks: result.completedChunks,
+        failedChunks: result.failedChunks
+      });
       throw new MultipartChunkUploadError(
-        `仍有 ${result.failedChunks.length} 个分片上传失败，可继续手动重试`,
-        {
-          ...retry,
-          completedChunks: result.completedChunks,
-          failedChunks: result.failedChunks
-        }
+        result.cancelled ? "已停止，可重试未完成分片" : `仍有 ${result.failedChunks.length} 个分片上传失败，可继续手动重试`,
+        nextRetry,
+        result.cancelled
       );
     }
 
     updateItemProgress(target.id, {
-      completed: retry.chunkCount,
-      total: retry.chunkCount,
-      label: retry.directAccess === false ? "正在生成文件索引" : "正在生成访问链接"
+      completed: syncedRetry.chunkCount,
+      total: syncedRetry.chunkCount,
+      label: syncedRetry.directAccess === false ? "正在生成文件索引" : "正在生成访问链接"
     });
-    await completeMultipartUpload(retry.uploadId, thumbnail);
+    await completeUploadOrRetryLater({
+      ...syncedRetry,
+      thumbnail,
+      task,
+      timeoutMs: LOCAL_CHUNK_REQUEST_TIMEOUT_MS
+    });
   }
 
   async function runConcurrentChunks(params: {
@@ -696,7 +826,9 @@ export function UploadDialog({
     taskLabel: string;
     doneLabel: string;
     concurrency?: number;
-    onChunk: (index: number) => Promise<void>;
+    task: UploadAbortContext;
+    requestTimeoutMs: number;
+    onChunk: (index: number, signal: AbortSignal) => Promise<void>;
     onProgress: (progress: ChunkProgress) => void;
     onChunkState?: (index: number, patch: Partial<UploadChunkState>) => void;
   }): Promise<ChunkQueueResult> {
@@ -715,6 +847,10 @@ export function UploadDialog({
 
     const workers = Array.from({ length: concurrency }, async () => {
       while (true) {
+        if (params.task.cancelled) {
+          break;
+        }
+
         const queueIndex = nextIndex;
         nextIndex += 1;
 
@@ -749,9 +885,22 @@ export function UploadDialog({
 
     await Promise.all(workers);
 
+    if (params.task.cancelled) {
+      for (const index of chunkIndexes) {
+        if (!completedSet.has(index)) {
+          failedChunks.push(index);
+          params.onChunkState?.(index, {
+            status: "failed",
+            errorMessage: "已停止"
+          });
+        }
+      }
+    }
+
     return {
       completedChunks: Array.from(completedSet).sort((left, right) => left - right),
-      failedChunks: Array.from(new Set(failedChunks)).sort((left, right) => left - right)
+      failedChunks: Array.from(new Set(failedChunks)).sort((left, right) => left - right),
+      cancelled: params.task.cancelled
     };
   }
 
@@ -759,13 +908,24 @@ export function UploadDialog({
     index: number;
     total: number;
     taskLabel: string;
-    onChunk: (index: number) => Promise<void>;
+    task: UploadAbortContext;
+    requestTimeoutMs: number;
+    onChunk: (index: number, signal: AbortSignal) => Promise<void>;
     onProgress: (progress: ChunkProgress) => void;
     onChunkState?: (index: number, patch: Partial<UploadChunkState>) => void;
     suffix: string;
     completed: () => number;
   }) {
     for (let attempt = 1; attempt <= MULTIPART_UPLOAD_MAX_ATTEMPTS; attempt += 1) {
+      if (params.task.cancelled) {
+        params.onChunkState?.(params.index, {
+          status: "failed",
+          attempts: Math.max(1, attempt - 1),
+          errorMessage: "已停止"
+        });
+        throw new Error("已停止");
+      }
+
       params.onChunkState?.(params.index, {
         status: "uploading",
         attempts: attempt,
@@ -780,7 +940,7 @@ export function UploadDialog({
       });
 
       try {
-        await params.onChunk(params.index);
+        await runAbortableUploadRequest(params.task, params.requestTimeoutMs, (signal) => params.onChunk(params.index, signal));
         params.onChunkState?.(params.index, {
           status: "completed",
           attempts: attempt,
@@ -788,6 +948,15 @@ export function UploadDialog({
         });
         return;
       } catch (error) {
+        if (params.task.cancelled) {
+          params.onChunkState?.(params.index, {
+            status: "failed",
+            attempts: attempt,
+            errorMessage: "已停止"
+          });
+          throw new Error("已停止");
+        }
+
         const canRetry = attempt < MULTIPART_UPLOAD_MAX_ATTEMPTS && isRetryableChunkUploadError(error);
         if (!canRetry) {
           params.onChunkState?.(params.index, {
@@ -798,8 +967,86 @@ export function UploadDialog({
           throw new Error(`分片 ${params.index + 1} 处理失败：${errorMessage(error)}`);
         }
 
-        await delay(retryDelayMs(attempt, error));
+        await delay(retryDelayMs(attempt, error), params.task.abortController.signal);
       }
+    }
+  }
+
+  async function runAbortableUploadRequest<T>(
+    task: UploadAbortContext,
+    timeoutMs: number,
+    request: (signal: AbortSignal) => Promise<T>
+  ): Promise<T> {
+    const controller = new AbortController();
+    const abortFromTask = () => controller.abort();
+    const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+
+    task.controllers.add(controller);
+    task.abortController.signal.addEventListener("abort", abortFromTask, { once: true });
+
+    try {
+      if (task.cancelled || task.abortController.signal.aborted) {
+        controller.abort();
+      }
+
+      return await request(controller.signal);
+    } finally {
+      window.clearTimeout(timeoutId);
+      task.controllers.delete(controller);
+      task.abortController.signal.removeEventListener("abort", abortFromTask);
+    }
+  }
+
+  async function completeUploadOrRetryLater(params: Omit<MultipartRetryState, "completedChunks" | "failedChunks"> & {
+    thumbnail?: ThumbnailUploadPayload;
+    task: UploadAbortContext;
+    timeoutMs: number;
+  }) {
+    const retry: MultipartRetryState = {
+      kind: params.kind,
+      uploadId: params.uploadId,
+      size: params.size,
+      chunkSize: params.chunkSize,
+      chunkCount: params.chunkCount,
+      directAccess: params.directAccess,
+      completedChunks: chunkRange(params.chunkCount),
+      failedChunks: []
+    };
+
+    try {
+      await runAbortableUploadRequest(params.task, params.timeoutMs, (signal) =>
+        completeMultipartUpload(params.uploadId, params.thumbnail, signal)
+      );
+    } catch (error) {
+      if (params.task.cancelled || isAbortError(error)) {
+        throw new MultipartChunkUploadError(
+          params.task.cancelled ? "已停止，可继续完成上传" : "生成文件索引超时，可继续完成上传",
+          retry,
+          params.task.cancelled
+        );
+      }
+      throw error;
+    }
+  }
+
+  async function refreshMultipartRetryState(retry: MultipartRetryState): Promise<MultipartRetryState> {
+    try {
+      const status = await getMultipartUploadStatus(retry.uploadId);
+      if (status.upload.source_kind !== retry.kind) {
+        return retry;
+      }
+
+      return {
+        ...retry,
+        size: status.upload.size,
+        chunkSize: status.upload.chunk_size,
+        chunkCount: status.upload.chunk_count,
+        directAccess: status.upload.direct_access !== false,
+        completedChunks: status.uploaded_chunks,
+        failedChunks: status.missing_chunks
+      };
+    } catch {
+      return retry;
     }
   }
 
@@ -840,6 +1087,7 @@ export function UploadDialog({
       return;
     }
 
+    const task = startUploadTask("url");
     setSubmitting(true);
     setUrlUpload((current) => ({
       ...current,
@@ -856,7 +1104,8 @@ export function UploadDialog({
         remark.trim() || undefined,
         uploadDirectoryPath,
         true,
-        fileNameOverride
+        fileNameOverride,
+        task.abortController.signal
       );
       if (init.mode === "multipart" && init.upload) {
         const upload = init.upload;
@@ -871,6 +1120,8 @@ export function UploadDialog({
           taskLabel: "导入分片",
           doneLabel: "已导入",
           concurrency: URL_MULTIPART_UPLOAD_CONCURRENCY,
+          task,
+          requestTimeoutMs: URL_CHUNK_REQUEST_TIMEOUT_MS,
           onProgress: (progress) => {
             setUrlUpload((current) => ({
               ...current,
@@ -879,24 +1130,26 @@ export function UploadDialog({
             }));
           },
           onChunkState: updateUrlChunk,
-          onChunk: async (index) => {
-            await uploadUrlMultipartChunk(upload.id, index);
+          onChunk: async (index, signal) => {
+            await uploadUrlMultipartChunk(upload.id, index, signal);
           }
         });
 
-        if (result.failedChunks.length > 0) {
+        if (result.failedChunks.length > 0 || result.cancelled) {
+          const retry = await refreshMultipartRetryState({
+            kind: "url",
+            uploadId: upload.id,
+            size: upload.size,
+            chunkSize: upload.chunk_size,
+            chunkCount: upload.chunk_count,
+            directAccess: upload.direct_access !== false,
+            completedChunks: result.completedChunks,
+            failedChunks: result.failedChunks
+          });
           throw new MultipartChunkUploadError(
-            `有 ${result.failedChunks.length} 个分片导入失败，可手动重试`,
-            {
-              kind: "url",
-              uploadId: upload.id,
-              size: upload.size,
-              chunkSize: upload.chunk_size,
-              chunkCount: upload.chunk_count,
-              directAccess: upload.direct_access !== false,
-              completedChunks: result.completedChunks,
-              failedChunks: result.failedChunks
-            }
+            result.cancelled ? "已停止，可重试未完成分片" : `有 ${result.failedChunks.length} 个分片导入失败，可手动重试`,
+            retry,
+            result.cancelled
           );
         }
 
@@ -909,7 +1162,17 @@ export function UploadDialog({
             label: upload.direct_access === false ? "正在生成文件索引" : "正在生成访问链接"
           }
         }));
-        await completeMultipartUpload(upload.id, thumbnail);
+        await completeUploadOrRetryLater({
+          kind: "url",
+          uploadId: upload.id,
+          size: upload.size,
+          chunkSize: upload.chunk_size,
+          chunkCount: upload.chunk_count,
+          directAccess: upload.direct_access !== false,
+          thumbnail,
+          task,
+          timeoutMs: URL_CHUNK_REQUEST_TIMEOUT_MS
+        });
       } else {
         throw new ApiError(500, "URL 上传初始化未返回分片会话", "InvalidUploadMode");
       }
@@ -925,12 +1188,15 @@ export function UploadDialog({
       onUploaded(1);
     } catch (uploadError) {
       const retry = uploadError instanceof MultipartChunkUploadError ? uploadError.retry : undefined;
+      const stopped = (uploadError instanceof MultipartChunkUploadError && uploadError.stopped) || task.cancelled || isAbortError(uploadError);
       const conflict = fileNameConflictFromError(uploadError);
-      const message = uploadError instanceof ApiError
-        ? uploadError.message
-        : uploadError instanceof Error
+      const message = stopped
+        ? "已停止"
+        : uploadError instanceof ApiError
           ? uploadError.message
-          : "URL 上传失败";
+          : uploadError instanceof Error
+            ? uploadError.message
+            : "URL 上传失败";
       setUrlUpload((current) => ({
         ...current,
         status: "error",
@@ -939,54 +1205,65 @@ export function UploadDialog({
         conflict,
         fileNameOverride: conflict?.suggestedName ?? current.fileNameOverride,
         editingFileName: conflict ? true : current.editingFileName,
-        progress: retry && !conflict ? retryFailureProgress(retry, "分片导入失败，可手动重试") : undefined
+        progress: retry && !conflict
+          ? retryFailureProgress(retry, stopped ? "已停止，可重试未完成分片" : "分片导入失败，可手动重试")
+          : undefined
       }));
-      onError(conflict ? FILE_NAME_CONFLICT_TOAST_MESSAGE : message);
+      if (!stopped) {
+        onError(conflict ? FILE_NAME_CONFLICT_TOAST_MESSAGE : message);
+      }
     } finally {
+      finishUploadTask(task);
       setSubmitting(false);
     }
   }
 
   async function retryUrlMultipart(retry: MultipartRetryState) {
+    const task = startUploadTask("url");
+    const syncedRetry = await refreshMultipartRetryState(retry);
     setSubmitting(true);
     setUrlUpload((current) => ({
       ...current,
       status: "uploading",
-      progress: retryFailureProgress(retry, "准备重试失败分片"),
-      chunks: prepareRetryChunks(current.chunks, retry),
-      retry
+      progress: retryFailureProgress(syncedRetry, "准备重试失败分片"),
+      chunks: prepareRetryChunks(current.chunks, syncedRetry),
+      retry: syncedRetry
     }));
 
     try {
       const result = await runConcurrentChunks({
-        total: retry.chunkCount,
-        chunkIndexes: retry.failedChunks,
-        completedChunks: retry.completedChunks,
+        total: syncedRetry.chunkCount,
+        chunkIndexes: syncedRetry.failedChunks,
+        completedChunks: syncedRetry.completedChunks,
         taskLabel: "重试导入分片",
         doneLabel: "已导入",
         concurrency: URL_MULTIPART_UPLOAD_CONCURRENCY,
+        task,
+        requestTimeoutMs: URL_CHUNK_REQUEST_TIMEOUT_MS,
         onProgress: (progress) => {
           setUrlUpload((current) => ({
             ...current,
             status: "uploading",
             progress,
-            retry
+            retry: syncedRetry
           }));
         },
         onChunkState: updateUrlChunk,
-        onChunk: async (index) => {
-          await uploadUrlMultipartChunk(retry.uploadId, index);
+        onChunk: async (index, signal) => {
+          await uploadUrlMultipartChunk(syncedRetry.uploadId, index, signal);
         }
       });
 
-      if (result.failedChunks.length > 0) {
+      if (result.failedChunks.length > 0 || result.cancelled) {
+        const nextRetry = await refreshMultipartRetryState({
+          ...syncedRetry,
+          completedChunks: result.completedChunks,
+          failedChunks: result.failedChunks
+        });
         throw new MultipartChunkUploadError(
-          `仍有 ${result.failedChunks.length} 个分片导入失败，可继续手动重试`,
-          {
-            ...retry,
-            completedChunks: result.completedChunks,
-            failedChunks: result.failedChunks
-          }
+          result.cancelled ? "已停止，可重试未完成分片" : `仍有 ${result.failedChunks.length} 个分片导入失败，可继续手动重试`,
+          nextRetry,
+          result.cancelled
         );
       }
 
@@ -994,15 +1271,20 @@ export function UploadDialog({
         ...current,
         status: "uploading",
         progress: {
-          completed: retry.chunkCount,
-          total: retry.chunkCount,
-          label: retry.directAccess === false ? "正在生成文件索引" : "正在生成访问链接"
+          completed: syncedRetry.chunkCount,
+          total: syncedRetry.chunkCount,
+          label: syncedRetry.directAccess === false ? "正在生成文件索引" : "正在生成访问链接"
         }
       }));
       const thumbnail = urlUpload.thumbnail?.status === "ready" && urlUpload.thumbnail.generated
         ? thumbnailPayload(urlUpload.thumbnail.generated)
         : undefined;
-      await completeMultipartUpload(retry.uploadId, thumbnail);
+      await completeUploadOrRetryLater({
+        ...syncedRetry,
+        thumbnail,
+        task,
+        timeoutMs: URL_CHUNK_REQUEST_TIMEOUT_MS
+      });
       setUrlUpload((current) => ({
         ...current,
         status: "done",
@@ -1013,17 +1295,21 @@ export function UploadDialog({
       }));
       onUploaded(1);
     } catch (uploadError) {
-      const nextRetry = uploadError instanceof MultipartChunkUploadError ? uploadError.retry : retry;
-      const message = uploadError instanceof Error ? uploadError.message : "URL 分片重试失败";
+      const nextRetry = uploadError instanceof MultipartChunkUploadError ? uploadError.retry : syncedRetry;
+      const stopped = (uploadError instanceof MultipartChunkUploadError && uploadError.stopped) || task.cancelled || isAbortError(uploadError);
+      const message = stopped ? "已停止" : uploadError instanceof Error ? uploadError.message : "URL 分片重试失败";
       setUrlUpload((current) => ({
         ...current,
         status: "error",
         message,
         retry: nextRetry,
-        progress: retryFailureProgress(nextRetry, "分片导入失败，可手动重试")
+        progress: retryFailureProgress(nextRetry, stopped ? "已停止，可重试未完成分片" : "分片导入失败，可手动重试")
       }));
-      onError(message);
+      if (!stopped) {
+        onError(message);
+      }
     } finally {
+      finishUploadTask(task);
       setSubmitting(false);
     }
   }
@@ -1036,6 +1322,7 @@ export function UploadDialog({
       return;
     }
 
+    const task = startUploadTask("local", id);
     setSubmitting(true);
     setItems((current) =>
       current.map((item) =>
@@ -1047,7 +1334,7 @@ export function UploadDialog({
 
     try {
       const thumbnail = await resolveLocalThumbnailForUpload(target);
-      await retryLocalMultipart(target, target.retry, thumbnail);
+      await retryLocalMultipart(target, target.retry, thumbnail, task);
       setItems((current) =>
         current.map((item) =>
           item.id === id ? { ...item, status: "done", message: undefined, progress: undefined, retry: undefined, editingFileName: false } : item
@@ -1056,7 +1343,8 @@ export function UploadDialog({
       onUploaded(1);
     } catch (error) {
       const retry = error instanceof MultipartChunkUploadError ? error.retry : target.retry;
-      const message = error instanceof Error ? error.message : "分片重试失败";
+      const stopped = (error instanceof MultipartChunkUploadError && error.stopped) || task.cancelled || isAbortError(error);
+      const message = stopped ? "已停止" : error instanceof Error ? error.message : "分片重试失败";
       setItems((current) =>
         current.map((item) =>
           item.id === id
@@ -1065,13 +1353,16 @@ export function UploadDialog({
                 status: "error",
                 message,
                 retry,
-                progress: retryFailureProgress(retry, "分片上传失败，可手动重试")
+                progress: retryFailureProgress(retry, stopped ? "已停止，可重试未完成分片" : "分片上传失败，可手动重试")
               }
             : item
         )
       );
-      onError(message);
+      if (!stopped) {
+        onError(message);
+      }
     } finally {
+      finishUploadTask(task);
       setSubmitting(false);
     }
   }
@@ -1095,6 +1386,20 @@ export function UploadDialog({
       closeOnEscape={!submitting}
       footer={
         <>
+          {activeUploadKind ? (
+            <Button
+              variant="danger-ghost"
+              disabled={stopRequested}
+              leadingIcon={<X size={15} />}
+              onClick={stopCurrentUpload}
+            >
+              {stopRequested
+                ? "正在停止"
+                : activeUploadKind === "url"
+                  ? "停止导入"
+                  : "停止上传"}
+            </Button>
+          ) : null}
           <Button variant="secondary" disabled={submitting} onClick={onClose}>
             {hasDone ? "关闭" : "取消"}
           </Button>
@@ -1202,6 +1507,8 @@ export function UploadDialog({
                     item={item}
                     onRemove={() => removeItem(item.id)}
                     onRetry={item.retry ? () => void retryItemFailedChunks(item.id) : undefined}
+                    onStop={activeUploadKind === "local" && activeUploadItemId === item.id ? stopCurrentUpload : undefined}
+                    stopping={stopRequested && activeUploadKind === "local" && activeUploadItemId === item.id}
                     onFileNameChange={(value) => updateItemFileName(item.id, value)}
                     onFileNameEditingChange={(editing) => setItemFileNameEditing(item.id, editing)}
                     onThumbnailChange={(file) => void handleManualItemThumbnail(item.id, file)}
@@ -1253,6 +1560,8 @@ export function UploadDialog({
                 conflict={urlUpload.conflict}
                 onClear={() => handleSourceUrlChange("")}
                 onRetry={urlUpload.retry ? () => void retryUrlMultipart(urlUpload.retry!) : undefined}
+                onStop={activeUploadKind === "url" ? stopCurrentUpload : undefined}
+                stopping={stopRequested && activeUploadKind === "url"}
                 onFileNameChange={updateUrlFileName}
                 onFileNameEditingChange={setUrlFileNameEditing}
                 thumbnail={urlUpload.thumbnail}
@@ -1281,6 +1590,19 @@ export function UploadDialog({
   );
 }
 
+function abortUploadTask(task: UploadAbortContext | null) {
+  if (!task) {
+    return;
+  }
+
+  task.cancelled = true;
+  task.abortController.abort();
+  for (const controller of task.controllers) {
+    controller.abort();
+  }
+  task.controllers.clear();
+}
+
 function isRetryableChunkUploadError(error: unknown): boolean {
   if (!(error instanceof ApiError)) {
     return true;
@@ -1289,7 +1611,15 @@ function isRetryableChunkUploadError(error: unknown): boolean {
   return error.status === 408 || error.status === 429 || error.status >= 500;
 }
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
 function errorMessage(error: unknown): string {
+  if (isAbortError(error)) {
+    return "请求已中止或超时";
+  }
+
   if (error instanceof Error && error.message.trim()) {
     return error.message;
   }
@@ -1309,8 +1639,24 @@ function retryDelayMs(failedAttempt: number, error: unknown): number {
   return MULTIPART_UPLOAD_RETRY_DELAY_MS * failedAttempt;
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+
+    const onAbort = () => {
+      window.clearTimeout(timeoutId);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    const timeoutId = window.setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function effectiveFileName(item: QueueItem): string {
@@ -1415,6 +1761,8 @@ interface QueueRowProps {
   item: QueueItem;
   onRemove: () => void;
   onRetry?: () => void;
+  onStop?: () => void;
+  stopping?: boolean;
   onFileNameChange: (value: string) => void;
   onFileNameEditingChange: (editing: boolean) => void;
   onThumbnailChange: (file: File) => void;
@@ -1426,6 +1774,8 @@ function QueueRow({
   item,
   onRemove,
   onRetry,
+  onStop,
+  stopping,
   onFileNameChange,
   onFileNameEditingChange,
   onThumbnailChange,
@@ -1471,7 +1821,17 @@ function QueueRow({
             disabled={disabled}
             className="shrink-0 rounded-md border border-primary/30 px-2.5 py-1 text-xs font-medium text-primary-strong transition-colors hover:bg-primary-soft disabled:pointer-events-none disabled:opacity-40"
           >
-            重试失败分片
+            {item.retry?.failedChunks.length === 0 ? "继续完成上传" : "重试失败分片"}
+          </button>
+        ) : null}
+        {onStop && status === "uploading" ? (
+          <button
+            type="button"
+            onClick={onStop}
+            disabled={stopping}
+            className="shrink-0 rounded-md border border-danger/30 px-2.5 py-1 text-xs font-medium text-danger transition-colors hover:bg-danger-soft disabled:pointer-events-none disabled:opacity-40"
+          >
+            {stopping ? "正在停止" : "停止上传"}
           </button>
         ) : null}
         <StatusBadge status={status} multipart={Boolean(item.progress)} />
@@ -1502,6 +1862,8 @@ interface UrlUploadRowProps {
   conflict?: FileNameConflictState;
   thumbnail?: UploadThumbnailState;
   onRetry?: () => void;
+  onStop?: () => void;
+  stopping?: boolean;
   onFileNameChange: (value: string) => void;
   onFileNameEditingChange: (editing: boolean) => void;
   onThumbnailChange: (file: File) => void;
@@ -1521,6 +1883,8 @@ function UrlUploadRow({
   thumbnail,
   onClear,
   onRetry,
+  onStop,
+  stopping,
   onFileNameChange,
   onFileNameEditingChange,
   onThumbnailChange,
@@ -1569,7 +1933,17 @@ function UrlUploadRow({
             disabled={disabled}
             className="shrink-0 rounded-md border border-primary/30 px-2.5 py-1 text-xs font-medium text-primary-strong transition-colors hover:bg-primary-soft disabled:pointer-events-none disabled:opacity-40"
           >
-            重试失败分片
+            {progress && progress.failed === 0 ? "继续完成上传" : "重试失败分片"}
+          </button>
+        ) : null}
+        {onStop && status === "uploading" ? (
+          <button
+            type="button"
+            onClick={onStop}
+            disabled={stopping}
+            className="shrink-0 rounded-md border border-danger/30 px-2.5 py-1 text-xs font-medium text-danger transition-colors hover:bg-danger-soft disabled:pointer-events-none disabled:opacity-40"
+          >
+            {stopping ? "正在停止" : "停止导入"}
           </button>
         ) : null}
         <StatusBadge status={status} multipart={Boolean(progress)} />

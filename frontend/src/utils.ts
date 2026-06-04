@@ -61,7 +61,7 @@ export function formatDateTime(value: string | null | undefined): string {
 
 export function fileKind(file: Pick<FileItem, "mime_type" | "file_name">): {
   label: string;
-  tone: "image" | "video" | "text" | "pdf" | "archive" | "file";
+  tone: "image" | "video" | "audio" | "text" | "pdf" | "archive" | "file";
 } {
   const mime = file.mime_type.toLowerCase();
   const name = file.file_name.toLowerCase();
@@ -72,6 +72,10 @@ export function fileKind(file: Pick<FileItem, "mime_type" | "file_name">): {
 
   if (mime.startsWith("video/") || /\.(mp4|m4v|mov|webm|ogv)$/i.test(name)) {
     return { label: "视频", tone: "video" };
+  }
+
+  if (mime.startsWith("audio/") || /\.(mp3|m4a|aac|wav|ogg|oga|flac|opus)$/i.test(name)) {
+    return { label: "音频", tone: "audio" };
   }
 
   if (mime === "application/pdf" || name.endsWith(".pdf")) {
@@ -89,7 +93,7 @@ export function fileKind(file: Pick<FileItem, "mime_type" | "file_name">): {
   return { label: "文件", tone: "file" };
 }
 
-export type PreviewKind = "image" | "video" | "text" | "markdown";
+export type PreviewKind = "image" | "video" | "audio" | "text" | "markdown";
 
 export function previewKind(file: Pick<FileItem, "mime_type" | "file_name">): PreviewKind | null {
   const mime = file.mime_type.toLowerCase();
@@ -101,6 +105,10 @@ export function previewKind(file: Pick<FileItem, "mime_type" | "file_name">): Pr
 
   if (mime.startsWith("video/") || /\.(mp4|m4v|mov|webm|ogv)$/i.test(name)) {
     return "video";
+  }
+
+  if (mime.startsWith("audio/") || /\.(mp3|m4a|aac|wav|ogg|oga|flac|opus)$/i.test(name)) {
+    return "audio";
   }
 
   if (mime === "text/markdown" || name.endsWith(".md") || name.endsWith(".markdown")) {

@@ -1210,6 +1210,19 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
     }, 201);
   }
 
+  const statusMatch = /^\/api\/admin\/uploads\/([^/]+)\/status$/.exec(url.pathname);
+  if (request.method === "GET" && statusMatch?.[1]) {
+    const upload = await requireMultipartUpload(db, decodeURIComponent(statusMatch[1]));
+    const chunks = await listFileChunkRecords(db, upload.id);
+
+    return jsonResponse({
+      ok: true,
+      upload: serializeMultipartUploadStatus(upload),
+      uploaded_chunks: chunks.map((chunk) => chunk.chunk_index),
+      missing_chunks: missingChunkIndexes(upload, chunks)
+    });
+  }
+
   const chunkMatch = /^\/api\/admin\/uploads\/([^/]+)\/chunks\/(\d+)$/.exec(url.pathname);
   if (request.method === "POST" && chunkMatch?.[1] && chunkMatch?.[2]) {
     const upload = await requireMultipartUpload(db, decodeURIComponent(chunkMatch[1]), "local");
@@ -4131,6 +4144,37 @@ function serializeUploadedFileResult(result: UploadResult, username: string | nu
     thumbnail_width: result.thumbnail?.width ?? null,
     thumbnail_height: result.thumbnail?.height ?? null
   };
+}
+
+function serializeMultipartUploadStatus(upload: MultipartUploadRecord): Record<string, unknown> {
+  return {
+    id: upload.id,
+    source_kind: upload.source_kind,
+    file_name: upload.file_name,
+    mime_type: upload.mime_type,
+    size: upload.size,
+    chunk_size: upload.chunk_size,
+    chunk_count: upload.chunk_count,
+    directory_path: upload.directory_path ?? "/",
+    max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
+    direct_access: upload.chunk_count <= DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
+    direct_access_max_chunks: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
+    direct_access_max_bytes: DIRECT_MULTIPART_ACCESS_MAX_BYTES,
+    thumbnail_source: null
+  };
+}
+
+function missingChunkIndexes(upload: MultipartUploadRecord, chunks: FileChunkRecord[]): number[] {
+  const uploaded = new Set(chunks.map((chunk) => chunk.chunk_index));
+  const missing: number[] = [];
+
+  for (let index = 0; index < upload.chunk_count; index += 1) {
+    if (!uploaded.has(index)) {
+      missing.push(index);
+    }
+  }
+
+  return missing;
 }
 
 function fileStorageBackend(file: FileRecord): "telegram_single" | "telegram_multipart" {

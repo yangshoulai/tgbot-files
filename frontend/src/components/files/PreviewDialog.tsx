@@ -1,21 +1,22 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import Plyr from "plyr";
-import "plyr/dist/plyr.css";
+import { useEffect, useState } from "react";
 import { Copy, Download, Maximize2, Minimize2 } from "lucide-react";
 import type { FileItem } from "../../api";
-import { canUseAcceleratedDownload, extractSignedFileToken } from "../../lib/accelerated-download";
-import { buildChunkedVideoPreviewUrl } from "../../lib/video-preview";
-import {
-  ensureVideoPreviewServiceWorker,
-  isVideoPreviewServiceWorkerControlling
-} from "../../lib/video-preview-service-worker";
+import { fileKind, formatBytes, previewKind } from "../../utils";
 import { hasDirectFileAccess } from "../../lib/file-access";
-import { previewKind } from "../../utils";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
-import { Spinner } from "../ui/Spinner";
+import { Badge } from "../ui/Badge";
+import { FileVisual } from "../ui/FileVisual";
+import { PreviewFrame } from "./preview/PreviewFrame";
+import { ImagePreview } from "./preview/ImagePreview";
+import { VideoPreview } from "./preview/VideoPreview";
+import { AudioPreview } from "./preview/AudioPreview";
+import { TextPreview } from "./preview/TextPreview";
+import { MarkdownPreview } from "./preview/MarkdownPreview";
+import { UnsupportedPreview } from "./preview/UnsupportedPreview";
+import type { TextPreviewState } from "./preview/types";
+
+const TEXT_PREVIEW_TIMEOUT_MS = 30_000;
 
 interface PreviewDialogProps {
   file: FileItem | null;
@@ -25,12 +26,9 @@ interface PreviewDialogProps {
 
 export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
   const preview = file ? previewKind(file) : null;
+  const kind = file ? fileKind(file) : null;
   const [fullscreen, setFullscreen] = useState(false);
-  const [textState, setTextState] = useState<{
-    status: "idle" | "loading" | "ready" | "error";
-    content: string;
-    message?: string;
-  }>({ status: "idle", content: "" });
+  const [textState, setTextState] = useState<TextPreviewState>({ status: "idle", content: "" });
 
   useEffect(() => {
     if (!file || (preview !== "text" && preview !== "markdown")) {
@@ -48,6 +46,7 @@ export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
     }
 
     const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort("timeout"), TEXT_PREVIEW_TIMEOUT_MS);
     setTextState({ status: "loading", content: "" });
 
     fetch(file.file_path, { signal: controller.signal })
@@ -60,38 +59,68 @@ export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
       })
       .then((content) => {
         if (!controller.signal.aborted) {
+          window.clearTimeout(timeout);
           setTextState({ status: "ready", content });
         }
       })
       .catch((error: unknown) => {
-        if (controller.signal.aborted) return;
+        window.clearTimeout(timeout);
+        if (controller.signal.aborted && controller.signal.reason !== "timeout") return;
         setTextState({
           status: "error",
           content: "",
-          message: error instanceof Error ? error.message : "读取预览内容失败"
+          message: controller.signal.reason === "timeout"
+            ? "读取预览内容超时，请检查网络后重试"
+            : error instanceof Error ? error.message : "读取预览内容失败"
         });
       });
 
-    return () => controller.abort();
+    return () => {
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
   }, [file, preview]);
 
   useEffect(() => {
     setFullscreen(false);
   }, [file?.id]);
 
-  if (!file) {
+  if (!file || !kind) {
     return <Modal open={false} onClose={onClose}>{null}</Modal>;
   }
 
-  const canCopyContent = (preview === "text" || preview === "markdown") && textState.status === "ready";
   const directFile = hasDirectFileAccess(file) ? file : null;
+  const canCopyContent = (preview === "text" || preview === "markdown") && textState.status === "ready";
+  const isMediaPreview = preview === "video" || preview === "audio";
+  const toggleFullscreen = () => setFullscreen((value) => !value);
 
   return (
     <Modal
       open
       onClose={onClose}
       size={fullscreen ? "full" : "xl"}
-      title={<span title={file.file_name}>{file.file_name}</span>}
+      title={
+        <span className="flex min-w-0 items-center gap-3">
+          <FileVisual
+            mimeType={file.mime_type}
+            fileName={file.file_name}
+            url={directFile ? file.file_path : undefined}
+            thumbnailUrl={file.thumbnail_url}
+            size="sm"
+          />
+          <span className="min-w-0 truncate" title={file.file_name}>{file.file_name}</span>
+        </span>
+      }
+      description={
+        <span className="inline-flex min-w-0 items-center gap-2">
+          <Badge tone={badgeTone(kind.tone)} size="sm">
+            {kind.label}
+          </Badge>
+          <span className="truncate">
+            {formatBytes(file.size)} · {file.mime_type || "未知 MIME"}
+          </span>
+        </span>
+      }
       footer={
         <>
           {preview === "text" || preview === "markdown" ? (
@@ -104,13 +133,15 @@ export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
               复制内容
             </Button>
           ) : null}
-          <Button
-            variant="secondary"
-            leadingIcon={fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
-            onClick={() => setFullscreen((value) => !value)}
-          >
-            {fullscreen ? "退出全屏" : "全屏"}
-          </Button>
+          {!isMediaPreview ? (
+            <Button
+              variant="secondary"
+              leadingIcon={fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+              onClick={toggleFullscreen}
+            >
+              {fullscreen ? "退出全屏" : "全屏"}
+            </Button>
+          ) : null}
           {directFile ? (
             <a
               href={directFile.download_url}
@@ -124,617 +155,44 @@ export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
       }
       bodyClassName={fullscreen ? "flex bg-background/40" : "bg-background/40"}
     >
-      <div
-        className={
-          fullscreen
-            ? "flex min-h-0 w-full flex-1 items-center justify-center overflow-hidden rounded-xl border border-border bg-surface"
-            : "grid min-h-72 place-items-center overflow-hidden rounded-xl border border-border bg-surface"
-        }
-      >
-        {preview === "image" && directFile ? (
-          <img
-            src={file.file_path}
-            alt={file.file_name}
-            className={fullscreen ? "block h-auto max-h-full w-auto max-w-full object-contain" : "h-[60vh] w-full object-contain"}
-            loading="lazy"
-          />
+      <PreviewFrame fullscreen={fullscreen} tone={previewTone(preview)}>
+        {preview === "image" ? (
+          <ImagePreview file={file} fullscreen={fullscreen} />
         ) : preview === "video" ? (
-          <VideoPreview file={file} fullscreen={fullscreen} />
+          <VideoPreview file={file} fullscreen={fullscreen} onToggleFullscreen={toggleFullscreen} />
+        ) : preview === "audio" ? (
+          <AudioPreview file={file} fullscreen={fullscreen} onToggleFullscreen={toggleFullscreen} />
         ) : preview === "text" ? (
           <TextPreview file={file} state={textState} fullscreen={fullscreen} />
         ) : preview === "markdown" ? (
           <MarkdownPreview state={textState} fullscreen={fullscreen} />
         ) : (
-          <div className="grid place-items-center gap-3 px-6 py-12 text-center">
-            <p className="text-sm font-medium text-foreground">该类型暂不支持直接预览</p>
-          </div>
+          <UnsupportedPreview file={file} />
         )}
-      </div>
+      </PreviewFrame>
     </Modal>
   );
 }
 
-function VideoPreview({ file, fullscreen }: { file: FileItem; fullscreen: boolean }) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const playerRef = useRef<Plyr | null>(null);
-  const [ratio, setRatio] = useState({ label: "16:9", value: 16 / 9 });
-  const [serviceWorkerState, setServiceWorkerState] = useState<VideoPreviewServiceWorkerState>(initialVideoPreviewServiceWorkerState);
-  const [isVideoLoading, setIsVideoLoading] = useState(true);
-  const heightLimit = fullscreen ? "calc(100dvh - 11rem)" : "min(64dvh, 760px)";
-  const directFile = hasDirectFileAccess(file) ? file : null;
-  const directAccessAvailable = Boolean(directFile);
-  const canUseMultipartPreview = canUseAcceleratedDownload(file);
-  const signedFileToken = canUseMultipartPreview ? extractSignedFileToken(file.file_path) : null;
-  const serviceWorkerReady = serviceWorkerState.status === "controlled";
-  const requiresChunkedPreview = !directAccessAvailable && canUseMultipartPreview && Boolean(signedFileToken);
-  const chunkedPreviewUrl = serviceWorkerReady ? buildChunkedVideoPreviewUrl(file) : null;
-  const videoSrc = chunkedPreviewUrl ?? (directFile ? file.file_path : null);
-
-  const refreshServiceWorker = useCallback(async () => {
-    if (isVideoPreviewServiceWorkerControlling()) {
-      setServiceWorkerState({ status: "controlled" });
-      return;
-    }
-
-    setServiceWorkerState({ status: "checking" });
-    const result = await ensureVideoPreviewServiceWorker();
-
-    if (result.controlled) {
-      setServiceWorkerState({ status: "controlled" });
-      return;
-    }
-
-    if (!result.supported) {
-      setServiceWorkerState({
-        status: "unsupported",
-        message: result.error || "当前浏览器不支持 Service Worker"
-      });
-      return;
-    }
-
-    if (!result.registered) {
-      setServiceWorkerState({
-        status: "failed",
-        message: result.error || "Service Worker 注册失败"
-      });
-      return;
-    }
-
-    setServiceWorkerState({
-      status: "need-reload",
-      message: "Service Worker 已注册，但当前页面还没有被它接管"
-    });
-  }, []);
-
-  useEffect(() => {
-    const node = videoRef.current;
-    if (!node) return;
-
-    const player = new Plyr(node, {
-      controls: [
-        "play-large",
-        "play",
-        "progress",
-        "current-time",
-        "mute",
-        "settings"
-      ],
-      settings: ["speed"],
-      speed: { selected: 1, options: [0.5, 0.75, 1, 1.25, 1.5, 2] },
-      tooltips: { controls: true, seek: true },
-      fullscreen: { enabled: false },
-      ratio: ratio.label
-    });
-    playerRef.current = player;
-
-    return () => {
-      player.destroy();
-      playerRef.current = null;
-    };
-  }, [videoSrc]);
-
-  useEffect(() => {
-    setIsVideoLoading(Boolean(videoSrc));
-  }, [videoSrc]);
-
-  useEffect(() => {
-    if (!requiresChunkedPreview) {
-      return;
-    }
-
-    if (!("serviceWorker" in navigator)) {
-      void refreshServiceWorker();
-      return;
-    }
-
-    let disposed = false;
-    const refresh = () => {
-      if (!disposed) {
-        setServiceWorkerState(isVideoPreviewServiceWorkerControlling() ? { status: "controlled" } : { status: "checking" });
-      }
-    };
-
-    navigator.serviceWorker.addEventListener("controllerchange", refresh);
-    void refreshServiceWorker();
-    refresh();
-
-    return () => {
-      disposed = true;
-      navigator.serviceWorker.removeEventListener("controllerchange", refresh);
-    };
-  }, [refreshServiceWorker, requiresChunkedPreview]);
-
-  useEffect(() => {
-    if (playerRef.current) {
-      applyPlyrAspectRatio(videoRef.current, ratio);
-    }
-  }, [ratio]);
-
-  if (!videoSrc) {
-    return (
-      <div className="grid w-full place-items-center gap-3 px-6 py-12 text-center">
-        <p className="text-sm font-medium text-foreground">该大文件不提供完整访问链接</p>
-        <p className="max-w-md text-xs leading-6 text-muted">
-          {videoPreviewUnavailableMessage({
-            canUseMultipartPreview,
-            hasSignedFileToken: Boolean(signedFileToken),
-            serviceWorkerState
-          })}
-        </p>
-        {requiresChunkedPreview ? (
-          <div className="flex flex-wrap items-center justify-center gap-2">
-            <Button variant="secondary" onClick={() => void refreshServiceWorker()}>
-              重新检查
-            </Button>
-            {serviceWorkerState.status === "need-reload" ? (
-              <Button onClick={() => window.location.reload()}>
-                刷新页面
-              </Button>
-            ) : null}
-          </div>
-        ) : null}
-      </div>
-    );
-  }
-
-  return (
-    <div className={(fullscreen ? "h-full min-h-0" : "h-[min(64dvh,760px)]") + " flex w-full items-center justify-center bg-foreground p-3 sm:p-4"}>
-      <div
-        className="relative max-h-full max-w-full overflow-hidden rounded-xl bg-black shadow-dialog [&_.plyr]:h-full [&_.plyr]:w-full [&_.plyr]:min-w-0 [&_.plyr]:rounded-xl [&_.plyr]:[aspect-ratio:inherit] [&_.plyr__controls]:rounded-b-xl [&_.plyr__video-wrapper]:h-full [&_.plyr__video-wrapper]:w-full [&_.plyr__video-wrapper]:rounded-xl [&_.plyr__video-wrapper]:[aspect-ratio:inherit] [&_.plyr__video-wrapper--fixed-ratio]:[aspect-ratio:inherit]"
-        style={{
-          aspectRatio: ratio.label.replace(":", " / "),
-          width: `min(100%, calc(${heightLimit} * ${ratio.value}))`
-        }}
-      >
-        <video
-          ref={videoRef}
-          src={videoSrc}
-          playsInline
-          preload="auto"
-          className="h-full w-full object-contain"
-          onLoadStart={() => setIsVideoLoading(true)}
-          onWaiting={() => setIsVideoLoading(true)}
-          onSeeking={() => setIsVideoLoading(true)}
-          onLoadedData={() => setIsVideoLoading(false)}
-          onCanPlay={() => setIsVideoLoading(false)}
-          onPlaying={() => setIsVideoLoading(false)}
-          onSeeked={(event) => {
-            if (event.currentTarget.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-              setIsVideoLoading(false);
-            }
-          }}
-          onError={() => setIsVideoLoading(false)}
-          onLoadedMetadata={(event) => {
-            const target = event.currentTarget;
-            if (target.videoWidth > 0 && target.videoHeight > 0) {
-              const nextRatio = toAspectRatio(target.videoWidth, target.videoHeight);
-              setRatio(nextRatio);
-              applyPlyrAspectRatio(target, nextRatio);
-            }
-          }}
-        >
-          当前浏览器不支持该视频预览。
-        </video>
-        {isVideoLoading ? (
-          <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center rounded-xl bg-black/35 text-white">
-            <div className="inline-flex items-center gap-2 rounded-full bg-black/60 px-4 py-2 text-sm font-medium shadow-card backdrop-blur">
-              <Spinner size={18} className="text-white" />
-              视频加载中…
-            </div>
-          </div>
-        ) : null}
-      </div>
-    </div>
-  );
+function previewTone(preview: ReturnType<typeof previewKind>): "surface" | "dark" | "code" {
+  if (preview === "video" || preview === "audio") return "dark";
+  if (preview === "text" || preview === "markdown") return "code";
+  return "surface";
 }
 
-type VideoPreviewServiceWorkerState = {
-  status: "checking" | "controlled" | "need-reload" | "unsupported" | "failed";
-  message?: string;
-};
-
-function initialVideoPreviewServiceWorkerState(): VideoPreviewServiceWorkerState {
-  return isVideoPreviewServiceWorkerControlling() ? { status: "controlled" } : { status: "checking" };
-}
-
-function videoPreviewUnavailableMessage({
-  canUseMultipartPreview,
-  hasSignedFileToken,
-  serviceWorkerState
-}: {
-  canUseMultipartPreview: boolean;
-  hasSignedFileToken: boolean;
-  serviceWorkerState: VideoPreviewServiceWorkerState;
-}): string {
-  if (!canUseMultipartPreview) {
-    return "该视频缺少分片下载元数据，无法通过分片代理进行预览。";
-  }
-
-  if (!hasSignedFileToken) {
-    return "该视频缺少签名访问令牌，无法生成分片预览地址。";
-  }
-
-  if (serviceWorkerState.status === "checking") {
-    return "正在注册并等待 Service Worker 接管页面；如果长时间没有变化，请点击“重新检查”。";
-  }
-
-  if (serviceWorkerState.status === "need-reload") {
-    return serviceWorkerState.message
-      ? `${serviceWorkerState.message}，请点击“刷新页面”后再预览。`
-      : "Service Worker 已注册，但当前页面还没有被它接管，请点击“刷新页面”后再预览。";
-  }
-
-  if (serviceWorkerState.status === "unsupported") {
-    return serviceWorkerState.message || "当前浏览器不支持 Service Worker，无法预览超过直链上限的视频。";
-  }
-
-  if (serviceWorkerState.status === "failed") {
-    return serviceWorkerState.message
-      ? `Service Worker 注册或激活失败：${serviceWorkerState.message}`
-      : "Service Worker 注册或激活失败，无法接管分片预览请求。";
-  }
-
-  return "Service Worker 已接管页面，但分片预览地址未生成，请重新打开预览窗口。";
-}
-
-function applyPlyrAspectRatio(
-  video: HTMLVideoElement | null,
-  ratio: { label: string; value: number }
-) {
-  const player = video?.closest<HTMLElement>(".plyr");
-  const wrapper = player?.querySelector<HTMLElement>(".plyr__video-wrapper");
-  const cssRatio = ratio.label.replace(":", " / ");
-
-  if (player) {
-    player.style.aspectRatio = cssRatio;
-  }
-
-  if (wrapper) {
-    wrapper.style.aspectRatio = cssRatio;
-  }
-}
-
-function toAspectRatio(width: number, height: number): { label: string; value: number } {
-  const gcd = greatestCommonDivisor(width, height);
-  const normalizedWidth = Math.max(1, Math.round(width / gcd));
-  const normalizedHeight = Math.max(1, Math.round(height / gcd));
-
-  return {
-    label: `${normalizedWidth}:${normalizedHeight}`,
-    value: width / height
-  };
-}
-
-function greatestCommonDivisor(left: number, right: number): number {
-  let a = Math.abs(Math.round(left));
-  let b = Math.abs(Math.round(right));
-
-  while (b > 0) {
-    const next = a % b;
-    a = b;
-    b = next;
-  }
-
-  return a || 1;
-}
-
-function TextPreview({
-  file,
-  state,
-  fullscreen
-}: {
-  file: FileItem;
-  state: { status: "idle" | "loading" | "ready" | "error"; content: string; message?: string };
-  fullscreen: boolean;
-}) {
-  const language = detectTextLanguage(file);
-  const prepared = useMemo(() => prepareTextContent(state.content, language), [state.content, language]);
-
-  if (state.status === "loading" || state.status === "idle") {
-    return <PreviewLoading />;
-  }
-
-  if (state.status === "error") {
-    return <PreviewError message={state.message || "读取预览内容失败"} />;
-  }
-
-  return (
-    <CodePreview
-      content={prepared}
-      fullscreen={fullscreen}
-      language={language}
-      originalContent={state.content}
-    />
-  );
-}
-
-function MarkdownPreview({
-  state,
-  fullscreen
-}: {
-  state: { status: "idle" | "loading" | "ready" | "error"; content: string; message?: string };
-  fullscreen: boolean;
-}) {
-  if (state.status === "loading" || state.status === "idle") {
-    return <PreviewLoading />;
-  }
-
-  if (state.status === "error") {
-    return <PreviewError message={state.message || "读取预览内容失败"} />;
-  }
-
-  return (
-    <div className={(fullscreen ? "h-full" : "h-[60vh]") + " w-full overflow-auto bg-white px-5 py-5 text-sm leading-7 text-foreground scroll-thin"}>
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          h1: (props) => <h1 {...props} className="mb-4 border-b border-border pb-2 text-2xl font-semibold" />,
-          h2: (props) => <h2 {...props} className="mb-3 mt-6 text-xl font-semibold" />,
-          h3: (props) => <h3 {...props} className="mb-2 mt-5 text-base font-semibold" />,
-          p: (props) => <p {...props} className="mb-3" />,
-          a: (props) => <a {...props} target="_blank" rel="noreferrer" className="text-primary-strong underline underline-offset-2" />,
-          ul: (props) => <ul {...props} className="mb-3 list-disc pl-5" />,
-          ol: (props) => <ol {...props} className="mb-3 list-decimal pl-5" />,
-          blockquote: (props) => <blockquote {...props} className="mb-3 border-l-4 border-border pl-3 text-muted" />,
-          code: (props) => <code {...props} className="rounded-md bg-background px-1.5 py-0.5 font-mono text-[0.92em] text-foreground ring-1 ring-border/70" />,
-          pre: (props) => (
-            <pre
-              {...props}
-              className="mb-4 overflow-auto rounded-xl border border-border bg-[#f8fafc] p-3 font-mono text-xs leading-6 text-[#334155] shadow-card scroll-thin [&_code]:rounded-none [&_code]:bg-transparent [&_code]:p-0 [&_code]:text-xs [&_code]:text-[#334155] [&_code]:ring-0"
-            />
-          ),
-          table: (props) => <table {...props} className="mb-3 w-full border-collapse text-sm" />,
-          th: (props) => <th {...props} className="border border-border bg-surface px-2 py-1 text-left font-semibold" />,
-          td: (props) => <td {...props} className="border border-border px-2 py-1" />
-        }}
-      >
-        {state.content || "空 Markdown 文件"}
-      </ReactMarkdown>
-    </div>
-  );
-}
-
-type TextLanguage = "javascript" | "json" | "yaml" | "toml" | "html" | "css" | "xml" | "text";
-
-function detectTextLanguage(file: Pick<FileItem, "mime_type" | "file_name">): TextLanguage {
-  const mime = file.mime_type.toLowerCase();
-  const name = file.file_name.toLowerCase();
-  const extension = name.split(".").pop() || "";
-
-  if (["js", "jsx", "ts", "tsx", "mjs", "cjs"].includes(extension) || mime.includes("javascript") || mime.includes("typescript")) {
-    return "javascript";
-  }
-
-  if (extension === "json" || mime === "application/json") {
-    return "json";
-  }
-
-  if (["yaml", "yml"].includes(extension) || mime.includes("yaml")) {
-    return "yaml";
-  }
-
-  if (extension === "toml" || mime.includes("toml")) {
-    return "toml";
-  }
-
-  if (["html", "htm"].includes(extension) || mime === "text/html") {
-    return "html";
-  }
-
-  if (extension === "css" || mime === "text/css") {
-    return "css";
-  }
-
-  if (extension === "xml" || mime.includes("xml")) {
-    return "xml";
-  }
-
-  return "text";
-}
-
-function prepareTextContent(content: string, language: TextLanguage): string {
-  if (!content) {
-    return "空文本文件";
-  }
-
-  if (language !== "json") {
-    return content;
-  }
-
-  try {
-    return JSON.stringify(JSON.parse(content), null, 2);
-  } catch {
-    return content;
-  }
-}
-
-function CodePreview({
-  content,
-  fullscreen,
-  language,
-  originalContent
-}: {
-  content: string;
-  fullscreen: boolean;
-  language: TextLanguage;
-  originalContent: string;
-}) {
-  const lines = content.split("\n");
-  const lineCountLabel = `${lines.length} 行`;
-  const formattedLabel = language === "json" && content !== originalContent ? "已格式化" : "原文";
-
-  return (
-    <div className={(fullscreen ? "h-full" : "h-[60vh]") + " flex w-full flex-col overflow-hidden bg-white text-[#334155]"}>
-      <div className="flex shrink-0 items-center justify-between gap-3 border-b border-border bg-background/80 px-4 py-2 text-xs text-muted">
-        <span className="font-medium text-foreground">{languageLabel(language)}</span>
-        <span className="flex items-center gap-2">
-          <span>{formattedLabel}</span>
-          <span className="h-1 w-1 rounded-full bg-subtle" />
-          <span>{lineCountLabel}</span>
-        </span>
-      </div>
-      <div className="min-h-0 flex-1 overflow-auto scroll-thin">
-        <div className="min-w-max py-2 font-mono text-xs leading-6">
-          {lines.map((line, index) => (
-            <div key={`${index}-${line}`} className="grid grid-cols-[3.75rem_1fr] hover:bg-primary-soft/35">
-              <span className="select-none border-r border-border px-3 text-right text-subtle">
-                {index + 1}
-              </span>
-              <code className="whitespace-pre px-4 text-[#334155]">
-                {highlightLine(line, language)}
-              </code>
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function languageLabel(language: TextLanguage): string {
-  switch (language) {
-    case "javascript":
-      return "JavaScript / TypeScript";
-    case "json":
-      return "JSON";
-    case "yaml":
-      return "YAML";
-    case "toml":
-      return "TOML";
-    case "html":
-      return "HTML";
-    case "css":
-      return "CSS";
-    case "xml":
-      return "XML";
+function badgeTone(tone: ReturnType<typeof fileKind>["tone"]): "success" | "danger" | "info" | "warning" | "neutral" {
+  switch (tone) {
+    case "image":
+    case "video":
+      return "success";
+    case "audio":
+    case "text":
+      return "info";
+    case "pdf":
+      return "danger";
+    case "archive":
+      return "warning";
     default:
-      return "Text";
+      return "neutral";
   }
-}
-
-const tokenPattern =
-  /(\/\/.*$|#.*$|<!--.*?-->|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b(?:async|await|break|case|catch|class|const|continue|default|delete|do|else|enum|export|extends|false|finally|for|from|function|if|implements|import|interface|let|new|null|private|protected|public|return|static|switch|this|throw|true|try|type|undefined|var|while|yield)\b|\b\d+(?:\.\d+)?\b|<\/?[A-Za-z][^>]*>|&[A-Za-z0-9#]+;|[{}[\]():,.;=<>+\-*\/])/g;
-
-function highlightLine(line: string, language: TextLanguage): ReactNode[] {
-  if (!line) {
-    return [""];
-  }
-
-  const nodes: ReactNode[] = [];
-  const keyMatch =
-    language === "json" || language === "yaml" || language === "toml"
-      ? /^(\s*)("?[\w.-]+"?)(\s*[:=])/.exec(line)
-      : null;
-
-  if (keyMatch) {
-    const [, indent, key, separator] = keyMatch;
-    const consumed = `${indent}${key}${separator}`;
-    nodes.push(indent);
-    nodes.push(<span key="key" className="text-[#1d4ed8]">{key}</span>);
-    nodes.push(<span key="separator" className="text-[#94a3b8]">{separator}</span>);
-    nodes.push(...highlightTokens(line.slice(consumed.length), language, consumed.length));
-    return nodes;
-  }
-
-  return highlightTokens(line, language, 0);
-}
-
-function highlightTokens(value: string, language: TextLanguage, offset: number): ReactNode[] {
-  const nodes: ReactNode[] = [];
-  let lastIndex = 0;
-
-  for (const match of value.matchAll(tokenPattern)) {
-    const index = match.index ?? 0;
-    const token = match[0];
-
-    if (index > lastIndex) {
-      nodes.push(value.slice(lastIndex, index));
-    }
-
-    nodes.push(
-      <span key={`${offset + index}-${token}`} className={tokenClass(token, language)}>
-        {token}
-      </span>
-    );
-    lastIndex = index + token.length;
-  }
-
-  if (lastIndex < value.length) {
-    nodes.push(value.slice(lastIndex));
-  }
-
-  return nodes.length > 0 ? nodes : [value];
-}
-
-function tokenClass(token: string, language: TextLanguage): string {
-  if (token.startsWith("//") || token.startsWith("#") || token.startsWith("<!--")) {
-    return "text-[#64748b]";
-  }
-
-  if (
-    token.startsWith("\"") ||
-    token.startsWith("'") ||
-    token.startsWith("`") ||
-    (language === "html" && token.startsWith("&"))
-  ) {
-    return "text-[#047857]";
-  }
-
-  if (token.startsWith("<") && token.endsWith(">")) {
-    return "text-[#0f766e]";
-  }
-
-  if (/^\d/.test(token)) {
-    return "text-[#b45309]";
-  }
-
-  if (/^(true|false|null|undefined)$/.test(token)) {
-    return "text-[#b45309]";
-  }
-
-  if (/^[A-Za-z_$][\w$]*$/.test(token)) {
-    return "text-[#7c3aed]";
-  }
-
-  return "text-[#94a3b8]";
-}
-
-function PreviewLoading() {
-  return (
-    <div className="flex h-[60vh] w-full items-center justify-center gap-2 text-sm text-muted">
-      <Spinner size={18} />
-      加载预览内容…
-    </div>
-  );
-}
-
-function PreviewError({ message }: { message: string }) {
-  return (
-    <div className="grid h-[60vh] w-full place-items-center px-6 text-center">
-      <div>
-        <p className="text-sm font-medium text-foreground">预览读取失败</p>
-        <p className="mt-1 text-xs text-muted">{message}</p>
-      </div>
-    </div>
-  );
 }
