@@ -20,10 +20,15 @@ interface VideoPreviewProps {
 }
 
 const VIDEO_PREVIEW_TIMEOUT_MS = 30_000;
+const VIDEO_CONTROLS_HIDE_DELAY_MS = 1_800;
 
 export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPreviewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const frameRef = useRef<HTMLDivElement>(null);
+  const controlsHideTimerRef = useRef<number | null>(null);
   const [ratio, setRatio] = useState({ label: "16:9", value: 16 / 9 });
+  const [controlsVisible, setControlsVisible] = useState(true);
+  const [controlsDensity, setControlsDensity] = useState<MediaControlsDensity>("regular");
   const [serviceWorkerState, setServiceWorkerState] = useState<VideoPreviewServiceWorkerState>(initialVideoPreviewServiceWorkerState);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
@@ -65,10 +70,61 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
     setServiceWorkerState({ status: "need-reload", message: "Service Worker 已注册，但当前页面还没有被它接管" });
   }, []);
 
+  const clearControlsHideTimer = useCallback(() => {
+    if (controlsHideTimerRef.current === null) return;
+    window.clearTimeout(controlsHideTimerRef.current);
+    controlsHideTimerRef.current = null;
+  }, []);
+
+  const showControls = useCallback(() => {
+    clearControlsHideTimer();
+    setControlsVisible(true);
+  }, [clearControlsHideTimer]);
+
+  const scheduleControlsHide = useCallback((delay = VIDEO_CONTROLS_HIDE_DELAY_MS) => {
+    clearControlsHideTimer();
+    controlsHideTimerRef.current = window.setTimeout(() => {
+      const activeElement = document.activeElement;
+      if (activeElement && frameRef.current?.contains(activeElement)) {
+        setControlsVisible(true);
+        controlsHideTimerRef.current = null;
+        return;
+      }
+
+      setControlsVisible(false);
+      controlsHideTimerRef.current = null;
+    }, delay);
+  }, [clearControlsHideTimer]);
+
   useEffect(() => {
     setLoading(Boolean(videoSrc));
     setFailed(false);
   }, [videoSrc, file.id]);
+
+  useEffect(() => {
+    setControlsVisible(true);
+    clearControlsHideTimer();
+  }, [clearControlsHideTimer, file.id]);
+
+  useEffect(() => clearControlsHideTimer, [clearControlsHideTimer]);
+
+  useEffect(() => {
+    const frame = frameRef.current;
+
+    const updateDensity = () => {
+      const frameWidth = frame?.clientWidth ?? 0;
+      setControlsDensity(controlsDensityForFrame(frameWidth, ratio.value));
+    };
+
+    updateDensity();
+
+    if (!frame || typeof ResizeObserver === "undefined") return undefined;
+
+    const observer = new ResizeObserver(updateDensity);
+    observer.observe(frame);
+
+    return () => observer.disconnect();
+  }, [ratio.value]);
 
   useEffect(() => {
     if (!loading || failed || !videoSrc) return;
@@ -132,10 +188,25 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
   return (
     <div className={cn("flex w-full items-center justify-center bg-[#07110f] p-3 sm:p-4", fullscreen ? "h-full min-h-0" : "h-[min(66dvh,760px)]") }>
       <div
+        ref={frameRef}
         className="relative max-h-full max-w-full overflow-hidden rounded-[1.5rem] bg-black shadow-dialog ring-1 ring-white/10"
         style={{
           aspectRatio: ratio.label.replace(":", " / "),
           width: `min(100%, calc(${heightLimit} * ${ratio.value}))`
+        }}
+        onPointerEnter={showControls}
+        onPointerMove={showControls}
+        onPointerLeave={() => scheduleControlsHide()}
+        onTouchStart={() => {
+          showControls();
+          scheduleControlsHide(3_000);
+        }}
+        onFocusCapture={showControls}
+        onBlurCapture={(event) => {
+          const nextTarget = event.relatedTarget;
+          if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) {
+            scheduleControlsHide();
+          }
         }}
       >
         {poster ? (
@@ -204,13 +275,27 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
           </div>
         ) : null}
 
-        <div className="absolute inset-x-3 bottom-3 z-20">
-          <MediaControls mediaRef={videoRef} fullscreen={fullscreen} onToggleFullscreen={onToggleFullscreen} />
+        <div
+          className={cn(
+            "absolute bottom-2 left-1/2 z-20 w-[calc(100%-0.75rem)] max-w-[44rem] -translate-x-1/2 transition-all duration-200 ease-out sm:bottom-3 sm:w-[calc(100%-1.5rem)]",
+            controlsVisible ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-3 opacity-0"
+          )}
+        >
+          <MediaControls
+            mediaRef={videoRef}
+            fullscreen={fullscreen}
+            onToggleFullscreen={onToggleFullscreen}
+            variant="floating"
+            density={controlsDensity}
+            interactive={controlsVisible}
+          />
         </div>
       </div>
     </div>
   );
 }
+
+type MediaControlsDensity = "regular" | "narrow" | "tiny";
 
 type VideoPreviewServiceWorkerState = {
   status: "checking" | "controlled" | "need-reload" | "unsupported" | "failed";
@@ -246,6 +331,12 @@ function toAspectRatio(width: number, height: number): { label: string; value: n
   const normalizedWidth = Math.max(1, Math.round(width / gcd));
   const normalizedHeight = Math.max(1, Math.round(height / gcd));
   return { label: `${normalizedWidth}:${normalizedHeight}`, value: width / height };
+}
+
+function controlsDensityForFrame(width: number, aspectRatio: number): MediaControlsDensity {
+  if (width > 0 && width < 330) return "tiny";
+  if ((width > 0 && width < 430) || aspectRatio < 0.8) return "narrow";
+  return "regular";
 }
 
 function greatestCommonDivisor(left: number, right: number): number {
