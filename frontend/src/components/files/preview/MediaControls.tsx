@@ -23,6 +23,7 @@ interface MediaState {
 const playbackRates = [0.5, 0.75, 1, 1.25, 1.5, 2];
 
 export function MediaControls({ mediaRef, fullscreen, onToggleFullscreen, compact = false, className }: MediaControlsProps) {
+  const dense = compact || fullscreen;
   const [state, setState] = useState<MediaState>({
     playing: false,
     currentTime: 0,
@@ -138,8 +139,8 @@ export function MediaControls({ mediaRef, fullscreen, onToggleFullscreen, compac
   const progressPercent = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
 
   return (
-    <div className={cn("rounded-2xl border border-white/10 bg-black/70 p-3 text-white shadow-dialog backdrop-blur-md", className)}>
-      <div className="relative mb-3 h-3 rounded-full bg-white/15">
+    <div className={cn("rounded-2xl border border-white/10 bg-black/70 text-white shadow-dialog backdrop-blur-md", dense ? "p-2.5" : "p-3", className)}>
+      <div className={cn("relative rounded-full bg-white/15", dense ? "mb-2 h-2.5" : "mb-3 h-3")}>
         <div className="absolute inset-y-0 left-0 rounded-full bg-white/20" style={{ width: `${bufferedPercent}%` }} />
         <div className="absolute inset-y-0 left-0 rounded-full bg-primary" style={{ width: `${progressPercent}%` }} />
         <input
@@ -154,28 +155,28 @@ export function MediaControls({ mediaRef, fullscreen, onToggleFullscreen, compac
         />
       </div>
 
-      <div className={cn("flex flex-wrap items-center gap-2", compact ? "justify-center" : "justify-between")}>
-        <div className="flex items-center gap-1.5">
-          <MediaButton label={state.playing ? "暂停" : "播放"} onClick={() => void togglePlay()} emphasis>
+      <div className="flex min-w-0 flex-nowrap items-center gap-2">
+        <div className="flex shrink-0 items-center gap-1">
+          <MediaButton label={state.playing ? "暂停" : "播放"} onClick={() => void togglePlay()} emphasis dense={dense}>
             {state.playing ? <Pause size={16} /> : <Play size={16} />}
           </MediaButton>
-          <MediaButton label="停止" onClick={stop}>
+          <MediaButton label="停止" onClick={stop} dense={dense} className="max-sm:hidden">
             <Square size={15} />
           </MediaButton>
-          <MediaButton label="快退 10 秒" onClick={() => seekBy(-10)}>
+          <MediaButton label="快退 10 秒" onClick={() => seekBy(-10)} dense={dense} className="max-[420px]:hidden">
             <Rewind size={15} />
           </MediaButton>
-          <MediaButton label="快进 10 秒" onClick={() => seekBy(10)}>
+          <MediaButton label="快进 10 秒" onClick={() => seekBy(10)} dense={dense} className="max-[420px]:hidden">
             <FastForward size={15} />
           </MediaButton>
         </div>
 
-        <div className="min-w-[7.5rem] text-center font-mono text-xs text-white/75">
+        <div className={cn("shrink-0 text-center font-mono text-xs text-white/75", dense ? "min-w-[5.75rem]" : "min-w-[6.75rem]")}>
           {formatMediaTime(currentTime)} / {duration ? formatMediaTime(duration) : "--:--"}
         </div>
 
-        <div className="flex items-center gap-2">
-          <MediaButton label={state.muted ? "取消静音" : "静音"} onClick={toggleMute}>
+        <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1.5">
+          <MediaButton label={state.muted ? "取消静音" : "静音"} onClick={toggleMute} dense={dense}>
             {state.muted || state.volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
           </MediaButton>
           <input
@@ -186,14 +187,17 @@ export function MediaControls({ mediaRef, fullscreen, onToggleFullscreen, compac
             value={state.muted ? 0 : state.volume}
             onChange={(event) => setVolume(event.target.value)}
             aria-label="音量"
-            className="h-1.5 w-20 cursor-pointer accent-primary"
+            className={cn("h-1.5 cursor-pointer accent-primary", dense ? "hidden w-14 lg:block" : "hidden w-20 md:block")}
           />
-          <label className="inline-flex items-center gap-1 text-xs text-white/70">
-            倍速
+          <label className="inline-flex shrink-0 items-center gap-1 text-xs text-white/70">
+            <span className={dense ? "sr-only" : "hidden xl:inline"}>倍速</span>
             <select
               value={state.rate}
               onChange={(event) => setRate(event.target.value)}
-              className="rounded-md border border-white/10 bg-white/10 px-2 py-1 text-xs text-white outline-none transition-colors hover:bg-white/15 focus-visible:focus-ring"
+              className={cn(
+                "rounded-md border border-white/10 bg-white/10 text-xs text-white outline-none transition-colors hover:bg-white/15 focus-visible:focus-ring",
+                dense ? "h-8 w-14 px-1.5" : "h-9 w-16 px-2"
+              )}
               aria-label="切换播放速度"
             >
               {playbackRates.map((rate) => (
@@ -203,7 +207,7 @@ export function MediaControls({ mediaRef, fullscreen, onToggleFullscreen, compac
               ))}
             </select>
           </label>
-          <MediaButton label={fullscreen ? "退出全屏" : "全屏"} onClick={onToggleFullscreen}>
+          <MediaButton label={fullscreen ? "退出全屏" : "全屏"} onClick={onToggleFullscreen} dense={dense}>
             {fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
           </MediaButton>
         </div>
@@ -212,11 +216,13 @@ export function MediaControls({ mediaRef, fullscreen, onToggleFullscreen, compac
   );
 }
 
-function MediaButton({ label, onClick, children, emphasis = false }: {
+function MediaButton({ label, onClick, children, emphasis = false, dense = false, className }: {
   label: string;
   onClick: () => void;
   children: ReactNode;
   emphasis?: boolean;
+  dense?: boolean;
+  className?: string;
 }) {
   return (
     <button
@@ -225,14 +231,16 @@ function MediaButton({ label, onClick, children, emphasis = false }: {
       title={label}
       onClick={onClick}
       className={cn(
-        "inline-flex h-9 items-center justify-center gap-1.5 rounded-lg border px-2.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:focus-ring",
+        "inline-flex shrink-0 items-center justify-center gap-1.5 rounded-lg border text-xs font-medium transition-colors focus-visible:outline-none focus-visible:focus-ring",
+        dense ? "size-8 px-0" : "h-9 px-2.5",
         emphasis
           ? "border-primary bg-primary text-white hover:bg-primary-strong"
-          : "border-white/10 bg-white/10 text-white/85 hover:bg-white/15 hover:text-white"
+          : "border-white/10 bg-white/10 text-white/85 hover:bg-white/15 hover:text-white",
+        className
       )}
     >
       {children}
-      <span className="hidden sm:inline">{label}</span>
+      {!dense ? <span className="hidden 2xl:inline">{label}</span> : null}
     </button>
   );
 }
