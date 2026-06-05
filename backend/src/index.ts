@@ -4873,7 +4873,7 @@ async function handleAdminHlsPreviewPlaylist(request: Request, env: Env, assetId
     throw new AppError(409, "HlsPreviewNotReady", "至少需要完成 1 个 HLS segment 后才能生成预览 playlist");
   }
 
-  const baseUrl = getPublicBaseUrl(request, env);
+  const baseUrl = new URL(request.url).origin;
   const playlist = buildRewrittenMediaPlaylist({
     targetDuration: asset.target_duration_seconds,
     segments: doneSegments.map((segment) => ({

@@ -257,6 +257,8 @@ export function UploadDialog({
   const folderInput = useRef<HTMLInputElement>(null);
   const onErrorRef = useRef(onError);
   const activeUploadRef = useRef<UploadAbortContext | null>(null);
+  const urlUploadRef = useRef(urlUpload);
+  const hlsThumbnailPromiseRef = useRef<Promise<GeneratedThumbnail | undefined> | null>(null);
   const hlsThumbnailGeneratingRef = useRef(false);
   const [activeUploadKind, setActiveUploadKind] = useState<"local" | "url" | null>(null);
   const [activeUploadItemId, setActiveUploadItemId] = useState<string | null>(null);
@@ -272,10 +274,15 @@ export function UploadDialog({
   }, [onError]);
 
   useEffect(() => {
+    urlUploadRef.current = urlUpload;
+  }, [urlUpload]);
+
+  useEffect(() => {
     if (!open) {
       abortUploadTask(activeUploadRef.current);
       activeUploadRef.current = null;
       hlsThumbnailGeneratingRef.current = false;
+      hlsThumbnailPromiseRef.current = null;
       setActiveUploadKind(null);
       setActiveUploadItemId(null);
       setStopRequested(false);
@@ -515,6 +522,7 @@ export function UploadDialog({
       cleanupTemporaryHlsUpload(current);
       revokeThumbnail(current.thumbnail?.generated);
       hlsThumbnailGeneratingRef.current = false;
+      hlsThumbnailPromiseRef.current = null;
       return { status: "pending" };
     });
   }
@@ -1639,6 +1647,7 @@ export function UploadDialog({
       }, task.abortController.signal);
       const asset = init.hls.asset;
       const segments = init.hls.segments;
+      const previewPlaylistUrl = sameOriginAdminUrl(asset.preview_playlist_url);
 
       completionRetry = hlsRetryFromStatus(asset, segments, conflictAction);
       setUrlUpload((current) => ({
@@ -1651,7 +1660,7 @@ export function UploadDialog({
           probe,
           assetId: asset.id,
           segmentCount: asset.segment_count,
-          previewPlaylistUrl: asset.preview_playlist_url,
+          previewPlaylistUrl,
           ...(selectedVariantId ? { variantId: selectedVariantId } : {})
         }
       }));
@@ -1672,7 +1681,7 @@ export function UploadDialog({
         },
         onChunkState: updateUrlChunk,
         onChunk: async (index, signal) => {
-          await uploadHlsSegmentFully(asset.id, index, asset.preview_playlist_url, asset.file_name, signal);
+          await uploadHlsSegmentFully(asset.id, index, previewPlaylistUrl, asset.file_name, signal);
         }
       });
 
@@ -1699,7 +1708,7 @@ export function UploadDialog({
         status: "uploading",
         progress: { completed: asset.segment_count, total: asset.segment_count, label: "正在生成 HLS 文件索引" }
       }));
-      const thumbnail = await resolveHlsThumbnailForUpload(asset.preview_playlist_url, asset.file_name);
+      const thumbnail = await resolveHlsThumbnailForUpload(previewPlaylistUrl, asset.file_name);
       await runAbortableUploadRequest(task, HLS_SEGMENT_REQUEST_TIMEOUT_MS, (signal) =>
         completeHlsUpload(asset.id, thumbnail, signal, conflictAction)
       );
@@ -1979,8 +1988,54 @@ export function UploadDialog({
   }
 
   async function maybeGenerateHlsThumbnail(previewPlaylistUrl: string, fileName: string) {
-    if (hlsThumbnailGeneratingRef.current) {
-      return;
+    await startHlsThumbnailGeneration(previewPlaylistUrl, fileName, "正在从首个 HLS 片段生成缩略图");
+  }
+
+  async function resolveHlsThumbnailForUpload(previewPlaylistUrl: string, fileName: string): Promise<ThumbnailUploadPayload | undefined> {
+    const latest = urlUploadRef.current.thumbnail;
+
+    if (latest?.status === "ready" && latest.generated) {
+      return thumbnailPayload(latest.generated);
+    }
+
+    if (latest?.status === "removed") {
+      return undefined;
+    }
+
+    if (hlsThumbnailPromiseRef.current) {
+      const generated = await hlsThumbnailPromiseRef.current;
+      if (urlUploadRef.current.thumbnail?.status === "removed") {
+        return undefined;
+      }
+      if (generated) {
+        return thumbnailPayload(generated);
+      }
+    }
+
+    const generated = await startHlsThumbnailGeneration(previewPlaylistUrl, fileName, "正在生成 HLS 缩略图");
+    if (urlUploadRef.current.thumbnail?.status === "removed") {
+      return undefined;
+    }
+    return generated ? thumbnailPayload(generated) : undefined;
+  }
+
+  function startHlsThumbnailGeneration(
+    previewPlaylistUrl: string,
+    fileName: string,
+    message: string
+  ): Promise<GeneratedThumbnail | undefined> {
+    const latest = urlUploadRef.current.thumbnail;
+
+    if (latest?.status === "ready" && latest.generated) {
+      return Promise.resolve(latest.generated);
+    }
+
+    if (latest?.status === "removed") {
+      return Promise.resolve(undefined);
+    }
+
+    if (hlsThumbnailPromiseRef.current) {
+      return hlsThumbnailPromiseRef.current;
     }
 
     hlsThumbnailGeneratingRef.current = true;
@@ -1991,62 +2046,47 @@ export function UploadDialog({
       revokeThumbnail(current.thumbnail?.generated);
       return {
         ...current,
-        thumbnail: { status: "generating", message: "正在从首个 HLS 片段生成缩略图" }
+        thumbnail: { status: "generating", message }
       };
     });
 
-    try {
-      const generated = await generateThumbnailFromHlsPlaylist(previewPlaylistUrl, fileName);
-      setUrlUpload((current) => {
-        if (current.thumbnail?.status === "removed") {
-          revokeThumbnail(generated);
-          return current;
-        }
-        revokeThumbnail(current.thumbnail?.generated);
-        return {
-          ...current,
-          thumbnail: { status: "ready", generated }
-        };
-      });
-    } catch (error) {
-      setUrlUpload((current) => {
-        if (current.thumbnail?.status === "removed") {
-          return current;
-        }
-        return {
-          ...current,
-          thumbnail: {
-            status: "failed",
-            message: error instanceof Error ? error.message : "HLS 缩略图生成失败"
+    const promise = generateThumbnailFromHlsPlaylist(sameOriginAdminUrl(previewPlaylistUrl), fileName)
+      .then((generated) => {
+        setUrlUpload((current) => {
+          if (current.thumbnail?.status === "removed") {
+            revokeThumbnail(generated);
+            return current;
           }
-        };
+          revokeThumbnail(current.thumbnail?.generated);
+          return {
+            ...current,
+            thumbnail: { status: "ready", generated }
+          };
+        });
+        return generated;
+      })
+      .catch((error) => {
+        hlsThumbnailPromiseRef.current = null;
+        setUrlUpload((current) => {
+          if (current.thumbnail?.status === "removed") {
+            return current;
+          }
+          return {
+            ...current,
+            thumbnail: {
+              status: "failed",
+              message: error instanceof Error ? error.message : "HLS 缩略图生成失败"
+            }
+          };
+        });
+        return undefined;
+      })
+      .finally(() => {
+        hlsThumbnailGeneratingRef.current = false;
       });
-    } finally {
-      hlsThumbnailGeneratingRef.current = false;
-    }
-  }
 
-  async function resolveHlsThumbnailForUpload(previewPlaylistUrl: string, fileName: string): Promise<ThumbnailUploadPayload | undefined> {
-    if (urlUpload.thumbnail?.status === "ready" && urlUpload.thumbnail.generated) {
-      return thumbnailPayload(urlUpload.thumbnail.generated);
-    }
-
-    if (urlUpload.thumbnail?.status === "removed") {
-      return undefined;
-    }
-
-    try {
-      updateUrlThumbnail({ status: "generating", message: "正在生成 HLS 缩略图" });
-      const generated = await generateThumbnailFromHlsPlaylist(previewPlaylistUrl, fileName);
-      updateUrlThumbnail({ status: "ready", generated });
-      return thumbnailPayload(generated);
-    } catch (error) {
-      updateUrlThumbnail({
-        status: "failed",
-        message: error instanceof Error ? error.message : "HLS 缩略图生成失败"
-      });
-      return undefined;
-    }
+    hlsThumbnailPromiseRef.current = promise;
+    return promise;
   }
 
   async function retryUrlMultipart(retry: MultipartRetryState) {
@@ -2933,6 +2973,23 @@ function hlsVariantLabel(variant: HlsProbeInfo["variants"][number]): string {
   return parts.length > 0 ? parts.join(" · ") : variant.id;
 }
 
+function sameOriginAdminUrl(value: string): string {
+  if (typeof window === "undefined") {
+    return value;
+  }
+
+  try {
+    const url = new URL(value, window.location.origin);
+    if (url.pathname.startsWith("/api/admin/")) {
+      return `${url.pathname}${url.search}${url.hash}`;
+    }
+  } catch {
+    return value;
+  }
+
+  return value;
+}
+
 function buildFolderTree(items: QueueItem[]): FolderTreeNode {
   const root: FolderTreeNode = {
     name: "root",
@@ -3480,41 +3537,64 @@ function HlsUploadDetails({
   const media = probe.media;
 
   return (
-    <div className="mt-2 rounded-lg border border-border bg-background/70 px-2.5 py-2 text-xs leading-5 text-muted">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div className="min-w-0">
-          <p className="font-medium text-foreground">
-            {probe.kind === "master" ? "HLS master playlist" : "HLS media playlist"}
-          </p>
-          <p className="truncate" title={probe.playlist_url}>
-            {media
-              ? `${media.segment_count} 个片段 · ${formatHlsDuration(media.duration)} · target ${media.target_duration}s`
-              : `${probe.variants.length} 个 variant，选择后再创建上传任务`}
-            {hls.previewPlaylistUrl ? " · 已生成临时预览 playlist" : ""}
-          </p>
-        </div>
-        {probe.kind === "master" ? (
-          <select
-            value={hls.variantId ?? probe.selected_variant_id ?? ""}
-            disabled={disabled}
-            className="h-8 min-w-40 shrink-0 rounded-lg border border-border bg-surface px-2 text-xs text-foreground outline-none transition-colors focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-ring)] disabled:opacity-60"
-            onChange={(event) => onVariantChange(event.target.value)}
-          >
-            <option value="">选择 variant</option>
-            {probe.variants.map((variant) => (
-              <option key={variant.id} value={variant.id}>
-                {hlsVariantLabel(variant)}
-              </option>
-            ))}
-          </select>
-        ) : null}
-      </div>
+    <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1.5 text-[11px] text-muted">
+      <HlsMetaPill tone="strong">HLS</HlsMetaPill>
+      <HlsMetaPill>{probe.kind === "master" ? "master playlist" : "media playlist"}</HlsMetaPill>
+      {media ? (
+        <>
+          <HlsMetaPill>{media.segment_count} 个片段</HlsMetaPill>
+          <HlsMetaPill>{formatHlsDuration(media.duration)}</HlsMetaPill>
+          <HlsMetaPill>target {media.target_duration}s</HlsMetaPill>
+        </>
+      ) : (
+        <HlsMetaPill>{probe.variants.length} 个 variant</HlsMetaPill>
+      )}
+      {hls.previewPlaylistUrl ? (
+        <HlsMetaPill tone="success">临时预览已就绪</HlsMetaPill>
+      ) : null}
       {selectedVariant ? (
-        <p className="mt-1 truncate text-[11px] text-subtle" title={selectedVariant.uri}>
-          当前 variant：{hlsVariantLabel(selectedVariant)}
-        </p>
+        <HlsMetaPill title={selectedVariant.uri}>{hlsVariantLabel(selectedVariant)}</HlsMetaPill>
+      ) : null}
+      {probe.kind === "master" ? (
+        <select
+          value={hls.variantId ?? probe.selected_variant_id ?? ""}
+          disabled={disabled}
+          className="h-7 max-w-full shrink-0 rounded-md border border-border bg-background px-2 text-[11px] text-foreground outline-none transition-colors focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-ring)] disabled:opacity-60"
+          onChange={(event) => onVariantChange(event.target.value)}
+        >
+          <option value="">选择 variant</option>
+          {probe.variants.map((variant) => (
+            <option key={variant.id} value={variant.id}>
+              {hlsVariantLabel(variant)}
+            </option>
+          ))}
+        </select>
       ) : null}
     </div>
+  );
+}
+
+function HlsMetaPill({
+  children,
+  title,
+  tone = "neutral"
+}: {
+  children: ReactNode;
+  title?: string;
+  tone?: "neutral" | "strong" | "success";
+}) {
+  return (
+    <span
+      title={title}
+      className={cn(
+        "inline-flex h-5 max-w-full shrink-0 items-center rounded-full px-1.5 font-medium",
+        tone === "neutral" && "bg-background text-muted ring-1 ring-border",
+        tone === "strong" && "bg-primary-soft text-primary-strong",
+        tone === "success" && "bg-success-soft text-success"
+      )}
+    >
+      <span className="truncate">{children}</span>
+    </span>
   );
 }
 
