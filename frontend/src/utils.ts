@@ -59,7 +59,7 @@ export function formatDateTime(value: string | null | undefined): string {
   }).format(date);
 }
 
-export function fileKind(file: Pick<FileItem, "mime_type" | "file_name">): {
+export function fileKind(file: Pick<FileItem, "mime_type" | "file_name"> & Partial<Pick<FileItem, "storage_backend">>): {
   label: string;
   tone: "image" | "video" | "audio" | "text" | "pdf" | "archive" | "file";
 } {
@@ -70,7 +70,13 @@ export function fileKind(file: Pick<FileItem, "mime_type" | "file_name">): {
     return { label: "图片", tone: "image" };
   }
 
-  if (mime.startsWith("video/") || /\.(mp4|m4v|mov|webm|ogv)$/i.test(name)) {
+  if (
+    file.storage_backend === "hls_package" ||
+    mime === "application/vnd.apple.mpegurl" ||
+    mime === "application/x-mpegurl" ||
+    mime.startsWith("video/") ||
+    /\.(m3u8|mp4|m4v|mov|webm|ogv)$/i.test(name)
+  ) {
     return { label: "视频", tone: "video" };
   }
 
@@ -95,7 +101,7 @@ export function fileKind(file: Pick<FileItem, "mime_type" | "file_name">): {
 
 export type PreviewKind = "image" | "video" | "audio" | "text" | "markdown";
 
-export function previewKind(file: Pick<FileItem, "mime_type" | "file_name">): PreviewKind | null {
+export function previewKind(file: Pick<FileItem, "mime_type" | "file_name"> & Partial<Pick<FileItem, "storage_backend">>): PreviewKind | null {
   const mime = file.mime_type.toLowerCase();
   const name = file.file_name.toLowerCase();
 
@@ -103,7 +109,13 @@ export function previewKind(file: Pick<FileItem, "mime_type" | "file_name">): Pr
     return "image";
   }
 
-  if (mime.startsWith("video/") || /\.(mp4|m4v|mov|webm|ogv)$/i.test(name)) {
+  if (
+    file.storage_backend === "hls_package" ||
+    mime === "application/vnd.apple.mpegurl" ||
+    mime === "application/x-mpegurl" ||
+    mime.startsWith("video/") ||
+    /\.(m3u8|mp4|m4v|mov|webm|ogv)$/i.test(name)
+  ) {
     return "video";
   }
 

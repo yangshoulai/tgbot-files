@@ -2,16 +2,27 @@ import { ChangeEvent, FormEvent, type ReactNode, useCallback, useEffect, useRef,
 import { AlertTriangle, Check, CheckCircle2, ClipboardPaste, FilePlus2, FolderOpen, FolderTree, ImageOff, ImagePlus, Layers3, Link2, Pencil, Trash2, UploadCloud, X } from "lucide-react";
 import {
   ApiError,
+  cancelHlsUpload,
+  completeHlsSegment,
+  completeHlsUpload,
   completeMultipartUpload,
+  getHlsUploadStatus,
   getMultipartUploadStatus,
+  importHlsSegment,
+  importHlsSegmentChunk,
   initMultipartUpload,
+  initHlsUpload,
   initUrlMultipartUpload,
   listDirectories,
   preflightUploads,
+  probeHlsUpload,
   uploadMultipartChunk,
   uploadUrlMultipartChunk,
   type DirectoryItem,
   type FileNameConflictAction,
+  type HlsAsset,
+  type HlsProbeInfo,
+  type HlsSegment,
   type MultipartUpload,
   type ThumbnailUploadPayload,
   type UploadPreflightResultEntry
@@ -29,6 +40,7 @@ import { cn } from "../../lib/cn";
 import {
   canAutoGenerateThumbnail,
   generateThumbnailFromFile,
+  generateThumbnailFromHlsPlaylist,
   generateThumbnailFromRemoteSource,
   revokeThumbnail,
   type GeneratedThumbnail
@@ -82,6 +94,25 @@ interface MultipartRetryState {
   failedChunks: number[];
 }
 
+interface HlsRetryState {
+  assetId: string;
+  fileName: string;
+  segmentCount: number;
+  previewPlaylistUrl: string;
+  conflictAction: FileNameConflictAction;
+  completedSegments: number[];
+  failedSegments: number[];
+}
+
+interface HlsUrlState {
+  probe?: HlsProbeInfo;
+  variantId?: string;
+  assetId?: string;
+  segmentCount?: number;
+  previewPlaylistUrl?: string;
+  retry?: HlsRetryState;
+}
+
 interface FileNameConflictState {
   fileName: string;
   suggestedName: string;
@@ -119,6 +150,7 @@ interface UrlUploadState {
   conflict?: FileNameConflictState;
   conflictAction?: FileNameConflictAction;
   thumbnail?: UploadThumbnailState;
+  hls?: HlsUrlState;
 }
 
 type UploadThumbnailStatus = "idle" | "generating" | "ready" | "failed" | "removed";
@@ -146,10 +178,12 @@ interface UploadAbortContext {
 let counter = 0;
 const MULTIPART_UPLOAD_CONCURRENCY = 5;
 const URL_MULTIPART_UPLOAD_CONCURRENCY = 5;
+const HLS_SEGMENT_UPLOAD_CONCURRENCY = 3;
 const MULTIPART_UPLOAD_MAX_ATTEMPTS = 3;
 const MULTIPART_UPLOAD_RETRY_DELAY_MS = 800;
 const LOCAL_CHUNK_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 const URL_CHUNK_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
+const HLS_SEGMENT_REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const FILE_NAME_CONFLICT_TOAST_MESSAGE = "上传目录已存在同名文件，请选择覆盖或改名上传";
 
 class MultipartChunkUploadError extends Error {
@@ -160,6 +194,17 @@ class MultipartChunkUploadError extends Error {
   ) {
     super(message);
     this.name = "MultipartChunkUploadError";
+  }
+}
+
+class HlsSegmentUploadError extends Error {
+  constructor(
+    message: string,
+    public readonly retry: HlsRetryState,
+    public readonly stopped = false
+  ) {
+    super(message);
+    this.name = "HlsSegmentUploadError";
   }
 }
 
@@ -212,6 +257,7 @@ export function UploadDialog({
   const folderInput = useRef<HTMLInputElement>(null);
   const onErrorRef = useRef(onError);
   const activeUploadRef = useRef<UploadAbortContext | null>(null);
+  const hlsThumbnailGeneratingRef = useRef(false);
   const [activeUploadKind, setActiveUploadKind] = useState<"local" | "url" | null>(null);
   const [activeUploadItemId, setActiveUploadItemId] = useState<string | null>(null);
   const [stopRequested, setStopRequested] = useState(false);
@@ -229,6 +275,7 @@ export function UploadDialog({
     if (!open) {
       abortUploadTask(activeUploadRef.current);
       activeUploadRef.current = null;
+      hlsThumbnailGeneratingRef.current = false;
       setActiveUploadKind(null);
       setActiveUploadItemId(null);
       setStopRequested(false);
@@ -237,6 +284,7 @@ export function UploadDialog({
         return [];
       });
       setUrlUpload((current) => {
+        cleanupTemporaryHlsUpload(current);
         revokeThumbnail(current.thumbnail?.generated);
         return { status: "pending" };
       });
@@ -257,6 +305,7 @@ export function UploadDialog({
     });
     setSourceUrl("");
     setUrlUpload((current) => {
+      cleanupTemporaryHlsUpload(current);
       revokeThumbnail(current.thumbnail?.generated);
       return { status: "pending" };
     });
@@ -463,7 +512,9 @@ export function UploadDialog({
   function handleSourceUrlChange(value: string) {
     setSourceUrl(value);
     setUrlUpload((current) => {
+      cleanupTemporaryHlsUpload(current);
       revokeThumbnail(current.thumbnail?.generated);
+      hlsThumbnailGeneratingRef.current = false;
       return { status: "pending" };
     });
   }
@@ -619,6 +670,20 @@ export function UploadDialog({
       fileNameOverride: editing && current.fileNameOverride === undefined && normalizedSourceUrl
         ? remoteFileLabel(normalizedSourceUrl)
         : current.fileNameOverride
+    }));
+  }
+
+  function selectHlsVariant(variantId: string) {
+    setUrlUpload((current) => ({
+      ...current,
+      status: "pending",
+      message: "已选择 HLS variant，点击上传开始导入",
+      progress: undefined,
+      chunks: undefined,
+      hls: {
+        ...(current.hls?.probe ? { probe: current.hls.probe } : {}),
+        variantId
+      }
     }));
   }
 
@@ -1320,6 +1385,15 @@ export function UploadDialog({
     }));
   }
 
+  function updateUrlChunkFromHlsSegment(segment: HlsSegment, missingChunks: number[]) {
+    updateUrlChunk(segment.segment_index, {
+      size: segment.size ?? 0,
+      status: hlsSegmentChunkStatus(segment),
+      attempts: segment.attempts,
+      errorMessage: hlsSegmentChunkMessage(segment, missingChunks)
+    });
+  }
+
   function toggleItemChunks(id: string) {
     setItems((current) =>
       current.map((item) => (item.id === id ? { ...item, chunksExpanded: !item.chunksExpanded } : item))
@@ -1327,6 +1401,11 @@ export function UploadDialog({
   }
 
   async function submitUrlUpload() {
+    if (urlUpload.hls?.retry) {
+      await retryHlsUpload(urlUpload.hls.retry);
+      return;
+    }
+
     if (urlUpload.retry?.kind === "url") {
       await retryUrlMultipart(urlUpload.retry);
       return;
@@ -1336,6 +1415,11 @@ export function UploadDialog({
     if (error) {
       setUrlUpload({ status: "error", message: error });
       onError(error);
+      return;
+    }
+
+    if (isLikelyHlsUrl(normalizedSourceUrl) || urlUpload.hls?.probe) {
+      await submitHlsUpload();
       return;
     }
 
@@ -1473,6 +1557,495 @@ export function UploadDialog({
     } finally {
       finishUploadTask(task);
       setSubmitting(false);
+    }
+  }
+
+  async function submitHlsUpload() {
+    const error = validateSourceUrl(sourceUrl);
+    if (error) {
+      setUrlUpload({ status: "error", message: error });
+      onError(error);
+      return;
+    }
+
+    const task = startUploadTask("url");
+    let completionRetry: HlsRetryState | undefined;
+
+    setSubmitting(true);
+    setUrlUpload((current) => ({
+      ...current,
+      status: "uploading",
+      message: undefined,
+      retry: undefined,
+      conflict: undefined,
+      progress: { completed: 0, total: 1, label: "探测 HLS 播放列表" }
+    }));
+
+    try {
+      let probe = urlUpload.hls?.probe;
+      let variantId = urlUpload.hls?.variantId;
+
+      if (!probe || (probe.kind === "master" && variantId && probe.selected_variant_id !== variantId)) {
+        probe = (await probeHlsUpload(normalizedSourceUrl, variantId, task.abortController.signal)).hls;
+      }
+
+      if (probe.kind === "master" && !probe.media) {
+        if (probe.variants.length === 1) {
+          variantId = probe.variants[0]?.id;
+          probe = (await probeHlsUpload(normalizedSourceUrl, variantId, task.abortController.signal)).hls;
+        } else if (!variantId) {
+          setUrlUpload((current) => ({
+            ...current,
+            status: "pending",
+            message: "检测到多码率 HLS，请先选择一个 variant",
+            progress: undefined,
+            chunks: undefined,
+            hls: { probe }
+          }));
+          return;
+        } else {
+          probe = (await probeHlsUpload(normalizedSourceUrl, variantId, task.abortController.signal)).hls;
+        }
+      }
+
+      if (probe.kind === "master" && !probe.media) {
+        throw new Error("请选择一个可导入的 HLS variant");
+      }
+
+      const selectedVariantId = probe.kind === "master"
+        ? probe.selected_variant_id ?? variantId
+        : undefined;
+      const fileName = normalizedFileNameOverride(urlUpload.fileNameOverride) ?? probe.file_name;
+      const conflictAction = urlUpload.conflictAction ?? "error";
+
+      setUrlUpload((current) => ({
+        ...current,
+        status: "uploading",
+        message: hlsProbeSummary(probe),
+        progress: { completed: 0, total: probe.media?.segment_count ?? 1, label: "创建 HLS 上传任务" },
+        hls: {
+          probe,
+          ...(selectedVariantId ? { variantId: selectedVariantId } : {})
+        }
+      }));
+
+      const init = await initHlsUpload({
+        url: normalizedSourceUrl,
+        ...(selectedVariantId ? { variant_id: selectedVariantId } : {}),
+        file_name: fileName,
+        directory_path: uploadDirectoryPath,
+        ...(remark.trim() ? { remark: remark.trim() } : {}),
+        ...(conflictAction !== "error" ? { on_conflict: conflictAction } : {})
+      }, task.abortController.signal);
+      const asset = init.hls.asset;
+      const segments = init.hls.segments;
+
+      completionRetry = hlsRetryFromStatus(asset, segments, conflictAction);
+      setUrlUpload((current) => ({
+        ...current,
+        status: "uploading",
+        message: `HLS 视频 · ${asset.segment_count} 个片段`,
+        chunks: createHlsSegmentStates(segments),
+        progress: { completed: 0, total: asset.segment_count, label: `开始导入 HLS 片段（${HLS_SEGMENT_UPLOAD_CONCURRENCY} 并发）` },
+        hls: {
+          probe,
+          assetId: asset.id,
+          segmentCount: asset.segment_count,
+          previewPlaylistUrl: asset.preview_playlist_url,
+          ...(selectedVariantId ? { variantId: selectedVariantId } : {})
+        }
+      }));
+
+      const result = await runConcurrentChunks({
+        total: asset.segment_count,
+        taskLabel: "导入 HLS 片段",
+        doneLabel: "已导入 HLS 片段",
+        concurrency: HLS_SEGMENT_UPLOAD_CONCURRENCY,
+        task,
+        requestTimeoutMs: HLS_SEGMENT_REQUEST_TIMEOUT_MS,
+        onProgress: (progress) => {
+          setUrlUpload((current) => ({
+            ...current,
+            status: "uploading",
+            progress
+          }));
+        },
+        onChunkState: updateUrlChunk,
+        onChunk: async (index, signal) => {
+          await uploadHlsSegmentFully(asset.id, index, asset.preview_playlist_url, asset.file_name, signal);
+        }
+      });
+
+      if (result.failedChunks.length > 0 || result.cancelled) {
+        const retry = await refreshHlsRetryState({
+          ...completionRetry,
+          completedSegments: result.completedChunks,
+          failedSegments: result.failedChunks
+        });
+        throw new HlsSegmentUploadError(
+          result.cancelled ? "已停止，可重试未完成 HLS 片段" : `有 ${result.failedChunks.length} 个 HLS 片段导入失败，可手动重试`,
+          retry,
+          result.cancelled
+        );
+      }
+
+      completionRetry = await refreshHlsRetryState({
+        ...completionRetry,
+        completedSegments: chunkRange(asset.segment_count),
+        failedSegments: []
+      });
+      setUrlUpload((current) => ({
+        ...current,
+        status: "uploading",
+        progress: { completed: asset.segment_count, total: asset.segment_count, label: "正在生成 HLS 文件索引" }
+      }));
+      const thumbnail = await resolveHlsThumbnailForUpload(asset.preview_playlist_url, asset.file_name);
+      await runAbortableUploadRequest(task, HLS_SEGMENT_REQUEST_TIMEOUT_MS, (signal) =>
+        completeHlsUpload(asset.id, thumbnail, signal, conflictAction)
+      );
+      setUrlUpload((current) => ({
+        ...current,
+        status: "done",
+        message: "已导入 HLS 视频",
+        progress: undefined,
+        retry: undefined,
+        conflict: undefined,
+        conflictAction: "error",
+        editingFileName: false,
+        hls: current.hls ? withoutHlsRetry(current.hls) : current.hls
+      }));
+      onUploaded(1);
+    } catch (uploadError) {
+      const retry = uploadError instanceof HlsSegmentUploadError ? uploadError.retry : completionRetry;
+      const stopped = (uploadError instanceof HlsSegmentUploadError && uploadError.stopped) || task.cancelled || isAbortError(uploadError);
+      const conflict = fileNameConflictFromError(uploadError);
+      const message = stopped
+        ? "已停止"
+        : uploadError instanceof ApiError
+          ? uploadError.message
+          : uploadError instanceof Error
+            ? uploadError.message
+            : "HLS 上传失败";
+
+      setUrlUpload((current) => ({
+        ...current,
+        status: "error",
+        message: conflict ? undefined : message,
+        retry: undefined,
+        conflict,
+        fileNameOverride: conflict?.suggestedName ?? current.fileNameOverride,
+        conflictAction: "error",
+        editingFileName: conflict ? true : current.editingFileName,
+        progress: retry && !conflict
+          ? hlsRetryFailureProgress(retry, stopped ? "已停止，可重试未完成 HLS 片段" : "HLS 片段导入失败，可手动重试")
+          : undefined,
+        hls: retry
+          ? {
+              ...(current.hls ?? {}),
+              assetId: retry.assetId,
+              segmentCount: retry.segmentCount,
+              previewPlaylistUrl: retry.previewPlaylistUrl,
+              retry
+            }
+          : current.hls
+      }));
+      if (!stopped) {
+        onError(conflict ? FILE_NAME_CONFLICT_TOAST_MESSAGE : message);
+      }
+    } finally {
+      finishUploadTask(task);
+      setSubmitting(false);
+    }
+  }
+
+  async function retryHlsUpload(retry: HlsRetryState) {
+    const task = startUploadTask("url");
+    const conflictAction = urlUpload.conflictAction ?? retry.conflictAction;
+    let syncedRetry = await refreshHlsRetryState({ ...retry, conflictAction });
+
+    setSubmitting(true);
+    setUrlUpload((current) => ({
+      ...current,
+      status: "uploading",
+      message: "准备重试 HLS 片段",
+      retry: undefined,
+      conflict: undefined,
+      progress: hlsRetryFailureProgress(syncedRetry, "准备重试失败 HLS 片段"),
+      chunks: prepareHlsRetryChunks(current.chunks, syncedRetry),
+      hls: {
+        ...(current.hls ?? {}),
+        assetId: syncedRetry.assetId,
+        segmentCount: syncedRetry.segmentCount,
+        previewPlaylistUrl: syncedRetry.previewPlaylistUrl,
+        retry: syncedRetry
+      }
+    }));
+
+    try {
+      if (syncedRetry.failedSegments.length > 0) {
+        const result = await runConcurrentChunks({
+          total: syncedRetry.segmentCount,
+          chunkIndexes: syncedRetry.failedSegments,
+          completedChunks: syncedRetry.completedSegments,
+          taskLabel: "重试 HLS 片段",
+          doneLabel: "已导入 HLS 片段",
+          concurrency: HLS_SEGMENT_UPLOAD_CONCURRENCY,
+          task,
+          requestTimeoutMs: HLS_SEGMENT_REQUEST_TIMEOUT_MS,
+          onProgress: (progress) => {
+            setUrlUpload((current) => ({
+              ...current,
+              status: "uploading",
+              progress
+            }));
+          },
+          onChunkState: updateUrlChunk,
+          onChunk: async (index, signal) => {
+            await uploadHlsSegmentFully(syncedRetry.assetId, index, syncedRetry.previewPlaylistUrl, syncedRetry.fileName, signal);
+          }
+        });
+
+        if (result.failedChunks.length > 0 || result.cancelled) {
+          const nextRetry = await refreshHlsRetryState({
+            ...syncedRetry,
+            completedSegments: result.completedChunks,
+            failedSegments: result.failedChunks
+          });
+          throw new HlsSegmentUploadError(
+            result.cancelled ? "已停止，可重试未完成 HLS 片段" : `仍有 ${result.failedChunks.length} 个 HLS 片段导入失败，可继续手动重试`,
+            nextRetry,
+            result.cancelled
+          );
+        }
+
+        syncedRetry = await refreshHlsRetryState({
+          ...syncedRetry,
+          completedSegments: result.completedChunks,
+          failedSegments: []
+        });
+      }
+
+      setUrlUpload((current) => ({
+        ...current,
+        status: "uploading",
+        progress: { completed: syncedRetry.segmentCount, total: syncedRetry.segmentCount, label: "正在生成 HLS 文件索引" }
+      }));
+      const thumbnail = await resolveHlsThumbnailForUpload(syncedRetry.previewPlaylistUrl, syncedRetry.fileName);
+      await runAbortableUploadRequest(task, HLS_SEGMENT_REQUEST_TIMEOUT_MS, (signal) =>
+        completeHlsUpload(syncedRetry.assetId, thumbnail, signal, conflictAction)
+      );
+      setUrlUpload((current) => ({
+        ...current,
+        status: "done",
+        message: "已导入 HLS 视频",
+        progress: undefined,
+        retry: undefined,
+        conflict: undefined,
+        conflictAction: "error",
+        editingFileName: false,
+        hls: current.hls ? withoutHlsRetry(current.hls) : current.hls
+      }));
+      onUploaded(1);
+    } catch (uploadError) {
+      const nextRetry = uploadError instanceof HlsSegmentUploadError ? uploadError.retry : syncedRetry;
+      const stopped = (uploadError instanceof HlsSegmentUploadError && uploadError.stopped) || task.cancelled || isAbortError(uploadError);
+      const conflict = fileNameConflictFromError(uploadError);
+      const message = stopped ? "已停止" : uploadError instanceof Error ? uploadError.message : "HLS 片段重试失败";
+      setUrlUpload((current) => ({
+        ...current,
+        status: "error",
+        message: conflict ? undefined : message,
+        retry: undefined,
+        conflict,
+        fileNameOverride: conflict?.suggestedName ?? current.fileNameOverride,
+        conflictAction: "error",
+        editingFileName: conflict ? true : current.editingFileName,
+        progress: nextRetry && !conflict
+          ? hlsRetryFailureProgress(nextRetry, stopped ? "已停止，可重试未完成 HLS 片段" : "HLS 片段导入失败，可手动重试")
+          : undefined,
+        hls: {
+          ...(current.hls ?? {}),
+          assetId: nextRetry.assetId,
+          segmentCount: nextRetry.segmentCount,
+          previewPlaylistUrl: nextRetry.previewPlaylistUrl,
+          retry: nextRetry
+        }
+      }));
+      if (!stopped) {
+        onError(conflict ? FILE_NAME_CONFLICT_TOAST_MESSAGE : message);
+      }
+    } finally {
+      finishUploadTask(task);
+      setSubmitting(false);
+    }
+  }
+
+  async function uploadHlsSegmentFully(
+    assetId: string,
+    segmentIndex: number,
+    previewPlaylistUrl: string,
+    fileName: string,
+    signal: AbortSignal
+  ) {
+    let response = await importHlsSegment(assetId, segmentIndex, signal);
+    updateUrlChunkFromHlsSegment(response.segment, response.missing_chunks);
+
+    if (response.segment.storage_backend === "telegram_multipart") {
+      response = await importHlsSegmentMultipartChunks(assetId, segmentIndex, response, signal);
+    }
+
+    if (response.segment.status !== "done") {
+      throw new Error(response.segment.error_message || `HLS 片段 ${segmentIndex + 1} 未完成`);
+    }
+
+    updateUrlChunkFromHlsSegment(response.segment, []);
+
+    if (segmentIndex === 0) {
+      void maybeGenerateHlsThumbnail(previewPlaylistUrl, fileName);
+    }
+  }
+
+  async function importHlsSegmentMultipartChunks(
+    assetId: string,
+    segmentIndex: number,
+    initialResponse: Awaited<ReturnType<typeof importHlsSegment>>,
+    signal: AbortSignal
+  ): Promise<Awaited<ReturnType<typeof importHlsSegment>>> {
+    let response = initialResponse;
+    let segment = response.segment;
+    const chunkCount = segment.chunk_count ?? Math.max(response.uploaded_chunks.length + response.missing_chunks.length, 1);
+
+    if (!segment.chunk_count || segment.chunk_count <= 0) {
+      throw new Error(`HLS 片段 ${segmentIndex + 1} 缺少内部 chunk 信息`);
+    }
+
+    for (const chunkIndex of response.missing_chunks) {
+      response = await importHlsSegmentChunkWithRetry(assetId, segmentIndex, chunkIndex, chunkCount, response.uploaded_chunks.length, signal);
+      segment = response.segment;
+      updateUrlChunkFromHlsSegment(segment, response.missing_chunks);
+    }
+
+    if (response.missing_chunks.length > 0) {
+      throw new Error(`HLS 片段 ${segmentIndex + 1} 仍有 ${response.missing_chunks.length} 个内部 chunk 未完成`);
+    }
+
+    updateUrlChunk(segmentIndex, {
+      status: "uploading",
+      errorMessage: "正在合成大 HLS 片段"
+    });
+    return completeHlsSegment(assetId, segmentIndex, signal);
+  }
+
+  async function importHlsSegmentChunkWithRetry(
+    assetId: string,
+    segmentIndex: number,
+    chunkIndex: number,
+    chunkCount: number,
+    completedBefore: number,
+    signal: AbortSignal
+  ): Promise<Awaited<ReturnType<typeof importHlsSegmentChunk>>> {
+    for (let attempt = 1; attempt <= MULTIPART_UPLOAD_MAX_ATTEMPTS; attempt += 1) {
+      if (signal.aborted) {
+        throw new DOMException("Aborted", "AbortError");
+      }
+
+      updateUrlChunk(segmentIndex, {
+        status: "uploading",
+        attempts: attempt,
+        errorMessage: `大 HLS 片段内部分片 ${completedBefore + 1}/${chunkCount}（#${chunkIndex + 1}，第 ${attempt}/${MULTIPART_UPLOAD_MAX_ATTEMPTS} 次）`
+      });
+
+      try {
+        return await importHlsSegmentChunk(assetId, segmentIndex, chunkIndex, signal);
+      } catch (error) {
+        const canRetry = attempt < MULTIPART_UPLOAD_MAX_ATTEMPTS && isRetryableChunkUploadError(error);
+        if (!canRetry) {
+          throw new Error(`HLS 片段 ${segmentIndex + 1} 的内部分片 ${chunkIndex + 1} 导入失败：${errorMessage(error)}`);
+        }
+        await delay(retryDelayMs(attempt, error), signal);
+      }
+    }
+
+    throw new Error(`HLS 片段 ${segmentIndex + 1} 的内部分片 ${chunkIndex + 1} 导入失败`);
+  }
+
+  async function refreshHlsRetryState(retry: HlsRetryState): Promise<HlsRetryState> {
+    try {
+      const status = await getHlsUploadStatus(retry.assetId);
+      return hlsRetryFromStatus(status.hls.asset, status.hls.segments, retry.conflictAction);
+    } catch {
+      return retry;
+    }
+  }
+
+  async function maybeGenerateHlsThumbnail(previewPlaylistUrl: string, fileName: string) {
+    if (hlsThumbnailGeneratingRef.current) {
+      return;
+    }
+
+    hlsThumbnailGeneratingRef.current = true;
+    setUrlUpload((current) => {
+      if (current.thumbnail?.status === "ready" || current.thumbnail?.status === "removed") {
+        return current;
+      }
+      revokeThumbnail(current.thumbnail?.generated);
+      return {
+        ...current,
+        thumbnail: { status: "generating", message: "正在从首个 HLS 片段生成缩略图" }
+      };
+    });
+
+    try {
+      const generated = await generateThumbnailFromHlsPlaylist(previewPlaylistUrl, fileName);
+      setUrlUpload((current) => {
+        if (current.thumbnail?.status === "removed") {
+          revokeThumbnail(generated);
+          return current;
+        }
+        revokeThumbnail(current.thumbnail?.generated);
+        return {
+          ...current,
+          thumbnail: { status: "ready", generated }
+        };
+      });
+    } catch (error) {
+      setUrlUpload((current) => {
+        if (current.thumbnail?.status === "removed") {
+          return current;
+        }
+        return {
+          ...current,
+          thumbnail: {
+            status: "failed",
+            message: error instanceof Error ? error.message : "HLS 缩略图生成失败"
+          }
+        };
+      });
+    } finally {
+      hlsThumbnailGeneratingRef.current = false;
+    }
+  }
+
+  async function resolveHlsThumbnailForUpload(previewPlaylistUrl: string, fileName: string): Promise<ThumbnailUploadPayload | undefined> {
+    if (urlUpload.thumbnail?.status === "ready" && urlUpload.thumbnail.generated) {
+      return thumbnailPayload(urlUpload.thumbnail.generated);
+    }
+
+    if (urlUpload.thumbnail?.status === "removed") {
+      return undefined;
+    }
+
+    try {
+      updateUrlThumbnail({ status: "generating", message: "正在生成 HLS 缩略图" });
+      const generated = await generateThumbnailFromHlsPlaylist(previewPlaylistUrl, fileName);
+      updateUrlThumbnail({ status: "ready", generated });
+      return thumbnailPayload(generated);
+    } catch (error) {
+      updateUrlThumbnail({
+        status: "failed",
+        message: error instanceof Error ? error.message : "HLS 缩略图生成失败"
+      });
+      return undefined;
     }
   }
 
@@ -1886,12 +2459,20 @@ export function UploadDialog({
                 fileNameOverride={urlUpload.fileNameOverride}
                 editingFileName={urlUpload.editingFileName}
                 conflict={urlUpload.conflict}
+                hls={urlUpload.hls}
                 onClear={() => handleSourceUrlChange("")}
-                onRetry={urlUpload.retry ? () => void retryUrlMultipart(urlUpload.retry!) : undefined}
+                onRetry={
+                  urlUpload.hls?.retry
+                    ? () => void retryHlsUpload(urlUpload.hls!.retry!)
+                    : urlUpload.retry
+                      ? () => void retryUrlMultipart(urlUpload.retry!)
+                      : undefined
+                }
                 onStop={activeUploadKind === "url" ? stopCurrentUpload : undefined}
                 stopping={stopRequested && activeUploadKind === "url"}
                 onFileNameChange={updateUrlFileName}
                 onFileNameEditingChange={setUrlFileNameEditing}
+                onHlsVariantChange={selectHlsVariant}
                 onRenameConflict={urlUpload.conflict ? () => resolveUrlConflict("error") : undefined}
                 onOverwriteConflict={urlUpload.conflict ? () => resolveUrlConflict("overwrite") : undefined}
                 thumbnail={urlUpload.thumbnail}
@@ -2179,6 +2760,177 @@ function retryFailureProgress(retry: MultipartRetryState, label: string): ChunkP
     failed: retry.failedChunks.length,
     label: `${label}（失败 ${retry.failedChunks.length} 个）`
   };
+}
+
+function cleanupTemporaryHlsUpload(state: UrlUploadState): void {
+  if (state.status === "done") {
+    return;
+  }
+
+  const assetId = state.hls?.assetId ?? state.hls?.retry?.assetId;
+  if (!assetId) {
+    return;
+  }
+
+  void getHlsUploadStatus(assetId)
+    .then((response) => {
+      if (response.hls.asset.status === "done" || response.hls.asset.final_file_id) {
+        return undefined;
+      }
+      return cancelHlsUpload(assetId);
+    })
+    .catch(() => undefined);
+}
+
+function withoutHlsRetry(state: HlsUrlState): HlsUrlState {
+  const { retry: _retry, ...rest } = state;
+  return rest;
+}
+
+function isLikelyHlsUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return /\.m3u8$/i.test(url.pathname) || url.pathname.toLowerCase().includes(".m3u8");
+  } catch {
+    return /\.m3u8(?:[?#]|$)/i.test(value);
+  }
+}
+
+function hlsRetryFromStatus(
+  asset: HlsAsset,
+  segments: HlsSegment[],
+  conflictAction: FileNameConflictAction
+): HlsRetryState {
+  const completedSegments = segments
+    .filter((segment) => segment.status === "done")
+    .map((segment) => segment.segment_index)
+    .sort((left, right) => left - right);
+  const completedSet = new Set(completedSegments);
+  const failedSegments = chunkRange(asset.segment_count)
+    .filter((index) => !completedSet.has(index));
+
+  return {
+    assetId: asset.id,
+    fileName: asset.file_name,
+    segmentCount: asset.segment_count,
+    previewPlaylistUrl: asset.preview_playlist_url,
+    conflictAction,
+    completedSegments,
+    failedSegments
+  };
+}
+
+function hlsRetryFailureProgress(retry: HlsRetryState, label: string): ChunkProgress {
+  return {
+    completed: retry.completedSegments.length,
+    total: retry.segmentCount,
+    failed: retry.failedSegments.length,
+    label: retry.failedSegments.length > 0
+      ? `${label}（失败 ${retry.failedSegments.length} 个片段）`
+      : label
+  };
+}
+
+function createHlsSegmentStates(segments: HlsSegment[]): UploadChunkState[] {
+  return segments.map((segment) => ({
+    index: segment.segment_index,
+    size: segment.size ?? 0,
+    status: hlsSegmentChunkStatus(segment),
+    attempts: segment.attempts,
+    ...(hlsSegmentChunkMessage(segment, segment.missing_chunks) ? { errorMessage: hlsSegmentChunkMessage(segment, segment.missing_chunks) } : {})
+  }));
+}
+
+function prepareHlsRetryChunks(chunks: UploadChunkState[] | undefined, retry: HlsRetryState): UploadChunkState[] {
+  const completed = new Set(retry.completedSegments);
+  const failed = new Set(retry.failedSegments);
+  const source = chunks ?? Array.from({ length: retry.segmentCount }, (_, index) => ({
+    index,
+    size: 0,
+    status: "queued" as UploadChunkStatus,
+    attempts: 0
+  }));
+
+  return source.map((chunk) => {
+    if (completed.has(chunk.index)) {
+      return { ...chunk, status: "completed", errorMessage: undefined };
+    }
+    if (failed.has(chunk.index)) {
+      return { ...chunk, status: "queued", errorMessage: undefined };
+    }
+    return { ...chunk, status: "queued", errorMessage: undefined };
+  });
+}
+
+function hlsSegmentChunkStatus(segment: HlsSegment): UploadChunkStatus {
+  switch (segment.status) {
+    case "done":
+      return "completed";
+    case "failed":
+      return "failed";
+    case "importing":
+      return "uploading";
+    default:
+      return "queued";
+  }
+}
+
+function hlsSegmentChunkMessage(segment: HlsSegment, missingChunks: number[]): string | undefined {
+  if (segment.status === "done") {
+    return undefined;
+  }
+
+  if (segment.status === "failed") {
+    return segment.error_message || "HLS 片段导入失败";
+  }
+
+  if (segment.storage_backend === "telegram_multipart" && segment.chunk_count) {
+    const uploaded = segment.uploaded_chunks.length;
+    return missingChunks.length > 0
+      ? `大 HLS 片段 · 内部分片 ${uploaded}/${segment.chunk_count}`
+      : "大 HLS 片段 · 等待合成";
+  }
+
+  return segment.error_message ?? undefined;
+}
+
+function hlsProbeSummary(probe: HlsProbeInfo): string {
+  if (probe.media) {
+    return `HLS VOD · ${probe.media.segment_count} 个片段 · ${formatHlsDuration(probe.media.duration)}`;
+  }
+
+  if (probe.kind === "master") {
+    return `HLS master · ${probe.variants.length} 个 variant`;
+  }
+
+  return "HLS 播放列表";
+}
+
+function formatHlsDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return "未知时长";
+  }
+
+  const total = Math.round(seconds);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const rest = total % 60;
+
+  if (hours > 0) {
+    return `${hours}小时${minutes.toString().padStart(2, "0")}分`;
+  }
+
+  return `${minutes}分${rest.toString().padStart(2, "0")}秒`;
+}
+
+function hlsVariantLabel(variant: HlsProbeInfo["variants"][number]): string {
+  const parts = [
+    variant.resolution,
+    variant.bandwidth ? `${Math.round(variant.bandwidth / 1000)}kbps` : undefined,
+    variant.codecs
+  ].filter(Boolean);
+
+  return parts.length > 0 ? parts.join(" · ") : variant.id;
 }
 
 function buildFolderTree(items: QueueItem[]): FolderTreeNode {
@@ -2581,12 +3333,14 @@ interface UrlUploadRowProps {
   fileNameOverride?: string;
   editingFileName?: boolean;
   conflict?: FileNameConflictState;
+  hls?: HlsUrlState;
   thumbnail?: UploadThumbnailState;
   onRetry?: () => void;
   onStop?: () => void;
   stopping?: boolean;
   onFileNameChange: (value: string) => void;
   onFileNameEditingChange: (editing: boolean) => void;
+  onHlsVariantChange: (variantId: string) => void;
   onRenameConflict?: () => void;
   onOverwriteConflict?: () => void;
   onThumbnailChange: (file: File) => void;
@@ -2603,6 +3357,7 @@ function UrlUploadRow({
   fileNameOverride,
   editingFileName,
   conflict,
+  hls,
   thumbnail,
   onClear,
   onRetry,
@@ -2610,6 +3365,7 @@ function UrlUploadRow({
   stopping,
   onFileNameChange,
   onFileNameEditingChange,
+  onHlsVariantChange,
   onRenameConflict,
   onOverwriteConflict,
   onThumbnailChange,
@@ -2645,6 +3401,13 @@ function UrlUploadRow({
             {thumbnailHint(thumbnail) ? <span> · {thumbnailHint(thumbnail)}</span> : null}
             {message ? <span className={status === "error" ? "text-danger" : "text-success"}> · {message}</span> : null}
           </p>
+          {hls?.probe ? (
+            <HlsUploadDetails
+              hls={hls}
+              disabled={disabled || status === "uploading" || status === "done"}
+              onVariantChange={onHlsVariantChange}
+            />
+          ) : null}
           {progress ? <ProgressBar progress={progress} /> : null}
           <ConflictResolutionActions
             conflict={conflict}
@@ -2667,7 +3430,9 @@ function UrlUploadRow({
               disabled={disabled}
               className="h-6 shrink-0 rounded-md border border-primary/30 px-2 text-[11px] font-medium text-primary-strong transition-colors hover:bg-primary-soft disabled:pointer-events-none disabled:opacity-40"
             >
-              {progress && progress.failed === 0 ? "继续完成上传" : "重试失败分片"}
+              {hls?.retry
+                ? hls.retry.failedSegments.length === 0 ? "继续完成上传" : "重试 HLS 片段"
+                : progress && progress.failed === 0 ? "继续完成上传" : "重试失败分片"}
             </button>
           ) : null}
           {onStop && status === "uploading" ? (
@@ -2692,7 +3457,63 @@ function UrlUploadRow({
           </button>
         </div>
       </div>
-      {chunks ? <UploadChunkList chunks={chunks} /> : null}
+      {chunks ? <UploadChunkList chunks={chunks} title={hls ? "HLS 片段明细" : "分片明细"} /> : null}
+    </div>
+  );
+}
+
+function HlsUploadDetails({
+  hls,
+  disabled,
+  onVariantChange
+}: {
+  hls: HlsUrlState;
+  disabled: boolean;
+  onVariantChange: (variantId: string) => void;
+}) {
+  const probe = hls.probe;
+  if (!probe) {
+    return null;
+  }
+
+  const selectedVariant = probe.variants.find((variant) => variant.id === hls.variantId || variant.id === probe.selected_variant_id);
+  const media = probe.media;
+
+  return (
+    <div className="mt-2 rounded-lg border border-border bg-background/70 px-2.5 py-2 text-xs leading-5 text-muted">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <p className="font-medium text-foreground">
+            {probe.kind === "master" ? "HLS master playlist" : "HLS media playlist"}
+          </p>
+          <p className="truncate" title={probe.playlist_url}>
+            {media
+              ? `${media.segment_count} 个片段 · ${formatHlsDuration(media.duration)} · target ${media.target_duration}s`
+              : `${probe.variants.length} 个 variant，选择后再创建上传任务`}
+            {hls.previewPlaylistUrl ? " · 已生成临时预览 playlist" : ""}
+          </p>
+        </div>
+        {probe.kind === "master" ? (
+          <select
+            value={hls.variantId ?? probe.selected_variant_id ?? ""}
+            disabled={disabled}
+            className="h-8 min-w-40 shrink-0 rounded-lg border border-border bg-surface px-2 text-xs text-foreground outline-none transition-colors focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-ring)] disabled:opacity-60"
+            onChange={(event) => onVariantChange(event.target.value)}
+          >
+            <option value="">选择 variant</option>
+            {probe.variants.map((variant) => (
+              <option key={variant.id} value={variant.id}>
+                {hlsVariantLabel(variant)}
+              </option>
+            ))}
+          </select>
+        ) : null}
+      </div>
+      {selectedVariant ? (
+        <p className="mt-1 truncate text-[11px] text-subtle" title={selectedVariant.uri}>
+          当前 variant：{hlsVariantLabel(selectedVariant)}
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -3153,7 +3974,7 @@ function UploadChunkPanel({
   );
 }
 
-function UploadChunkList({ chunks }: { chunks: UploadChunkState[] }) {
+function UploadChunkList({ chunks, title = "分片明细" }: { chunks: UploadChunkState[]; title?: string }) {
   const completed = chunks.filter((chunk) => chunk.status === "completed").length;
   const failed = chunks.filter((chunk) => chunk.status === "failed").length;
   const uploading = chunks.filter((chunk) => chunk.status === "uploading").length;
@@ -3162,7 +3983,7 @@ function UploadChunkList({ chunks }: { chunks: UploadChunkState[] }) {
     <div className="mt-2 border-t border-border pt-2">
       <div className="mb-2 flex items-center justify-between gap-3 text-[11px] text-muted">
         <span>
-          分片明细：{completed}/{chunks.length} 完成
+          {title}：{completed}/{chunks.length} 完成
           {uploading > 0 ? ` · ${uploading} 上传中` : ""}
           {failed > 0 ? ` · ${failed} 失败` : ""}
         </span>
@@ -3188,7 +4009,7 @@ function UploadChunkList({ chunks }: { chunks: UploadChunkState[] }) {
               {chunk.attempts > 0 ? ` · 第 ${chunk.attempts} 次` : ""}
               {chunk.errorMessage ? ` · ${chunk.errorMessage}` : ""}
             </span>
-            <span className="shrink-0 opacity-70">{formatBytes(chunk.size)}</span>
+            {chunk.size > 0 ? <span className="shrink-0 opacity-70">{formatBytes(chunk.size)}</span> : null}
           </div>
         ))}
       </div>

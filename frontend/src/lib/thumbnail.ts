@@ -1,4 +1,5 @@
 import type { ThumbnailUploadPayload } from "../api";
+import Hls from "hls.js";
 
 export type ThumbnailKind = "image" | "video" | "audio";
 
@@ -82,6 +83,40 @@ export async function generateThumbnailFromRemoteSource(source: RemoteThumbnailS
   return renderVideoThumbnail(source.url, fileName, "auto", false);
 }
 
+export async function generateThumbnailFromHlsPlaylist(playlistUrl: string, fileName = "hls-video.m3u8"): Promise<GeneratedThumbnail> {
+  const video = document.createElement("video");
+  let hls: Hls | null = null;
+
+  video.preload = "auto";
+  video.muted = true;
+  video.playsInline = true;
+
+  try {
+    const metadataReady = waitForVideoMetadata(video);
+
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = playlistUrl;
+    } else if (Hls.isSupported()) {
+      hls = new Hls({
+        xhrSetup(xhr) {
+          xhr.withCredentials = true;
+        }
+      });
+      hls.loadSource(playlistUrl);
+      hls.attachMedia(video);
+    } else {
+      throw new Error("当前浏览器不支持 HLS 预览");
+    }
+
+    await metadataReady;
+    return renderLoadedVideoThumbnail(video, fileName, "auto");
+  } finally {
+    hls?.destroy();
+    video.removeAttribute("src");
+    video.load();
+  }
+}
+
 export function revokeThumbnail(thumbnail: GeneratedThumbnail | undefined): void {
   if (thumbnail?.objectUrl) {
     URL.revokeObjectURL(thumbnail.objectUrl);
@@ -133,25 +168,7 @@ async function renderVideoThumbnail(
       throw new Error("无法读取视频画面尺寸");
     }
 
-    for (const targetTime of videoCaptureTimes(duration)) {
-      await seekVideo(video, targetTime);
-      await waitForVideoPaint(video);
-
-      const canvas = drawToCanvas(
-        width,
-        height,
-        (context, targetWidth, targetHeight) => {
-          context.drawImage(video, 0, 0, targetWidth, targetHeight);
-        },
-        { fillBackground: false }
-      );
-
-      if (!isProbablyBlankVideoFrame(canvas)) {
-        return await canvasToGeneratedThumbnail(canvas, fileName, generatedSource);
-      }
-    }
-
-    throw new Error("视频截帧为空白，请手动选择缩略图");
+    return await renderLoadedVideoThumbnail(video, fileName, generatedSource, duration, width, height);
   } finally {
     video.removeAttribute("src");
     video.load();
@@ -159,6 +176,39 @@ async function renderVideoThumbnail(
       URL.revokeObjectURL(sourceUrl);
     }
   }
+}
+
+async function renderLoadedVideoThumbnail(
+  video: HTMLVideoElement,
+  fileName: string,
+  generatedSource: "auto" | "manual",
+  duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : VIDEO_SEEK_SECONDS,
+  width = video.videoWidth,
+  height = video.videoHeight
+): Promise<GeneratedThumbnail> {
+  if (!width || !height) {
+    throw new Error("无法读取视频画面尺寸");
+  }
+
+  for (const targetTime of videoCaptureTimes(duration)) {
+    await seekVideo(video, targetTime);
+    await waitForVideoPaint(video);
+
+    const canvas = drawToCanvas(
+      width,
+      height,
+      (context, targetWidth, targetHeight) => {
+        context.drawImage(video, 0, 0, targetWidth, targetHeight);
+      },
+      { fillBackground: false }
+    );
+
+    if (!isProbablyBlankVideoFrame(canvas)) {
+      return await canvasToGeneratedThumbnail(canvas, fileName, generatedSource);
+    }
+  }
+
+  throw new Error("视频截帧为空白，请手动选择缩略图");
 }
 
 async function renderAudioCoverThumbnail(file: File, generatedSource: "auto" | "manual"): Promise<GeneratedThumbnail> {

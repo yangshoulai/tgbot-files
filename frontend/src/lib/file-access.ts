@@ -30,6 +30,10 @@ export function canPreviewThroughAvailableAccess(file: FileItem): boolean {
 }
 
 export function fileAccessLabel(file: FileItem): string {
+  if (file.storage_backend === "hls_package") {
+    return "HLS 播放列表";
+  }
+
   if (file.storage_backend !== "telegram_multipart") {
     return "文件链接";
   }

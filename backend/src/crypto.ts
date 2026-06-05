@@ -31,7 +31,21 @@ export interface MultipartFileTokenPayload {
   iat: number;
 }
 
-export type FileTokenPayload = SingleFileTokenPayload | MultipartFileTokenPayload | ChannelFileTokenPayload;
+export interface HlsFileTokenPayload {
+  v: 4;
+  hls_asset_id: string;
+  file_record_id: string;
+  name: string;
+  mime_type: string;
+  size: number;
+  iat: number;
+}
+
+export type FileTokenPayload =
+  | SingleFileTokenPayload
+  | MultipartFileTokenPayload
+  | ChannelFileTokenPayload
+  | HlsFileTokenPayload;
 
 export class TokenError extends Error {
   constructor(message: string) {
@@ -214,6 +228,37 @@ function parsePayload(parsed: unknown): FileTokenPayload {
       v: 3,
       channel_id: payload.channel_id,
       file_id: payload.file_id,
+      name: payload.name,
+      mime_type: payload.mime_type,
+      size: payload.size,
+      iat: payload.iat
+    };
+  }
+
+  if (payload.v === 4) {
+    if (
+      typeof payload.hls_asset_id !== "string" ||
+      payload.hls_asset_id.length === 0 ||
+      typeof payload.file_record_id !== "string" ||
+      payload.file_record_id.length === 0 ||
+      typeof payload.name !== "string" ||
+      payload.name.length === 0 ||
+      typeof payload.mime_type !== "string" ||
+      payload.mime_type.length === 0 ||
+      typeof payload.size !== "number" ||
+      !Number.isSafeInteger(payload.size) ||
+      payload.size < 0 ||
+      typeof payload.iat !== "number" ||
+      !Number.isSafeInteger(payload.iat) ||
+      payload.iat <= 0
+    ) {
+      throw new TokenError("Invalid token payload fields");
+    }
+
+    return {
+      v: 4,
+      hls_asset_id: payload.hls_asset_id,
+      file_record_id: payload.file_record_id,
       name: payload.name,
       mime_type: payload.mime_type,
       size: payload.size,

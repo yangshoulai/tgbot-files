@@ -62,7 +62,7 @@ export interface FileItem {
   download_url: string | null;
   direct_access?: boolean;
   download_strategy?: "direct" | "direct_or_accelerated" | "accelerated";
-  storage_backend?: "telegram_single" | "telegram_multipart";
+  storage_backend?: "telegram_single" | "telegram_multipart" | "hls_package";
   chunk_size?: number | null;
   chunk_count?: number | null;
   thumbnail_file_id?: string | null;
@@ -232,6 +232,95 @@ export interface MultipartUploadStatusResponse {
   upload: MultipartUpload & {
     source_kind: "local" | "url";
   };
+  uploaded_chunks: number[];
+  missing_chunks: number[];
+}
+
+export interface HlsVariant {
+  id: string;
+  uri: string;
+  bandwidth: number | null;
+  resolution: string | null;
+  codecs: string | null;
+}
+
+export interface HlsMediaSummary {
+  playlist_url: string;
+  target_duration: number;
+  duration: number;
+  segment_count: number;
+}
+
+export interface HlsProbeInfo {
+  playlist_url: string;
+  file_name: string;
+  kind: "master" | "media";
+  selected_variant_id: string | null;
+  variants: HlsVariant[];
+  media: HlsMediaSummary | null;
+}
+
+export interface HlsAsset {
+  id: string;
+  source_url: string;
+  media_playlist_url: string;
+  file_name: string;
+  mime_type: string;
+  directory_id: string | null;
+  directory_path: string;
+  status: "pending" | "importing" | "done" | "failed" | "cancelled";
+  selected_variant_id: string | null;
+  target_duration: number;
+  duration: number;
+  segment_count: number;
+  estimated_size: number | null;
+  final_file_id: string | null;
+  remark: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  preview_playlist_url: string;
+}
+
+export interface HlsSegment {
+  id: string;
+  asset_id: string;
+  segment_index: number;
+  source_url: string;
+  duration: number;
+  mime_type: string;
+  size: number | null;
+  storage_backend: "telegram_single" | "telegram_multipart" | null;
+  telegram_channel_id: string;
+  multipart_upload_id: string | null;
+  chunk_size: number | null;
+  chunk_count: number | null;
+  status: "pending" | "importing" | "done" | "failed";
+  attempts: number;
+  error_message: string | null;
+  uploaded_chunks: number[];
+  missing_chunks: number[];
+  completed_at: string | null;
+}
+
+export interface HlsUploadInfo {
+  asset: HlsAsset;
+  segments: HlsSegment[];
+}
+
+export interface HlsProbeResponse {
+  ok: boolean;
+  hls: HlsProbeInfo;
+}
+
+export interface HlsInitResponse {
+  ok: boolean;
+  hls: HlsUploadInfo;
+}
+
+export interface HlsSegmentImportResponse {
+  ok: boolean;
+  segment: HlsSegment;
   uploaded_chunks: number[];
   missing_chunks: number[];
 }
@@ -547,6 +636,73 @@ export function preflightUploads(entries: UploadPreflightRequestEntry[], signal?
   });
 }
 
+export function probeHlsUpload(url: string, variantId?: string, signal?: AbortSignal) {
+  return requestJson<HlsProbeResponse>("/api/admin/uploads/hls/probe", {
+    method: "POST",
+    signal,
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      url,
+      ...(variantId ? { variant_id: variantId } : {})
+    })
+  });
+}
+
+export function initHlsUpload(params: {
+  url: string;
+  variant_id?: string;
+  file_name?: string;
+  directory_path?: string;
+  remark?: string;
+  on_conflict?: FileNameConflictAction;
+}, signal?: AbortSignal) {
+  return requestJson<HlsInitResponse>("/api/admin/uploads/hls/init", {
+    method: "POST",
+    signal,
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(params)
+  });
+}
+
+export function getHlsUploadStatus(assetId: string, signal?: AbortSignal) {
+  return requestJson<HlsInitResponse>(
+    `/api/admin/uploads/hls/${encodeURIComponent(assetId)}/status`,
+    { signal }
+  );
+}
+
+export function importHlsSegment(assetId: string, segmentIndex: number, signal?: AbortSignal) {
+  return requestJson<HlsSegmentImportResponse>(
+    `/api/admin/uploads/hls/${encodeURIComponent(assetId)}/segments/${segmentIndex}/import`,
+    { method: "POST", signal }
+  );
+}
+
+export function importHlsSegmentChunk(assetId: string, segmentIndex: number, chunkIndex: number, signal?: AbortSignal) {
+  return requestJson<HlsSegmentImportResponse>(
+    `/api/admin/uploads/hls/${encodeURIComponent(assetId)}/segments/${segmentIndex}/chunks/${chunkIndex}/import`,
+    { method: "POST", signal }
+  );
+}
+
+export function completeHlsSegment(assetId: string, segmentIndex: number, signal?: AbortSignal) {
+  return requestJson<HlsSegmentImportResponse>(
+    `/api/admin/uploads/hls/${encodeURIComponent(assetId)}/segments/${segmentIndex}/complete`,
+    { method: "POST", signal }
+  );
+}
+
+export function cancelHlsUpload(assetId: string, signal?: AbortSignal) {
+  return requestJson<{ ok: boolean }>(
+    `/api/admin/uploads/hls/${encodeURIComponent(assetId)}`,
+    { method: "DELETE", signal }
+  );
+}
+
 export interface ThumbnailUploadPayload {
   blob: Blob;
   fileName: string;
@@ -561,6 +717,44 @@ export function completeMultipartUpload(
   conflictAction?: FileNameConflictAction
 ) {
   const path = `/api/admin/uploads/${encodeURIComponent(uploadId)}/complete`;
+
+  if (!thumbnail) {
+    return requestJson<AdminUploadResponse>(path, {
+      method: "POST",
+      signal,
+      ...(conflictAction && conflictAction !== "error"
+        ? {
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ on_conflict: conflictAction })
+          }
+        : {})
+    });
+  }
+
+  const form = new FormData();
+  if (conflictAction && conflictAction !== "error") {
+    form.set("on_conflict", conflictAction);
+  }
+  form.set("thumbnail", thumbnail.blob, thumbnail.fileName);
+  if (thumbnail.width) form.set("thumbnail_width", String(thumbnail.width));
+  if (thumbnail.height) form.set("thumbnail_height", String(thumbnail.height));
+
+  return requestJson<AdminUploadResponse>(path, {
+    method: "POST",
+    signal,
+    body: form
+  });
+}
+
+export function completeHlsUpload(
+  assetId: string,
+  thumbnail?: ThumbnailUploadPayload,
+  signal?: AbortSignal,
+  conflictAction?: FileNameConflictAction
+) {
+  const path = `/api/admin/uploads/hls/${encodeURIComponent(assetId)}/complete`;
 
   if (!thumbnail) {
     return requestJson<AdminUploadResponse>(path, {

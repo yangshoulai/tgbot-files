@@ -3741,7 +3741,7 @@ describe("admin file manager", () => {
     );
     await Promise.all(waitUntilPromises);
 
-    expect(db.batchCalls).toBe(1);
+    expect(db.batchCalls).toBe(2);
     expect(db.multipartUploads.map((item) => item.id)).toEqual([
       "recent-upload",
       "completed-upload",

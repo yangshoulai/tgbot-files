@@ -1,7 +1,10 @@
 import { AppError } from "./http";
 
-export type StorageBackend = "telegram_single" | "telegram_multipart";
+export type StorageBackend = "telegram_single" | "telegram_multipart" | "hls_package";
 export type MultipartSourceKind = "local" | "url";
+export type HlsAssetStatus = "pending" | "importing" | "done" | "failed" | "cancelled";
+export type HlsSegmentStatus = "pending" | "importing" | "done" | "failed";
+export type HlsSegmentStorageBackend = "telegram_single" | "telegram_multipart";
 
 export interface DirectoryRecord {
   id: string;
@@ -209,6 +212,98 @@ export interface TelegramChannelUsage {
 }
 
 export interface MultipartCleanupResult {
+  deletedUploads: number;
+  deletedChunks: number;
+}
+
+export interface HlsAssetRecord {
+  id: string;
+  source_url: string;
+  media_playlist_url: string;
+  file_name: string;
+  mime_type: string;
+  directory_id: string | null;
+  directory_path: string;
+  status: HlsAssetStatus;
+  selected_variant_id: string | null;
+  target_duration_seconds: number;
+  duration_seconds: number;
+  segment_count: number;
+  estimated_size: number | null;
+  playlist_text: string;
+  playlist_file_id: string | null;
+  final_file_id: string | null;
+  thumbnail_status: ThumbnailStatus;
+  remark: string | null;
+  uploaded_by: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  deleted_at: string | null;
+}
+
+export interface NewHlsAssetRecord {
+  id: string;
+  sourceUrl: string;
+  mediaPlaylistUrl: string;
+  fileName: string;
+  mimeType: string;
+  directoryId?: string | null;
+  directoryPath: string;
+  status: HlsAssetStatus;
+  selectedVariantId?: string | null;
+  targetDurationSeconds: number;
+  durationSeconds: number;
+  segmentCount: number;
+  estimatedSize?: number | null;
+  playlistText: string;
+  remark?: string;
+  uploadedBy?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface HlsSegmentRecord {
+  id: string;
+  asset_id: string;
+  variant_id: string;
+  segment_index: number;
+  source_url: string;
+  duration_seconds: number;
+  mime_type: string;
+  size: number | null;
+  storage_backend: HlsSegmentStorageBackend | null;
+  telegram_file_id: string | null;
+  telegram_file_unique_id: string | null;
+  telegram_channel_id: string;
+  multipart_upload_id: string | null;
+  chunk_size: number | null;
+  chunk_count: number | null;
+  status: HlsSegmentStatus;
+  attempts: number;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+export interface NewHlsSegmentRecord {
+  id: string;
+  assetId: string;
+  variantId: string;
+  segmentIndex: number;
+  sourceUrl: string;
+  durationSeconds: number;
+  mimeType: string;
+  size?: number | null;
+  status: HlsSegmentStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface HlsCleanupResult {
+  deletedAssets: number;
+  deletedSegments: number;
   deletedUploads: number;
   deletedChunks: number;
 }
@@ -467,12 +562,51 @@ export async function findActiveFileNameConflict(params: {
 
 export async function deleteFileRecord(db: D1Database, id: string): Promise<boolean> {
   const existing = await db
-    .prepare("SELECT id FROM files WHERE id = ? AND deleted_at IS NULL")
+    .prepare("SELECT id, COALESCE(storage_backend, 'telegram_single') AS storage_backend FROM files WHERE id = ? AND deleted_at IS NULL")
     .bind(id)
-    .first<{ id: string }>();
+    .first<{ id: string; storage_backend: StorageBackend }>();
 
   if (!existing) {
     return false;
+  }
+
+  if (existing.storage_backend === "hls_package") {
+    await db
+      .prepare(
+        `DELETE FROM file_chunks
+        WHERE file_id IN (
+          SELECT hls_segments.multipart_upload_id
+          FROM hls_segments
+          JOIN hls_assets ON hls_assets.id = hls_segments.asset_id
+          WHERE hls_assets.final_file_id = ?
+            AND hls_segments.multipart_upload_id IS NOT NULL
+        )`
+      )
+      .bind(id)
+      .run();
+    await db
+      .prepare(
+        `DELETE FROM multipart_uploads
+        WHERE id IN (
+          SELECT hls_segments.multipart_upload_id
+          FROM hls_segments
+          JOIN hls_assets ON hls_assets.id = hls_segments.asset_id
+          WHERE hls_assets.final_file_id = ?
+            AND hls_segments.multipart_upload_id IS NOT NULL
+        )`
+      )
+      .bind(id)
+      .run();
+    await db
+      .prepare(
+        `DELETE FROM hls_segments
+        WHERE asset_id IN (
+          SELECT id FROM hls_assets WHERE final_file_id = ?
+        )`
+      )
+      .bind(id)
+      .run();
+    await db.prepare("DELETE FROM hls_assets WHERE final_file_id = ?").bind(id).run();
   }
 
   await db.prepare("DELETE FROM file_chunks WHERE file_id = ?").bind(id).run();
@@ -1125,6 +1259,46 @@ function prepareDeleteActiveFileRecordsByName(
 
   return [
     db
+      .prepare(
+        `DELETE FROM file_chunks
+        WHERE file_id IN (
+          SELECT hls_segments.multipart_upload_id
+          FROM hls_segments
+          JOIN hls_assets ON hls_assets.id = hls_segments.asset_id
+          WHERE hls_assets.final_file_id IN (SELECT id FROM files WHERE ${whereClause})
+            AND hls_segments.multipart_upload_id IS NOT NULL
+        )`
+      )
+      .bind(...bindings),
+    db
+      .prepare(
+        `DELETE FROM multipart_uploads
+        WHERE id IN (
+          SELECT hls_segments.multipart_upload_id
+          FROM hls_segments
+          JOIN hls_assets ON hls_assets.id = hls_segments.asset_id
+          WHERE hls_assets.final_file_id IN (SELECT id FROM files WHERE ${whereClause})
+            AND hls_segments.multipart_upload_id IS NOT NULL
+        )`
+      )
+      .bind(...bindings),
+    db
+      .prepare(
+        `DELETE FROM hls_segments
+        WHERE asset_id IN (
+          SELECT hls_assets.id
+          FROM hls_assets
+          WHERE hls_assets.final_file_id IN (SELECT id FROM files WHERE ${whereClause})
+        )`
+      )
+      .bind(...bindings),
+    db
+      .prepare(
+        `DELETE FROM hls_assets
+        WHERE final_file_id IN (SELECT id FROM files WHERE ${whereClause})`
+      )
+      .bind(...bindings),
+    db
       .prepare(`DELETE FROM file_chunks WHERE file_id IN (SELECT id FROM files WHERE ${whereClause})`)
       .bind(...bindings),
     db
@@ -1386,6 +1560,536 @@ export async function deleteStaleMultipartUploadData(
   };
 }
 
+export async function insertHlsAssetRecord(db: D1Database, record: NewHlsAssetRecord): Promise<HlsAssetRecord> {
+  await db
+    .prepare(
+      `INSERT INTO hls_assets (
+        id,
+        source_url,
+        media_playlist_url,
+        file_name,
+        mime_type,
+        directory_id,
+        directory_path,
+        status,
+        selected_variant_id,
+        target_duration_seconds,
+        duration_seconds,
+        segment_count,
+        estimated_size,
+        playlist_text,
+        remark,
+        uploaded_by,
+        created_at,
+        updated_at,
+        completed_at,
+        deleted_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`
+    )
+    .bind(
+      record.id,
+      record.sourceUrl,
+      record.mediaPlaylistUrl,
+      record.fileName,
+      record.mimeType,
+      record.directoryId ?? null,
+      record.directoryPath,
+      record.status,
+      record.selectedVariantId ?? null,
+      record.targetDurationSeconds,
+      record.durationSeconds,
+      record.segmentCount,
+      record.estimatedSize ?? null,
+      record.playlistText,
+      record.remark ?? null,
+      record.uploadedBy ?? null,
+      record.createdAt,
+      record.updatedAt
+    )
+    .run();
+
+  const created = await getHlsAssetRecord(db, record.id);
+  if (!created) {
+    throw new AppError(500, "HlsAssetCreateFailed", "HLS asset was not created");
+  }
+  return created;
+}
+
+export async function insertHlsSegmentRecords(db: D1Database, records: NewHlsSegmentRecord[]): Promise<void> {
+  if (records.length === 0) {
+    return;
+  }
+
+  await db.batch(records.map((record) =>
+    db
+      .prepare(
+        `INSERT INTO hls_segments (
+          id,
+          asset_id,
+          variant_id,
+          segment_index,
+          source_url,
+          duration_seconds,
+          mime_type,
+          size,
+          status,
+          created_at,
+          updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        record.id,
+        record.assetId,
+        record.variantId,
+        record.segmentIndex,
+        record.sourceUrl,
+        record.durationSeconds,
+        record.mimeType,
+        record.size ?? null,
+        record.status,
+        record.createdAt,
+        record.updatedAt
+      )
+  ));
+}
+
+export async function getHlsAssetRecord(db: D1Database, id: string): Promise<HlsAssetRecord | null> {
+  return db
+    .prepare(
+      `SELECT
+        id,
+        source_url,
+        media_playlist_url,
+        file_name,
+        mime_type,
+        directory_id,
+        COALESCE(directory_path, '/') AS directory_path,
+        status,
+        selected_variant_id,
+        target_duration_seconds,
+        duration_seconds,
+        segment_count,
+        estimated_size,
+        playlist_text,
+        playlist_file_id,
+        final_file_id,
+        COALESCE(thumbnail_status, 'none') AS thumbnail_status,
+        remark,
+        uploaded_by,
+        created_at,
+        updated_at,
+        completed_at,
+        deleted_at
+      FROM hls_assets
+      WHERE id = ? AND deleted_at IS NULL`
+    )
+    .bind(id)
+    .first<HlsAssetRecord>();
+}
+
+export async function getHlsAssetRecordByFinalFileId(db: D1Database, finalFileId: string): Promise<HlsAssetRecord | null> {
+  return db
+    .prepare(
+      `SELECT
+        id,
+        source_url,
+        media_playlist_url,
+        file_name,
+        mime_type,
+        directory_id,
+        COALESCE(directory_path, '/') AS directory_path,
+        status,
+        selected_variant_id,
+        target_duration_seconds,
+        duration_seconds,
+        segment_count,
+        estimated_size,
+        playlist_text,
+        playlist_file_id,
+        final_file_id,
+        COALESCE(thumbnail_status, 'none') AS thumbnail_status,
+        remark,
+        uploaded_by,
+        created_at,
+        updated_at,
+        completed_at,
+        deleted_at
+      FROM hls_assets
+      WHERE final_file_id = ? AND deleted_at IS NULL
+      LIMIT 1`
+    )
+    .bind(finalFileId)
+    .first<HlsAssetRecord>();
+}
+
+export async function listHlsSegmentRecords(db: D1Database, assetId: string): Promise<HlsSegmentRecord[]> {
+  const result = await db
+    .prepare(
+      `SELECT
+        id,
+        asset_id,
+        variant_id,
+        segment_index,
+        source_url,
+        duration_seconds,
+        mime_type,
+        size,
+        storage_backend,
+        telegram_file_id,
+        telegram_file_unique_id,
+        COALESCE(telegram_channel_id, 'default') AS telegram_channel_id,
+        multipart_upload_id,
+        chunk_size,
+        chunk_count,
+        status,
+        attempts,
+        error_message,
+        created_at,
+        updated_at,
+        completed_at
+      FROM hls_segments
+      WHERE asset_id = ?
+      ORDER BY segment_index ASC`
+    )
+    .bind(assetId)
+    .all<HlsSegmentRecord>();
+
+  return result.results ?? [];
+}
+
+export async function getHlsSegmentRecordByIndex(
+  db: D1Database,
+  assetId: string,
+  segmentIndex: number
+): Promise<HlsSegmentRecord | null> {
+  return db
+    .prepare(
+      `SELECT
+        id,
+        asset_id,
+        variant_id,
+        segment_index,
+        source_url,
+        duration_seconds,
+        mime_type,
+        size,
+        storage_backend,
+        telegram_file_id,
+        telegram_file_unique_id,
+        COALESCE(telegram_channel_id, 'default') AS telegram_channel_id,
+        multipart_upload_id,
+        chunk_size,
+        chunk_count,
+        status,
+        attempts,
+        error_message,
+        created_at,
+        updated_at,
+        completed_at
+      FROM hls_segments
+      WHERE asset_id = ? AND segment_index = ?
+      LIMIT 1`
+    )
+    .bind(assetId, segmentIndex)
+    .first<HlsSegmentRecord>();
+}
+
+export async function markHlsAssetStatus(
+  db: D1Database,
+  id: string,
+  status: HlsAssetStatus,
+  updatedAt: string
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE hls_assets
+      SET status = ?, updated_at = ?
+      WHERE id = ? AND deleted_at IS NULL`
+    )
+    .bind(status, updatedAt, id)
+    .run();
+}
+
+export async function markHlsSegmentImporting(
+  db: D1Database,
+  id: string,
+  updatedAt: string
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE hls_segments
+      SET status = 'importing',
+        attempts = attempts + 1,
+        error_message = NULL,
+        updated_at = ?
+      WHERE id = ?`
+    )
+    .bind(updatedAt, id)
+    .run();
+}
+
+export async function completeHlsSegmentSingle(params: {
+  db: D1Database;
+  id: string;
+  mimeType: string;
+  size: number;
+  telegramFileId: string;
+  telegramFileUniqueId?: string;
+  telegramChannelId?: string;
+  completedAt: string;
+}): Promise<void> {
+  await params.db
+    .prepare(
+      `UPDATE hls_segments
+      SET status = 'done',
+        mime_type = ?,
+        size = ?,
+        storage_backend = 'telegram_single',
+        telegram_file_id = ?,
+        telegram_file_unique_id = ?,
+        telegram_channel_id = ?,
+        multipart_upload_id = NULL,
+        chunk_size = NULL,
+        chunk_count = NULL,
+        error_message = NULL,
+        updated_at = ?,
+        completed_at = ?
+      WHERE id = ?`
+    )
+    .bind(
+      params.mimeType,
+      params.size,
+      params.telegramFileId,
+      params.telegramFileUniqueId ?? null,
+      params.telegramChannelId ?? "default",
+      params.completedAt,
+      params.completedAt,
+      params.id
+    )
+    .run();
+}
+
+export async function attachHlsSegmentMultipartUpload(params: {
+  db: D1Database;
+  id: string;
+  multipartUploadId: string;
+  mimeType: string;
+  size: number;
+  chunkSize: number;
+  chunkCount: number;
+  updatedAt: string;
+}): Promise<void> {
+  await params.db
+    .prepare(
+      `UPDATE hls_segments
+      SET storage_backend = 'telegram_multipart',
+        mime_type = ?,
+        multipart_upload_id = ?,
+        size = ?,
+        chunk_size = ?,
+        chunk_count = ?,
+        updated_at = ?
+      WHERE id = ?`
+    )
+    .bind(
+      params.mimeType,
+      params.multipartUploadId,
+      params.size,
+      params.chunkSize,
+      params.chunkCount,
+      params.updatedAt,
+      params.id
+    )
+    .run();
+}
+
+export async function completeHlsSegmentMultipart(params: {
+  db: D1Database;
+  id: string;
+  multipartUploadId: string;
+  chunkSize: number;
+  chunkCount: number;
+  completedAt: string;
+}): Promise<void> {
+  await params.db
+    .prepare(
+      `UPDATE hls_segments
+      SET status = 'done',
+        storage_backend = 'telegram_multipart',
+        multipart_upload_id = ?,
+        chunk_size = ?,
+        chunk_count = ?,
+        error_message = NULL,
+        updated_at = ?,
+        completed_at = ?
+      WHERE id = ?`
+    )
+    .bind(
+      params.multipartUploadId,
+      params.chunkSize,
+      params.chunkCount,
+      params.completedAt,
+      params.completedAt,
+      params.id
+    )
+    .run();
+}
+
+export async function failHlsSegment(
+  db: D1Database,
+  id: string,
+  message: string,
+  updatedAt: string
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE hls_segments
+      SET status = 'failed',
+        error_message = ?,
+        updated_at = ?
+      WHERE id = ?`
+    )
+    .bind(message.slice(0, 1000), updatedAt, id)
+    .run();
+}
+
+export async function completeHlsAssetWithFileRecord(params: {
+  db: D1Database;
+  assetId: string;
+  file: NewFileRecord;
+  completedAt: string;
+  conflictAction?: FileNameConflictAction;
+}): Promise<void> {
+  await params.db.batch([
+    ...(params.conflictAction === "overwrite"
+      ? prepareDeleteActiveFileRecordsByName(
+          params.db,
+          params.file.directoryPath ?? "/",
+          params.file.fileName,
+          params.file.id
+        )
+      : []),
+    prepareInsertFileRecord(params.db, params.file),
+    params.db
+      .prepare(
+        `UPDATE hls_assets
+        SET status = 'done',
+          final_file_id = ?,
+          updated_at = ?,
+          completed_at = ?
+        WHERE id = ? AND deleted_at IS NULL`
+      )
+      .bind(params.file.id, params.completedAt, params.completedAt, params.assetId)
+  ]);
+}
+
+export async function deleteHlsAssetTempData(
+  db: D1Database,
+  assetId: string
+): Promise<HlsCleanupResult> {
+  const [chunkResult, uploadResult, segmentResult, assetResult] = await db.batch([
+    db
+      .prepare(
+        `DELETE FROM file_chunks
+        WHERE file_id IN (
+          SELECT multipart_upload_id
+          FROM hls_segments
+          WHERE asset_id = ? AND multipart_upload_id IS NOT NULL
+        )`
+      )
+      .bind(assetId),
+    db
+      .prepare(
+        `DELETE FROM multipart_uploads
+        WHERE id IN (
+          SELECT multipart_upload_id
+          FROM hls_segments
+          WHERE asset_id = ? AND multipart_upload_id IS NOT NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM files WHERE files.id = multipart_uploads.id
+        )`
+      )
+      .bind(assetId),
+    db.prepare("DELETE FROM hls_segments WHERE asset_id = ?").bind(assetId),
+    db
+      .prepare(
+        `DELETE FROM hls_assets
+        WHERE id = ? AND final_file_id IS NULL`
+      )
+      .bind(assetId)
+  ]);
+
+  return {
+    deletedChunks: Number(chunkResult?.meta.changes ?? 0),
+    deletedUploads: Number(uploadResult?.meta.changes ?? 0),
+    deletedSegments: Number(segmentResult?.meta.changes ?? 0),
+    deletedAssets: Number(assetResult?.meta.changes ?? 0)
+  };
+}
+
+export async function deleteStaleHlsUploadData(
+  db: D1Database,
+  expiredBefore: string
+): Promise<HlsCleanupResult> {
+  const [chunkResult, uploadResult, segmentResult, assetResult] = await db.batch([
+    db
+      .prepare(
+        `DELETE FROM file_chunks
+        WHERE file_id IN (
+          SELECT hls_segments.multipart_upload_id
+          FROM hls_segments
+          JOIN hls_assets ON hls_assets.id = hls_segments.asset_id
+          WHERE hls_assets.final_file_id IS NULL
+            AND hls_assets.created_at < ?
+            AND hls_segments.multipart_upload_id IS NOT NULL
+        )`
+      )
+      .bind(expiredBefore),
+    db
+      .prepare(
+        `DELETE FROM multipart_uploads
+        WHERE id IN (
+          SELECT hls_segments.multipart_upload_id
+          FROM hls_segments
+          JOIN hls_assets ON hls_assets.id = hls_segments.asset_id
+          WHERE hls_assets.final_file_id IS NULL
+            AND hls_assets.created_at < ?
+            AND hls_segments.multipart_upload_id IS NOT NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM files WHERE files.id = multipart_uploads.id
+        )`
+      )
+      .bind(expiredBefore),
+    db
+      .prepare(
+        `DELETE FROM hls_segments
+        WHERE asset_id IN (
+          SELECT id
+          FROM hls_assets
+          WHERE final_file_id IS NULL
+            AND created_at < ?
+        )`
+      )
+      .bind(expiredBefore),
+    db
+      .prepare(
+        `DELETE FROM hls_assets
+        WHERE final_file_id IS NULL
+          AND created_at < ?`
+      )
+      .bind(expiredBefore)
+  ]);
+
+  return {
+    deletedChunks: Number(chunkResult?.meta.changes ?? 0),
+    deletedUploads: Number(uploadResult?.meta.changes ?? 0),
+    deletedSegments: Number(segmentResult?.meta.changes ?? 0),
+    deletedAssets: Number(assetResult?.meta.changes ?? 0)
+  };
+}
+
 export async function insertApiKeyRecord(db: D1Database, record: NewApiKeyRecord): Promise<ApiKeyRecord> {
   await db
     .prepare(
@@ -1573,11 +2277,13 @@ function fileTypeWhereClause(type: FileTypeFilter): string {
   const image = "LOWER(mime_type) LIKE 'image/%'";
   const video = [
     "LOWER(mime_type) LIKE 'video/%'",
+    "LOWER(mime_type) IN ('application/vnd.apple.mpegurl', 'application/x-mpegurl')",
     "LOWER(file_name) LIKE '%.mp4'",
     "LOWER(file_name) LIKE '%.m4v'",
     "LOWER(file_name) LIKE '%.mov'",
     "LOWER(file_name) LIKE '%.webm'",
-    "LOWER(file_name) LIKE '%.ogv'"
+    "LOWER(file_name) LIKE '%.ogv'",
+    "LOWER(file_name) LIKE '%.m3u8'"
   ].join(" OR ");
   const text = [
     "LOWER(mime_type) LIKE 'text/%'",

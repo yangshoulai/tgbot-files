@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Hls from "hls.js";
 import { RotateCcw } from "lucide-react";
 import type { FileItem } from "../../../api";
 import { canUseAcceleratedDownload, extractSignedFileToken } from "../../../lib/accelerated-download";
@@ -43,6 +44,7 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
   const [failed, setFailed] = useState(false);
   const heightLimit = fullscreen ? "calc(100dvh - 9rem)" : "min(68dvh, 760px)";
   const directFile = hasDirectFileAccess(file) ? file : null;
+  const isHlsPackage = file.storage_backend === "hls_package";
   const directAccessAvailable = Boolean(directFile);
   const canUseMultipartPreview = canUseAcceleratedDownload(file);
   const signedFileToken = canUseMultipartPreview ? extractSignedFileToken(file.file_path) : null;
@@ -230,6 +232,51 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
     };
   }, [chunkedPreviewMetadata, chunkedPreviewUrl]);
 
+  useEffect(() => {
+    if (!isHlsPackage || !videoSrc || !videoRef.current) return undefined;
+
+    const video = videoRef.current;
+    let hls: Hls | null = null;
+
+    showLoading(true);
+    setFailed(false);
+
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = videoSrc;
+      video.load();
+      return () => {
+        video.removeAttribute("src");
+        video.load();
+      };
+    }
+
+    if (!Hls.isSupported()) {
+      hideLoading();
+      setFailed(true);
+      return undefined;
+    }
+
+    hls = new Hls({
+      xhrSetup(xhr) {
+        xhr.withCredentials = true;
+      }
+    });
+    hls.on(Hls.Events.ERROR, (_event, data) => {
+      if (data.fatal) {
+        hideLoading();
+        setFailed(true);
+      }
+    });
+    hls.loadSource(videoSrc);
+    hls.attachMedia(video);
+
+    return () => {
+      hls?.destroy();
+      video.removeAttribute("src");
+      video.load();
+    };
+  }, [file.id, hideLoading, isHlsPackage, showLoading, videoSrc]);
+
   if (!videoSrc) {
     return (
       <div className="grid w-full place-items-center bg-[#07110f] px-6 py-12 text-center text-white">
@@ -287,7 +334,7 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
         ) : null}
         <video
           ref={videoRef}
-          src={videoSrc}
+          src={isHlsPackage ? undefined : videoSrc ?? undefined}
           poster={poster}
           playsInline
           preload="auto"

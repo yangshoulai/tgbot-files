@@ -7,8 +7,16 @@ import {
 } from "./admin-auth";
 import { createSignedPayload, createSignedToken, TokenError, verifySignedPayload, verifySignedToken } from "./crypto";
 import {
+  attachHlsSegmentMultipartUpload,
+  completeHlsAssetWithFileRecord,
+  completeHlsSegmentMultipart,
+  completeHlsSegmentSingle,
+  completeMultipartUploadRecord,
   completeMultipartUploadWithFileRecord,
+  deleteHlsAssetTempData,
+  deleteStaleHlsUploadData,
   deleteStaleMultipartUploadData,
+  failHlsSegment,
   getDirectoryRecord,
   getDirectoryRecordByPath,
   getDirectoryUsageStats,
@@ -18,18 +26,24 @@ import {
   getFileChunkRecord,
   getFileRecord,
   getGlobalFileUsageStats,
+  getHlsAssetRecord,
+  getHlsAssetRecordByFinalFileId,
+  getHlsSegmentRecordByIndex,
   getMultipartUploadRecord,
   getTelegramChannelRecord,
   getTelegramChannelUsage,
   insertDirectoryRecord,
   insertApiKeyRecord,
   insertFileRecordWithConflictAction,
+  insertHlsAssetRecord,
+  insertHlsSegmentRecords,
   insertMultipartUploadRecord,
   insertTelegramChannelRecord,
   listActiveTelegramChannelRecords,
   listAllDirectoryRecords,
   listDirectoryChildren,
   listFileChunkRecords,
+  listHlsSegmentRecords,
   listApiKeyRecords,
   listFileRecords,
   listTelegramChannelRecords,
@@ -37,6 +51,8 @@ import {
   moveDirectoryTree,
   renameDirectoryTree,
   requireDb,
+  markHlsAssetStatus,
+  markHlsSegmentImporting,
   softDeleteApiKeyRecord,
   deleteDirectoryTree,
   deleteFileRecord,
@@ -53,6 +69,8 @@ import {
   type FileNameConflictAction,
   type FileRecord,
   type FileTypeFilter,
+  type HlsAssetRecord,
+  type HlsSegmentRecord,
   type MultipartUploadRecord,
   type TelegramChannelRecord,
   type TelegramChannelStatus,
@@ -72,6 +90,16 @@ import {
   withSecurityHeaders
 } from "./http";
 import { md5Hex } from "./md5";
+import {
+  buildRewrittenMediaPlaylist,
+  hlsFileNameFromUrl,
+  hlsMimeTypeForSegment,
+  hlsSegmentFileName,
+  parseHlsPlaylist,
+  type HlsMediaPlan,
+  type HlsPlaylistPlan,
+  type HlsVariantPlan
+} from "./hls";
 import { extensionForMimeType, mimeTypeForFileName, resolveStoredMimeType } from "./mime";
 import { fetchTelegramFile, getTelegramFileUrl, uploadDocumentToTelegram } from "./telegram";
 
@@ -104,11 +132,30 @@ interface UploadResult {
   createdAt: string;
   directoryId?: string | null;
   directoryPath: string;
-  storageBackend: "telegram_single" | "telegram_multipart";
+  storageBackend: "telegram_single" | "telegram_multipart" | "hls_package";
   telegramChannelId?: string;
   chunkSize?: number | null;
   chunkCount?: number | null;
   thumbnail?: UploadedThumbnailResult;
+}
+
+interface HlsProbeResult {
+  playlistUrl: string;
+  fileName: string;
+  plan: HlsPlaylistPlan;
+  media?: HlsMediaPlan;
+  selectedVariantId?: string;
+}
+
+interface HlsInitResult {
+  asset: HlsAssetRecord;
+  segments: HlsSegmentRecord[];
+}
+
+interface HlsSegmentImportResult {
+  segment: HlsSegmentRecord;
+  uploadedChunks: number[];
+  missingChunks: number[];
 }
 
 interface MultipartInitResult {
@@ -183,6 +230,11 @@ const IMAGE_THUMBNAIL_SOURCE_MAX_BYTES = 100 * 1024 * 1024;
 const VIDEO_THUMBNAIL_SOURCE_MAX_BYTES = MAX_TELEGRAM_MULTIPART_BYTES;
 const VIDEO_THUMBNAIL_PROXY_DEFAULT_RANGE_BYTES = 2 * 1024 * 1024;
 const ALLOWED_THUMBNAIL_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+const HLS_PLAYLIST_MIME_TYPE = "application/vnd.apple.mpegurl";
+const HLS_MAX_PLAYLIST_BYTES = 2 * 1024 * 1024;
+const HLS_MAX_SEGMENTS = 2000;
+const HLS_SEGMENT_IMPORT_TIMEOUT_MS = 10 * 60 * 1000;
+const HLS_PREVIEW_SEGMENT_COUNT = 4;
 
 type TelegramRateLimitScope = "sendDocument" | "getFile";
 
@@ -422,16 +474,58 @@ export default worker;
 
 async function runScheduledCleanup(controller: ScheduledController, env: Env): Promise<void> {
   const scheduledTime = Number.isFinite(controller.scheduledTime) ? controller.scheduledTime : Date.now();
-  const result = await cleanupStaleMultipartUploads(env, scheduledTime);
+  const result = await cleanupStaleUploads(env, scheduledTime);
 
-  if (result.deletedUploads > 0 || result.deletedChunks > 0) {
-    console.log("Stale multipart upload cleanup completed", {
+  if (
+    result.deletedMultipartUploads > 0 ||
+    result.deletedMultipartChunks > 0 ||
+    result.deletedHlsAssets > 0 ||
+    result.deletedHlsSegments > 0 ||
+    result.deletedHlsUploads > 0 ||
+    result.deletedHlsChunks > 0
+  ) {
+    console.log("Stale upload cleanup completed", {
       cron: controller.cron,
       expired_before: result.expiredBefore,
-      deleted_uploads: result.deletedUploads,
-      deleted_chunks: result.deletedChunks
+      deleted_multipart_uploads: result.deletedMultipartUploads,
+      deleted_multipart_chunks: result.deletedMultipartChunks,
+      deleted_hls_assets: result.deletedHlsAssets,
+      deleted_hls_segments: result.deletedHlsSegments,
+      deleted_hls_uploads: result.deletedHlsUploads,
+      deleted_hls_chunks: result.deletedHlsChunks
     });
   }
+}
+
+async function cleanupStaleUploads(
+  env: Env,
+  nowMs: number
+): Promise<{
+  expiredBefore: string;
+  deletedMultipartUploads: number;
+  deletedMultipartChunks: number;
+  deletedHlsAssets: number;
+  deletedHlsSegments: number;
+  deletedHlsUploads: number;
+  deletedHlsChunks: number;
+}> {
+  const db = requireDb(env);
+  const ttlMs = parseStaleMultipartUploadTtlMs(env.STALE_MULTIPART_UPLOAD_TTL_HOURS);
+  const expiredBefore = new Date(nowMs - ttlMs).toISOString();
+  const [multipart, hls] = await Promise.all([
+    deleteStaleMultipartUploadData(db, expiredBefore),
+    deleteStaleHlsUploadData(db, expiredBefore)
+  ]);
+
+  return {
+    expiredBefore,
+    deletedMultipartUploads: multipart.deletedUploads,
+    deletedMultipartChunks: multipart.deletedChunks,
+    deletedHlsAssets: hls.deletedAssets,
+    deletedHlsSegments: hls.deletedSegments,
+    deletedHlsUploads: hls.deletedUploads,
+    deletedHlsChunks: hls.deletedChunks
+  };
 }
 
 async function cleanupStaleMultipartUploads(
@@ -607,6 +701,10 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
 
   if (request.method === "GET" && url.pathname.startsWith("/f/")) {
     return handleFileAccess(request, env);
+  }
+
+  if (request.method === "GET" && url.pathname.startsWith("/hls/")) {
+    return handleHlsAccess(request, env);
   }
 
   return errorResponse(new AppError(404, "NotFound", "Route not found"));
@@ -1141,6 +1239,10 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
   const db = requireDb(env);
   const url = new URL(request.url);
 
+  if (url.pathname === "/api/admin/uploads/hls" || url.pathname.startsWith("/api/admin/uploads/hls/")) {
+    return handleAdminHlsUploads(request, env, username);
+  }
+
   if (request.method === "POST" && url.pathname === "/api/admin/uploads/preflight") {
     const body = await readJsonObject(request);
     const entries = normalizeUploadPreflightEntries(body.entries);
@@ -1325,6 +1427,165 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
   return errorResponse(new AppError(404, "NotFound", "Admin multipart upload route not found"));
 }
 
+async function handleAdminHlsUploads(request: Request, env: Env, username: string): Promise<Response> {
+  const db = requireDb(env);
+  const url = new URL(request.url);
+
+  if (request.method === "POST" && url.pathname === "/api/admin/uploads/hls/probe") {
+    const body = await readJsonObject(request);
+    const sourceUrl = normalizeSourceUrl(body.url);
+    const variantId = optionalTrimmedString(body.variant_id, 80);
+
+    if (!sourceUrl) {
+      throw new AppError(400, "MissingUrl", "JSON field 'url' is required");
+    }
+
+    const result = await probeHlsSource(sourceUrl, variantId);
+    return jsonResponse({ ok: true, hls: serializeHlsProbeResult(result) });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/admin/uploads/hls/init") {
+    const body = await readJsonObject(request);
+    const sourceUrl = normalizeSourceUrl(body.url);
+
+    if (!sourceUrl) {
+      throw new AppError(400, "MissingUrl", "JSON field 'url' is required");
+    }
+
+    const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
+    const directory = await ensureWritableDirectory(db, directoryPath);
+    const result = await createHlsUpload({
+      db,
+      sourceUrl,
+      selectedVariantId: optionalTrimmedString(body.variant_id, 80),
+      fileNameOverride: normalizeOptionalFileName(body.file_name),
+      conflictAction: normalizeFileNameConflictAction(body.on_conflict),
+      remark: normalizeRemark(body.remark),
+      uploadedBy: username,
+      directoryId: directory?.id ?? null,
+      directoryPath
+    });
+
+    return jsonResponse({
+      ok: true,
+      hls: await serializeHlsUploadResult(db, request, env, result)
+    }, 201);
+  }
+
+  const statusMatch = /^\/api\/admin\/uploads\/hls\/([^/]+)\/status$/.exec(url.pathname);
+  if (request.method === "GET" && statusMatch?.[1]) {
+    const asset = await requireHlsAsset(db, decodeURIComponent(statusMatch[1]));
+    const segments = await listHlsSegmentRecords(db, asset.id);
+
+    return jsonResponse({
+      ok: true,
+      hls: await serializeHlsUploadResult(db, request, env, { asset, segments })
+    });
+  }
+
+  const previewPlaylistMatch = /^\/api\/admin\/uploads\/hls\/([^/]+)\/preview\.m3u8$/.exec(url.pathname);
+  if (request.method === "GET" && previewPlaylistMatch?.[1]) {
+    return handleAdminHlsPreviewPlaylist(request, env, decodeURIComponent(previewPlaylistMatch[1]));
+  }
+
+  const previewSegmentMatch = /^\/api\/admin\/uploads\/hls\/([^/]+)\/preview-segments\/(\d+)$/.exec(url.pathname);
+  if (request.method === "GET" && previewSegmentMatch?.[1] && previewSegmentMatch?.[2]) {
+    const asset = await requireHlsAsset(db, decodeURIComponent(previewSegmentMatch[1]));
+    const segment = await requireHlsSegment(db, asset.id, normalizeHlsSegmentIndex(previewSegmentMatch[2], asset.segment_count));
+    return serveStoredHlsSegment({
+      env,
+      db,
+      segment,
+      rangeHeader: request.headers.get("Range"),
+      forceDownload: false
+    });
+  }
+
+  const segmentImportMatch = /^\/api\/admin\/uploads\/hls\/([^/]+)\/segments\/(\d+)\/import$/.exec(url.pathname);
+  if (request.method === "POST" && segmentImportMatch?.[1] && segmentImportMatch?.[2]) {
+    const asset = await requireMutableHlsAsset(db, decodeURIComponent(segmentImportMatch[1]));
+    const segmentIndex = normalizeHlsSegmentIndex(segmentImportMatch[2], asset.segment_count);
+    const result = await importHlsSegment({
+      env,
+      db,
+      asset,
+      segmentIndex
+    });
+
+    return jsonResponse({
+      ok: true,
+      segment: await serializeHlsSegment(db, result.segment),
+      uploaded_chunks: result.uploadedChunks,
+      missing_chunks: result.missingChunks
+    });
+  }
+
+  const segmentChunkMatch = /^\/api\/admin\/uploads\/hls\/([^/]+)\/segments\/(\d+)\/chunks\/(\d+)\/import$/.exec(url.pathname);
+  if (request.method === "POST" && segmentChunkMatch?.[1] && segmentChunkMatch?.[2] && segmentChunkMatch?.[3]) {
+    const asset = await requireMutableHlsAsset(db, decodeURIComponent(segmentChunkMatch[1]));
+    const segmentIndex = normalizeHlsSegmentIndex(segmentChunkMatch[2], asset.segment_count);
+    const result = await importHlsSegmentChunk({
+      env,
+      db,
+      asset,
+      segmentIndex,
+      chunkIndexValue: segmentChunkMatch[3]
+    });
+
+    return jsonResponse({
+      ok: true,
+      segment: await serializeHlsSegment(db, result.segment),
+      uploaded_chunks: result.uploadedChunks,
+      missing_chunks: result.missingChunks
+    });
+  }
+
+  const segmentCompleteMatch = /^\/api\/admin\/uploads\/hls\/([^/]+)\/segments\/(\d+)\/complete$/.exec(url.pathname);
+  if (request.method === "POST" && segmentCompleteMatch?.[1] && segmentCompleteMatch?.[2]) {
+    const asset = await requireMutableHlsAsset(db, decodeURIComponent(segmentCompleteMatch[1]));
+    const segmentIndex = normalizeHlsSegmentIndex(segmentCompleteMatch[2], asset.segment_count);
+    const result = await completeHlsMultipartSegment({
+      db,
+      asset,
+      segmentIndex
+    });
+
+    return jsonResponse({
+      ok: true,
+      segment: await serializeHlsSegment(db, result.segment),
+      uploaded_chunks: result.uploadedChunks,
+      missing_chunks: result.missingChunks
+    });
+  }
+
+  const completeMatch = /^\/api\/admin\/uploads\/hls\/([^/]+)\/complete$/.exec(url.pathname);
+  if (request.method === "POST" && completeMatch?.[1]) {
+    const asset = await requireMutableHlsAsset(db, decodeURIComponent(completeMatch[1]));
+    const completeInput = await readCompleteUploadInput(request, url.searchParams);
+    const result = await completeHlsUpload({
+      request,
+      env,
+      db,
+      asset,
+      conflictAction: completeInput.conflictAction,
+      ...(completeInput.thumbnail ? { thumbnail: completeInput.thumbnail } : {})
+    });
+
+    return jsonResponse({
+      ok: true,
+      file: serializeUploadedFileResult(result, username)
+    });
+  }
+
+  const deleteMatch = /^\/api\/admin\/uploads\/hls\/([^/]+)$/.exec(url.pathname);
+  if (request.method === "DELETE" && deleteMatch?.[1]) {
+    const cleanup = await deleteHlsAssetTempData(db, decodeURIComponent(deleteMatch[1]));
+    return jsonResponse({ ok: true, cleanup });
+  }
+
+  return errorResponse(new AppError(404, "NotFound", "Admin HLS upload route not found"));
+}
+
 async function handleApiMultipartUploads(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
 
@@ -1480,6 +1741,738 @@ async function handleApiMultipartUploads(request: Request, env: Env): Promise<Re
   }
 
   return errorResponse(new AppError(404, "NotFound", "API multipart upload route not found"));
+}
+
+async function probeHlsSource(sourceUrl: URL, selectedVariantId: string | undefined): Promise<HlsProbeResult> {
+  const plan = await fetchHlsPlaylistPlan(sourceUrl);
+  const fileName = hlsFileNameFromUrl(sourceUrl);
+
+  if (plan.kind === "media") {
+    return {
+      playlistUrl: sourceUrl.toString(),
+      fileName,
+      plan,
+      media: plan
+    };
+  }
+
+  if (!selectedVariantId) {
+    return {
+      playlistUrl: sourceUrl.toString(),
+      fileName,
+      plan
+    };
+  }
+
+  const variant = selectHlsVariant(plan.variants, selectedVariantId);
+  const mediaPlan = await fetchHlsMediaPlaylist(new URL(variant.uri));
+
+  return {
+    playlistUrl: sourceUrl.toString(),
+    fileName: hlsFileNameFromUrl(new URL(mediaPlan.playlistUrl)),
+    plan,
+    media: mediaPlan,
+    selectedVariantId: variant.id
+  };
+}
+
+async function createHlsUpload(params: {
+  db: D1Database;
+  sourceUrl: URL;
+  selectedVariantId: string | undefined;
+  fileNameOverride: string | undefined;
+  conflictAction: FileNameConflictAction;
+  remark: string | undefined;
+  uploadedBy: string;
+  directoryId: string | null;
+  directoryPath: string;
+}): Promise<HlsInitResult> {
+  const resolved = await resolveHlsMediaPlan(params.sourceUrl, params.selectedVariantId);
+  validateHlsMediaPlan(resolved.mediaPlan);
+  const fileName = params.fileNameOverride ?? hlsFileNameFromUrl(new URL(resolved.mediaPlan.playlistUrl));
+
+  await requireFileNameWritable({
+    db: params.db,
+    directoryPath: params.directoryPath,
+    fileName,
+    conflictAction: params.conflictAction
+  });
+
+  const now = new Date().toISOString();
+  const assetId = crypto.randomUUID();
+  const asset = await insertHlsAssetRecord(params.db, {
+    id: assetId,
+    sourceUrl: params.sourceUrl.toString(),
+    mediaPlaylistUrl: resolved.mediaPlan.playlistUrl,
+    fileName,
+    mimeType: HLS_PLAYLIST_MIME_TYPE,
+    directoryId: params.directoryId,
+    directoryPath: params.directoryPath,
+    status: "pending",
+    selectedVariantId: resolved.selectedVariantId ?? null,
+    targetDurationSeconds: resolved.mediaPlan.targetDuration,
+    durationSeconds: resolved.mediaPlan.duration,
+    segmentCount: resolved.mediaPlan.segments.length,
+    playlistText: resolved.mediaPlan.playlistText,
+    createdAt: now,
+    updatedAt: now,
+    ...(params.remark ? { remark: params.remark } : {}),
+    ...(params.uploadedBy ? { uploadedBy: params.uploadedBy } : {})
+  });
+
+  await insertHlsSegmentRecords(params.db, resolved.mediaPlan.segments.map((segment) => {
+    const segmentUrl = new URL(segment.uri);
+    return {
+      id: crypto.randomUUID(),
+      assetId,
+      variantId: resolved.selectedVariantId ?? "media",
+      segmentIndex: segment.index,
+      sourceUrl: segment.uri,
+      durationSeconds: segment.duration,
+      mimeType: hlsMimeTypeForSegment(segmentUrl),
+      status: "pending",
+      createdAt: now,
+      updatedAt: now
+    };
+  }));
+
+  return {
+    asset,
+    segments: await listHlsSegmentRecords(params.db, asset.id)
+  };
+}
+
+async function importHlsSegment(params: {
+  env: Env;
+  db: D1Database;
+  asset: HlsAssetRecord;
+  segmentIndex: number;
+}): Promise<HlsSegmentImportResult> {
+  const segment = await requireHlsSegment(params.db, params.asset.id, params.segmentIndex);
+
+  if (segment.status === "done") {
+    return hlsSegmentImportResult(params.db, segment);
+  }
+
+  await markHlsAssetStatus(params.db, params.asset.id, "importing", new Date().toISOString());
+  await markHlsSegmentImporting(params.db, segment.id, new Date().toISOString());
+
+  try {
+    const sourceUrl = new URL(segment.source_url);
+    const probe = await probeHlsSegmentSource(sourceUrl);
+    const mimeType = hlsMimeTypeForSegment(sourceUrl, probe.contentType);
+
+    if (probe.size !== undefined && probe.size > MAX_TELEGRAM_MULTIPART_BYTES) {
+      throw fileTooLargeError(MAX_TELEGRAM_MULTIPART_BYTES, probe.size);
+    }
+
+    if (probe.size !== undefined && probe.size > TELEGRAM_CHUNK_SIZE_BYTES) {
+      if (!probe.supportsRange) {
+        throw new AppError(400, "RangeNotSupported", "较大的 HLS segment 必须支持 Range 请求");
+      }
+
+      const upload = await ensureHlsSegmentMultipartUpload({
+        db: params.db,
+        asset: params.asset,
+        segment,
+        mimeType,
+        size: probe.size
+      });
+      const refreshed = await requireHlsSegment(params.db, params.asset.id, params.segmentIndex);
+      const chunks = await listFileChunkRecords(params.db, upload.id);
+
+      return {
+        segment: refreshed,
+        uploadedChunks: chunks.map((chunk) => chunk.chunk_index),
+        missingChunks: missingChunkIndexes(upload, chunks)
+      };
+    }
+
+    const blob = await downloadHlsSegmentBlob(sourceUrl, TELEGRAM_CHUNK_SIZE_BYTES, probe.size);
+    const fileName = hlsSegmentFileName(sourceUrl, segment.segment_index);
+    const { telegramDocument, channel } = await uploadTelegramDocumentWithChannel({
+      env: params.env,
+      db: params.db,
+      file: blob,
+      fileName,
+      preferredChannelIndex: segment.segment_index
+    });
+    const completedAt = new Date().toISOString();
+
+    await completeHlsSegmentSingle({
+      db: params.db,
+      id: segment.id,
+      mimeType,
+      size: telegramDocument.file_size ?? blob.size,
+      telegramFileId: telegramDocument.file_id,
+      telegramChannelId: channel.id,
+      completedAt,
+      ...(telegramDocument.file_unique_id ? { telegramFileUniqueId: telegramDocument.file_unique_id } : {})
+    });
+
+    return hlsSegmentImportResult(params.db, await requireHlsSegment(params.db, params.asset.id, params.segmentIndex));
+  } catch (error) {
+    await failHlsSegment(params.db, segment.id, errorMessageForServer(error), new Date().toISOString());
+    await markHlsAssetStatus(params.db, params.asset.id, "failed", new Date().toISOString());
+    throw error;
+  }
+}
+
+async function importHlsSegmentChunk(params: {
+  env: Env;
+  db: D1Database;
+  asset: HlsAssetRecord;
+  segmentIndex: number;
+  chunkIndexValue: string;
+}): Promise<HlsSegmentImportResult> {
+  const segment = await requireHlsSegment(params.db, params.asset.id, params.segmentIndex);
+  const upload = await requireHlsSegmentMultipartUpload(params.db, segment);
+  const chunkIndex = normalizeChunkIndex(params.chunkIndexValue, upload);
+
+  await markHlsAssetStatus(params.db, params.asset.id, "importing", new Date().toISOString());
+  await markHlsSegmentImporting(params.db, segment.id, new Date().toISOString());
+
+  try {
+    const record = await downloadAndUploadRemoteChunk({
+      env: params.env,
+      db: params.db,
+      upload,
+      chunkIndex
+    });
+
+    await upsertFileChunkRecord(params.db, record);
+    return hlsSegmentImportResult(params.db, await requireHlsSegment(params.db, params.asset.id, params.segmentIndex));
+  } catch (error) {
+    await failHlsSegment(params.db, segment.id, errorMessageForServer(error), new Date().toISOString());
+    await markHlsAssetStatus(params.db, params.asset.id, "failed", new Date().toISOString());
+    throw error;
+  }
+}
+
+async function completeHlsMultipartSegment(params: {
+  db: D1Database;
+  asset: HlsAssetRecord;
+  segmentIndex: number;
+}): Promise<HlsSegmentImportResult> {
+  const segment = await requireHlsSegment(params.db, params.asset.id, params.segmentIndex);
+  const upload = await requireHlsSegmentMultipartUpload(params.db, segment);
+  const chunks = await listFileChunkRecords(params.db, upload.id);
+
+  validateCompleteChunks(upload, chunks);
+  const completedAt = new Date().toISOString();
+  await completeMultipartUploadRecord(params.db, upload.id, completedAt);
+  await completeHlsSegmentMultipart({
+    db: params.db,
+    id: segment.id,
+    multipartUploadId: upload.id,
+    chunkSize: upload.chunk_size,
+    chunkCount: upload.chunk_count,
+    completedAt
+  });
+
+  return hlsSegmentImportResult(params.db, await requireHlsSegment(params.db, params.asset.id, params.segmentIndex));
+}
+
+async function completeHlsUpload(params: {
+  request: Request;
+  env: Env;
+  db: D1Database;
+  asset: HlsAssetRecord;
+  conflictAction?: FileNameConflictAction;
+  thumbnail?: ThumbnailInput;
+}): Promise<UploadResult> {
+  const segments = await listHlsSegmentRecords(params.db, params.asset.id);
+  validateCompleteHlsSegments(params.asset, segments);
+  const totalSize = segments.reduce((total, segment) => total + requireHlsSegmentSize(segment), 0);
+
+  await requireFileNameWritable({
+    db: params.db,
+    directoryPath: params.asset.directory_path ?? "/",
+    fileName: params.asset.file_name,
+    excludeId: params.asset.id,
+    conflictAction: params.conflictAction ?? "error"
+  });
+
+  const signingSecret = requireEnv(params.env, "LINK_SIGNING_SECRET");
+  const createdAt = new Date().toISOString();
+  const token = await createSignedToken(
+    {
+      v: 4,
+      hls_asset_id: params.asset.id,
+      file_record_id: params.asset.id,
+      name: params.asset.file_name,
+      mime_type: HLS_PLAYLIST_MIME_TYPE,
+      size: totalSize,
+      iat: Math.floor(Date.now() / 1000)
+    },
+    signingSecret
+  );
+  const filePath = `/hls/${token}/${encodeURIComponent(params.asset.file_name)}`;
+  const publicUrl = `${getPublicBaseUrl(params.request, params.env)}${filePath}`;
+  const thumbnail = await uploadOptionalThumbnail({
+    request: params.request,
+    env: params.env,
+    db: params.db,
+    originalFileName: params.asset.file_name,
+    thumbnail: params.thumbnail
+  });
+  const md5 = `hls:${params.asset.id}:${segments.length}:${totalSize}`;
+
+  await completeHlsAssetWithFileRecord({
+    db: params.db,
+    assetId: params.asset.id,
+    completedAt: createdAt,
+    conflictAction: params.conflictAction ?? "error",
+    file: {
+      id: params.asset.id,
+      fileName: params.asset.file_name,
+      mimeType: HLS_PLAYLIST_MIME_TYPE,
+      size: totalSize,
+      md5,
+      telegramFileId: `hls:${params.asset.id}`,
+      telegramChannelId: segments[0]?.telegram_channel_id ?? "default",
+      filePath,
+      createdAt,
+      storageBackend: "hls_package",
+      directoryId: params.asset.directory_id ?? null,
+      directoryPath: params.asset.directory_path ?? "/",
+      ...thumbnailFileRecordFields(thumbnail),
+      ...(params.asset.remark ? { remark: params.asset.remark } : {}),
+      ...(params.asset.uploaded_by ? { uploadedBy: params.asset.uploaded_by } : {})
+    }
+  });
+
+  return {
+    id: params.asset.id,
+    name: params.asset.file_name,
+    size: totalSize,
+    mimeType: HLS_PLAYLIST_MIME_TYPE,
+    md5,
+    filePath,
+    publicUrl,
+    telegramFileId: `hls:${params.asset.id}`,
+    telegramChannelId: segments[0]?.telegram_channel_id ?? "default",
+    ...(params.asset.remark ? { remark: params.asset.remark } : {}),
+    createdAt,
+    directoryId: params.asset.directory_id ?? null,
+    directoryPath: params.asset.directory_path ?? "/",
+    storageBackend: "hls_package",
+    chunkSize: null,
+    chunkCount: null,
+    ...(thumbnail ? { thumbnail } : {})
+  };
+}
+
+async function fetchHlsPlaylistPlan(sourceUrl: URL): Promise<HlsPlaylistPlan> {
+  return parseHlsPlaylist(await fetchHlsPlaylistText(sourceUrl), sourceUrl);
+}
+
+async function fetchHlsMediaPlaylist(sourceUrl: URL): Promise<HlsMediaPlan> {
+  const plan = await fetchHlsPlaylistPlan(sourceUrl);
+  if (plan.kind !== "media") {
+    throw new AppError(400, "InvalidHlsPlaylist", "variant URI 必须指向 media playlist");
+  }
+  return plan;
+}
+
+async function fetchHlsPlaylistText(sourceUrl: URL): Promise<string> {
+  let response: Response;
+  try {
+    response = await fetch(sourceUrl.toString(), {
+      redirect: "follow",
+      headers: {
+        Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*"
+      }
+    });
+  } catch {
+    throw new AppError(502, "HlsPlaylistFetchFailed", "m3u8 文件获取失败");
+  }
+
+  if (!response.ok) {
+    throw new AppError(
+      response.status >= 500 ? 502 : 400,
+      "HlsPlaylistFetchFailed",
+      `m3u8 文件返回 ${response.status}`,
+      { source_status: response.status }
+    );
+  }
+
+  const contentLength = parseContentLength(response.headers.get("Content-Length"));
+  if (contentLength !== undefined && contentLength > HLS_MAX_PLAYLIST_BYTES) {
+    throw fileTooLargeError(HLS_MAX_PLAYLIST_BYTES, contentLength);
+  }
+
+  const text = await response.text().catch(() => {
+    throw new AppError(502, "HlsPlaylistReadFailed", "m3u8 文件读取失败");
+  });
+
+  if (new TextEncoder().encode(text).byteLength > HLS_MAX_PLAYLIST_BYTES) {
+    throw fileTooLargeError(HLS_MAX_PLAYLIST_BYTES, new TextEncoder().encode(text).byteLength);
+  }
+
+  return text;
+}
+
+async function resolveHlsMediaPlan(
+  sourceUrl: URL,
+  selectedVariantId: string | undefined
+): Promise<{ sourcePlan: HlsPlaylistPlan; mediaPlan: HlsMediaPlan; selectedVariantId?: string }> {
+  const sourcePlan = await fetchHlsPlaylistPlan(sourceUrl);
+
+  if (sourcePlan.kind === "media") {
+    return { sourcePlan, mediaPlan: sourcePlan };
+  }
+
+  if (!selectedVariantId && sourcePlan.variants.length > 1) {
+    throw new AppError(400, "MissingHlsVariant", "master playlist 需要选择一个 variant 后再导入", {
+      variants: sourcePlan.variants.map(serializeHlsVariant)
+    });
+  }
+
+  const variant = selectHlsVariant(sourcePlan.variants, selectedVariantId ?? sourcePlan.variants[0]?.id ?? "");
+  const mediaPlan = await fetchHlsMediaPlaylist(new URL(variant.uri));
+  return { sourcePlan, mediaPlan, selectedVariantId: variant.id };
+}
+
+function selectHlsVariant(variants: HlsVariantPlan[], selectedVariantId: string): HlsVariantPlan {
+  const variant = variants.find((item) => item.id === selectedVariantId || item.uri === selectedVariantId);
+  if (!variant) {
+    throw new AppError(400, "InvalidHlsVariant", "选择的 HLS variant 不存在");
+  }
+  return variant;
+}
+
+function validateHlsMediaPlan(plan: HlsMediaPlan): void {
+  if (plan.segments.length > HLS_MAX_SEGMENTS) {
+    throw new AppError(400, "TooManyHlsSegments", `HLS playlist 最多支持 ${HLS_MAX_SEGMENTS} 个 segment`, {
+      max_segments: HLS_MAX_SEGMENTS,
+      actual_segments: plan.segments.length
+    });
+  }
+}
+
+async function probeHlsSegmentSource(sourceUrl: URL): Promise<{
+  size?: number;
+  contentType?: string | null;
+  supportsRange: boolean;
+}> {
+  const head = await fetchRemoteHead(sourceUrl);
+  const contentType = head?.headers.get("Content-Type") ?? null;
+  const size = parseContentLength(head?.headers.get("Content-Length") ?? null);
+  const headSupportsRange = (head?.headers.get("Accept-Ranges") ?? "").toLowerCase().includes("bytes");
+
+  if (size !== undefined && size <= TELEGRAM_CHUNK_SIZE_BYTES) {
+    return { size, contentType, supportsRange: headSupportsRange };
+  }
+
+  try {
+    const rangeProbe = await fetchRemoteRange(sourceUrl, 0, 0);
+    if (rangeProbe.status === 206) {
+      const contentRange = parseContentRange(rangeProbe.headers.get("Content-Range"));
+      const probedSize = contentRange?.size ?? size;
+      return {
+        contentType: rangeProbe.headers.get("Content-Type") ?? contentType,
+        supportsRange: true,
+        ...(probedSize !== undefined ? { size: probedSize } : {})
+      };
+    }
+  } catch {
+    if (size !== undefined) {
+      return { size, contentType, supportsRange: headSupportsRange };
+    }
+  }
+
+  return { ...(size !== undefined ? { size } : {}), contentType, supportsRange: headSupportsRange };
+}
+
+async function downloadHlsSegmentBlob(sourceUrl: URL, maxBytes: number, expectedSize: number | undefined): Promise<Blob> {
+  let response: Response;
+  try {
+    response = await fetch(sourceUrl.toString(), {
+      redirect: "follow",
+      headers: { Accept: "video/*, audio/*, application/octet-stream, */*" }
+    });
+  } catch {
+    throw new AppError(502, "HlsSegmentFetchFailed", "HLS segment 获取失败");
+  }
+
+  if (!response.ok) {
+    throw new AppError(
+      response.status >= 500 ? 502 : 400,
+      "HlsSegmentFetchFailed",
+      `HLS segment 返回 ${response.status}`,
+      { source_status: response.status }
+    );
+  }
+
+  const contentLength = parseContentLength(response.headers.get("Content-Length"));
+  const sizeHint = contentLength ?? expectedSize;
+  if (sizeHint !== undefined && sizeHint > maxBytes) {
+    throw new AppError(400, "RangeNotSupported", "较大的 HLS segment 必须支持 Range 请求");
+  }
+
+  const blob = await response.blob().catch(() => {
+    throw new AppError(502, "HlsSegmentReadFailed", "HLS segment 读取失败");
+  });
+
+  if (blob.size > maxBytes) {
+    throw new AppError(400, "RangeNotSupported", "较大的 HLS segment 必须支持 Range 请求");
+  }
+
+  return blob;
+}
+
+async function ensureHlsSegmentMultipartUpload(params: {
+  db: D1Database;
+  asset: HlsAssetRecord;
+  segment: HlsSegmentRecord;
+  mimeType: string;
+  size: number;
+}): Promise<MultipartUploadRecord> {
+  if (params.segment.multipart_upload_id) {
+    const existing = await getMultipartUploadRecord(params.db, params.segment.multipart_upload_id);
+    if (existing) {
+      if (existing.size !== params.size) {
+        throw new AppError(409, "HlsSegmentSizeChanged", "HLS segment 大小发生变化，请取消后重新导入");
+      }
+      return existing;
+    }
+  }
+
+  validateMultipartFileSize(params.size);
+  const chunkCount = Math.ceil(params.size / TELEGRAM_CHUNK_SIZE_BYTES);
+  const now = new Date().toISOString();
+  const sourceUrl = new URL(params.segment.source_url);
+  const upload = await insertMultipartUploadRecord(params.db, {
+    id: crypto.randomUUID(),
+    sourceKind: "url",
+    sourceUrl: params.segment.source_url,
+    fileName: hlsSegmentFileName(sourceUrl, params.segment.segment_index),
+    mimeType: params.mimeType,
+    size: params.size,
+    chunkSize: TELEGRAM_CHUNK_SIZE_BYTES,
+    chunkCount,
+    directoryId: params.asset.directory_id ?? null,
+    directoryPath: params.asset.directory_path ?? "/",
+    createdAt: now,
+    ...(params.asset.uploaded_by ? { uploadedBy: params.asset.uploaded_by } : {})
+  });
+
+  await attachHlsSegmentMultipartUpload({
+    db: params.db,
+    id: params.segment.id,
+    multipartUploadId: upload.id,
+    mimeType: params.mimeType,
+    size: params.size,
+    chunkSize: TELEGRAM_CHUNK_SIZE_BYTES,
+    chunkCount,
+    updatedAt: now
+  });
+
+  return upload;
+}
+
+async function hlsSegmentImportResult(db: D1Database, segment: HlsSegmentRecord): Promise<HlsSegmentImportResult> {
+  if (!segment.multipart_upload_id) {
+    return {
+      segment,
+      uploadedChunks: [],
+      missingChunks: []
+    };
+  }
+
+  const upload = await getMultipartUploadRecord(db, segment.multipart_upload_id);
+  const chunks = await listFileChunkRecords(db, segment.multipart_upload_id);
+  return {
+    segment,
+    uploadedChunks: chunks.map((chunk) => chunk.chunk_index),
+    missingChunks: upload ? missingChunkIndexes(upload, chunks) : []
+  };
+}
+
+async function requireHlsAsset(db: D1Database, assetId: string): Promise<HlsAssetRecord> {
+  const asset = await getHlsAssetRecord(db, assetId);
+  if (!asset) {
+    throw new AppError(404, "HlsAssetNotFound", "HLS 上传任务不存在");
+  }
+  return asset;
+}
+
+async function requireMutableHlsAsset(db: D1Database, assetId: string): Promise<HlsAssetRecord> {
+  const asset = await requireHlsAsset(db, assetId);
+  if (asset.status === "done" || asset.status === "cancelled" || asset.final_file_id) {
+    throw new AppError(409, "HlsAssetClosed", "HLS 上传任务已结束");
+  }
+  return asset;
+}
+
+async function requireHlsSegment(db: D1Database, assetId: string, segmentIndex: number): Promise<HlsSegmentRecord> {
+  const segment = await getHlsSegmentRecordByIndex(db, assetId, segmentIndex);
+  if (!segment) {
+    throw new AppError(404, "HlsSegmentNotFound", "HLS segment 不存在");
+  }
+  return segment;
+}
+
+async function requireHlsSegmentMultipartUpload(db: D1Database, segment: HlsSegmentRecord): Promise<MultipartUploadRecord> {
+  if (segment.storage_backend !== "telegram_multipart" || !segment.multipart_upload_id) {
+    throw new AppError(400, "HlsSegmentNotMultipart", "该 HLS segment 不是大 segment 分片任务");
+  }
+
+  const upload = await getMultipartUploadRecord(db, segment.multipart_upload_id);
+  if (!upload) {
+    throw new AppError(404, "UploadNotFound", "HLS segment 分片会话不存在");
+  }
+  return upload;
+}
+
+function normalizeHlsSegmentIndex(value: string, segmentCount: number): number {
+  const index = Number(value);
+  if (!Number.isSafeInteger(index) || index < 0 || index >= segmentCount) {
+    throw new AppError(400, "InvalidSegmentIndex", "HLS segment index 超出范围");
+  }
+  return index;
+}
+
+function validateCompleteHlsSegments(asset: HlsAssetRecord, segments: HlsSegmentRecord[]): void {
+  if (segments.length !== asset.segment_count) {
+    throw new AppError(409, "HlsUploadIncomplete", "HLS segment 数量不完整", {
+      expected_segments: asset.segment_count,
+      actual_segments: segments.length
+    });
+  }
+
+  for (let index = 0; index < asset.segment_count; index += 1) {
+    const segment = segments[index];
+    if (!segment || segment.segment_index !== index || segment.status !== "done") {
+      throw new AppError(409, "HlsUploadIncomplete", "仍有 HLS segment 未导入完成", {
+        segment_index: index,
+        status: segment?.status
+      });
+    }
+    requireHlsSegmentSize(segment);
+  }
+}
+
+function requireHlsSegmentSize(segment: HlsSegmentRecord): number {
+  if (!Number.isSafeInteger(segment.size) || Number(segment.size) < 0) {
+    throw new AppError(409, "HlsUploadIncomplete", "HLS segment 缺少文件大小", {
+      segment_index: segment.segment_index
+    });
+  }
+  return Number(segment.size);
+}
+
+function errorMessageForServer(error: unknown): string {
+  if (error instanceof AppError) {
+    return error.message;
+  }
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+  return "HLS segment 导入失败";
+}
+
+function serializeHlsProbeResult(result: HlsProbeResult): Record<string, unknown> {
+  return {
+    playlist_url: result.playlistUrl,
+    file_name: result.fileName,
+    kind: result.plan.kind,
+    selected_variant_id: result.selectedVariantId ?? null,
+    variants: result.plan.kind === "master" ? result.plan.variants.map(serializeHlsVariant) : [],
+    media: result.media ? serializeHlsMediaPlan(result.media) : null
+  };
+}
+
+function serializeHlsVariant(variant: HlsVariantPlan): Record<string, unknown> {
+  return {
+    id: variant.id,
+    uri: variant.uri,
+    bandwidth: variant.bandwidth ?? null,
+    resolution: variant.resolution ?? null,
+    codecs: variant.codecs ?? null
+  };
+}
+
+function serializeHlsMediaPlan(plan: HlsMediaPlan): Record<string, unknown> {
+  return {
+    playlist_url: plan.playlistUrl,
+    target_duration: plan.targetDuration,
+    duration: plan.duration,
+    segment_count: plan.segments.length
+  };
+}
+
+async function serializeHlsUploadResult(
+  db: D1Database,
+  request: Request,
+  env: Env,
+  result: HlsInitResult
+): Promise<Record<string, unknown>> {
+  return {
+    asset: serializeHlsAsset(result.asset, request, env),
+    segments: await Promise.all(result.segments.map((segment) => serializeHlsSegment(db, segment)))
+  };
+}
+
+function serializeHlsAsset(asset: HlsAssetRecord, request: Request, env: Env): Record<string, unknown> {
+  const baseUrl = getPublicBaseUrl(request, env);
+  return {
+    id: asset.id,
+    source_url: asset.source_url,
+    media_playlist_url: asset.media_playlist_url,
+    file_name: asset.file_name,
+    mime_type: asset.mime_type,
+    directory_id: asset.directory_id,
+    directory_path: asset.directory_path ?? "/",
+    status: asset.status,
+    selected_variant_id: asset.selected_variant_id,
+    target_duration: asset.target_duration_seconds,
+    duration: asset.duration_seconds,
+    segment_count: asset.segment_count,
+    estimated_size: asset.estimated_size,
+    final_file_id: asset.final_file_id,
+    remark: asset.remark,
+    created_at: asset.created_at,
+    updated_at: asset.updated_at,
+    completed_at: asset.completed_at,
+    preview_playlist_url: `${baseUrl}/api/admin/uploads/hls/${encodeURIComponent(asset.id)}/preview.m3u8`
+  };
+}
+
+async function serializeHlsSegment(db: D1Database, segment: HlsSegmentRecord): Promise<Record<string, unknown>> {
+  const chunks = segment.multipart_upload_id
+    ? await listFileChunkRecords(db, segment.multipart_upload_id)
+    : [];
+  const uploadedChunks = chunks.map((chunk) => chunk.chunk_index);
+  const missingChunks = Number.isSafeInteger(segment.chunk_count) && Number(segment.chunk_count) > 0
+    ? chunkRange(Number(segment.chunk_count)).filter((index) => !uploadedChunks.includes(index))
+    : [];
+
+  return {
+    id: segment.id,
+    asset_id: segment.asset_id,
+    segment_index: segment.segment_index,
+    source_url: segment.source_url,
+    duration: segment.duration_seconds,
+    mime_type: segment.mime_type,
+    size: segment.size,
+    storage_backend: segment.storage_backend,
+    telegram_channel_id: segment.telegram_channel_id,
+    multipart_upload_id: segment.multipart_upload_id,
+    chunk_size: segment.chunk_size,
+    chunk_count: segment.chunk_count,
+    status: segment.status,
+    attempts: segment.attempts,
+    error_message: segment.error_message,
+    uploaded_chunks: uploadedChunks,
+    missing_chunks: missingChunks,
+    completed_at: segment.completed_at
+  };
+}
+
+function chunkRange(count: number): number[] {
+  return Array.from({ length: count }, (_, index) => index);
 }
 
 async function handleAdminApiKeys(request: Request, env: Env): Promise<Response> {
@@ -3691,33 +4684,54 @@ async function uploadAndRecordFile(params: {
 async function createFilePathForRecord(record: FileRecord, fileName: string, env: Env): Promise<string> {
   const signingSecret = requireEnv(env, "LINK_SIGNING_SECRET");
   const iat = Math.floor(Date.now() / 1000);
-  const isMultipart = record.storage_backend === "telegram_multipart";
-  const token = isMultipart
+  const storageBackend = fileStorageBackend(record);
+
+  if (storageBackend === "hls_package") {
+    const hlsAssetId = record.telegram_file_id.startsWith("hls:")
+      ? record.telegram_file_id.slice("hls:".length)
+      : record.id;
+    const token = await createSignedToken(
+      {
+        v: 4,
+        hls_asset_id: hlsAssetId,
+        file_record_id: record.id,
+        name: fileName,
+        mime_type: record.mime_type,
+        size: record.size,
+        iat
+      },
+      signingSecret
+    );
+
+    return `/hls/${token}/${encodeURIComponent(fileName)}`;
+  }
+
+  const token = storageBackend === "telegram_multipart"
     ? await createSignedToken(
-        {
-          v: 2,
-          file_record_id: record.id,
-          name: fileName,
-          mime_type: record.mime_type,
-          size: record.size,
-          chunk_size: requirePositiveRecordInteger(record.chunk_size, "chunk_size"),
-          chunk_count: requirePositiveRecordInteger(record.chunk_count, "chunk_count"),
-          iat
-        },
-        signingSecret
-      )
+      {
+        v: 2,
+        file_record_id: record.id,
+        name: fileName,
+        mime_type: record.mime_type,
+        size: record.size,
+        chunk_size: requirePositiveRecordInteger(record.chunk_size, "chunk_size"),
+        chunk_count: requirePositiveRecordInteger(record.chunk_count, "chunk_count"),
+        iat
+      },
+      signingSecret
+    )
     : await createSignedToken(
-        {
-          v: 3,
-          channel_id: normalizeTelegramChannelId(record.telegram_channel_id),
-          file_id: record.telegram_file_id,
-          name: fileName,
-          mime_type: record.mime_type,
-          size: record.size,
-          iat
-        },
-        signingSecret
-      );
+      {
+        v: 3,
+        channel_id: normalizeTelegramChannelId(record.telegram_channel_id),
+        file_id: record.telegram_file_id,
+        name: fileName,
+        mime_type: record.mime_type,
+        size: record.size,
+        iat
+      },
+      signingSecret
+    );
 
   return `/f/${token}/${encodeURIComponent(fileName)}`;
 }
@@ -3756,6 +4770,10 @@ async function handleFileAccess(request: Request, env: Env): Promise<Response> {
     });
   }
 
+  if (payload.v === 4) {
+    throw new AppError(400, "NotHlsRoute", "HLS files must be accessed through /hls");
+  }
+
   const db = env.FILES_DB;
   const channel = await resolveTelegramChannel(env, db, payload.v === 3 ? payload.channel_id : "default");
   const telegramFileUrl = await getRateLimitedTelegramFileUrl({
@@ -3786,6 +4804,328 @@ async function handleFileAccess(request: Request, env: Env): Promise<Response> {
     statusText: telegramResponse.statusText,
     headers
   });
+}
+
+async function handleHlsAccess(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const access = extractHlsAccess(url.pathname);
+  const payload = await verifySignedToken(access.token, requireEnv(env, "LINK_SIGNING_SECRET"));
+
+  if (payload.v !== 4) {
+    throw new AppError(400, "NotHlsFile", "HLS access token is required");
+  }
+
+  const db = requireDb(env);
+  const asset = await getHlsAssetRecord(db, payload.hls_asset_id);
+  if (!asset || asset.final_file_id !== payload.file_record_id || asset.status !== "done") {
+    throw new AppError(404, "HlsAssetNotFound", "HLS 文件不存在");
+  }
+
+  if (access.segmentIndex !== undefined) {
+    const segment = await requireHlsSegment(db, asset.id, access.segmentIndex);
+    return serveStoredHlsSegment({
+      env,
+      db,
+      segment,
+      rangeHeader: request.headers.get("Range"),
+      forceDownload: url.searchParams.get("download") === "1" || url.searchParams.get("download") === "true"
+    });
+  }
+
+  const segments = await listHlsSegmentRecords(db, asset.id);
+  validateCompleteHlsSegments(asset, segments);
+  const forceDownload = url.searchParams.get("download") === "1" || url.searchParams.get("download") === "true";
+
+  if (forceDownload) {
+    return serveHlsPackageDownload({
+      env,
+      db,
+      asset,
+      segments,
+      fileName: payload.name
+    });
+  }
+
+  const baseUrl = getPublicBaseUrl(request, env);
+  const playlist = buildRewrittenMediaPlaylist({
+    playlistText: asset.playlist_text,
+    targetDuration: asset.target_duration_seconds,
+    segments: segments.map((segment) => ({
+      index: segment.segment_index,
+      duration: segment.duration_seconds,
+      path: `${baseUrl}/hls/${encodeURIComponent(access.token)}/segments/${segment.segment_index}/${encodeURIComponent(hlsSegmentFileName(new URL(segment.source_url), segment.segment_index))}`
+    }))
+  });
+  const headers = withSecurityHeaders();
+  headers.set("Content-Type", `${HLS_PLAYLIST_MIME_TYPE}; charset=utf-8`);
+  headers.set("Content-Disposition", contentDispositionInline(payload.name));
+  headers.set("Cache-Control", "public, max-age=60");
+
+  return new Response(playlist, { headers });
+}
+
+async function handleAdminHlsPreviewPlaylist(request: Request, env: Env, assetId: string): Promise<Response> {
+  const db = requireDb(env);
+  const asset = await requireHlsAsset(db, assetId);
+  const doneSegments = leadingDoneHlsSegments(await listHlsSegmentRecords(db, asset.id), HLS_PREVIEW_SEGMENT_COUNT);
+
+  if (doneSegments.length === 0) {
+    throw new AppError(409, "HlsPreviewNotReady", "至少需要完成 1 个 HLS segment 后才能生成预览 playlist");
+  }
+
+  const baseUrl = getPublicBaseUrl(request, env);
+  const playlist = buildRewrittenMediaPlaylist({
+    targetDuration: asset.target_duration_seconds,
+    segments: doneSegments.map((segment) => ({
+      index: segment.segment_index,
+      duration: segment.duration_seconds,
+      path: `${baseUrl}/api/admin/uploads/hls/${encodeURIComponent(asset.id)}/preview-segments/${segment.segment_index}`
+    }))
+  });
+  const headers = withSecurityHeaders();
+  headers.set("Content-Type", `${HLS_PLAYLIST_MIME_TYPE}; charset=utf-8`);
+  headers.set("Cache-Control", "no-store");
+
+  return new Response(playlist, { headers });
+}
+
+async function serveHlsPackageDownload(params: {
+  env: Env;
+  db: D1Database;
+  asset: HlsAssetRecord;
+  segments: HlsSegmentRecord[];
+  fileName: string;
+}): Promise<Response> {
+  if (!params.segments.every(isDownloadableTsSegment)) {
+    throw new AppError(400, "UnsupportedHlsDownload", "当前仅支持未加密 TS HLS 顺序合并下载");
+  }
+
+  const totalSize = params.segments.reduce((total, segment) => total + requireHlsSegmentSize(segment), 0);
+  const headers = withSecurityHeaders();
+  headers.set("Content-Type", "video/mp2t");
+  headers.set("Content-Disposition", contentDispositionAttachment(hlsDownloadFileName(params.fileName)));
+  headers.set("Content-Length", String(totalSize));
+  headers.set("Cache-Control", "public, max-age=31536000, immutable");
+
+  return new Response(streamHlsSegmentsForDownload(params), { headers });
+}
+
+async function serveStoredHlsSegment(params: {
+  env: Env;
+  db: D1Database;
+  segment: HlsSegmentRecord;
+  rangeHeader: string | null;
+  forceDownload: boolean;
+}): Promise<Response> {
+  if (params.segment.status !== "done") {
+    throw new AppError(404, "HlsSegmentNotReady", "HLS segment 尚未导入完成");
+  }
+
+  if (params.segment.storage_backend === "telegram_single") {
+    return serveSingleHlsSegment(params);
+  }
+
+  if (params.segment.storage_backend === "telegram_multipart") {
+    return serveMultipartHlsSegment(params);
+  }
+
+  throw new AppError(404, "HlsSegmentNotReady", "HLS segment 尚未导入完成");
+}
+
+async function serveSingleHlsSegment(params: {
+  env: Env;
+  db: D1Database;
+  segment: HlsSegmentRecord;
+  rangeHeader: string | null;
+  forceDownload: boolean;
+}): Promise<Response> {
+  if (!params.segment.telegram_file_id || !Number.isSafeInteger(params.segment.size)) {
+    throw new AppError(404, "HlsSegmentNotFound", "HLS segment 文件不存在");
+  }
+
+  const size = Number(params.segment.size);
+  const range = parseByteRange(params.rangeHeader, size);
+  if (!range) {
+    return rangeNotSatisfiableResponse(size);
+  }
+
+  const channel = await resolveTelegramChannel(params.env, params.db, params.segment.telegram_channel_id);
+  const telegramFileUrl = await getRateLimitedTelegramFileUrl({
+    env: params.env,
+    botToken: channel.botToken,
+    channelId: channel.id,
+    fileId: params.segment.telegram_file_id
+  });
+  const telegramResponse = await fetchTelegramFile({
+    fileUrl: telegramFileUrl,
+    rangeHeader: range.partial ? `bytes=${range.start}-${range.end}` : null
+  });
+
+  if (range.partial && telegramResponse.status !== 206 && (range.start !== 0 || range.end !== size - 1)) {
+    throw new AppError(502, "TelegramFileDownloadFailed", "Telegram file server ignored a partial Range request");
+  }
+
+  const headers = hlsSegmentHeaders(params.segment, range, params.forceDownload);
+  copyHeader(telegramResponse.headers, headers, "Content-Range");
+
+  if (!telegramResponse.body) {
+    throw new AppError(502, "TelegramFileDownloadFailed", "Telegram file response did not include a body");
+  }
+
+  return new Response(telegramResponse.body, {
+    status: range.partial ? 206 : 200,
+    statusText: telegramResponse.statusText,
+    headers
+  });
+}
+
+async function serveMultipartHlsSegment(params: {
+  env: Env;
+  db: D1Database;
+  segment: HlsSegmentRecord;
+  rangeHeader: string | null;
+  forceDownload: boolean;
+}): Promise<Response> {
+  if (!params.segment.multipart_upload_id || !Number.isSafeInteger(params.segment.size)) {
+    throw new AppError(404, "HlsSegmentNotFound", "HLS segment 分片文件不存在");
+  }
+
+  const uploadId = params.segment.multipart_upload_id;
+  const chunkSize = requirePositiveRecordInteger(params.segment.chunk_size, "chunk_size");
+  const chunkCount = requirePositiveRecordInteger(params.segment.chunk_count, "chunk_count");
+  const size = Number(params.segment.size);
+  const chunks = await listFileChunkRecords(params.db, uploadId);
+  const payload = {
+    v: 2 as const,
+    file_record_id: uploadId,
+    name: hlsSegmentFileName(new URL(params.segment.source_url), params.segment.segment_index),
+    mime_type: params.segment.mime_type,
+    size,
+    chunk_size: chunkSize,
+    chunk_count: chunkCount,
+    iat: Math.floor(Date.now() / 1000)
+  };
+
+  validateTokenChunks(payload, chunks);
+  const range = parseByteRange(params.rangeHeader, size);
+  if (!range) {
+    return rangeNotSatisfiableResponse(size);
+  }
+
+  return new Response(streamMultipartFile({
+    env: params.env,
+    payload,
+    chunks,
+    range
+  }), {
+    status: range.partial ? 206 : 200,
+    headers: hlsSegmentHeaders(params.segment, range, params.forceDownload)
+  });
+}
+
+function hlsSegmentHeaders(
+  segment: HlsSegmentRecord,
+  range: ParsedByteRange,
+  forceDownload: boolean
+): Headers {
+  const fileName = hlsSegmentFileName(new URL(segment.source_url), segment.segment_index);
+  const headers = withSecurityHeaders();
+  headers.set("Content-Type", segment.mime_type || "video/mp2t");
+  headers.set(
+    "Content-Disposition",
+    forceDownload ? contentDispositionAttachment(fileName) : contentDispositionInline(fileName)
+  );
+  headers.set("Content-Length", String(range.end - range.start + 1));
+  headers.set("Cache-Control", "public, max-age=31536000, immutable");
+  headers.set("Accept-Ranges", "bytes");
+  if (range.partial && Number.isSafeInteger(segment.size)) {
+    headers.set("Content-Range", `bytes ${range.start}-${range.end}/${Number(segment.size)}`);
+  }
+  return headers;
+}
+
+function streamHlsSegmentsForDownload(params: {
+  env: Env;
+  db: D1Database;
+  segments: HlsSegmentRecord[];
+}): ReadableStream<Uint8Array> {
+  let segmentIndex = 0;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        while (true) {
+          if (reader) {
+            const { done, value } = await reader.read();
+            if (done) {
+              reader.releaseLock();
+              reader = undefined;
+              segmentIndex += 1;
+              continue;
+            }
+
+            if (value) {
+              controller.enqueue(value);
+              return;
+            }
+            continue;
+          }
+
+          const segment = params.segments[segmentIndex];
+          if (!segment) {
+            controller.close();
+            return;
+          }
+
+          const response = await serveStoredHlsSegment({
+            env: params.env,
+            db: params.db,
+            segment,
+            rangeHeader: null,
+            forceDownload: false
+          });
+
+          if (!response.body) {
+            throw new AppError(502, "HlsDownloadFailed", "HLS segment response did not include a body");
+          }
+
+          reader = response.body.getReader();
+        }
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      await reader?.cancel(reason);
+      reader = undefined;
+    }
+  });
+}
+
+function leadingDoneHlsSegments(segments: HlsSegmentRecord[], limit: number): HlsSegmentRecord[] {
+  const result: HlsSegmentRecord[] = [];
+  for (const segment of segments) {
+    if (segment.segment_index !== result.length || segment.status !== "done") {
+      break;
+    }
+    result.push(segment);
+    if (result.length >= limit) {
+      break;
+    }
+  }
+  return result;
+}
+
+function isDownloadableTsSegment(segment: HlsSegmentRecord): boolean {
+  const sourcePath = new URL(segment.source_url).pathname.toLowerCase();
+  const mimeType = segment.mime_type.toLowerCase();
+  return sourcePath.endsWith(".ts") || mimeType === "video/mp2t";
+}
+
+function hlsDownloadFileName(fileName: string): string {
+  const normalized = sanitizeFileName(fileName);
+  return normalized.replace(/\.m3u8$/i, "") + ".ts";
 }
 
 async function handleMultipartChunkAccess(params: {
@@ -4388,7 +5728,11 @@ function missingChunkIndexes(upload: MultipartUploadRecord, chunks: FileChunkRec
   return missing;
 }
 
-function fileStorageBackend(file: FileRecord): "telegram_single" | "telegram_multipart" {
+function fileStorageBackend(file: FileRecord): "telegram_single" | "telegram_multipart" | "hls_package" {
+  if (file.storage_backend === "hls_package" || file.telegram_file_id.startsWith("hls:")) {
+    return "hls_package";
+  }
+
   if (file.storage_backend === "telegram_multipart" || file.telegram_file_id.startsWith("multipart:")) {
     return "telegram_multipart";
   }
@@ -4399,7 +5743,7 @@ function fileStorageBackend(file: FileRecord): "telegram_single" | "telegram_mul
 function canDirectlyAccessFileRecord(file: FileRecord): boolean {
   const storageBackend = fileStorageBackend(file);
 
-  if (storageBackend === "telegram_single") {
+  if (storageBackend === "telegram_single" || storageBackend === "hls_package") {
     return true;
   }
 
@@ -4409,7 +5753,7 @@ function canDirectlyAccessFileRecord(file: FileRecord): boolean {
 }
 
 function canDirectlyAccessUploadResult(result: UploadResult): boolean {
-  if (result.storageBackend === "telegram_single") {
+  if (result.storageBackend === "telegram_single" || result.storageBackend === "hls_package") {
     return true;
   }
 
@@ -4425,10 +5769,10 @@ function canDirectlyAccessMultipartPayload(
 }
 
 function downloadStrategy(
-  storageBackend: "telegram_single" | "telegram_multipart",
+  storageBackend: "telegram_single" | "telegram_multipart" | "hls_package",
   directAccess: boolean
 ): "direct" | "direct_or_accelerated" | "accelerated" {
-  if (storageBackend === "telegram_single") {
+  if (storageBackend === "telegram_single" || storageBackend === "hls_package") {
     return "direct";
   }
 
@@ -4980,6 +6324,26 @@ function extractMultipartChunkAccess(pathname: string): { token: string; chunkIn
     token,
     chunkIndex
   };
+}
+
+function extractHlsAccess(pathname: string): { token: string; segmentIndex?: number } {
+  const parts = pathname.split("/").filter(Boolean);
+  const token = parts[0] === "hls" && parts[1] ? decodeURIComponent(parts[1]) : "";
+
+  if (!token) {
+    throw new AppError(404, "NotFound", "HLS route not found");
+  }
+
+  if (parts[2] !== "segments") {
+    return { token };
+  }
+
+  const segmentIndex = Number(parts[3]);
+  if (!Number.isSafeInteger(segmentIndex) || segmentIndex < 0) {
+    throw new AppError(400, "InvalidSegmentIndex", "HLS segment index must be a non-negative integer");
+  }
+
+  return { token, segmentIndex };
 }
 
 function extractOptionalFileToken(pathname: string): string | undefined {
