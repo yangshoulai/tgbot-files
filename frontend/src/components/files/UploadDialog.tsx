@@ -1,5 +1,5 @@
 import { ChangeEvent, FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
-import { Check, CheckCircle2, ClipboardPaste, FilePlus2, ImageOff, ImagePlus, Layers3, Link2, Pencil, Trash2, UploadCloud, X } from "lucide-react";
+import { AlertTriangle, Check, CheckCircle2, ClipboardPaste, FilePlus2, FolderOpen, FolderTree, ImageOff, ImagePlus, Layers3, Link2, Pencil, Trash2, UploadCloud, X } from "lucide-react";
 import {
   ApiError,
   completeMultipartUpload,
@@ -7,12 +7,14 @@ import {
   initMultipartUpload,
   initUrlMultipartUpload,
   listDirectories,
+  preflightUploads,
   uploadMultipartChunk,
   uploadUrlMultipartChunk,
   type DirectoryItem,
   type FileNameConflictAction,
   type MultipartUpload,
-  type ThumbnailUploadPayload
+  type ThumbnailUploadPayload,
+  type UploadPreflightResultEntry
 } from "../../api";
 import { formatBytes, formatCompactBytes } from "../../utils";
 import { Modal } from "../ui/Modal";
@@ -79,11 +81,15 @@ interface FileNameConflictState {
   fileName: string;
   suggestedName: string;
   directoryPath: string;
+  source?: "file" | "batch";
+  message?: string;
 }
 
 interface QueueItem {
   id: string;
   file: File;
+  relativePath?: string;
+  relativeDirectoryPath?: string;
   status: ItemStatus;
   message?: string;
   progress?: ChunkProgress;
@@ -151,11 +157,16 @@ class MultipartChunkUploadError extends Error {
   }
 }
 
-function makeItem(file: File): QueueItem {
+function makeItem(file: File, options: { relativePath?: string } = {}): QueueItem {
   counter += 1;
+  const relativePath = normalizeRelativePath(options.relativePath);
+  const relativeDirectoryPath = relativeDirectoryPathFor(relativePath);
+
   return {
     id: `${Date.now()}-${counter}`,
     file,
+    ...(relativePath ? { relativePath } : {}),
+    ...(relativeDirectoryPath ? { relativeDirectoryPath } : {}),
     status: "pending",
     thumbnail: canAutoGenerateThumbnail(file) ? { status: "idle" } : undefined
   };
@@ -178,16 +189,23 @@ export function UploadDialog({
   const [urlUpload, setUrlUpload] = useState<UrlUploadState>({ status: "pending" });
   const [remark, setRemark] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [checkingConflicts, setCheckingConflicts] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [uploadDirectoryPath, setUploadDirectoryPath] = useState(directoryPath);
   const [directoryOptions, setDirectoryOptions] = useState<DirectoryItem[]>([]);
   const [directoriesLoading, setDirectoriesLoading] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
+  const folderInput = useRef<HTMLInputElement>(null);
   const onErrorRef = useRef(onError);
   const activeUploadRef = useRef<UploadAbortContext | null>(null);
   const [activeUploadKind, setActiveUploadKind] = useState<"local" | "url" | null>(null);
   const [activeUploadItemId, setActiveUploadItemId] = useState<string | null>(null);
   const [stopRequested, setStopRequested] = useState(false);
+
+  useEffect(() => {
+    folderInput.current?.setAttribute("webkitdirectory", "");
+    folderInput.current?.setAttribute("directory", "");
+  }, [mode, open]);
 
   useEffect(() => {
     onErrorRef.current = onError;
@@ -212,6 +230,7 @@ export function UploadDialog({
       setSourceUrl("");
       setRemark("");
       setSubmitting(false);
+      setCheckingConflicts(false);
       setDragOver(false);
       setUploadDirectoryPath(directoryPath);
       return;
@@ -220,7 +239,7 @@ export function UploadDialog({
     setUploadDirectoryPath(directoryPath);
     setItems((current) => {
       current.forEach((item) => revokeThumbnail(item.thumbnail?.generated));
-      return initialFiles.map(makeItem);
+      return initialFiles.map((file) => makeItem(file));
     });
     setSourceUrl("");
     setUrlUpload((current) => {
@@ -260,13 +279,29 @@ export function UploadDialog({
   const addFiles = useCallback((files: File[]) => {
     if (files.length === 0) return;
     setMode("file");
-    setItems((current) => [...current, ...files.map(makeItem)]);
+    setItems((current) => [...current, ...files.map((file) => makeItem(file))]);
+  }, []);
+
+  const addFolderFiles = useCallback((files: File[]) => {
+    if (files.length === 0) return;
+    setMode("file");
+    setItems((current) => [
+      ...current,
+      ...files.map((file) => makeItem(file, { relativePath: browserRelativePath(file) }))
+    ]);
   }, []);
 
   const handlePick = (event: ChangeEvent<HTMLInputElement>) => {
     const list = event.target.files;
     if (!list) return;
     addFiles(Array.from(list));
+    event.target.value = "";
+  };
+
+  const handlePickFolder = (event: ChangeEvent<HTMLInputElement>) => {
+    const list = event.target.files;
+    if (!list) return;
+    addFolderFiles(Array.from(list));
     event.target.value = "";
   };
 
@@ -329,7 +364,13 @@ export function UploadDialog({
     updateUrlThumbnail({ status: "removed", message: "已移除缩略图" });
   };
 
+  const uploadBusy = submitting || checkingConflicts;
   const filePendingCount = items.filter((item) => item.status === "pending" || item.status === "error").length;
+  const folderItemCount = items.filter((item) => item.relativePath).length;
+  const conflictItemCount = items.filter((item) =>
+    (item.status === "pending" || item.status === "error") && Boolean(item.conflict)
+  ).length;
+  const skippedItemCount = items.filter((item) => item.status === "skipped").length;
   const normalizedSourceUrl = sourceUrl.trim();
   const urlPendingCount = normalizedSourceUrl && urlUpload.status !== "uploading" && urlUpload.status !== "done" ? 1 : 0;
   const pendingCount = mode === "url" ? urlPendingCount : filePendingCount;
@@ -349,7 +390,7 @@ export function UploadDialog({
         item.fileNameOverride !== undefined &&
         item.fileNameOverride.trim().length === 0
       );
-  const hasDone = urlUpload.status === "done" || items.some((item) => item.status === "done");
+  const hasDone = urlUpload.status === "done" || items.some((item) => item.status === "done" || item.status === "skipped");
 
   useEffect(() => {
     if (!open) return;
@@ -393,7 +434,7 @@ export function UploadDialog({
   }, [items, open]);
 
   function handleModeChange(nextMode: UploadMode) {
-    if (submitting || mode === nextMode) return;
+    if (uploadBusy || mode === nextMode) return;
     setMode(nextMode);
   }
 
@@ -403,6 +444,27 @@ export function UploadDialog({
       revokeThumbnail(current.thumbnail?.generated);
       return { status: "pending" };
     });
+  }
+
+  function handleUploadDirectoryPathChange(path: string) {
+    setUploadDirectoryPath(path);
+    setItems((current) =>
+      current.map((item) => {
+        if (!item.conflict) return item;
+
+        const usingSuggestedName = item.fileNameOverride === item.conflict.suggestedName;
+        return {
+          ...item,
+          status: "pending",
+          message: undefined,
+          progress: undefined,
+          conflict: undefined,
+          conflictAction: "error",
+          editingFileName: false,
+          fileNameOverride: usingSuggestedName ? undefined : item.fileNameOverride
+        };
+      })
+    );
   }
 
   function updateItemFileName(id: string, value: string) {
@@ -465,6 +527,60 @@ export function UploadDialog({
           editingFileName: false,
           conflict: undefined,
           conflictAction: action
+        };
+      })
+    );
+  }
+
+  function skipItemConflict(id: string) {
+    setItems((current) =>
+      current.map((item) =>
+        item.id === id && item.conflict
+          ? {
+              ...item,
+              status: "skipped",
+              message: "已忽略",
+              progress: undefined,
+              retry: undefined,
+              conflict: undefined,
+              conflictAction: "error",
+              editingFileName: false
+            }
+          : item
+      )
+    );
+  }
+
+  function resolveAllItemConflicts(action: "overwrite" | "skip") {
+    setItems((current) =>
+      current.map((item) => {
+        if (!item.conflict || (item.status !== "pending" && item.status !== "error")) {
+          return item;
+        }
+
+        if (action === "skip") {
+          return {
+            ...item,
+            status: "skipped",
+            message: "已忽略",
+            progress: undefined,
+            retry: undefined,
+            conflict: undefined,
+            conflictAction: "error",
+            editingFileName: false
+          };
+        }
+
+        return {
+          ...item,
+          status: "pending",
+          message: "将覆盖当前目录中的同名文件索引",
+          progress: undefined,
+          retry: undefined,
+          fileNameOverride: item.conflict.fileName,
+          editingFileName: false,
+          conflict: undefined,
+          conflictAction: "overwrite"
         };
       })
     );
@@ -586,9 +702,62 @@ export function UploadDialog({
     return items.find((item) => item.id === id)?.chunks?.length ?? 1;
   }
 
+  async function preflightLocalItems(targets: QueueItem[]): Promise<boolean> {
+    const entries = targets
+      .filter((item) => !item.retry && (item.conflictAction ?? "error") === "error")
+      .map((item) => ({
+        client_id: item.id,
+        directory_path: effectiveDirectoryPath(item, uploadDirectoryPath),
+        file_name: effectiveFileName(item),
+        ...(item.relativePath ? { relative_path: item.relativePath } : {}),
+        size: item.file.size
+      }));
+
+    if (entries.length === 0) {
+      return true;
+    }
+
+    setCheckingConflicts(true);
+    try {
+      const response = await preflightUploads(entries);
+      const conflicts = response.entries.filter((entry) => entry.status === "conflict");
+
+      if (conflicts.length === 0) {
+        return true;
+      }
+
+      const conflictById = new Map(conflicts.map((entry) => [entry.client_id, entry]));
+      setItems((current) =>
+        current.map((item) => {
+          const conflict = conflictById.get(item.id);
+          if (!conflict) return item;
+
+          return {
+            ...item,
+            status: "error",
+            message: undefined,
+            progress: undefined,
+            retry: undefined,
+            conflict: fileNameConflictFromPreflight(conflict),
+            fileNameOverride: conflict.suggested_name ?? suggestAlternativeFileName(conflict.file_name),
+            conflictAction: "error",
+            editingFileName: true
+          };
+        })
+      );
+      onError(`发现 ${conflicts.length} 个同名文件，请选择覆盖、忽略或单项改名`);
+      return false;
+    } catch (error) {
+      onError(`重复检测失败：${errorMessage(error)}`);
+      return false;
+    } finally {
+      setCheckingConflicts(false);
+    }
+  }
+
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
-    if (submitting) return;
+    if (uploadBusy) return;
     if (mode === "url") {
       await submitUrlUpload();
       return;
@@ -600,6 +769,10 @@ export function UploadDialog({
     const targets = items.filter((item) => item.status === "pending" || item.status === "error");
     if (targets.length === 0) {
       onClose();
+      return;
+    }
+
+    if (!(await preflightLocalItems(targets))) {
       return;
     }
 
@@ -707,7 +880,7 @@ export function UploadDialog({
       file_name: fileName,
       mime_type: target.file.type || "application/octet-stream",
       size: target.file.size,
-      directory_path: uploadDirectoryPath,
+      directory_path: effectiveDirectoryPath(target, uploadDirectoryPath),
       ...(conflictAction !== "error" ? { on_conflict: conflictAction } : {}),
       ...(remark.trim() ? { remark: remark.trim() } : {})
     }, task.abortController.signal);
@@ -1386,7 +1559,7 @@ export function UploadDialog({
   }
 
   async function retryItemFailedChunks(id: string) {
-    if (submitting) return;
+    if (uploadBusy) return;
 
     const target = items.find((item) => item.id === id);
     if (!target?.retry || target.retry.kind !== "local") {
@@ -1463,8 +1636,8 @@ export function UploadDialog({
       title="上传文件"
       description={`上传到 ${uploadDirectoryPath}；所有文件统一按 ${formatBytes(multipartChunkBytes)} 分片上传，单文件上限 ${formatBytes(maxMultipartBytes)}，最多 ${MULTIPART_UPLOAD_CONCURRENCY} 分片并发`}
       size="lg"
-      closeOnBackdrop={!submitting}
-      closeOnEscape={!submitting}
+      closeOnBackdrop={!uploadBusy}
+      closeOnEscape={!uploadBusy}
       footer={
         <>
           {activeUploadKind ? (
@@ -1481,18 +1654,20 @@ export function UploadDialog({
                   : "停止上传"}
             </Button>
           ) : null}
-          <Button variant="secondary" disabled={submitting} onClick={onClose}>
+          <Button variant="secondary" disabled={uploadBusy} onClick={onClose}>
             {hasDone ? "关闭" : "取消"}
           </Button>
           <Button
             type="submit"
             form="upload-form"
             variant="primary"
-            loading={submitting}
+            loading={uploadBusy}
             leadingIcon={mode === "url" ? <Link2 size={16} /> : <FilePlus2 size={16} />}
             disabled={pendingCount === 0 || hasInvalidFileName || hasUnresolvedConflict}
           >
-            {submitting
+            {checkingConflicts
+              ? "检测重复项"
+              : submitting
               ? mode === "url" ? "导入中" : "上传中"
               : hasInvalidFileName
                 ? "文件名不能为空"
@@ -1538,8 +1713,8 @@ export function UploadDialog({
             ariaLabel="选择上传目录"
             value={uploadDirectoryPath}
             directories={directoryOptions}
-            disabled={submitting}
-            onChange={setUploadDirectoryPath}
+            disabled={uploadBusy}
+            onChange={handleUploadDirectoryPathChange}
           />
           <p className="text-xs leading-5 text-muted">
             默认使用当前文件列表目录；这里只影响本次上传，不会切换控制台当前目录。
@@ -1550,10 +1725,12 @@ export function UploadDialog({
           <>
             <label
               onDragEnter={(event) => {
+                if (uploadBusy) return;
                 event.preventDefault();
                 setDragOver(true);
               }}
               onDragOver={(event) => {
+                if (uploadBusy) return;
                 event.preventDefault();
                 setDragOver(true);
               }}
@@ -1577,10 +1754,48 @@ export function UploadDialog({
                 ref={fileInput}
                 type="file"
                 multiple
+                disabled={uploadBusy}
                 className="absolute inset-0 cursor-pointer opacity-0"
                 onChange={handlePick}
               />
             </label>
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border bg-background px-3 py-2.5">
+              <div className="min-w-0 text-xs leading-5 text-muted">
+                <span className="font-medium text-foreground">{items.length}</span> 个文件
+                {folderItemCount > 0 ? <span> · {folderItemCount} 个来自文件夹</span> : null}
+                {skippedItemCount > 0 ? <span> · 已忽略 {skippedItemCount} 个</span> : null}
+              </div>
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={uploadBusy}
+                leadingIcon={<FolderOpen size={15} />}
+                onClick={() => folderInput.current?.click()}
+              >
+                选择文件夹
+              </Button>
+              <input
+                ref={folderInput}
+                type="file"
+                multiple
+                disabled={uploadBusy}
+                className="hidden"
+                onChange={handlePickFolder}
+              />
+            </div>
+
+            {conflictItemCount > 0 ? (
+              <ConflictSummary
+                count={conflictItemCount}
+                disabled={uploadBusy}
+                onOverwriteAll={() => resolveAllItemConflicts("overwrite")}
+                onSkipAll={() => resolveAllItemConflicts("skip")}
+              />
+            ) : null}
+
+            {folderItemCount > 0 ? (
+              <FolderUploadTree items={items} baseDirectoryPath={uploadDirectoryPath} />
+            ) : null}
 
             {items.length > 0 ? (
               <div className="flex max-h-[32rem] flex-col gap-2 overflow-auto scroll-thin">
@@ -1588,6 +1803,7 @@ export function UploadDialog({
                   <QueueRow
                     key={item.id}
                     item={item}
+                    targetDirectoryPath={effectiveDirectoryPath(item, uploadDirectoryPath)}
                     onRemove={() => removeItem(item.id)}
                     onRetry={item.retry ? () => void retryItemFailedChunks(item.id) : undefined}
                     onStop={activeUploadKind === "local" && activeUploadItemId === item.id ? stopCurrentUpload : undefined}
@@ -1596,9 +1812,10 @@ export function UploadDialog({
                     onFileNameEditingChange={(editing) => setItemFileNameEditing(item.id, editing)}
                     onRenameConflict={item.conflict ? () => resolveItemConflict(item.id, "error") : undefined}
                     onOverwriteConflict={item.conflict ? () => resolveItemConflict(item.id, "overwrite") : undefined}
+                    onSkipConflict={item.conflict ? () => skipItemConflict(item.id) : undefined}
                     onThumbnailChange={(file) => void handleManualItemThumbnail(item.id, file)}
                     onThumbnailRemove={() => removeItemThumbnail(item.id)}
-                    disabled={submitting}
+                    disabled={uploadBusy}
                   />
                 ))}
               </div>
@@ -1615,7 +1832,7 @@ export function UploadDialog({
                 type="url"
                 placeholder="https://example.com/report.pdf"
                 value={sourceUrl}
-                disabled={submitting}
+                disabled={uploadBusy}
                 invalid={urlUpload.status === "error"}
                 leadingIcon={<ClipboardPaste size={15} />}
                 onChange={(event) => handleSourceUrlChange(event.target.value)}
@@ -1654,7 +1871,7 @@ export function UploadDialog({
                 thumbnail={urlUpload.thumbnail}
                 onThumbnailChange={(file) => void handleManualUrlThumbnail(file)}
                 onThumbnailRemove={removeUrlThumbnail}
-                disabled={submitting}
+                disabled={uploadBusy}
               />
             ) : null}
           </div>
@@ -1669,6 +1886,7 @@ export function UploadDialog({
             placeholder="补充说明，便于后续检索"
             value={remark}
             maxLength={1000}
+            disabled={uploadBusy}
             onChange={(event) => setRemark(event.target.value)}
           />
         </div>
@@ -1750,6 +1968,45 @@ function effectiveFileName(item: QueueItem): string {
   return normalizedFileNameOverride(item.fileNameOverride) ?? item.file.name;
 }
 
+function effectiveDirectoryPath(item: QueueItem, baseDirectoryPath: string): string {
+  return joinDirectoryPath(baseDirectoryPath, item.relativeDirectoryPath);
+}
+
+function browserRelativePath(file: File): string | undefined {
+  const value = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
+  return normalizeRelativePath(value);
+}
+
+function normalizeRelativePath(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+
+  const segments = value
+    .replace(/\\/g, "/")
+    .split("/")
+    .map((segment) => segment.trim())
+    .filter((segment) => segment && segment !== "." && segment !== "..");
+
+  return segments.length > 0 ? segments.join("/") : undefined;
+}
+
+function relativeDirectoryPathFor(relativePath: string | undefined): string | undefined {
+  if (!relativePath) return undefined;
+  const segments = relativePath.split("/").filter(Boolean);
+  if (segments.length <= 1) return undefined;
+  return segments.slice(0, -1).join("/");
+}
+
+function joinDirectoryPath(baseDirectoryPath: string, relativeDirectoryPath: string | undefined): string {
+  const base = baseDirectoryPath === "/" ? "" : baseDirectoryPath.replace(/\/+$/g, "");
+  const relative = relativeDirectoryPath?.replace(/^\/+|\/+$/g, "");
+
+  if (!relative) {
+    return base || "/";
+  }
+
+  return `${base}/${relative}`.replace(/\/+/g, "/") || "/";
+}
+
 function normalizedFileNameOverride(value: string | undefined): string | undefined {
   const normalized = value?.trim();
   return normalized || undefined;
@@ -1773,7 +2030,18 @@ function fileNameConflictFromError(error: unknown): FileNameConflictState | unde
   return {
     fileName,
     suggestedName: stringDetail(error.details, "suggested_name") || suggestAlternativeFileName(fileName),
-    directoryPath: stringDetail(error.details, "directory_path") || "/"
+    directoryPath: stringDetail(error.details, "directory_path") || "/",
+    source: stringDetail(error.details, "source") === "file" ? "file" : undefined
+  };
+}
+
+function fileNameConflictFromPreflight(entry: UploadPreflightResultEntry): FileNameConflictState {
+  return {
+    fileName: entry.file_name,
+    suggestedName: entry.suggested_name || suggestAlternativeFileName(entry.file_name),
+    directoryPath: entry.directory_path,
+    source: entry.source,
+    message: entry.message
   };
 }
 
@@ -1801,6 +2069,105 @@ function retryFailureProgress(retry: MultipartRetryState, label: string): ChunkP
     failed: retry.failedChunks.length,
     label: `${label}（失败 ${retry.failedChunks.length} 个）`
   };
+}
+
+function buildFolderTree(items: QueueItem[]): FolderTreeNode {
+  const root: FolderTreeNode = {
+    name: "root",
+    path: "/",
+    kind: "directory",
+    children: new Map()
+  };
+
+  for (const item of items) {
+    const relativePath = item.relativePath;
+    if (!relativePath) continue;
+
+    const segments = relativePath.split("/").filter(Boolean);
+    let current = root;
+    let currentPath = "";
+
+    segments.forEach((segment, index) => {
+      const isFile = index === segments.length - 1;
+      currentPath = `${currentPath}/${segment}`;
+      const key = `${isFile ? "file" : "dir"}:${segment}`;
+      let child = current.children.get(key);
+
+      if (!child) {
+        child = {
+          name: isFile ? effectiveFileName(item) : segment,
+          path: currentPath,
+          kind: isFile ? "file" : "directory",
+          children: new Map()
+        };
+        current.children.set(key, child);
+      }
+
+      if (isFile) {
+        child.name = effectiveFileName(item);
+        child.status = item.status;
+      }
+
+      current = child;
+    });
+  }
+
+  sortFolderTree(root);
+  return root;
+}
+
+function sortFolderTree(node: FolderTreeNode): void {
+  const sorted = Array.from(node.children.entries()).sort(([, left], [, right]) => {
+    if (left.kind !== right.kind) {
+      return left.kind === "directory" ? -1 : 1;
+    }
+    return left.name.localeCompare(right.name, undefined, { sensitivity: "base" });
+  });
+
+  node.children = new Map(sorted);
+  for (const child of node.children.values()) {
+    sortFolderTree(child);
+  }
+}
+
+function countFolderTreeDirectories(node: FolderTreeNode): number {
+  let count = node.kind === "directory" && node.path !== "/" ? 1 : 0;
+  for (const child of node.children.values()) {
+    count += countFolderTreeDirectories(child);
+  }
+  return count;
+}
+
+function folderNodeStatusClass(status: ItemStatus | undefined, isFile: boolean): string {
+  if (!isFile) return "bg-primary";
+
+  switch (status) {
+    case "done":
+      return "bg-success";
+    case "error":
+      return "bg-warning";
+    case "skipped":
+      return "bg-subtle";
+    case "uploading":
+      return "bg-primary";
+    default:
+      return "bg-border-strong";
+  }
+}
+
+function folderNodeStatusLabel(status: ItemStatus): string {
+  switch (status) {
+    case "done":
+      return "完成";
+    case "error":
+      return "待处理";
+    case "skipped":
+      return "忽略";
+    case "uploading":
+      return "上传中";
+    default:
+      return "待上传";
+  }
 }
 
 function createUploadChunkStates(size: number, chunkSize: number, chunkCount: number): UploadChunkState[] {
@@ -1844,8 +2211,122 @@ function expectedUploadChunkSize(size: number, chunkSize: number, chunkCount: nu
   return chunkIndex === chunkCount - 1 ? size - chunkSize * chunkIndex : chunkSize;
 }
 
+function ConflictSummary({
+  count,
+  disabled,
+  onOverwriteAll,
+  onSkipAll
+}: {
+  count: number;
+  disabled: boolean;
+  onOverwriteAll: () => void;
+  onSkipAll: () => void;
+}) {
+  return (
+    <div className="flex flex-col gap-2 rounded-xl border border-warning/35 bg-warning-soft/45 px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex min-w-0 items-start gap-2 text-sm text-warning">
+        <AlertTriangle size={16} className="mt-0.5 shrink-0" />
+        <div className="min-w-0">
+          <p className="font-medium">发现 {count} 个同名文件</p>
+          <p className="text-xs leading-5 text-warning/85">可以批量处理，也可以在下方逐项选择。</p>
+        </div>
+      </div>
+      <div className="flex shrink-0 flex-wrap gap-2">
+        <Button
+          variant="secondary"
+          size="sm"
+          disabled={disabled}
+          onClick={onOverwriteAll}
+        >
+          全部覆盖
+        </Button>
+        <Button
+          variant="secondary"
+          size="sm"
+          disabled={disabled}
+          onClick={onSkipAll}
+        >
+          全部忽略
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+interface FolderTreeNode {
+  name: string;
+  path: string;
+  kind: "directory" | "file";
+  status?: ItemStatus;
+  children: Map<string, FolderTreeNode>;
+}
+
+function FolderUploadTree({ items, baseDirectoryPath }: { items: QueueItem[]; baseDirectoryPath: string }) {
+  const folderItems = items.filter((item) => item.relativePath);
+  if (folderItems.length === 0) {
+    return null;
+  }
+
+  const root = buildFolderTree(folderItems);
+  const nodes = Array.from(root.children.values());
+  const directoryCount = countFolderTreeDirectories(root);
+
+  return (
+    <div className="rounded-xl border border-border bg-background p-3">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-primary-soft text-primary-strong">
+            <FolderTree size={16} />
+          </span>
+          <div className="min-w-0">
+            <p className="text-sm font-medium text-foreground">文件夹目录树</p>
+            <p className="truncate text-xs text-muted" title={baseDirectoryPath}>
+              上传到 {baseDirectoryPath}
+            </p>
+          </div>
+        </div>
+        <span className="shrink-0 text-xs text-muted">
+          {folderItems.length} 文件 · {directoryCount} 目录
+        </span>
+      </div>
+      <div className="max-h-56 overflow-auto rounded-lg border border-border bg-surface/70 p-2 scroll-thin">
+        {nodes.map((node) => (
+          <FolderTreeNodeRow key={node.path} node={node} depth={0} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function FolderTreeNodeRow({ node, depth }: { node: FolderTreeNode; depth: number }) {
+  const children = Array.from(node.children.values());
+  const isFile = node.kind === "file";
+
+  return (
+    <div>
+      <div
+        className={cn(
+          "flex min-w-0 items-center gap-2 rounded-md px-2 py-1 text-xs",
+          isFile ? "text-muted" : "font-medium text-foreground"
+        )}
+        style={{ paddingLeft: `${8 + depth * 16}px` }}
+      >
+        <span className={cn("size-1.5 shrink-0 rounded-full", folderNodeStatusClass(node.status, isFile))} />
+        <span className="min-w-0 flex-1 truncate" title={node.path}>{node.name}</span>
+        {isFile && node.status ? (
+          <span className="shrink-0 text-[11px] text-subtle">{folderNodeStatusLabel(node.status)}</span>
+        ) : null}
+      </div>
+      {children.map((child) => (
+        <FolderTreeNodeRow key={child.path} node={child} depth={depth + 1} />
+      ))}
+    </div>
+  );
+}
+
 interface QueueRowProps {
   item: QueueItem;
+  targetDirectoryPath: string;
   onRemove: () => void;
   onRetry?: () => void;
   onStop?: () => void;
@@ -1854,6 +2335,7 @@ interface QueueRowProps {
   onFileNameEditingChange: (editing: boolean) => void;
   onRenameConflict?: () => void;
   onOverwriteConflict?: () => void;
+  onSkipConflict?: () => void;
   onThumbnailChange: (file: File) => void;
   onThumbnailRemove: () => void;
   disabled: boolean;
@@ -1861,6 +2343,7 @@ interface QueueRowProps {
 
 function QueueRow({
   item,
+  targetDirectoryPath,
   onRemove,
   onRetry,
   onStop,
@@ -1869,6 +2352,7 @@ function QueueRow({
   onFileNameEditingChange,
   onRenameConflict,
   onOverwriteConflict,
+  onSkipConflict,
   onThumbnailChange,
   onThumbnailRemove,
   disabled
@@ -1888,21 +2372,27 @@ function QueueRow({
             originalValue={item.file.name}
             editing={Boolean(item.editingFileName)}
             conflict={item.conflict}
-            disabled={disabled || status === "uploading" || status === "done"}
+            disabled={disabled || status === "uploading" || status === "done" || status === "skipped"}
             onChange={onFileNameChange}
             onEditingChange={onFileNameEditingChange}
           />
           <p className="truncate text-xs text-muted">
-            {formatBytes(item.file.size)} · 分片上传
+            {formatBytes(item.file.size)} · 上传到 {targetDirectoryPath} · 分片上传
             {thumbnailHint(item.thumbnail) ? <span> · {thumbnailHint(item.thumbnail)}</span> : null}
-            {item.message ? <span className="text-danger"> · {item.message}</span> : null}
+            {item.message ? <span className={status === "error" ? "text-danger" : "text-muted"}> · {item.message}</span> : null}
           </p>
+          {item.relativePath ? (
+            <p className="truncate text-[11px] text-subtle" title={item.relativePath}>
+              本地路径：{item.relativePath}
+            </p>
+          ) : null}
           {item.progress ? <ProgressBar progress={item.progress} /> : null}
           <ConflictResolutionActions
             conflict={item.conflict}
             disabled={disabled}
             onRename={onRenameConflict}
             onOverwrite={onOverwriteConflict}
+            onSkip={onSkipConflict}
           />
         </div>
         <ThumbnailPicker
@@ -2073,26 +2563,31 @@ function ConflictResolutionActions({
   conflict,
   disabled,
   onRename,
-  onOverwrite
+  onOverwrite,
+  onSkip
 }: {
   conflict?: FileNameConflictState;
   disabled: boolean;
   onRename?: () => void;
   onOverwrite?: () => void;
+  onSkip?: () => void;
 }) {
   if (!conflict) {
     return null;
   }
 
+  const title = conflict.source === "batch" ? "本次队列已有相同目标路径" : "目标目录已存在同名文件";
+
   return (
     <div className="mt-2 flex min-w-0 flex-col gap-2 rounded-lg border border-warning/35 bg-warning-soft/50 px-2.5 py-2 text-xs leading-5 text-warning">
       <div className="min-w-0 space-y-0.5">
-        <p className="font-medium">当前目录已存在同名文件</p>
+        <p className="font-medium">{title}</p>
         <p className="break-all text-warning/90">
           <span className="font-semibold">{conflict.directoryPath}</span>
           {conflict.directoryPath.endsWith("/") ? "" : "/"}
           <span className="font-semibold">{conflict.fileName}</span>
         </p>
+        {conflict.message ? <p className="text-warning/80">{conflict.message}</p> : null}
       </div>
       <span className="flex min-w-0 flex-wrap gap-1.5">
         <button
@@ -2115,6 +2610,17 @@ function ConflictResolutionActions({
         >
           覆盖原文件
         </button>
+        {onSkip ? (
+          <button
+            type="button"
+            onClick={onSkip}
+            onPointerDown={(event) => event.preventDefault()}
+            disabled={disabled}
+            className="rounded-md border border-border bg-surface px-2.5 py-1 font-medium text-muted transition-colors hover:bg-background hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
+          >
+            忽略此文件
+          </button>
+        ) : null}
       </span>
     </div>
   );

@@ -3073,6 +3073,98 @@ describe("admin file manager", () => {
     expect(db.multipartUploads[0]?.directory_path).toBe("/incoming/big");
   });
 
+  it("preflights folder uploads and reports existing and queued file name conflicts", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    db.files.push(fileRecord({
+      id: "existing-trip-photo",
+      file_name: "a.jpg",
+      directory_path: "/photos/trip"
+    }));
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/uploads/preflight", {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          entries: [
+            {
+              client_id: "local-a",
+              directory_path: "/photos/trip",
+              file_name: "a.jpg",
+              relative_path: "trip/a.jpg",
+              size: 10
+            },
+            {
+              client_id: "local-b",
+              directory_path: "/photos/trip",
+              file_name: "b.jpg",
+              relative_path: "trip/b.jpg",
+              size: 11
+            },
+            {
+              client_id: "local-b-duplicate",
+              directory_path: "/photos/trip",
+              file_name: "b.jpg",
+              relative_path: "trip/copy/b.jpg",
+              size: 12
+            }
+          ]
+        })
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      summary: { total: number; ready: number; conflicts: number };
+      entries: Array<{
+        client_id: string;
+        status: string;
+        source?: string;
+        suggested_name?: string;
+        directory_path: string;
+        file_name: string;
+      }>;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.summary).toEqual({ total: 3, ready: 1, conflicts: 2 });
+    expect(body.entries).toEqual([
+      expect.objectContaining({
+        client_id: "local-a",
+        status: "conflict",
+        source: "file",
+        suggested_name: "a (1).jpg",
+        directory_path: "/photos/trip",
+        file_name: "a.jpg"
+      }),
+      expect.objectContaining({
+        client_id: "local-b",
+        status: "ready",
+        directory_path: "/photos/trip",
+        file_name: "b.jpg"
+      }),
+      expect.objectContaining({
+        client_id: "local-b-duplicate",
+        status: "conflict",
+        source: "batch",
+        suggested_name: "b (1).jpg",
+        directory_path: "/photos/trip",
+        file_name: "b.jpg"
+      })
+    ]);
+    expect(db.directories).toHaveLength(0);
+    expect(db.multipartUploads).toHaveLength(0);
+  });
+
   it("rejects multipart upload sessions that reuse an active file name", async () => {
     const db = new FakeD1();
     const adminEnv: Env = {

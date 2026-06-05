@@ -236,6 +236,31 @@ export interface MultipartUploadStatusResponse {
   missing_chunks: number[];
 }
 
+export interface UploadPreflightRequestEntry {
+  client_id: string;
+  directory_path: string;
+  file_name: string;
+  relative_path?: string;
+  size?: number;
+}
+
+export interface UploadPreflightResultEntry extends UploadPreflightRequestEntry {
+  status: "ready" | "conflict";
+  source?: "file" | "batch";
+  suggested_name?: string;
+  message?: string;
+}
+
+export interface UploadPreflightResponse {
+  ok: boolean;
+  entries: UploadPreflightResultEntry[];
+  summary: {
+    total: number;
+    ready: number;
+    conflicts: number;
+  };
+}
+
 export interface TelegramChannelItem {
   id: string;
   name: string;
@@ -509,6 +534,17 @@ export function getMultipartUploadStatus(uploadId: string, signal?: AbortSignal)
     `/api/admin/uploads/${encodeURIComponent(uploadId)}/status`,
     { signal }
   );
+}
+
+export function preflightUploads(entries: UploadPreflightRequestEntry[], signal?: AbortSignal) {
+  return requestJson<UploadPreflightResponse>("/api/admin/uploads/preflight", {
+    method: "POST",
+    signal,
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ entries })
+  });
 }
 
 export interface ThumbnailUploadPayload {

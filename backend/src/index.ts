@@ -1141,6 +1141,23 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
   const db = requireDb(env);
   const url = new URL(request.url);
 
+  if (request.method === "POST" && url.pathname === "/api/admin/uploads/preflight") {
+    const body = await readJsonObject(request);
+    const entries = normalizeUploadPreflightEntries(body.entries);
+    const checked = await preflightUploadEntries(db, entries);
+    const conflictCount = checked.filter((entry) => entry.status === "conflict").length;
+
+    return jsonResponse({
+      ok: true,
+      entries: checked,
+      summary: {
+        total: checked.length,
+        ready: checked.length - conflictCount,
+        conflicts: conflictCount
+      }
+    });
+  }
+
   if (request.method === "POST" && url.pathname === "/api/admin/uploads/init") {
     const body = await readJsonObject(request);
     const fileName = sanitizeFileName(stringField(body.file_name, "file_name"));
@@ -2990,6 +3007,106 @@ async function requireFileNameWritable(params: {
   await requireFileNameAvailable(params);
 }
 
+interface UploadPreflightEntry {
+  client_id: string;
+  directory_path: string;
+  file_name: string;
+  relative_path?: string;
+  size?: number;
+}
+
+type UploadPreflightConflictSource = "file" | "batch";
+
+type UploadPreflightResultEntry = UploadPreflightEntry & {
+  status: "ready" | "conflict";
+  source?: UploadPreflightConflictSource;
+  suggested_name?: string;
+  message?: string;
+};
+
+function normalizeUploadPreflightEntries(value: unknown): UploadPreflightEntry[] {
+  if (!Array.isArray(value)) {
+    throw new AppError(400, "InvalidBody", "entries must be an array");
+  }
+
+  if (value.length === 0) {
+    throw new AppError(400, "InvalidBody", "entries must not be empty");
+  }
+
+  if (value.length > 1000) {
+    throw new AppError(400, "InvalidBody", "entries must contain at most 1000 files");
+  }
+
+  return value.map((item, index) => {
+    if (!isPlainRecord(item)) {
+      throw new AppError(400, "InvalidBody", `entries[${index}] must be an object`);
+    }
+
+    const clientId = stringField(item.client_id, `entries[${index}].client_id`);
+    const fileName = sanitizeFileName(stringField(item.file_name, `entries[${index}].file_name`));
+    const directoryPath = normalizeDirectoryPath(item.directory_path ?? "/");
+    const relativePath = optionalTrimmedString(item.relative_path, 512);
+    const size = optionalNonNegativeInteger(item.size, `entries[${index}].size`);
+
+    return {
+      client_id: clientId,
+      directory_path: directoryPath,
+      file_name: fileName,
+      ...(relativePath ? { relative_path: relativePath } : {}),
+      ...(size !== undefined ? { size } : {})
+    };
+  });
+}
+
+async function preflightUploadEntries(
+  db: D1Database,
+  entries: UploadPreflightEntry[]
+): Promise<UploadPreflightResultEntry[]> {
+  const seenTargets = new Map<string, string>();
+  const results: UploadPreflightResultEntry[] = [];
+
+  for (const entry of entries) {
+    const targetKey = `${entry.directory_path}\u0000${entry.file_name}`;
+    const firstClientId = seenTargets.get(targetKey);
+
+    if (firstClientId) {
+      results.push({
+        ...entry,
+        status: "conflict",
+        source: "batch",
+        suggested_name: suggestAlternativeFileName(entry.file_name),
+        message: "本次上传队列中已有相同目标路径的文件"
+      });
+      continue;
+    }
+
+    seenTargets.set(targetKey, entry.client_id);
+    const conflict = await findActiveFileNameConflict({
+      db,
+      directoryPath: entry.directory_path,
+      fileName: entry.file_name
+    });
+
+    if (conflict) {
+      results.push({
+        ...entry,
+        status: "conflict",
+        source: conflict.source,
+        suggested_name: suggestAlternativeFileName(entry.file_name),
+        message: "目标目录已存在同名文件"
+      });
+      continue;
+    }
+
+    results.push({
+      ...entry,
+      status: "ready"
+    });
+  }
+
+  return results;
+}
+
 async function requireFileMoveNamesAvailable(params: {
   db: D1Database;
   files: FileRecord[];
@@ -4362,6 +4479,29 @@ function positiveIntegerField(value: unknown, fieldName: string): number {
   }
 
   return parsed;
+}
+
+function optionalNonNegativeInteger(value: unknown, fieldName: string): number | undefined {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+
+  const parsed = typeof value === "number" ? value : Number(value);
+
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new AppError(400, "InvalidBody", `${fieldName} must be a non-negative integer`);
+  }
+
+  return parsed;
+}
+
+function optionalTrimmedString(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const normalized = value.trim();
+  return normalized ? normalized.slice(0, maxLength) : undefined;
 }
 
 function normalizeMimeTypeField(value: unknown): string {
