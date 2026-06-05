@@ -159,17 +159,26 @@ export function MediaControls({
       className={cn(
         "text-white",
         floating
-          ? "rounded-[1.35rem] border border-white/15 bg-black/35 shadow-[0_18px_54px_rgba(0,0,0,0.35)] backdrop-blur-xl supports-[backdrop-filter]:bg-black/30"
-          : "rounded-2xl border border-white/10 bg-black/70 shadow-dialog backdrop-blur-md",
-        dense ? "p-2.5" : "p-3",
-        tiny && "p-2",
+          ? "w-full drop-shadow-[0_2px_12px_rgba(0,0,0,0.65)]"
+          : "rounded-2xl border border-white/10 bg-black/70 p-3 shadow-dialog backdrop-blur-md",
+        !floating && dense ? "p-2.5" : null,
+        !floating && tiny ? "p-2" : null,
         className
       )}
       aria-hidden={interactive ? undefined : true}
     >
-      <div className={cn("relative rounded-full bg-white/15", dense ? "mb-2 h-2.5" : "mb-3 h-3", tiny && "mb-1.5 h-2")}>
-        <div className="absolute inset-y-0 left-0 rounded-full bg-white/20" style={{ width: `${bufferedPercent}%` }} />
-        <div className="absolute inset-y-0 left-0 rounded-full bg-primary" style={{ width: `${progressPercent}%` }} />
+      <div
+        className={cn(
+          "relative rounded-full",
+          floating ? "mb-2 h-1.5 bg-white/30 sm:h-2" : dense ? "mb-2 h-2.5 bg-white/15" : "mb-3 h-3 bg-white/15",
+          tiny && "mb-1.5 h-1.5"
+        )}
+      >
+        <div className="absolute inset-y-0 left-0 rounded-full bg-white/35" style={{ width: `${bufferedPercent}%` }} />
+        <div
+          className={cn("absolute inset-y-0 left-0 rounded-full", floating ? "bg-[#ff0033]" : "bg-primary")}
+          style={{ width: `${progressPercent}%` }}
+        />
         <input
           type="range"
           min={0}
@@ -179,12 +188,12 @@ export function MediaControls({
           onChange={(event) => seekTo(event.target.value)}
           aria-label="播放进度"
           tabIndex={controlTabIndex}
-          className="absolute inset-0 h-3 w-full cursor-pointer opacity-0"
+          className={cn("absolute inset-x-0 -inset-y-2 h-5 w-full cursor-pointer opacity-0", floating && "sm:-inset-y-2.5 sm:h-6")}
         />
       </div>
 
-      <div className={cn("flex min-w-0 flex-nowrap items-center", floating ? "gap-1.5" : "gap-2", tiny && "gap-1")}>
-        <div className="flex shrink-0 items-center gap-1">
+      <div className={cn("flex min-w-0 flex-nowrap items-center", floating ? "gap-1.5 sm:gap-2" : "gap-2", tiny && "gap-1")}>
+        <div className="flex shrink-0 items-center gap-1 sm:gap-1.5">
           <MediaButton
             label={state.playing ? "暂停" : "播放"}
             onClick={() => void togglePlay()}
@@ -208,7 +217,7 @@ export function MediaControls({
                 dense={dense}
                 floating={floating}
                 tabIndex={controlTabIndex}
-                className="max-[420px]:hidden"
+                className="max-[520px]:hidden"
               >
                 <Rewind size={15} />
               </MediaButton>
@@ -218,7 +227,7 @@ export function MediaControls({
                 dense={dense}
                 floating={floating}
                 tabIndex={controlTabIndex}
-                className="max-[420px]:hidden"
+                className="max-[520px]:hidden"
               >
                 <FastForward size={15} />
               </MediaButton>
@@ -230,30 +239,35 @@ export function MediaControls({
           className={cn(
             "shrink-0 text-center font-mono text-xs text-white/75",
             dense ? "min-w-[5.75rem]" : "min-w-[6.75rem]",
-            floating && "min-w-[5.25rem]",
+            floating && "min-w-[5.1rem] text-white/90 sm:min-w-[6.5rem]",
             tiny && "min-w-[3.5rem] text-[11px]"
           )}
         >
-          {tiny ? formatMediaTime(currentTime) : `${formatMediaTime(currentTime)} / ${duration ? formatMediaTime(duration) : "--:--"}`}
+          {tiny
+            ? formatMediaTime(currentTime)
+            : floating
+              ? `${formatMediaTime(currentTime)}${duration ? ` / ${formatMediaTime(duration)}` : ""}`
+              : `${formatMediaTime(currentTime)} / ${duration ? formatMediaTime(duration) : "--:--"}`}
         </div>
 
-        <div className={cn("ml-auto flex min-w-0 shrink-0 items-center", floating ? "gap-1" : "gap-1.5")}>
+        <div className={cn("ml-auto flex min-w-0 shrink-0 items-center", floating ? "gap-1 sm:gap-1.5" : "gap-1.5")}>
           <MediaButton label={state.muted ? "取消静音" : "静音"} onClick={toggleMute} dense={dense} floating={floating} tabIndex={controlTabIndex}>
             {state.muted || state.volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
           </MediaButton>
-          {!floating ? (
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step="0.01"
-              value={state.muted ? 0 : state.volume}
-              onChange={(event) => setVolume(event.target.value)}
-              aria-label="音量"
-              tabIndex={controlTabIndex}
-              className={cn("h-1.5 cursor-pointer accent-primary", dense ? "hidden w-14 lg:block" : "hidden w-20 md:block")}
-            />
-          ) : null}
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step="0.01"
+            value={state.muted ? 0 : state.volume}
+            onChange={(event) => setVolume(event.target.value)}
+            aria-label="音量"
+            tabIndex={controlTabIndex}
+            className={cn(
+              "h-1.5 cursor-pointer",
+              floating ? "hidden w-16 accent-[#ff0033] min-[560px]:block" : dense ? "hidden w-14 accent-primary lg:block" : "hidden w-20 accent-primary md:block"
+            )}
+          />
           {!tiny ? (
             <label className="inline-flex shrink-0 items-center gap-1 text-xs text-white/70">
               <span className={dense ? "sr-only" : "hidden xl:inline"}>倍速</span>
@@ -263,7 +277,7 @@ export function MediaControls({
                 tabIndex={controlTabIndex}
                 className={cn(
                   "border border-white/10 bg-white/10 text-xs text-white outline-none transition-colors hover:bg-white/15 focus-visible:focus-ring",
-                  floating ? "h-8 w-[3.25rem] rounded-full px-1.5" : "rounded-md",
+                  floating ? "h-8 w-[3.1rem] rounded-md px-1 sm:w-[3.35rem] sm:rounded-full sm:px-1.5" : "rounded-md",
                   dense && !floating ? "h-8 w-14 px-1.5" : null,
                   !dense ? "h-9 w-16 px-2" : null
                 )}
@@ -304,15 +318,15 @@ function MediaButton({ label, onClick, children, emphasis = false, dense = false
       onClick={onClick}
       tabIndex={tabIndex}
       className={cn(
-        "inline-flex shrink-0 items-center justify-center gap-1.5 rounded-lg border text-xs font-medium transition-colors focus-visible:outline-none focus-visible:focus-ring",
-        dense ? "size-8 px-0" : "h-9 px-2.5",
-        floating && "rounded-full border-white/15 bg-white/15 text-white/90 shadow-[inset_0_1px_0_rgba(255,255,255,0.16)] hover:bg-white/25 hover:text-white",
+        "inline-flex shrink-0 items-center justify-center gap-1.5 border text-xs font-medium transition-colors focus-visible:outline-none focus-visible:focus-ring",
+        dense ? "size-8 px-0" : "h-9 rounded-lg px-2.5",
+        floating && "size-8 rounded-full border-transparent bg-transparent text-white/92 hover:bg-white/15 hover:text-white active:bg-white/20 sm:size-9",
         emphasis && !floating
           ? "border-primary bg-primary text-white hover:bg-primary-strong"
           : !floating
             ? "border-white/10 bg-white/10 text-white/85 hover:bg-white/15 hover:text-white"
             : null,
-        emphasis && floating && "border-primary/70 bg-primary/90 text-white hover:bg-primary",
+        emphasis && floating && "text-white",
         className
       )}
     >

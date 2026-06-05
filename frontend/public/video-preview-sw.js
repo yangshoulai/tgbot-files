@@ -5,8 +5,8 @@ const DB_VERSION = 1;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024;
 const TARGET_CACHE_BYTES = Math.floor(1.8 * 1024 * 1024 * 1024);
 const RESPONSE_WINDOW_BYTES = 2 * 1024 * 1024;
-const PREFETCH_CHUNKS = 3;
-const CONTINUOUS_PREFETCH_RATIOS = [0, 0.25, 0.5, 0.75];
+const PREFETCH_CHUNKS = 1;
+const CONTINUOUS_PREFETCH_RATIOS = [0];
 const CONTINUOUS_PREFETCH_SESSION_TTL_MS = 12_000;
 const HOT_CHUNK_CACHE_MAX_BYTES = 160 * 1024 * 1024;
 const fullChunkLoads = new Map();
@@ -70,7 +70,7 @@ async function handleVideoPreviewRequest(request, event) {
     return new Response("Invalid video preview metadata", { status: 400 });
   }
 
-  const range = parseRange(request.headers.get("Range"), metadata.size);
+  const range = parseRange(request.headers.get("Range"), metadata.size, metadata.chunkSize);
   if (!range) {
     return rangeNotSatisfiable(metadata.size);
   }
@@ -183,11 +183,13 @@ function previewMetadataKey(metadata) {
   ].join(":");
 }
 
-function parseRange(rangeHeader, size) {
+function parseRange(rangeHeader, size, chunkSize = RESPONSE_WINDOW_BYTES) {
+  const responseWindow = Math.min(RESPONSE_WINDOW_BYTES, Math.max(1, chunkSize));
+
   if (!rangeHeader) {
     return {
       start: 0,
-      end: Math.min(size - 1, RESPONSE_WINDOW_BYTES - 1)
+      end: Math.min(size - 1, responseWindow - 1)
     };
   }
 
@@ -204,7 +206,7 @@ function parseRange(rangeHeader, size) {
     if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) {
       return null;
     }
-    start = Math.max(0, size - Math.min(suffixLength, RESPONSE_WINDOW_BYTES));
+    start = Math.max(0, size - Math.min(suffixLength, responseWindow));
     end = size - 1;
   } else {
     start = Number(match[1]);
@@ -215,7 +217,7 @@ function parseRange(rangeHeader, size) {
     }
   }
 
-  const maxEnd = Math.min(size - 1, start + RESPONSE_WINDOW_BYTES - 1);
+  const maxEnd = Math.min(size - 1, start + responseWindow - 1);
   return {
     start,
     end: Math.min(end, maxEnd)

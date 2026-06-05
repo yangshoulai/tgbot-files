@@ -35,13 +35,13 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
   const controlsHideTimerRef = useRef<number | null>(null);
   const loadingTimerRef = useRef<number | null>(null);
   const previewCacheSessionIdRef = useRef(`video-preview-${file.id}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-  const [ratio, setRatio] = useState({ label: "16:9", value: 16 / 9 });
+  const [ratio, setRatio] = useState(() => initialAspectRatio(file));
   const [controlsVisible, setControlsVisible] = useState(true);
   const [controlsDensity, setControlsDensity] = useState<MediaControlsDensity>("regular");
   const [serviceWorkerState, setServiceWorkerState] = useState<VideoPreviewServiceWorkerState>(initialVideoPreviewServiceWorkerState);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
-  const heightLimit = fullscreen ? "calc(100dvh - 11rem)" : "min(66dvh, 760px)";
+  const heightLimit = fullscreen ? "calc(100dvh - 9rem)" : "min(68dvh, 760px)";
   const directFile = hasDirectFileAccess(file) ? file : null;
   const directAccessAvailable = Boolean(directFile);
   const canUseMultipartPreview = canUseAcceleratedDownload(file);
@@ -55,6 +55,10 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
   const chunkedPreviewUrl = chunkedPreviewMetadata ? buildChunkedVideoPreviewUrl(file, chunkedPreviewMetadata) : null;
   const videoSrc = chunkedPreviewUrl ?? (directFile ? file.file_path : null);
   const poster = file.thumbnail_url || undefined;
+
+  useEffect(() => {
+    setRatio(initialAspectRatio(file));
+  }, [file.id, file.thumbnail_height, file.thumbnail_width]);
 
   const refreshServiceWorker = useCallback(async () => {
     if (isVideoPreviewServiceWorkerControlling()) {
@@ -250,10 +254,10 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
   }
 
   return (
-    <div className={cn("flex w-full items-center justify-center bg-[#07110f] p-3 sm:p-4", fullscreen ? "h-full min-h-0" : "h-[min(66dvh,760px)]") }>
+    <div className={cn("flex w-full items-center justify-center bg-[#07110f] p-0 sm:p-4", fullscreen ? "h-full min-h-0" : "h-[min(68dvh,760px)] min-h-56") }>
       <div
         ref={frameRef}
-        className="relative max-h-full max-w-full overflow-hidden rounded-[1.5rem] bg-black shadow-dialog ring-1 ring-white/10"
+        className="relative max-h-full max-w-full overflow-hidden bg-black shadow-dialog ring-1 ring-white/10 sm:rounded-[1.25rem]"
         style={{
           aspectRatio: ratio.label.replace(":", " / "),
           width: `min(100%, calc(${heightLimit} * ${ratio.value}))`
@@ -286,7 +290,7 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
           src={videoSrc}
           poster={poster}
           playsInline
-          preload="metadata"
+          preload="auto"
           className="h-full w-full bg-black object-contain"
           onLoadStart={() => showLoading(true)}
           onWaiting={() => showLoading()}
@@ -341,7 +345,7 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
 
         <div
           className={cn(
-            "absolute bottom-2 left-1/2 z-20 w-[calc(100%-0.75rem)] max-w-[44rem] -translate-x-1/2 transition-all duration-200 ease-out sm:bottom-3 sm:w-[calc(100%-1.5rem)]",
+            "absolute inset-x-0 bottom-0 z-20 bg-gradient-to-t from-black/90 via-black/45 to-transparent px-2 pb-2 pt-14 transition-all duration-200 ease-out sm:px-4 sm:pb-4 sm:pt-20",
             controlsVisible ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-3 opacity-0"
           )}
         >
@@ -395,6 +399,16 @@ function toAspectRatio(width: number, height: number): { label: string; value: n
   const normalizedWidth = Math.max(1, Math.round(width / gcd));
   const normalizedHeight = Math.max(1, Math.round(height / gcd));
   return { label: `${normalizedWidth}:${normalizedHeight}`, value: width / height };
+}
+
+function initialAspectRatio(file: FileItem): { label: string; value: number } {
+  const width = Number(file.thumbnail_width);
+  const height = Number(file.thumbnail_height);
+  if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
+    return toAspectRatio(width, height);
+  }
+
+  return { label: "16:9", value: 16 / 9 };
 }
 
 function controlsDensityForFrame(width: number, aspectRatio: number): MediaControlsDensity {

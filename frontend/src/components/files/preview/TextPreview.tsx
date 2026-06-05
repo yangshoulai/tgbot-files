@@ -27,7 +27,7 @@ export function TextPreview({ file, state, fullscreen }: {
 
   return (
     <div className={cn("flex w-full flex-col overflow-hidden bg-white text-[#334155]", fullscreen ? "h-full" : "h-[64vh]") }>
-      <div className="flex shrink-0 items-center justify-between gap-3 border-b border-border bg-background/90 px-4 py-2 text-xs text-muted">
+      <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-border bg-background/90 px-3 py-2 text-xs text-muted sm:px-4">
         <span className="inline-flex items-center gap-2 font-medium text-foreground">
           <span className="grid size-2 rounded-full bg-primary" />
           {languageLabel(prepared.language)}
@@ -39,13 +39,13 @@ export function TextPreview({ file, state, fullscreen }: {
         </span>
       </div>
       <div className="min-h-0 flex-1 overflow-auto scroll-thin">
-        <div className="min-w-max py-2 font-mono text-xs leading-6">
+        <div className="min-w-max py-2 font-mono text-[13px] leading-6 sm:text-sm sm:leading-7">
           {lines.map((line, index) => (
-            <div key={`${index}-${line}`} className="grid grid-cols-[4rem_1fr] hover:bg-primary-soft/35">
-              <span className="select-none border-r border-border bg-background/40 px-3 text-right text-subtle">
+            <div key={`${index}-${line}`} className="grid grid-cols-[3rem_1fr] hover:bg-primary-soft/35 sm:grid-cols-[4rem_1fr]">
+              <span className="select-none border-r border-border bg-background/40 px-2 text-right text-subtle sm:px-3">
                 {index + 1}
               </span>
-              <code className="whitespace-pre px-4 text-[#334155]">
+              <code className="whitespace-pre px-3 text-[#334155] sm:px-4">
                 {highlightLine(line, prepared.language)}
               </code>
             </div>
