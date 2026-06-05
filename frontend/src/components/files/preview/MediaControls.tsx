@@ -7,7 +7,7 @@ interface MediaControlsProps {
   fullscreen: boolean;
   onToggleFullscreen: () => void;
   compact?: boolean;
-  variant?: "panel" | "floating";
+  variant?: "panel" | "floating" | "inline";
   density?: "regular" | "narrow" | "tiny";
   interactive?: boolean;
   className?: string;
@@ -36,6 +36,7 @@ export function MediaControls({
   className
 }: MediaControlsProps) {
   const floating = variant === "floating";
+  const inline = variant === "inline";
   const dense = compact || fullscreen || floating;
   const narrow = density === "narrow" || density === "tiny";
   const tiny = density === "tiny";
@@ -157,12 +158,15 @@ export function MediaControls({
   return (
     <div
       className={cn(
-        "text-white",
+        inline ? "text-foreground" : "text-white",
         floating
           ? "w-full drop-shadow-[0_2px_12px_rgba(0,0,0,0.65)]"
-          : "rounded-2xl border border-white/10 bg-black/70 p-3 shadow-dialog backdrop-blur-md",
-        !floating && dense ? "p-2.5" : null,
-        !floating && tiny ? "p-2" : null,
+          : inline
+            ? "rounded-2xl border border-border bg-background p-3 shadow-card"
+            : "rounded-2xl border border-white/10 bg-black/70 p-3 shadow-dialog backdrop-blur-md",
+        !floating && !inline && dense ? "p-2.5" : null,
+        !floating && !inline && tiny ? "p-2" : null,
+        inline && dense ? "p-3" : null,
         className
       )}
       aria-hidden={interactive ? undefined : true}
@@ -170,11 +174,11 @@ export function MediaControls({
       <div
         className={cn(
           "relative rounded-full",
-          floating ? "mb-2 h-1.5 bg-white/30 sm:h-2" : dense ? "mb-2 h-2.5 bg-white/15" : "mb-3 h-3 bg-white/15",
+          floating ? "mb-2 h-1.5 bg-white/30 sm:h-2" : inline ? "mb-3 h-2 bg-border" : dense ? "mb-2 h-2.5 bg-white/15" : "mb-3 h-3 bg-white/15",
           tiny && "mb-1.5 h-1.5"
         )}
       >
-        <div className="absolute inset-y-0 left-0 rounded-full bg-white/35" style={{ width: `${bufferedPercent}%` }} />
+        <div className={cn("absolute inset-y-0 left-0 rounded-full", inline ? "bg-border-strong/60" : "bg-white/35")} style={{ width: `${bufferedPercent}%` }} />
         <div
           className={cn("absolute inset-y-0 left-0 rounded-full", floating ? "bg-[#ff0033]" : "bg-primary")}
           style={{ width: `${progressPercent}%` }}
@@ -200,12 +204,13 @@ export function MediaControls({
             emphasis
             dense={dense}
             floating={floating}
+            inline={inline}
             tabIndex={controlTabIndex}
           >
             {state.playing ? <Pause size={16} /> : <Play size={16} />}
           </MediaButton>
-          {!floating ? (
-            <MediaButton label="停止" onClick={stop} dense={dense} tabIndex={controlTabIndex} className="max-sm:hidden">
+          {!floating && !inline ? (
+            <MediaButton label="停止" onClick={stop} dense={dense} floating={floating} inline={inline} tabIndex={controlTabIndex} className="max-sm:hidden">
               <Square size={15} />
             </MediaButton>
           ) : null}
@@ -216,6 +221,7 @@ export function MediaControls({
                 onClick={() => seekBy(-10)}
                 dense={dense}
                 floating={floating}
+                inline={inline}
                 tabIndex={controlTabIndex}
                 className="max-[520px]:hidden"
               >
@@ -226,6 +232,7 @@ export function MediaControls({
                 onClick={() => seekBy(10)}
                 dense={dense}
                 floating={floating}
+                inline={inline}
                 tabIndex={controlTabIndex}
                 className="max-[520px]:hidden"
               >
@@ -240,6 +247,7 @@ export function MediaControls({
             "shrink-0 text-center font-mono text-xs text-white/75",
             dense ? "min-w-[5.75rem]" : "min-w-[6.75rem]",
             floating && "min-w-[5.1rem] text-white/90 sm:min-w-[6.5rem]",
+            inline && "text-muted",
             tiny && "min-w-[3.5rem] text-[11px]"
           )}
         >
@@ -251,7 +259,7 @@ export function MediaControls({
         </div>
 
         <div className={cn("ml-auto flex min-w-0 shrink-0 items-center", floating ? "gap-1 sm:gap-1.5" : "gap-1.5")}>
-          <MediaButton label={state.muted ? "取消静音" : "静音"} onClick={toggleMute} dense={dense} floating={floating} tabIndex={controlTabIndex}>
+          <MediaButton label={state.muted ? "取消静音" : "静音"} onClick={toggleMute} dense={dense} floating={floating} inline={inline} tabIndex={controlTabIndex}>
             {state.muted || state.volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
           </MediaButton>
           <input
@@ -265,33 +273,34 @@ export function MediaControls({
             tabIndex={controlTabIndex}
             className={cn(
               "h-1.5 cursor-pointer",
-              floating ? "hidden w-16 accent-[#ff0033] min-[560px]:block" : dense ? "hidden w-14 accent-primary lg:block" : "hidden w-20 accent-primary md:block"
+              floating ? "hidden w-16 accent-[#ff0033] min-[560px]:block" : inline ? "hidden w-16 accent-primary sm:block" : dense ? "hidden w-14 accent-primary lg:block" : "hidden w-20 accent-primary md:block"
             )}
           />
           {!tiny ? (
-            <label className="inline-flex shrink-0 items-center gap-1 text-xs text-white/70">
+            <label className={cn("inline-flex shrink-0 items-center gap-1 text-xs", inline ? "text-muted" : "text-white/70")}>
               <span className={dense ? "sr-only" : "hidden xl:inline"}>倍速</span>
               <select
                 value={state.rate}
                 onChange={(event) => setRate(event.target.value)}
                 tabIndex={controlTabIndex}
                 className={cn(
-                  "border border-white/10 bg-white/10 text-xs text-white outline-none transition-colors hover:bg-white/15 focus-visible:focus-ring",
+                  "border text-xs outline-none transition-colors focus-visible:focus-ring",
                   floating ? "h-8 w-[3.1rem] rounded-md px-1 sm:w-[3.35rem] sm:rounded-full sm:px-1.5" : "rounded-md",
+                  inline ? "h-8 w-[3.35rem] border-border bg-surface px-1.5 text-foreground hover:bg-primary-soft/50" : "border-white/10 bg-white/10 text-white hover:bg-white/15",
                   dense && !floating ? "h-8 w-14 px-1.5" : null,
                   !dense ? "h-9 w-16 px-2" : null
                 )}
                 aria-label="切换播放速度"
               >
                 {playbackRates.map((rate) => (
-                  <option key={rate} value={rate} className="bg-foreground text-white">
+                  <option key={rate} value={rate} className={inline ? "bg-surface text-foreground" : "bg-foreground text-white"}>
                     {rate}x
                   </option>
                 ))}
               </select>
             </label>
           ) : null}
-          <MediaButton label={fullscreen ? "退出全屏" : "全屏"} onClick={onToggleFullscreen} dense={dense} floating={floating} tabIndex={controlTabIndex}>
+          <MediaButton label={fullscreen ? "退出全屏" : "全屏"} onClick={onToggleFullscreen} dense={dense} floating={floating} inline={inline} tabIndex={controlTabIndex}>
             {fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
           </MediaButton>
         </div>
@@ -300,13 +309,14 @@ export function MediaControls({
   );
 }
 
-function MediaButton({ label, onClick, children, emphasis = false, dense = false, floating = false, tabIndex, className }: {
+function MediaButton({ label, onClick, children, emphasis = false, dense = false, floating = false, inline = false, tabIndex, className }: {
   label: string;
   onClick: () => void;
   children: ReactNode;
   emphasis?: boolean;
   dense?: boolean;
   floating?: boolean;
+  inline?: boolean;
   tabIndex?: number;
   className?: string;
 }) {
@@ -319,12 +329,17 @@ function MediaButton({ label, onClick, children, emphasis = false, dense = false
       tabIndex={tabIndex}
       className={cn(
         "inline-flex shrink-0 items-center justify-center gap-1.5 border text-xs font-medium transition-colors focus-visible:outline-none focus-visible:focus-ring",
-        dense ? "size-8 px-0" : "h-9 rounded-lg px-2.5",
+        dense ? "size-8 rounded-lg px-0" : "h-9 rounded-lg px-2.5",
         floating && "size-8 rounded-full border-transparent bg-transparent text-white/92 hover:bg-white/15 hover:text-white active:bg-white/20 sm:size-9",
+        inline && "border-border bg-surface text-muted hover:bg-primary-soft/50 hover:text-primary-strong",
         emphasis && !floating
-          ? "border-primary bg-primary text-white hover:bg-primary-strong"
+          ? inline
+            ? "border-primary bg-primary text-white hover:bg-primary-strong"
+            : "border-primary bg-primary text-white hover:bg-primary-strong"
           : !floating
-            ? "border-white/10 bg-white/10 text-white/85 hover:bg-white/15 hover:text-white"
+            ? inline
+              ? null
+              : "border-white/10 bg-white/10 text-white/85 hover:bg-white/15 hover:text-white"
             : null,
         emphasis && floating && "text-white",
         className

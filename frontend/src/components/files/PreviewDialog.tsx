@@ -175,7 +175,7 @@ export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
 }
 
 function previewTone(preview: ReturnType<typeof previewKind>): "surface" | "dark" | "code" {
-  if (preview === "video" || preview === "audio") return "dark";
+  if (preview === "video") return "dark";
   if (preview === "text" || preview === "markdown") return "code";
   return "surface";
 }
