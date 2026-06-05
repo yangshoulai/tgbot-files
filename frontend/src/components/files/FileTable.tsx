@@ -10,12 +10,16 @@ import {
   FolderOpen,
   Info,
   Pencil,
-  Trash2,
-  Zap
+  Trash2
 } from "lucide-react";
 import type { DirectoryItem, FileItem } from "../../api";
-import { canUseAcceleratedDownload } from "../../lib/accelerated-download";
-import { canPreviewThroughAvailableAccess, hasDirectFileAccess } from "../../lib/file-access";
+import {
+  canUseAnyAcceleratedDownload,
+  canPreviewThroughAvailableAccess,
+  hasDirectDownloadAccess,
+  hasFileLinkAccess,
+  type DirectDownloadableFile
+} from "../../lib/file-access";
 import { fileKind, formatBytes, formatDateTime } from "../../utils";
 import { FileVisual } from "../ui/FileVisual";
 import { IconButton } from "../ui/IconButton";
@@ -87,6 +91,46 @@ function SortHeader({
         <Icon size={14} className={active ? "text-primary" : "text-subtle"} />
       </button>
     </th>
+  );
+}
+
+function DownloadIconAction({
+  file,
+  directFile,
+  canAccelerateDownload,
+  onAcceleratedDownload
+}: {
+  file: FileItem;
+  directFile: DirectDownloadableFile | null;
+  canAccelerateDownload: boolean;
+  onAcceleratedDownload: (file: FileItem) => void;
+}) {
+  if (canAccelerateDownload) {
+    return (
+      <IconButton
+        variant="ghost"
+        size="sm"
+        label="加速下载"
+        onClick={() => onAcceleratedDownload(file)}
+      >
+        <Download size={16} />
+      </IconButton>
+    );
+  }
+
+  if (!directFile) {
+    return null;
+  }
+
+  return (
+    <a
+      href={directFile.download_url}
+      title="下载"
+      aria-label="下载"
+      className="inline-grid size-8 shrink-0 place-items-center rounded-lg border border-transparent bg-transparent text-muted transition-colors duration-150 hover:bg-primary-soft hover:text-primary-strong"
+    >
+      <Download size={16} />
+    </a>
   );
 }
 
@@ -189,7 +233,9 @@ export function FileTable({
           </div>
         ))}
         {files.map((file) => {
-          const directFile = hasDirectFileAccess(file) ? file : null;
+          const linkFile = hasFileLinkAccess(file) ? file : null;
+          const directFile = hasDirectDownloadAccess(file) ? file : null;
+          const canAccelerateDownload = canUseAnyAcceleratedDownload(file);
           const canPreviewFile = canPreviewThroughAvailableAccess(file);
           const kind = fileKind(file);
           const mimeLabel = file.mime_type || "未知 MIME";
@@ -208,7 +254,7 @@ export function FileTable({
                   <FileVisual
                     mimeType={file.mime_type}
                     fileName={file.file_name}
-                    url={directFile ? file.file_path : undefined}
+                    url={linkFile ? file.file_path : undefined}
                     thumbnailUrl={file.thumbnail_url}
                     size="sm"
                     className="size-11 rounded-xl"
@@ -261,7 +307,7 @@ export function FileTable({
                     <Eye size={16} />
                   </IconButton>
                 ) : null}
-                {directFile ? (
+                {linkFile ? (
                   <>
                     <IconButton
                       variant="ghost"
@@ -271,26 +317,14 @@ export function FileTable({
                     >
                       <Copy size={16} />
                     </IconButton>
-                    <a
-                      href={directFile.download_url}
-                      title="下载"
-                      aria-label="下载"
-                      className="inline-grid size-8 shrink-0 place-items-center rounded-lg border border-transparent bg-transparent text-muted transition-colors duration-150 hover:bg-primary-soft hover:text-primary-strong"
-                    >
-                      <Download size={16} />
-                    </a>
                   </>
                 ) : null}
-                {canUseAcceleratedDownload(file) ? (
-                  <IconButton
-                    variant="ghost"
-                    size="sm"
-                    label="加速下载"
-                    onClick={() => onAcceleratedDownload(file)}
-                  >
-                    <Zap size={16} />
-                  </IconButton>
-                ) : null}
+                <DownloadIconAction
+                  file={file}
+                  directFile={directFile}
+                  canAccelerateDownload={canAccelerateDownload}
+                  onAcceleratedDownload={onAcceleratedDownload}
+                />
                 <IconButton
                   variant="danger"
                   size="sm"
@@ -445,133 +479,123 @@ export function FileTable({
               </tr>
             ))}
             {files.map((file) => {
-              const directFile = hasDirectFileAccess(file) ? file : null;
+              const linkFile = hasFileLinkAccess(file) ? file : null;
+              const directFile = hasDirectDownloadAccess(file) ? file : null;
+              const canAccelerateDownload = canUseAnyAcceleratedDownload(file);
               const canPreviewFile = canPreviewThroughAvailableAccess(file);
               const kind = fileKind(file);
               const mimeLabel = file.mime_type || "未知 MIME";
 
               return (
-              <tr
-                key={file.id}
-                className="border-b border-border last:border-b-0 transition-colors duration-150 hover:bg-primary-soft/25"
-              >
-                <td className="px-4 py-3 align-middle">
-                  <input
-                    type="checkbox"
-                    aria-label={`选择 ${file.file_name}`}
-                    checked={selectedFileIds.has(file.id)}
-                    onChange={(event) => onToggleFileSelected(file, event.target.checked)}
-                    className={checkboxClass}
-                  />
-                </td>
-                <td className="px-4 py-3 align-middle">
-                  <div className="flex min-w-0 items-center gap-3">
-                    <FileVisual
-                      mimeType={file.mime_type}
-                      fileName={file.file_name}
-                      url={directFile ? file.file_path : undefined}
-                      thumbnailUrl={file.thumbnail_url}
-                      size="sm"
+                <tr
+                  key={file.id}
+                  className="border-b border-border last:border-b-0 transition-colors duration-150 hover:bg-primary-soft/25"
+                >
+                  <td className="px-4 py-3 align-middle">
+                    <input
+                      type="checkbox"
+                      aria-label={`选择 ${file.file_name}`}
+                      checked={selectedFileIds.has(file.id)}
+                      onChange={(event) => onToggleFileSelected(file, event.target.checked)}
+                      className={checkboxClass}
                     />
-                    <div className="flex min-w-0 flex-col gap-0.5">
-                      <span className="truncate text-sm font-medium text-foreground" title={file.file_name}>
-                        {file.file_name}
-                      </span>
-                      <span className="truncate text-xs text-muted lg:hidden">
-                        {kind.label} · {mimeLabel} · {formatBytes(file.size)}
-                      </span>
-                      <span className="hidden truncate text-xs text-muted lg:inline">
-                        {kind.label} · {mimeLabel}
-                      </span>
+                  </td>
+                  <td className="px-4 py-3 align-middle">
+                    <div className="flex min-w-0 items-center gap-3">
+                      <FileVisual
+                        mimeType={file.mime_type}
+                        fileName={file.file_name}
+                        url={linkFile ? file.file_path : undefined}
+                        thumbnailUrl={file.thumbnail_url}
+                        size="sm"
+                      />
+                      <div className="flex min-w-0 flex-col gap-0.5">
+                        <span className="truncate text-sm font-medium text-foreground" title={file.file_name}>
+                          {file.file_name}
+                        </span>
+                        <span className="truncate text-xs text-muted lg:hidden">
+                          {kind.label} · {mimeLabel} · {formatBytes(file.size)}
+                        </span>
+                        <span className="hidden truncate text-xs text-muted lg:inline">
+                          {kind.label} · {mimeLabel}
+                        </span>
+                      </div>
                     </div>
-                  </div>
-                </td>
-                <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-foreground lg:table-cell">
-                  {formatBytes(file.size)}
-                </td>
-                <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted md:table-cell">
-                  {kind.label}
-                </td>
-                <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted md:table-cell">
-                  {formatDateTime(file.created_at)}
-                </td>
-                <td className="px-4 py-3 align-middle">
-                  <div className="flex items-center justify-end gap-1.5">
-                    <IconButton
-                      variant="ghost"
-                      size="sm"
-                      label="详情"
-                      onClick={() => onDetail(file)}
-                    >
-                      <Info size={16} />
-                    </IconButton>
-                    <IconButton
-                      variant="ghost"
-                      size="sm"
-                      label="编辑文件信息"
-                      onClick={() => onEdit(file)}
-                    >
-                      <Pencil size={16} />
-                    </IconButton>
-                    <IconButton
-                      variant="ghost"
-                      size="sm"
-                      label="移动文件"
-                      onClick={() => onMoveFile(file)}
-                    >
-                      <FolderInput size={16} />
-                    </IconButton>
-                    {canPreviewFile ? (
+                  </td>
+                  <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-foreground lg:table-cell">
+                    {formatBytes(file.size)}
+                  </td>
+                  <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted md:table-cell">
+                    {kind.label}
+                  </td>
+                  <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted md:table-cell">
+                    {formatDateTime(file.created_at)}
+                  </td>
+                  <td className="px-4 py-3 align-middle">
+                    <div className="flex items-center justify-end gap-1.5">
                       <IconButton
                         variant="ghost"
                         size="sm"
-                        label="预览"
-                        onClick={() => onPreview(file)}
+                        label="详情"
+                        onClick={() => onDetail(file)}
                       >
-                        <Eye size={16} />
+                        <Info size={16} />
                       </IconButton>
-                    ) : null}
-                    {directFile ? (
-                      <>
+                      <IconButton
+                        variant="ghost"
+                        size="sm"
+                        label="编辑文件信息"
+                        onClick={() => onEdit(file)}
+                      >
+                        <Pencil size={16} />
+                      </IconButton>
+                      <IconButton
+                        variant="ghost"
+                        size="sm"
+                        label="移动文件"
+                        onClick={() => onMoveFile(file)}
+                      >
+                        <FolderInput size={16} />
+                      </IconButton>
+                      {canPreviewFile ? (
                         <IconButton
                           variant="ghost"
                           size="sm"
-                          label="复制链接"
-                          onClick={() => onCopy(file)}
+                          label="预览"
+                          onClick={() => onPreview(file)}
                         >
-                          <Copy size={16} />
+                          <Eye size={16} />
                         </IconButton>
-                        <a
-                          href={directFile.download_url}
-                          title="下载"
-                          aria-label="下载"
-                          className="inline-grid size-8 place-items-center rounded-lg border border-transparent bg-transparent text-muted transition-colors duration-150 hover:bg-primary-soft hover:text-primary-strong"
-                        >
-                          <Download size={16} />
-                        </a>
-                      </>
-                    ) : null}
-                    {canUseAcceleratedDownload(file) ? (
+                      ) : null}
+                      {linkFile ? (
+                        <>
+                          <IconButton
+                            variant="ghost"
+                            size="sm"
+                            label="复制链接"
+                            onClick={() => onCopy(file)}
+                          >
+                            <Copy size={16} />
+                          </IconButton>
+                        </>
+                      ) : null}
+                      <DownloadIconAction
+                        file={file}
+                        directFile={directFile}
+                        canAccelerateDownload={canAccelerateDownload}
+                        onAcceleratedDownload={onAcceleratedDownload}
+                      />
                       <IconButton
-                        variant="ghost"
+                        variant="danger"
                         size="sm"
-                        label="加速下载"
-                        onClick={() => onAcceleratedDownload(file)}
+                        label="删除索引"
+                        onClick={() => onDelete(file)}
                       >
-                        <Zap size={16} />
+                        <Trash2 size={16} />
                       </IconButton>
-                    ) : null}
-                    <IconButton
-                      variant="danger"
-                      size="sm"
-                      label="删除索引"
-                      onClick={() => onDelete(file)}
-                    >
-                      <Trash2 size={16} />
-                    </IconButton>
-                  </div>
-                </td>
-              </tr>
+                    </div>
+                  </td>
+                </tr>
               );
             })}
           </tbody>

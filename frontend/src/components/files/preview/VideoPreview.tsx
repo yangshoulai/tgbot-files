@@ -3,7 +3,7 @@ import Hls from "hls.js";
 import { RotateCcw } from "lucide-react";
 import type { FileItem } from "../../../api";
 import { canUseAcceleratedDownload, extractSignedFileToken } from "../../../lib/accelerated-download";
-import { hasDirectFileAccess } from "../../../lib/file-access";
+import { hasFileLinkAccess } from "../../../lib/file-access";
 import {
   VIDEO_PREVIEW_CACHE_HEARTBEAT_MS,
   buildChunkedVideoPreviewMetadata,
@@ -43,9 +43,9 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
   const heightLimit = fullscreen ? "calc(100dvh - 9rem)" : "min(68dvh, 760px)";
-  const directFile = hasDirectFileAccess(file) ? file : null;
+  const linkFile = hasFileLinkAccess(file) ? file : null;
   const isHlsPackage = file.storage_backend === "hls_package";
-  const directAccessAvailable = Boolean(directFile);
+  const directAccessAvailable = Boolean(linkFile);
   const canUseMultipartPreview = canUseAcceleratedDownload(file);
   const signedFileToken = canUseMultipartPreview ? extractSignedFileToken(file.file_path) : null;
   const serviceWorkerReady = serviceWorkerState.status === "controlled";
@@ -55,7 +55,7 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
     [file.chunk_count, file.chunk_size, file.file_path, file.id, file.mime_type, file.size, file.storage_backend, serviceWorkerReady]
   );
   const chunkedPreviewUrl = chunkedPreviewMetadata ? buildChunkedVideoPreviewUrl(file, chunkedPreviewMetadata) : null;
-  const videoSrc = chunkedPreviewUrl ?? (directFile ? file.file_path : null);
+  const videoSrc = chunkedPreviewUrl ?? (linkFile ? file.file_path : null);
   const poster = file.thumbnail_url || undefined;
 
   useEffect(() => {

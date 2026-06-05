@@ -4,11 +4,13 @@ import {
   ApiError,
   DirectoryItem,
   FileItem,
+  HlsDownloadPart,
   SessionResponse,
   createDirectory,
   deleteEntries,
   deleteDirectory,
   deleteFile,
+  getHlsDownloadPlan,
   listDirectories,
   listFiles,
   moveDirectory,
@@ -42,13 +44,14 @@ import {
   type NativeFileWritableStream,
   canUseAcceleratedDownload,
   createWritableFile,
+  downloadAcceleratedPart,
   downloadMultipartChunk,
   extractSignedFileToken,
   expectedMultipartChunkSize,
   isAbortError,
   supportsNativeFileSave
 } from "../lib/accelerated-download";
-import { hasDirectFileAccess } from "../lib/file-access";
+import { canUseHlsAcceleratedDownload, hasDirectDownloadAccess, hasFileLinkAccess } from "../lib/file-access";
 
 type FileTypeFilter = "all" | "image" | "video" | "text" | "pdf" | "archive" | "other";
 type FileSortKey = "name" | "size" | "created_at" | "type";
@@ -78,11 +81,22 @@ const FILE_TYPE_OPTIONS: Array<{ value: FileTypeFilter; label: string }> = [
 
 const collator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
 
+interface AcceleratedDownloadPartTask {
+  index: number;
+  size: number;
+  offset: number;
+  download: (
+    signal: AbortSignal,
+    onProgress: (downloadedBytes: number) => void
+  ) => Promise<ArrayBuffer>;
+}
+
 interface AcceleratedDownloadTask {
-  file: MultipartDownloadFile;
-  token: string;
+  fileId: string;
+  fileName: string;
   writable: NativeFileWritableStream;
   concurrency: number;
+  parts: AcceleratedDownloadPartTask[];
   queue: number[];
   running: Set<number>;
   completed: Set<number>;
@@ -609,7 +623,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   }
 
   function onCopy(file: FileItem) {
-    if (!hasDirectFileAccess(file)) {
+    if (!hasFileLinkAccess(file)) {
       toast.info("该文件仅支持加速下载，不提供完整文件链接");
       return;
     }
@@ -623,13 +637,15 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       return;
     }
 
-    if (!canUseAcceleratedDownload(file)) {
-      toast.info("该文件不是 Telegram 分片文件，已保留普通下载入口");
+    const isMultipart = canUseAcceleratedDownload(file);
+    const isHls = canUseHlsAcceleratedDownload(file);
+    if (!isMultipart && !isHls) {
+      toast.info("该文件不支持加速下载，已保留普通下载入口");
       return;
     }
 
     if (!supportsNativeFileSave()) {
-      if (!hasDirectFileAccess(file)) {
+      if (!hasDirectDownloadAccess(file)) {
         toast.info("当前浏览器不支持加速下载，该文件也不提供普通下载链接");
         return;
       }
@@ -638,29 +654,46 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       return;
     }
 
-    const token = extractSignedFileToken(file.file_path);
-    if (!token) {
-      if (!hasDirectFileAccess(file)) {
-        toast.info("无法解析分片下载 token，该文件也不提供普通下载链接");
-        return;
+    let fileName = file.file_name;
+    let totalBytes = file.size;
+    let parts: AcceleratedDownloadPartTask[];
+
+    try {
+      if (isMultipart) {
+        const token = extractSignedFileToken(file.file_path);
+        if (!token) {
+          if (!hasDirectDownloadAccess(file)) {
+            toast.info("无法解析分片下载 token，该文件也不提供普通下载链接");
+            return;
+          }
+          toast.info("无法解析分片下载 token，已切换为普通下载");
+          triggerFallbackDownload(file);
+          return;
+        }
+        parts = createMultipartAcceleratedParts(file, token);
+      } else {
+        const plan = (await getHlsDownloadPlan(file.id)).hls_download;
+        fileName = plan.file_name;
+        totalBytes = plan.total_size;
+        parts = createHlsAcceleratedParts(plan.parts);
       }
-      toast.info("无法解析分片下载 token，已切换为普通下载");
-      triggerFallbackDownload(file);
+    } catch (error) {
+      toast.danger(errorMessage(error));
       return;
     }
 
     setAcceleratedDownload({
       fileId: file.id,
-      fileName: file.file_name,
+      fileName,
       status: "preparing",
       concurrency: DEFAULT_ACCELERATED_DOWNLOAD_CONCURRENCY,
-      totalBytes: file.size,
-      chunks: createInitialAcceleratedChunks(file)
+      totalBytes,
+      chunks: createInitialAcceleratedChunks(parts)
     });
 
     let writable: Awaited<ReturnType<typeof createWritableFile>>;
     try {
-      writable = await createWritableFile(file.file_name);
+      writable = await createWritableFile(fileName);
     } catch (error) {
       setAcceleratedDownload(null);
       if (!isAbortError(error)) {
@@ -670,11 +703,12 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     }
 
     const task: AcceleratedDownloadTask = {
-      file,
-      token,
+      fileId: file.id,
+      fileName,
       writable,
       concurrency: DEFAULT_ACCELERATED_DOWNLOAD_CONCURRENCY,
-      queue: Array.from({ length: file.chunk_count }, (_, index) => index),
+      parts,
+      queue: parts.map((part) => part.index),
       running: new Set(),
       completed: new Set(),
       failed: new Set(),
@@ -686,7 +720,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
 
     acceleratedDownloadTaskRef.current = task;
     setAcceleratedDownload((current) =>
-      current?.fileId === file.id
+      current?.fileId === task.fileId
         ? { ...current, status: "downloading" }
         : current
     );
@@ -713,9 +747,20 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   }
 
   async function runAcceleratedChunk(task: AcceleratedDownloadTask, chunkIndex: number) {
+    const part = task.parts[chunkIndex];
+    if (!part) {
+      task.failed.add(chunkIndex);
+      updateAcceleratedChunk(task.fileId, chunkIndex, (chunk) => ({
+        ...chunk,
+        status: "failed",
+        errorMessage: "下载 part 不存在"
+      }));
+      return;
+    }
+
     const controller = new AbortController();
     task.controllers.set(chunkIndex, controller);
-    updateAcceleratedChunk(task.file.id, chunkIndex, (chunk) => ({
+    updateAcceleratedChunk(task.fileId, chunkIndex, (chunk) => ({
       ...chunk,
       status: "downloading",
       downloadedBytes: 0,
@@ -724,21 +769,15 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     }));
 
     try {
-      const bytes = await downloadMultipartChunk({
-        file: task.file,
-        token: task.token,
-        chunkIndex,
-        signal: controller.signal,
-        onProgress: (progress) => {
-          updateAcceleratedChunk(task.file.id, chunkIndex, (chunk) =>
-            chunk.downloadedBytes === progress.downloadedBytes
-              ? chunk
-              : {
-                  ...chunk,
-                  downloadedBytes: progress.downloadedBytes
-                }
-          );
-        }
+      const bytes = await part.download(controller.signal, (downloadedBytes) => {
+        updateAcceleratedChunk(task.fileId, chunkIndex, (chunk) =>
+          chunk.downloadedBytes === downloadedBytes
+            ? chunk
+            : {
+                ...chunk,
+                downloadedBytes
+              }
+        );
       });
 
       if (task.cancelled) {
@@ -753,7 +792,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
 
       task.failed.delete(chunkIndex);
       task.completed.add(chunkIndex);
-      updateAcceleratedChunk(task.file.id, chunkIndex, (chunk) => ({
+      updateAcceleratedChunk(task.fileId, chunkIndex, (chunk) => ({
         ...chunk,
         status: "completed",
         downloadedBytes: chunk.size,
@@ -763,7 +802,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     } catch (error) {
       if (!task.cancelled) {
         task.failed.add(chunkIndex);
-        updateAcceleratedChunk(task.file.id, chunkIndex, (chunk) => ({
+        updateAcceleratedChunk(task.fileId, chunkIndex, (chunk) => ({
           ...chunk,
           status: "failed",
           errorMessage: errorMessage(error)
@@ -783,10 +822,15 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     chunkIndex: number,
     bytes: ArrayBuffer
   ): Promise<void> {
+    const part = task.parts[chunkIndex];
+    if (!part) {
+      return Promise.reject(new Error("下载 part 不存在"));
+    }
+
     const writeOperation = task.writeChain.then(() =>
       task.writable.write({
         type: "write",
-        position: chunkIndex * task.file.chunk_size,
+        position: part.offset,
         data: bytes
       })
     );
@@ -796,13 +840,13 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   }
 
   async function finalizeAcceleratedDownloadIfReady(task: AcceleratedDownloadTask) {
-    if (task.finalized || task.cancelled || task.completed.size !== task.file.chunk_count) {
+    if (task.finalized || task.cancelled || task.completed.size !== task.parts.length) {
       return;
     }
 
     task.finalized = true;
     setAcceleratedDownload((current) =>
-      current?.fileId === task.file.id ? { ...current, status: "finalizing" } : current
+      current?.fileId === task.fileId ? { ...current, status: "finalizing" } : current
     );
 
     try {
@@ -812,7 +856,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         acceleratedDownloadTaskRef.current = null;
       }
       setAcceleratedDownload((current) =>
-        current?.fileId === task.file.id ? { ...current, status: "completed" } : current
+        current?.fileId === task.fileId ? { ...current, status: "completed" } : current
       );
       toast.success("加速下载完成");
     } catch (error) {
@@ -820,7 +864,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         acceleratedDownloadTaskRef.current = null;
       }
       setAcceleratedDownload((current) =>
-        current?.fileId === task.file.id
+        current?.fileId === task.fileId
           ? {
               ...current,
               status: "error",
@@ -842,7 +886,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     if (!task.queue.includes(chunkIndex)) {
       task.queue.unshift(chunkIndex);
     }
-    updateAcceleratedChunk(task.file.id, chunkIndex, (chunk) => ({
+    updateAcceleratedChunk(task.fileId, chunkIndex, (chunk) => ({
       ...chunk,
       status: "queued",
       downloadedBytes: 0,
@@ -867,7 +911,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         continue;
       }
       task.queue.push(chunkIndex);
-      updateAcceleratedChunk(task.file.id, chunkIndex, (chunk) => ({
+      updateAcceleratedChunk(task.fileId, chunkIndex, (chunk) => ({
         ...chunk,
         status: "queued",
         downloadedBytes: 0,
@@ -905,13 +949,13 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         }
       });
     setAcceleratedDownload((current) =>
-      current?.fileId === task.file.id ? { ...current, status: "cancelled" } : current
+      current?.fileId === task.fileId ? { ...current, status: "cancelled" } : current
     );
     toast.info("下载已取消");
   }
 
   function triggerFallbackDownload(file: FileItem) {
-    if (!hasDirectFileAccess(file)) {
+    if (!hasDirectDownloadAccess(file)) {
       toast.info("该文件仅支持加速下载，不提供普通下载链接");
       return;
     }
@@ -953,7 +997,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
 
   function updateAcceleratedOverallStatus(task: AcceleratedDownloadTask) {
     setAcceleratedDownload((current) => {
-      if (!current || current.fileId !== task.file.id || task.finalized || task.cancelled) {
+      if (!current || current.fileId !== task.fileId || task.finalized || task.cancelled) {
         return current;
       }
 
@@ -971,10 +1015,44 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     });
   }
 
-  function createInitialAcceleratedChunks(file: MultipartDownloadFile): AcceleratedChunkState[] {
+  function createMultipartAcceleratedParts(file: MultipartDownloadFile, token: string): AcceleratedDownloadPartTask[] {
     return Array.from({ length: file.chunk_count }, (_, index) => ({
       index,
       size: expectedMultipartChunkSize(file, index),
+      offset: index * file.chunk_size,
+      download: (signal, onProgress) =>
+        downloadMultipartChunk({
+          file,
+          token,
+          chunkIndex: index,
+          signal,
+          onProgress: (progress) => onProgress(progress.downloadedBytes)
+        })
+    }));
+  }
+
+  function createHlsAcceleratedParts(parts: HlsDownloadPart[]): AcceleratedDownloadPartTask[] {
+    return parts.map((part) => ({
+      index: part.index,
+      size: part.size,
+      offset: part.offset,
+      download: (signal, onProgress) =>
+        downloadAcceleratedPart({
+          url: part.url,
+          expectedSize: part.size,
+          label: part.chunk_index === null
+            ? `HLS 片段 ${part.segment_index + 1}`
+            : `HLS 片段 ${part.segment_index + 1} / 分片 ${part.chunk_index + 1}`,
+          signal,
+          onProgress: (progress) => onProgress(progress.downloadedBytes)
+        })
+    }));
+  }
+
+  function createInitialAcceleratedChunks(parts: AcceleratedDownloadPartTask[]): AcceleratedChunkState[] {
+    return parts.map((part) => ({
+      index: part.index,
+      size: part.size,
       downloadedBytes: 0,
       status: "queued",
       attempts: 0
@@ -1237,7 +1315,12 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         </div>
       </div>
 
-      <PreviewDialog file={previewFile} onClose={() => setPreviewFile(null)} onCopy={copyText} />
+      <PreviewDialog
+        file={previewFile}
+        onClose={() => setPreviewFile(null)}
+        onCopy={copyText}
+        onAcceleratedDownload={(file) => void onAcceleratedDownload(file)}
+      />
       <FileDetailDialog
         file={detailFile}
         onClose={() => setDetailFile(null)}

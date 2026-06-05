@@ -7,6 +7,8 @@ import type {
   DirectoryRecord,
   FileChunkRecord,
   FileRecord,
+  HlsAssetRecord,
+  HlsSegmentRecord,
   MultipartUploadRecord,
   TelegramChannelRecord
 } from "../src/database";
@@ -28,6 +30,8 @@ class FakeD1 {
   readonly telegramChannels: TelegramChannelRecord[] = [];
   readonly multipartUploads: MultipartUploadRecord[] = [];
   readonly fileChunks: FileChunkRecord[] = [];
+  readonly hlsAssets: HlsAssetRecord[] = [];
+  readonly hlsSegments: HlsSegmentRecord[] = [];
   batchCalls = 0;
 
   prepare(sql: string): D1PreparedStatement {
@@ -42,7 +46,9 @@ class FakeD1 {
       apiKeys: this.apiKeys.map((item) => ({ ...item })),
       telegramChannels: this.telegramChannels.map((item) => ({ ...item })),
       multipartUploads: this.multipartUploads.map((item) => ({ ...item })),
-      fileChunks: this.fileChunks.map((item) => ({ ...item }))
+      fileChunks: this.fileChunks.map((item) => ({ ...item })),
+      hlsAssets: this.hlsAssets.map((item) => ({ ...item })),
+      hlsSegments: this.hlsSegments.map((item) => ({ ...item }))
     };
     const results: D1Result<T>[] = [];
 
@@ -58,6 +64,8 @@ class FakeD1 {
       this.telegramChannels.splice(0, this.telegramChannels.length, ...snapshots.telegramChannels);
       this.multipartUploads.splice(0, this.multipartUploads.length, ...snapshots.multipartUploads);
       this.fileChunks.splice(0, this.fileChunks.length, ...snapshots.fileChunks);
+      this.hlsAssets.splice(0, this.hlsAssets.length, ...snapshots.hlsAssets);
+      this.hlsSegments.splice(0, this.hlsSegments.length, ...snapshots.hlsSegments);
       throw error;
     }
 
@@ -313,6 +321,71 @@ class FakeD1Statement {
       }
     }
 
+    if (normalizedSql.startsWith("UPDATE HLS_ASSETS") && normalizedSql.includes("SET STATUS = ?")) {
+      const status = String(this.bindings[0]);
+      const updatedAt = String(this.bindings[1]);
+      const id = String(this.bindings[2]);
+      const asset = this.db.hlsAssets.find((item) => item.id === id && item.deleted_at === null);
+      if (asset) {
+        asset.status = status as HlsAssetRecord["status"];
+        asset.updated_at = updatedAt;
+        changes = 1;
+      }
+    }
+
+    if (normalizedSql.startsWith("UPDATE HLS_SEGMENTS") && normalizedSql.includes("SET STATUS = 'IMPORTING'")) {
+      const [updatedAt, id] = this.bindings;
+      const segment = this.db.hlsSegments.find((item) => item.id === id);
+      if (segment) {
+        segment.status = "importing";
+        segment.attempts += 1;
+        segment.error_message = null;
+        segment.updated_at = String(updatedAt);
+        changes = 1;
+      }
+    }
+
+    if (normalizedSql.startsWith("UPDATE HLS_SEGMENTS") && normalizedSql.includes("STORAGE_BACKEND = 'TELEGRAM_SINGLE'")) {
+      const [
+        mimeType,
+        size,
+        telegramFileId,
+        telegramFileUniqueId,
+        telegramChannelId,
+        updatedAt,
+        completedAt,
+        id
+      ] = this.bindings;
+      const segment = this.db.hlsSegments.find((item) => item.id === id);
+      if (segment) {
+        segment.status = "done";
+        segment.mime_type = String(mimeType);
+        segment.size = Number(size);
+        segment.storage_backend = "telegram_single";
+        segment.telegram_file_id = String(telegramFileId);
+        segment.telegram_file_unique_id = telegramFileUniqueId === null ? null : String(telegramFileUniqueId);
+        segment.telegram_channel_id = String(telegramChannelId || "default");
+        segment.multipart_upload_id = null;
+        segment.chunk_size = null;
+        segment.chunk_count = null;
+        segment.error_message = null;
+        segment.updated_at = String(updatedAt);
+        segment.completed_at = String(completedAt);
+        changes = 1;
+      }
+    }
+
+    if (normalizedSql.startsWith("UPDATE HLS_SEGMENTS") && normalizedSql.includes("SET STATUS = 'FAILED'")) {
+      const [message, updatedAt, id] = this.bindings;
+      const segment = this.db.hlsSegments.find((item) => item.id === id);
+      if (segment) {
+        segment.status = "failed";
+        segment.error_message = String(message);
+        segment.updated_at = String(updatedAt);
+        changes = 1;
+      }
+    }
+
     if (normalizedSql.startsWith("UPDATE DIRECTORIES") && normalizedSql.includes("SET PARENT_ID")) {
       const [parentId, path, id] = this.bindings;
       const directory = this.db.directories.find((item) => item.id === id && item.deleted_at === null);
@@ -529,6 +602,23 @@ class FakeD1Statement {
       return { total: this.visibleFiles().length } as T;
     }
 
+    if (normalizedSql.includes("FROM HLS_ASSETS")) {
+      const lookupValue = this.bindings[0];
+      const asset = normalizedSql.includes("WHERE FINAL_FILE_ID =")
+        ? this.db.hlsAssets.find((item) => item.final_file_id === lookupValue && item.deleted_at === null)
+        : this.db.hlsAssets.find((item) => item.id === lookupValue && item.deleted_at === null);
+      return (asset ?? null) as T | null;
+    }
+
+    if (normalizedSql.includes("FROM HLS_SEGMENTS")) {
+      const [assetId, segmentIndex] = this.bindings;
+      const segment = this.db.hlsSegments.find((item) =>
+        item.asset_id === assetId &&
+        (!normalizedSql.includes("SEGMENT_INDEX = ?") || item.segment_index === Number(segmentIndex))
+      );
+      return (segment ?? null) as T | null;
+    }
+
     if (normalizedSql.includes("FROM FILES") && normalizedSql.includes("FILE_NAME = ?")) {
       const file = this.matchingFileNameConflict();
       return (file ? { id: file.id } : null) as T | null;
@@ -613,6 +703,17 @@ class FakeD1Statement {
         results: this.db.fileChunks
           .filter((item) => item.file_id === fileId)
           .sort((left, right) => left.chunk_index - right.chunk_index) as T[]
+      };
+    }
+
+    if (normalizedSql.includes("FROM HLS_SEGMENTS")) {
+      const assetId = this.bindings[0];
+      return {
+        success: true,
+        meta: fakeD1Meta(),
+        results: this.db.hlsSegments
+          .filter((item) => item.asset_id === assetId)
+          .sort((left, right) => left.segment_index - right.segment_index) as T[]
       };
     }
 
@@ -946,6 +1047,62 @@ function fileRecord(overrides: Partial<FileRecord> = {}): FileRecord {
   };
 }
 
+function hlsAssetRecord(overrides: Partial<HlsAssetRecord> = {}): HlsAssetRecord {
+  return {
+    id: "hls-asset",
+    source_url: "https://media.example.com/master.m3u8",
+    media_playlist_url: "https://media.example.com/playlist.m3u8",
+    file_name: "movie.m3u8",
+    mime_type: "application/vnd.apple.mpegurl",
+    directory_id: null,
+    directory_path: "/",
+    status: "done",
+    selected_variant_id: "variant-0",
+    target_duration_seconds: 6,
+    duration_seconds: 12,
+    segment_count: 2,
+    estimated_size: 6,
+    playlist_text: "#EXTM3U\n#EXTINF:6,\nseg-0.ts\n#EXTINF:6,\nseg-1.ts\n#EXT-X-ENDLIST\n",
+    playlist_file_id: "tg-playlist",
+    final_file_id: "file-hls",
+    thumbnail_status: "none",
+    remark: null,
+    uploaded_by: "admin",
+    created_at: "2026-06-01T00:00:00.000Z",
+    updated_at: "2026-06-01T00:00:00.000Z",
+    completed_at: "2026-06-01T00:00:00.000Z",
+    deleted_at: null,
+    ...overrides
+  };
+}
+
+function hlsSegmentRecord(segmentIndex: number, overrides: Partial<HlsSegmentRecord> = {}): HlsSegmentRecord {
+  return {
+    id: `hls-segment-${segmentIndex}`,
+    asset_id: "hls-asset",
+    variant_id: "variant-0",
+    segment_index: segmentIndex,
+    source_url: `https://media.example.com/seg-${segmentIndex}.ts`,
+    duration_seconds: 6,
+    mime_type: "video/mp2t",
+    size: 3,
+    storage_backend: "telegram_single",
+    telegram_file_id: `tg-hls-segment-${segmentIndex}`,
+    telegram_file_unique_id: null,
+    telegram_channel_id: "default",
+    multipart_upload_id: null,
+    chunk_size: null,
+    chunk_count: null,
+    status: "done",
+    attempts: 1,
+    error_message: null,
+    created_at: "2026-06-01T00:00:00.000Z",
+    updated_at: "2026-06-01T00:00:00.000Z",
+    completed_at: "2026-06-01T00:00:00.000Z",
+    ...overrides
+  };
+}
+
 function fakeD1Meta(): D1Meta & Record<string, unknown> {
   return {
     duration: 0,
@@ -1001,6 +1158,28 @@ function jsonResponse(body: unknown, init?: ResponseInit): Response {
       ...(init?.headers as Record<string, string> | undefined)
     }
   });
+}
+
+async function aesCbcEncrypt(plainBytes: Uint8Array, keyBytes: Uint8Array, ivBytes: Uint8Array): Promise<ArrayBuffer> {
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    toExactArrayBuffer(keyBytes),
+    { name: "AES-CBC" },
+    false,
+    ["encrypt"]
+  );
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-CBC", iv: toExactArrayBuffer(ivBytes) },
+    cryptoKey,
+    toExactArrayBuffer(plainBytes)
+  );
+  return encrypted;
+}
+
+function toExactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return copy.buffer;
 }
 
 describe("worker upload endpoint", () => {
@@ -2127,6 +2306,152 @@ describe("worker file access endpoint", () => {
     expect(body.details.chunk_count).toBe(directAccessMaxChunks + 1);
     expect(body.details.direct_access_max_chunks).toBe(directAccessMaxChunks);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects direct HLS package downloads when the part count exceeds the direct-link budget", async () => {
+    const db = new FakeD1();
+    db.hlsAssets.push(hlsAssetRecord({
+      segment_count: directAccessMaxChunks + 1,
+      duration_seconds: directAccessMaxChunks + 1,
+      estimated_size: directAccessMaxChunks + 1
+    }));
+    db.hlsSegments.push(
+      ...Array.from({ length: directAccessMaxChunks + 1 }, (_, index) =>
+        hlsSegmentRecord(index, {
+          size: 1,
+          duration_seconds: 1
+        })
+      )
+    );
+    const token = await createSignedToken(
+      {
+        v: 4,
+        hls_asset_id: "hls-asset",
+        file_record_id: "file-hls",
+        name: "movie.m3u8",
+        mime_type: "application/vnd.apple.mpegurl",
+        size: 123,
+        iat: 1_768_566_400
+      },
+      env.LINK_SIGNING_SECRET
+    );
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await worker.fetch(
+      new Request(`https://files.example.com/api/hls/${token}/movie.m3u8?download=1`),
+      envWithDb(db)
+    );
+    const body = await response.json() as {
+      error: string;
+      details: { hls_download_part_count: number; direct_access_max_parts: number };
+    };
+
+    expect(response.status).toBe(403);
+    expect(body.error).toBe("DirectAccessDisabled");
+    expect(body.details.hls_download_part_count).toBe(directAccessMaxChunks + 1);
+    expect(body.details.direct_access_max_parts).toBe(directAccessMaxChunks);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("downloads a single HLS multipart segment chunk without fetching sibling chunks", async () => {
+    const db = new FakeD1();
+    db.hlsAssets.push(hlsAssetRecord({
+      segment_count: 1,
+      estimated_size: 5
+    }));
+    db.hlsSegments.push(hlsSegmentRecord(0, {
+      size: 5,
+      storage_backend: "telegram_multipart",
+      telegram_file_id: null,
+      telegram_file_unique_id: null,
+      multipart_upload_id: "hls-segment-upload",
+      chunk_size: 3,
+      chunk_count: 2
+    }));
+    db.fileChunks.push(
+      {
+        file_id: "hls-segment-upload",
+        chunk_index: 0,
+        size: 3,
+        md5: "chunk-a",
+        telegram_file_id: "tg-hls-chunk-0",
+        telegram_file_unique_id: null,
+        created_at: "2026-05-31T00:00:00.000Z"
+      },
+      {
+        file_id: "hls-segment-upload",
+        chunk_index: 1,
+        size: 2,
+        md5: "chunk-b",
+        telegram_file_id: "tg-hls-chunk-1",
+        telegram_file_unique_id: null,
+        created_at: "2026-05-31T00:00:01.000Z"
+      }
+    );
+    const token = await createSignedToken(
+      {
+        v: 4,
+        hls_asset_id: "hls-asset",
+        file_record_id: "file-hls",
+        name: "movie.m3u8",
+        mime_type: "application/vnd.apple.mpegurl",
+        size: 123,
+        iat: 1_768_566_400
+      },
+      env.LINK_SIGNING_SECRET
+    );
+    const fetchCalls: Array<{ input: string; range: string | null }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const inputUrl = String(input);
+        const range = new Headers(init?.headers).get("Range");
+        fetchCalls.push({ input: inputUrl, range });
+
+        if (inputUrl.includes("file_id=tg-hls-chunk-1")) {
+          return jsonResponse({ ok: true, result: { file_id: "tg-hls-chunk-1", file_path: "documents/hls-chunk1" } });
+        }
+        if (inputUrl.endsWith("/documents/hls-chunk1")) {
+          expect(range).toBe("bytes=0-0");
+          return new Response("d", {
+            status: 206,
+            headers: {
+              "Content-Type": "application/octet-stream",
+              "Content-Length": "1"
+            }
+          });
+        }
+
+        throw new Error(`Unexpected fetch ${inputUrl}`);
+      })
+    );
+
+    const response = await worker.fetch(
+      new Request(`https://files.example.com/api/hls/${token}/segments/0/chunks/1`, {
+        headers: { Range: "bytes=0-0" }
+      }),
+      envWithDb(db)
+    );
+
+    expect(response.status).toBe(206);
+    expect(await response.text()).toBe("d");
+    expect(response.headers.get("Content-Length")).toBe("1");
+    expect(response.headers.get("Content-Range")).toBe("bytes 0-0/2");
+    expect(response.headers.get("X-HLS-Segment-Index")).toBe("0");
+    expect(response.headers.get("X-Chunk-Index")).toBe("1");
+    expect(response.headers.get("X-Chunk-Count")).toBe("2");
+    expect(response.headers.get("X-Chunk-Offset")).toBe("3");
+    expect(fetchCalls).toEqual([
+      {
+        input: "https://api.telegram.org/bot123456:test-token/getFile?file_id=tg-hls-chunk-1",
+        range: null
+      },
+      {
+        input: "https://api.telegram.org/file/bot123456:test-token/documents/hls-chunk1",
+        range: "bytes=0-0"
+      }
+    ]);
   });
 
   it("downloads an existing multipart chunk without issuing Telegram range requests", async () => {
@@ -3388,6 +3713,141 @@ describe("admin file manager", () => {
     expect(body.missing_chunks).toEqual([1, 3]);
   });
 
+  it("decrypts AES-128 HLS segments before storing them in Telegram", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const playlistText = `#EXTM3U
+#EXT-X-TARGETDURATION:4
+#EXT-X-KEY:METHOD=AES-128,URI="enc.key",IV=0x00000000000000000000000000000001
+#EXTINF:4.000,
+seg-0.ts
+#EXT-X-ENDLIST
+`;
+    db.hlsAssets.push(hlsAssetRecord({
+      id: "hls-encrypted",
+      final_file_id: null,
+      status: "pending",
+      source_url: "https://media.example.com/index.m3u8",
+      media_playlist_url: "https://media.example.com/path/index.m3u8",
+      playlist_text: playlistText,
+      segment_count: 1,
+      estimated_size: null
+    }));
+    db.hlsSegments.push(hlsSegmentRecord(0, {
+      id: "hls-encrypted-segment-0",
+      asset_id: "hls-encrypted",
+      source_url: "https://media.example.com/path/seg-0.ts",
+      status: "pending",
+      size: null,
+      storage_backend: null,
+      telegram_file_id: null,
+      completed_at: null
+    }));
+    const keyBytes = new Uint8Array([
+      0x00, 0x01, 0x02, 0x03,
+      0x04, 0x05, 0x06, 0x07,
+      0x08, 0x09, 0x0a, 0x0b,
+      0x0c, 0x0d, 0x0e, 0x0f
+    ]);
+    const ivBytes = new Uint8Array(16);
+    ivBytes[15] = 1;
+    const plainBytes = new TextEncoder().encode("decrypted ts payload");
+    const encryptedBytes = await aesCbcEncrypt(plainBytes, keyBytes, ivBytes);
+    let uploadedBytes: Uint8Array | null = null;
+    const fetchCalls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const inputUrl = String(input);
+        fetchCalls.push(inputUrl);
+
+        if (inputUrl === "https://media.example.com/path/seg-0.ts" && init?.method === "HEAD") {
+          return new Response(null, {
+            headers: {
+              "Content-Length": String(encryptedBytes.byteLength),
+              "Content-Type": "video/mp2t"
+            }
+          });
+        }
+        if (inputUrl === "https://media.example.com/path/seg-0.ts") {
+          return new Response(encryptedBytes, {
+            headers: {
+              "Content-Length": String(encryptedBytes.byteLength),
+              "Content-Type": "video/mp2t"
+            }
+          });
+        }
+        if (inputUrl === "https://media.example.com/path/enc.key") {
+          return new Response(new Blob([toExactArrayBuffer(keyBytes)]), {
+            headers: {
+              "Content-Length": String(keyBytes.byteLength),
+              "Content-Type": "application/octet-stream"
+            }
+          });
+        }
+        if (inputUrl === "https://api.telegram.org/bot123456:test-token/sendDocument") {
+          const formData = init?.body as FormData;
+          const document = formData.get("document");
+          if (!(document instanceof Blob)) {
+            throw new Error("Expected Telegram document Blob");
+          }
+          uploadedBytes = new Uint8Array(await document.arrayBuffer());
+          return jsonResponse({
+            ok: true,
+            result: {
+              document: {
+                file_id: "tg-decrypted-hls-segment",
+                file_unique_id: "tg-decrypted-unique",
+                file_name: "seg-0.ts",
+                mime_type: "video/mp2t",
+                file_size: document.size
+              }
+            }
+          });
+        }
+
+        throw new Error(`Unexpected fetch ${inputUrl}`);
+      })
+    );
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/uploads/hls/hls-encrypted/segments/0/import", {
+        method: "POST",
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      segment: { status: string; storage_backend: string; size: number };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.segment).toMatchObject({
+      status: "done",
+      storage_backend: "telegram_single",
+      size: plainBytes.byteLength
+    });
+    expect(uploadedBytes).toEqual(plainBytes);
+    expect(db.hlsSegments[0]).toMatchObject({
+      status: "done",
+      size: plainBytes.byteLength,
+      storage_backend: "telegram_single",
+      telegram_file_id: "tg-decrypted-hls-segment"
+    });
+    expect(fetchCalls).toEqual([
+      "https://media.example.com/path/seg-0.ts",
+      "https://media.example.com/path/seg-0.ts",
+      "https://media.example.com/path/enc.key",
+      "https://api.telegram.org/bot123456:test-token/sendDocument"
+    ]);
+  });
+
   it("completes oversized-direct multipart uploads without returning a full file link", async () => {
     const db = new FakeD1();
     const adminEnv: Env = {
@@ -4071,6 +4531,177 @@ describe("admin file manager", () => {
     );
     const afterDeleteBody = await afterDeleteResponse.json() as { pagination: { total: number } };
     expect(afterDeleteBody.pagination.total).toBe(0);
+  });
+
+  it("keeps the HLS playback link but omits the direct download link when HLS parts exceed the direct-link budget", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      PUBLIC_BASE_URL: "https://cdn.example.com",
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    db.files.push(fileRecord({
+      id: "file-hls",
+      file_name: "movie.m3u8",
+      mime_type: "application/vnd.apple.mpegurl",
+      size: 123,
+      md5: "hls-md5",
+      telegram_file_id: "hls:hls-asset",
+      telegram_file_unique_id: null,
+      file_path: "/hls/signed-token/movie.m3u8",
+      storage_backend: "hls_package",
+      chunk_size: null,
+      chunk_count: null
+    }));
+    db.hlsAssets.push(hlsAssetRecord({
+      segment_count: directAccessMaxChunks + 1,
+      duration_seconds: directAccessMaxChunks + 1,
+      estimated_size: directAccessMaxChunks + 1
+    }));
+    db.hlsSegments.push(
+      ...Array.from({ length: directAccessMaxChunks + 1 }, (_, index) =>
+        hlsSegmentRecord(index, {
+          size: 1,
+          duration_seconds: 1
+        })
+      )
+    );
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/files", {
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      files: Array<{
+        id: string;
+        url: string | null;
+        download_url: string | null;
+        direct_access: boolean;
+        direct_download: boolean;
+        download_strategy: string;
+        hls_download: {
+          part_count: number;
+          direct_access: boolean;
+          direct_access_max_parts: number;
+          downloadable: boolean;
+        };
+      }>;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.files).toHaveLength(1);
+    expect(body.files[0]).toMatchObject({
+      id: "file-hls",
+      url: "https://cdn.example.com/api/hls/signed-token/movie.m3u8",
+      download_url: null,
+      direct_access: true,
+      direct_download: false,
+      download_strategy: "accelerated"
+    });
+    expect(body.files[0]?.hls_download).toMatchObject({
+      part_count: directAccessMaxChunks + 1,
+      direct_access: false,
+      direct_access_max_parts: directAccessMaxChunks,
+      downloadable: true
+    });
+  });
+
+  it("returns an HLS accelerated download plan with contiguous part offsets", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    db.files.push(fileRecord({
+      id: "file-hls",
+      file_name: "movie.m3u8",
+      mime_type: "application/vnd.apple.mpegurl",
+      size: 123,
+      md5: "hls-md5",
+      telegram_file_id: "hls:hls-asset",
+      telegram_file_unique_id: null,
+      file_path: "/hls/signed-token/movie.m3u8",
+      storage_backend: "hls_package",
+      chunk_size: null,
+      chunk_count: null
+    }));
+    db.hlsAssets.push(hlsAssetRecord({
+      segment_count: 2,
+      estimated_size: 7
+    }));
+    db.hlsSegments.push(
+      hlsSegmentRecord(0, {
+        size: 3
+      }),
+      hlsSegmentRecord(1, {
+        size: 4,
+        storage_backend: "telegram_multipart",
+        telegram_file_id: null,
+        telegram_file_unique_id: null,
+        multipart_upload_id: "hls-segment-upload",
+        chunk_size: 3,
+        chunk_count: 2
+      })
+    );
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/files/file-hls/hls-download", {
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      hls_download: {
+        file_id: string;
+        file_name: string;
+        total_size: number;
+        segment_count: number;
+        part_count: number;
+        direct_access: boolean;
+        direct_access_max_parts: number;
+        parts: Array<{
+          index: number;
+          segment_index: number;
+          chunk_index: number | null;
+          offset: number;
+          size: number;
+          url: string;
+        }>;
+      };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.hls_download).toMatchObject({
+      file_id: "file-hls",
+      file_name: "movie.ts",
+      total_size: 7,
+      segment_count: 2,
+      part_count: 3,
+      direct_access: true,
+      direct_access_max_parts: directAccessMaxChunks
+    });
+    expect(body.hls_download.parts.map(({ index, segment_index, chunk_index, offset, size }) => ({
+      index,
+      segment_index,
+      chunk_index,
+      offset,
+      size
+    }))).toEqual([
+      { index: 0, segment_index: 0, chunk_index: null, offset: 0, size: 3 },
+      { index: 1, segment_index: 1, chunk_index: 0, offset: 3, size: 3 },
+      { index: 2, segment_index: 1, chunk_index: 1, offset: 6, size: 1 }
+    ]);
+    expect(new URL(body.hls_download.parts[0]?.url || "").pathname).toMatch(/^\/api\/hls\/[^/]+\/segments\/0\/seg-0\.ts$/);
+    expect(new URL(body.hls_download.parts[1]?.url || "").pathname).toMatch(/^\/api\/hls\/[^/]+\/segments\/1\/chunks\/0$/);
+    expect(new URL(body.hls_download.parts[2]?.url || "").pathname).toMatch(/^\/api\/hls\/[^/]+\/segments\/1\/chunks\/1$/);
   });
 
   it("filters D1 file records by filename, remark, type and upload time", async () => {

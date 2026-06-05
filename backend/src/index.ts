@@ -98,6 +98,7 @@ import {
   parseHlsPlaylist,
   type HlsMediaPlan,
   type HlsPlaylistPlan,
+  type HlsSegmentEncryption,
   type HlsVariantPlan
 } from "./hls";
 import { extensionForMimeType, mimeTypeForFileName, resolveStoredMimeType } from "./mime";
@@ -234,6 +235,7 @@ const ALLOWED_THUMBNAIL_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/
 const HLS_PLAYLIST_MIME_TYPE = "application/vnd.apple.mpegurl";
 const HLS_PUBLIC_ROUTE_PREFIX = "/api/hls";
 const HLS_MAX_PLAYLIST_BYTES = 2 * 1024 * 1024;
+const HLS_AES_128_KEY_BYTES = 16;
 const HLS_MAX_SEGMENTS = 2000;
 const HLS_SEGMENT_IMPORT_TIMEOUT_MS = 10 * 60 * 1000;
 const HLS_PREVIEW_SEGMENT_COUNT = 4;
@@ -768,7 +770,7 @@ async function handleApiFiles(request: Request, env: Env): Promise<Response> {
 
     return jsonResponse({
       ok: true,
-      file: serializeFileRecord(file, getPublicBaseUrl(request, env))
+      file: await serializeFileRecord(file, getPublicBaseUrl(request, env), db)
     });
   }
 
@@ -914,7 +916,7 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
     ]);
     const directoryStats = await getDirectoryUsageStats(db, directories);
     const baseUrl = getPublicBaseUrl(request, env);
-    const files = result.files.map((file) => serializeFileRecord(file, baseUrl));
+    const files = await Promise.all(result.files.map((file) => serializeFileRecord(file, baseUrl, db)));
 
     return jsonResponse({
       ok: true,
@@ -934,6 +936,21 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
       max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
       direct_access_max_chunks: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
       direct_access_max_bytes: DIRECT_MULTIPART_ACCESS_MAX_BYTES
+    });
+  }
+
+  const hlsDownloadMatch = /^\/api\/admin\/files\/([^/]+)\/hls-download$/.exec(url.pathname);
+  if (request.method === "GET" && hlsDownloadMatch?.[1]) {
+    const file = await requireFileRecord(db, decodeURIComponent(hlsDownloadMatch[1]));
+
+    return jsonResponse({
+      ok: true,
+      hls_download: await serializeHlsDownloadPlanForFile({
+        request,
+        env,
+        db,
+        file
+      })
     });
   }
 
@@ -1027,7 +1044,7 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
 
     return jsonResponse({
       ok: true,
-      file: serializeFileRecord(updated, getPublicBaseUrl(request, env))
+      file: await serializeFileRecord(updated, getPublicBaseUrl(request, env), db)
     });
   }
 
@@ -1865,11 +1882,59 @@ async function importHlsSegment(params: {
 
   try {
     const sourceUrl = new URL(segment.source_url);
+    const encryption = hlsSegmentEncryptionForAsset(params.asset, params.segmentIndex);
     const probe = await probeHlsSegmentSource(sourceUrl);
     const mimeType = hlsMimeTypeForSegment(sourceUrl, probe.contentType);
 
     if (probe.size !== undefined && probe.size > MAX_TELEGRAM_MULTIPART_BYTES) {
       throw fileTooLargeError(MAX_TELEGRAM_MULTIPART_BYTES, probe.size);
+    }
+
+    if (encryption) {
+      if (probe.size !== undefined && probe.size > TELEGRAM_CHUNK_SIZE_BYTES + HLS_AES_128_KEY_BYTES) {
+        throw new AppError(
+          400,
+          "EncryptedHlsSegmentTooLarge",
+          `加密 HLS segment 目前最大支持 ${formatHumanFileSize(TELEGRAM_CHUNK_SIZE_BYTES)} 明文大小`
+        );
+      }
+
+      const encryptedBlob = await downloadHlsSegmentBlob(
+        sourceUrl,
+        TELEGRAM_CHUNK_SIZE_BYTES + HLS_AES_128_KEY_BYTES,
+        probe.size
+      );
+      const blob = await decryptHlsSegmentBlob(encryptedBlob, encryption);
+      if (blob.size > TELEGRAM_CHUNK_SIZE_BYTES) {
+        throw new AppError(
+          400,
+          "EncryptedHlsSegmentTooLarge",
+          `解密后的 HLS segment 目前最大支持 ${formatHumanFileSize(TELEGRAM_CHUNK_SIZE_BYTES)}`
+        );
+      }
+
+      const fileName = hlsSegmentFileName(sourceUrl, segment.segment_index);
+      const { telegramDocument, channel } = await uploadTelegramDocumentWithChannel({
+        env: params.env,
+        db: params.db,
+        file: blob,
+        fileName,
+        preferredChannelIndex: segment.segment_index
+      });
+      const completedAt = new Date().toISOString();
+
+      await completeHlsSegmentSingle({
+        db: params.db,
+        id: segment.id,
+        mimeType,
+        size: telegramDocument.file_size ?? blob.size,
+        telegramFileId: telegramDocument.file_id,
+        telegramChannelId: channel.id,
+        completedAt,
+        ...(telegramDocument.file_unique_id ? { telegramFileUniqueId: telegramDocument.file_unique_id } : {})
+      });
+
+      return hlsSegmentImportResult(params.db, await requireHlsSegment(params.db, params.asset.id, params.segmentIndex));
     }
 
     if (probe.size !== undefined && probe.size > TELEGRAM_CHUNK_SIZE_BYTES) {
@@ -2226,6 +2291,98 @@ async function downloadHlsSegmentBlob(sourceUrl: URL, maxBytes: number, expected
   }
 
   return blob;
+}
+
+function hlsSegmentEncryptionForAsset(asset: HlsAssetRecord, segmentIndex: number): HlsSegmentEncryption | null {
+  const plan = parseHlsPlaylist(asset.playlist_text, new URL(asset.media_playlist_url));
+  if (plan.kind !== "media") {
+    throw new AppError(400, "InvalidHlsPlaylist", "HLS media playlist 无效");
+  }
+
+  return plan.segments[segmentIndex]?.encryption ?? null;
+}
+
+async function decryptHlsSegmentBlob(blob: Blob, encryption: HlsSegmentEncryption): Promise<Blob> {
+  const [keyBytes, encryptedBytes] = await Promise.all([
+    fetchHlsAes128Key(new URL(encryption.keyUri)),
+    blob.arrayBuffer().catch(() => {
+      throw new AppError(502, "HlsSegmentReadFailed", "HLS segment 读取失败");
+    })
+  ]);
+
+  let cryptoKey: CryptoKey;
+  try {
+    cryptoKey = await crypto.subtle.importKey(
+      "raw",
+      keyBytes,
+      { name: "AES-CBC" },
+      false,
+      ["decrypt"]
+    );
+  } catch {
+    throw new AppError(400, "InvalidHlsKey", "HLS AES-128 key 无效");
+  }
+
+  let decrypted: ArrayBuffer;
+  try {
+    decrypted = await crypto.subtle.decrypt(
+      { name: "AES-CBC", iv: hexToArrayBuffer(encryption.ivHex) },
+      cryptoKey,
+      encryptedBytes
+    );
+  } catch {
+    throw new AppError(400, "HlsSegmentDecryptFailed", "HLS segment 解密失败");
+  }
+
+  return new Blob([decrypted], { type: blob.type || "video/mp2t" });
+}
+
+async function fetchHlsAes128Key(keyUrl: URL): Promise<ArrayBuffer> {
+  let response: Response;
+  try {
+    response = await fetch(keyUrl.toString(), {
+      redirect: "follow",
+      headers: { Accept: "application/octet-stream, */*" }
+    });
+  } catch {
+    throw new AppError(502, "HlsKeyFetchFailed", "HLS key 获取失败");
+  }
+
+  if (!response.ok) {
+    throw new AppError(
+      response.status >= 500 ? 502 : 400,
+      "HlsKeyFetchFailed",
+      `HLS key 返回 ${response.status}`,
+      { source_status: response.status }
+    );
+  }
+
+  const contentLength = parseContentLength(response.headers.get("Content-Length"));
+  if (contentLength !== undefined && contentLength !== HLS_AES_128_KEY_BYTES) {
+    throw new AppError(400, "InvalidHlsKey", "HLS AES-128 key 必须是 16 字节");
+  }
+
+  const keyBytes = await response.arrayBuffer().catch(() => {
+    throw new AppError(502, "HlsKeyReadFailed", "HLS key 读取失败");
+  });
+
+  if (keyBytes.byteLength !== HLS_AES_128_KEY_BYTES) {
+    throw new AppError(400, "InvalidHlsKey", "HLS AES-128 key 必须是 16 字节");
+  }
+
+  return keyBytes;
+}
+
+function hexToArrayBuffer(hex: string): ArrayBuffer {
+  if (!/^[0-9a-f]{32}$/i.test(hex)) {
+    throw new AppError(400, "InvalidHlsPlaylist", "HLS IV 必须是 16 字节十六进制值");
+  }
+
+  const bytes = new Uint8Array(16);
+  for (let index = 0; index < bytes.length; index += 1) {
+    bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes.buffer;
 }
 
 async function ensureHlsSegmentMultipartUpload(params: {
@@ -4829,6 +4986,17 @@ async function handleHlsAccess(request: Request, env: Env): Promise<Response> {
 
   if (access.segmentIndex !== undefined) {
     const segment = await requireHlsSegment(db, asset.id, access.segmentIndex);
+    if (access.chunkIndex !== undefined) {
+      return serveHlsSegmentChunk({
+        env,
+        db,
+        segment,
+        chunkIndex: access.chunkIndex,
+        rangeHeader: request.headers.get("Range"),
+        forceDownload: url.searchParams.get("download") === "1" || url.searchParams.get("download") === "true"
+      });
+    }
+
     return serveStoredHlsSegment({
       env,
       db,
@@ -4843,6 +5011,22 @@ async function handleHlsAccess(request: Request, env: Env): Promise<Response> {
   const forceDownload = url.searchParams.get("download") === "1" || url.searchParams.get("download") === "true";
 
   if (forceDownload) {
+    const downloadInfo = hlsDownloadAvailability(segments);
+    if (!downloadInfo.downloadable) {
+      throw new AppError(400, "UnsupportedHlsDownload", "当前仅支持未加密 TS HLS 顺序合并下载");
+    }
+    if (!downloadInfo.directAccess) {
+      throw new AppError(
+        403,
+        "DirectAccessDisabled",
+        "该 HLS 文件分片数量过多，不提供整包直链下载，请在控制台使用加速下载",
+        {
+          hls_download_part_count: downloadInfo.partCount,
+          direct_access_max_parts: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS
+        }
+      );
+    }
+
     return serveHlsPackageDownload({
       env,
       db,
@@ -5029,6 +5213,93 @@ async function serveMultipartHlsSegment(params: {
   });
 }
 
+async function serveHlsSegmentChunk(params: {
+  env: Env;
+  db: D1Database;
+  segment: HlsSegmentRecord;
+  chunkIndex: number;
+  rangeHeader: string | null;
+  forceDownload: boolean;
+}): Promise<Response> {
+  if (params.segment.status !== "done") {
+    throw new AppError(404, "HlsSegmentNotReady", "HLS segment 尚未导入完成");
+  }
+
+  if (params.segment.storage_backend !== "telegram_multipart" || !params.segment.multipart_upload_id) {
+    if (params.segment.storage_backend === "telegram_single" && params.chunkIndex === 0) {
+      return serveSingleHlsSegment(params);
+    }
+
+    throw new AppError(400, "NotMultipartHlsSegment", "HLS segment chunk download is only available for multipart segments");
+  }
+
+  const chunkSize = requirePositiveRecordInteger(params.segment.chunk_size, "chunk_size");
+  const chunkCount = requirePositiveRecordInteger(params.segment.chunk_count, "chunk_count");
+  const segmentSize = requireHlsSegmentSize(params.segment);
+
+  if (!Number.isSafeInteger(params.chunkIndex) || params.chunkIndex < 0 || params.chunkIndex >= chunkCount) {
+    throw new AppError(400, "InvalidChunkIndex", "Chunk index is out of range");
+  }
+
+  const chunk = await getFileChunkRecord(params.db, params.segment.multipart_upload_id, params.chunkIndex);
+  const expectedSize = expectedRecordChunkSize(segmentSize, chunkSize, chunkCount, params.chunkIndex);
+  if (!chunk || chunk.size !== expectedSize) {
+    throw new AppError(404, "FileChunkNotFound", "HLS segment chunk was not found");
+  }
+
+  const range = parseByteRange(params.rangeHeader, chunk.size);
+  if (!range) {
+    return rangeNotSatisfiableResponse(chunk.size);
+  }
+
+  const channel = await resolveTelegramChannel(params.env, params.db, chunk.telegram_channel_id);
+  const telegramFileUrl = await getRateLimitedTelegramFileUrl({
+    env: params.env,
+    botToken: channel.botToken,
+    channelId: channel.id,
+    fileId: chunk.telegram_file_id
+  });
+  const telegramResponse = await fetchTelegramFile({
+    fileUrl: telegramFileUrl,
+    rangeHeader: range.partial ? `bytes=${range.start}-${range.end}` : null
+  });
+
+  if (range.partial && telegramResponse.status !== 206 && (range.start !== 0 || range.end !== chunk.size - 1)) {
+    throw new AppError(502, "TelegramFileDownloadFailed", "Telegram file server ignored a partial Range request");
+  }
+
+  if (!telegramResponse.body) {
+    throw new AppError(502, "TelegramFileDownloadFailed", "Telegram file response did not include a body");
+  }
+
+  const fileName = recordChunkDownloadFileName(
+    hlsSegmentFileName(new URL(params.segment.source_url), params.segment.segment_index),
+    chunkCount,
+    params.chunkIndex
+  );
+  const headers = withSecurityHeaders();
+  headers.set("Content-Type", params.segment.mime_type || telegramResponse.headers.get("Content-Type") || "video/mp2t");
+  headers.set(
+    "Content-Disposition",
+    params.forceDownload ? contentDispositionAttachment(fileName) : contentDispositionInline(fileName)
+  );
+  headers.set("Content-Length", String(range.end - range.start + 1));
+  headers.set("Cache-Control", "public, max-age=31536000, immutable");
+  headers.set("Accept-Ranges", "bytes");
+  if (range.partial) {
+    headers.set("Content-Range", `bytes ${range.start}-${range.end}/${chunk.size}`);
+  }
+  headers.set("X-HLS-Segment-Index", String(params.segment.segment_index));
+  headers.set("X-Chunk-Index", String(params.chunkIndex));
+  headers.set("X-Chunk-Count", String(chunkCount));
+  headers.set("X-Chunk-Offset", String(params.chunkIndex * chunkSize));
+
+  return new Response(telegramResponse.body, {
+    status: range.partial ? 206 : 200,
+    headers
+  });
+}
+
 function hlsSegmentHeaders(
   segment: HlsSegmentRecord,
   range: ParsedByteRange,
@@ -5132,6 +5403,35 @@ function isDownloadableTsSegment(segment: HlsSegmentRecord): boolean {
 function hlsDownloadFileName(fileName: string): string {
   const normalized = sanitizeFileName(fileName);
   return normalized.replace(/\.m3u8$/i, "") + ".ts";
+}
+
+function hlsDownloadAvailability(segments: HlsSegmentRecord[]): {
+  downloadable: boolean;
+  partCount: number;
+  directAccess: boolean;
+} {
+  const downloadable = segments.every(isDownloadableTsSegment);
+  const partCount = downloadable
+    ? segments.reduce((total, segment) => total + hlsSegmentDownloadPartCount(segment), 0)
+    : 0;
+
+  return {
+    downloadable,
+    partCount,
+    directAccess: downloadable && partCount > 0 && partCount <= DIRECT_MULTIPART_ACCESS_MAX_CHUNKS
+  };
+}
+
+function hlsSegmentDownloadPartCount(segment: HlsSegmentRecord): number {
+  if (segment.storage_backend === "telegram_multipart") {
+    return requirePositiveRecordInteger(segment.chunk_count, "chunk_count");
+  }
+
+  if (segment.storage_backend === "telegram_single") {
+    return 1;
+  }
+
+  throw new AppError(404, "HlsSegmentNotReady", "HLS segment 尚未导入完成");
 }
 
 async function handleMultipartChunkAccess(params: {
@@ -5556,11 +5856,144 @@ function isFormContentType(contentType: string | null): boolean {
   return normalized.includes("application/x-www-form-urlencoded") || normalized.includes("multipart/form-data");
 }
 
-function serializeFileRecord(file: FileRecord, baseUrl: string): Record<string, unknown> {
+async function hlsDownloadSummaryForFile(db: D1Database, file: FileRecord): Promise<{
+  segment_count: number;
+  part_count: number;
+  direct_access: boolean;
+  direct_access_max_parts: number;
+  downloadable: boolean;
+}> {
+  const { asset, segments } = await requireHlsDownloadRecordsForFile(db, file);
+  validateCompleteHlsSegments(asset, segments);
+  const availability = hlsDownloadAvailability(segments);
+
+  return {
+    segment_count: asset.segment_count,
+    part_count: availability.partCount,
+    direct_access: availability.directAccess,
+    direct_access_max_parts: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
+    downloadable: availability.downloadable
+  };
+}
+
+async function serializeHlsDownloadPlanForFile(params: {
+  request: Request;
+  env: Env;
+  db: D1Database;
+  file: FileRecord;
+}): Promise<Record<string, unknown>> {
+  if (fileStorageBackend(params.file) !== "hls_package") {
+    throw new AppError(400, "NotHlsFile", "Only HLS package files have HLS download plans");
+  }
+
+  const { asset, segments } = await requireHlsDownloadRecordsForFile(params.db, params.file);
+  validateCompleteHlsSegments(asset, segments);
+  const availability = hlsDownloadAvailability(segments);
+  if (!availability.downloadable) {
+    throw new AppError(400, "UnsupportedHlsDownload", "当前仅支持未加密 TS HLS 顺序合并下载");
+  }
+
+  const token = await createHlsAccessTokenForFile(params.file, params.env);
+  const baseUrl = getPublicBaseUrl(params.request, params.env);
+  let offset = 0;
+  let partIndex = 0;
+  const parts: Array<Record<string, unknown>> = [];
+
+  for (const segment of segments) {
+    const segmentSize = requireHlsSegmentSize(segment);
+
+    if (segment.storage_backend === "telegram_multipart") {
+      const chunkSize = requirePositiveRecordInteger(segment.chunk_size, "chunk_size");
+      const chunkCount = requirePositiveRecordInteger(segment.chunk_count, "chunk_count");
+      for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+        const size = expectedRecordChunkSize(segmentSize, chunkSize, chunkCount, chunkIndex);
+        parts.push({
+          index: partIndex,
+          segment_index: segment.segment_index,
+          chunk_index: chunkIndex,
+          offset,
+          size,
+          url: `${baseUrl}${hlsPublicSegmentChunkPath(token, segment.segment_index, chunkIndex)}`
+        });
+        offset += size;
+        partIndex += 1;
+      }
+      continue;
+    }
+
+    if (segment.storage_backend !== "telegram_single") {
+      throw new AppError(404, "HlsSegmentNotReady", "HLS segment 尚未导入完成");
+    }
+
+    parts.push({
+      index: partIndex,
+      segment_index: segment.segment_index,
+      chunk_index: null,
+      offset,
+      size: segmentSize,
+      url: `${baseUrl}${hlsPublicSegmentPath(token, segment)}`
+    });
+    offset += segmentSize;
+    partIndex += 1;
+  }
+
+  return {
+    file_id: params.file.id,
+    file_name: hlsDownloadFileName(params.file.file_name),
+    total_size: offset,
+    segment_count: asset.segment_count,
+    part_count: parts.length,
+    direct_access: availability.directAccess,
+    direct_access_max_parts: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
+    parts
+  };
+}
+
+async function requireHlsDownloadRecordsForFile(
+  db: D1Database,
+  file: FileRecord
+): Promise<{ asset: HlsAssetRecord; segments: HlsSegmentRecord[] }> {
+  const assetId = file.telegram_file_id.startsWith("hls:")
+    ? file.telegram_file_id.slice("hls:".length)
+    : file.id;
+  const asset = await getHlsAssetRecordByFinalFileId(db, file.id) ?? await getHlsAssetRecord(db, assetId);
+
+  if (!asset || asset.final_file_id !== file.id || asset.status !== "done") {
+    throw new AppError(404, "HlsAssetNotFound", "HLS 文件不存在");
+  }
+
+  const segments = await listHlsSegmentRecords(db, asset.id);
+  return { asset, segments };
+}
+
+async function createHlsAccessTokenForFile(file: FileRecord, env: Env): Promise<string> {
+  const assetId = file.telegram_file_id.startsWith("hls:")
+    ? file.telegram_file_id.slice("hls:".length)
+    : file.id;
+
+  return createSignedToken(
+    {
+      v: 4,
+      hls_asset_id: assetId,
+      file_record_id: file.id,
+      name: file.file_name,
+      mime_type: file.mime_type,
+      size: file.size,
+      iat: Math.floor(Date.now() / 1000)
+    },
+    requireEnv(env, "LINK_SIGNING_SECRET")
+  );
+}
+
+async function serializeFileRecord(file: FileRecord, baseUrl: string, db: D1Database): Promise<Record<string, unknown>> {
   const storageBackend = fileStorageBackend(file);
   const directAccess = canDirectlyAccessFileRecord(file);
   const filePath = publicFilePathForResponse(file.file_path, storageBackend);
   const url = directAccess ? `${baseUrl}${filePath}` : null;
+  const hlsDownload = storageBackend === "hls_package"
+    ? await hlsDownloadSummaryForFile(db, file)
+    : null;
+  const directDownload = hlsDownload ? hlsDownload.direct_access : directAccess;
   const thumbnailUrl = file.thumbnail_file_path && file.thumbnail_status === "ready"
     ? `${baseUrl}${file.thumbnail_file_path}`
     : null;
@@ -5574,9 +6007,11 @@ function serializeFileRecord(file: FileRecord, baseUrl: string): Record<string, 
     chunk_size: storageBackend === "telegram_multipart" ? file.chunk_size ?? null : null,
     chunk_count: storageBackend === "telegram_multipart" ? file.chunk_count ?? null : null,
     direct_access: directAccess,
-    download_strategy: downloadStrategy(storageBackend, directAccess),
+    direct_download: directDownload,
+    download_strategy: downloadStrategy(storageBackend, directDownload),
     url,
-    download_url: url ? appendDownloadParam(url) : null,
+    download_url: url && directDownload ? appendDownloadParam(url) : null,
+    hls_download: hlsDownload,
     thumbnail_status: file.thumbnail_status ?? "none",
     thumbnail_url: thumbnailUrl,
     telegram_channel_id: file.telegram_channel_id ?? "default",
@@ -5782,7 +6217,7 @@ function downloadStrategy(
   storageBackend: "telegram_single" | "telegram_multipart" | "hls_package",
   directAccess: boolean
 ): "direct" | "direct_or_accelerated" | "accelerated" {
-  if (storageBackend === "telegram_single" || storageBackend === "hls_package") {
+  if (storageBackend === "telegram_single") {
     return "direct";
   }
 
@@ -6242,6 +6677,10 @@ function hlsPublicSegmentPath(token: string, segment: HlsSegmentRecord): string 
   return `${HLS_PUBLIC_ROUTE_PREFIX}/${encodeURIComponent(token)}/segments/${segment.segment_index}/${encodeURIComponent(hlsSegmentFileName(new URL(segment.source_url), segment.segment_index))}`;
 }
 
+function hlsPublicSegmentChunkPath(token: string, segmentIndex: number, chunkIndex: number): string {
+  return `${HLS_PUBLIC_ROUTE_PREFIX}/${encodeURIComponent(token)}/segments/${segmentIndex}/chunks/${chunkIndex}`;
+}
+
 function publicFilePathForResponse(
   filePath: string,
   storageBackend: "telegram_single" | "telegram_multipart" | "hls_package"
@@ -6359,7 +6798,7 @@ function extractMultipartChunkAccess(pathname: string): { token: string; chunkIn
   };
 }
 
-function extractHlsAccess(pathname: string): { token: string; segmentIndex?: number } {
+function extractHlsAccess(pathname: string): { token: string; segmentIndex?: number; chunkIndex?: number } {
   const parts = pathname.split("/").filter(Boolean);
   const tokenPartIndex = parts[0] === "hls"
     ? 1
@@ -6382,7 +6821,21 @@ function extractHlsAccess(pathname: string): { token: string; segmentIndex?: num
     throw new AppError(400, "InvalidSegmentIndex", "HLS segment index must be a non-negative integer");
   }
 
-  return { token, segmentIndex };
+  const chunkPartIndex = segmentsPartIndex + 2;
+  if (parts[chunkPartIndex] === undefined) {
+    return { token, segmentIndex };
+  }
+
+  if (parts[chunkPartIndex] !== "chunks") {
+    return { token, segmentIndex };
+  }
+
+  const chunkIndex = Number(parts[chunkPartIndex + 1]);
+  if (!Number.isSafeInteger(chunkIndex) || chunkIndex < 0) {
+    throw new AppError(400, "InvalidChunkIndex", "HLS segment chunk index must be a non-negative integer");
+  }
+
+  return { token, segmentIndex, chunkIndex };
 }
 
 function extractOptionalFileToken(pathname: string): string | undefined {

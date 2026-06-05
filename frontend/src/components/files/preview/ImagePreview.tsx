@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { ImageOff } from "lucide-react";
-import { hasDirectFileAccess } from "../../../lib/file-access";
+import { hasFileLinkAccess } from "../../../lib/file-access";
 import { cn } from "../../../lib/cn";
 import type { PreviewComponentProps } from "./types";
 import { PreviewError, PreviewLoading } from "./PreviewFrame";
@@ -10,7 +10,7 @@ const IMAGE_PREVIEW_TIMEOUT_MS = 30_000;
 export function ImagePreview({ file, fullscreen }: PreviewComponentProps) {
   const [loaded, setLoaded] = useState(false);
   const [failed, setFailed] = useState(false);
-  const directFile = hasDirectFileAccess(file) ? file : null;
+  const linkFile = hasFileLinkAccess(file) ? file : null;
 
   useEffect(() => {
     setLoaded(false);
@@ -18,16 +18,16 @@ export function ImagePreview({ file, fullscreen }: PreviewComponentProps) {
   }, [file.id]);
 
   useEffect(() => {
-    if (!directFile || loaded || failed) return;
+    if (!linkFile || loaded || failed) return;
 
     const timeout = window.setTimeout(() => {
       setFailed(true);
     }, IMAGE_PREVIEW_TIMEOUT_MS);
 
     return () => window.clearTimeout(timeout);
-  }, [directFile, failed, loaded]);
+  }, [linkFile, failed, loaded]);
 
-  if (!directFile) {
+  if (!linkFile) {
     return <PreviewError message="该文件不提供完整访问链接，无法直接预览图片" />;
   }
 

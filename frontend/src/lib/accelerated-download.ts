@@ -20,9 +20,10 @@ interface SaveFilePickerWindow extends Window {
 }
 
 export interface AcceleratedDownloadProgress {
-  chunkIndex: number;
   downloadedBytes: number;
   totalBytes: number;
+  chunkIndex?: number;
+  partIndex?: number;
 }
 
 export interface MultipartDownloadFile extends FileItem {
@@ -88,22 +89,46 @@ export async function downloadMultipartChunk({
   signal,
   onProgress
 }: AcceleratedDownloadOptions): Promise<ArrayBuffer> {
-  const response = await fetch(`/f/${encodeURIComponent(token)}/chunks/${chunkIndex}`, {
+  const expectedSize = expectedMultipartChunkSize(file, chunkIndex);
+  return downloadAcceleratedPart({
+    url: `/f/${encodeURIComponent(token)}/chunks/${chunkIndex}`,
+    expectedSize,
+    label: `分片 ${chunkIndex + 1}`,
+    signal,
+    onProgress: onProgress
+      ? (progress) => onProgress({ ...progress, chunkIndex })
+      : undefined
+  });
+}
+
+export async function downloadAcceleratedPart({
+  url,
+  expectedSize,
+  label,
+  signal,
+  onProgress
+}: {
+  url: string;
+  expectedSize: number;
+  label: string;
+  signal: AbortSignal;
+  onProgress?: (progress: AcceleratedDownloadProgress) => void;
+}): Promise<ArrayBuffer> {
+  const response = await fetch(url, {
     signal,
     credentials: "omit"
   });
 
   if (!response.ok) {
-    throw new Error(await readChunkErrorMessage(response, chunkIndex));
+    throw new Error(await readPartErrorMessage(response, label));
   }
 
-  const expectedSize = expectedMultipartChunkSize(file, chunkIndex);
-  onProgress?.({ chunkIndex, downloadedBytes: 0, totalBytes: expectedSize });
+  onProgress?.({ downloadedBytes: 0, totalBytes: expectedSize });
 
   if (!response.body) {
     const bytes = await response.arrayBuffer();
-    validateChunkSize(bytes.byteLength, expectedSize, chunkIndex);
-    onProgress?.({ chunkIndex, downloadedBytes: bytes.byteLength, totalBytes: expectedSize });
+    validatePartSize(bytes.byteLength, expectedSize, label);
+    onProgress?.({ downloadedBytes: bytes.byteLength, totalBytes: expectedSize });
     return bytes;
   }
 
@@ -129,7 +154,7 @@ export async function downloadMultipartChunk({
     }
 
     lastReportedAt = now;
-    onProgress({ chunkIndex, downloadedBytes, totalBytes: expectedSize });
+    onProgress({ downloadedBytes, totalBytes: expectedSize });
   }
 
   while (true) {
@@ -148,7 +173,7 @@ export async function downloadMultipartChunk({
   }
 
   reportProgress(true);
-  validateChunkSize(downloadedBytes, expectedSize, chunkIndex);
+  validatePartSize(downloadedBytes, expectedSize, label);
   return concatChunks(chunks, downloadedBytes);
 }
 
@@ -158,8 +183,8 @@ export function expectedMultipartChunkSize(file: MultipartDownloadFile, chunkInd
     : file.chunk_size;
 }
 
-async function readChunkErrorMessage(response: Response, chunkIndex: number): Promise<string> {
-  const prefix = `分片 ${chunkIndex + 1} 下载失败（HTTP ${response.status}）`;
+async function readPartErrorMessage(response: Response, label: string): Promise<string> {
+  const prefix = `${label} 下载失败（HTTP ${response.status}）`;
   const contentType = response.headers.get("Content-Type") || "";
 
   if (!contentType.includes("application/json")) {
@@ -181,10 +206,10 @@ async function readChunkErrorMessage(response: Response, chunkIndex: number): Pr
   return prefix;
 }
 
-function validateChunkSize(actualSize: number, expectedSize: number, chunkIndex: number): void {
+function validatePartSize(actualSize: number, expectedSize: number, label: string): void {
   if (actualSize !== expectedSize) {
     throw new Error(
-      `分片 ${chunkIndex + 1} 大小不匹配：期望 ${expectedSize} 字节，实际 ${actualSize} 字节`
+      `${label} 大小不匹配：期望 ${expectedSize} 字节，实际 ${actualSize} 字节`
     );
   }
 }

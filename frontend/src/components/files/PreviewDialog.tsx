@@ -2,7 +2,12 @@ import { useEffect, useState } from "react";
 import { Copy, Download, Maximize2, Minimize2 } from "lucide-react";
 import type { FileItem } from "../../api";
 import { fileKind, formatBytes, previewKind } from "../../utils";
-import { hasDirectFileAccess } from "../../lib/file-access";
+import { canUseAcceleratedDownload } from "../../lib/accelerated-download";
+import {
+  canUseHlsAcceleratedDownload,
+  hasDirectDownloadAccess,
+  hasFileLinkAccess
+} from "../../lib/file-access";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
 import { Badge } from "../ui/Badge";
@@ -22,9 +27,10 @@ interface PreviewDialogProps {
   file: FileItem | null;
   onClose: () => void;
   onCopy: (value: string) => void;
+  onAcceleratedDownload?: (file: FileItem) => void;
 }
 
-export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
+export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload }: PreviewDialogProps) {
   const preview = file ? previewKind(file) : null;
   const kind = file ? fileKind(file) : null;
   const [fullscreen, setFullscreen] = useState(false);
@@ -36,7 +42,7 @@ export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
       return;
     }
 
-    if (!hasDirectFileAccess(file)) {
+    if (!hasFileLinkAccess(file)) {
       setTextState({
         status: "error",
         content: "",
@@ -89,7 +95,9 @@ export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
     return <Modal open={false} onClose={onClose}>{null}</Modal>;
   }
 
-  const directFile = hasDirectFileAccess(file) ? file : null;
+  const linkFile = hasFileLinkAccess(file) ? file : null;
+  const directFile = hasDirectDownloadAccess(file) ? file : null;
+  const canAccelerateDownload = canUseAcceleratedDownload(file) || canUseHlsAcceleratedDownload(file);
   const canCopyContent = (preview === "text" || preview === "markdown") && textState.status === "ready";
   const isMediaPreview = preview === "video" || preview === "audio";
   const toggleFullscreen = () => setFullscreen((value) => !value);
@@ -104,7 +112,7 @@ export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
           <FileVisual
             mimeType={file.mime_type}
             fileName={file.file_name}
-            url={directFile ? file.file_path : undefined}
+            url={linkFile ? file.file_path : undefined}
             thumbnailUrl={file.thumbnail_url}
             size="sm"
           />
@@ -142,7 +150,15 @@ export function PreviewDialog({ file, onClose, onCopy }: PreviewDialogProps) {
               {fullscreen ? "退出全屏" : "全屏"}
             </Button>
           ) : null}
-          {directFile ? (
+          {onAcceleratedDownload && canAccelerateDownload ? (
+            <Button
+              variant="primary"
+              leadingIcon={<Download size={15} />}
+              onClick={() => onAcceleratedDownload(file)}
+            >
+              加速下载
+            </Button>
+          ) : directFile ? (
             <a
               href={directFile.download_url}
               className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-primary bg-primary px-4 text-sm font-medium text-white shadow-card transition-colors duration-150 hover:border-primary-strong hover:bg-primary-strong"

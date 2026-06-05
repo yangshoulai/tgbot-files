@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Music2 } from "lucide-react";
-import { hasDirectFileAccess } from "../../../lib/file-access";
+import { hasFileLinkAccess } from "../../../lib/file-access";
 import { formatBytes } from "../../../utils";
 import { cn } from "../../../lib/cn";
 import type { PreviewComponentProps } from "./types";
@@ -19,7 +19,7 @@ export function AudioPreview({ file, fullscreen, onToggleFullscreen }: AudioPrev
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
   const [coverFailed, setCoverFailed] = useState(false);
-  const directFile = hasDirectFileAccess(file) ? file : null;
+  const linkFile = hasFileLinkAccess(file) ? file : null;
   const coverUrl = file.thumbnail_url && !coverFailed ? file.thumbnail_url : null;
 
   useEffect(() => {
@@ -29,7 +29,7 @@ export function AudioPreview({ file, fullscreen, onToggleFullscreen }: AudioPrev
   }, [file.id]);
 
   useEffect(() => {
-    if (!loading || failed || !directFile) return;
+    if (!loading || failed || !linkFile) return;
 
     const timeout = window.setTimeout(() => {
       setLoading(false);
@@ -37,9 +37,9 @@ export function AudioPreview({ file, fullscreen, onToggleFullscreen }: AudioPrev
     }, AUDIO_PREVIEW_TIMEOUT_MS);
 
     return () => window.clearTimeout(timeout);
-  }, [directFile, failed, loading]);
+  }, [linkFile, failed, loading]);
 
-  if (!directFile) {
+  if (!linkFile) {
     return <PreviewError message="该音频不提供完整访问链接，无法直接在线播放" dark />;
   }
 

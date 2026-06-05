@@ -61,10 +61,12 @@ export interface FileItem {
   url: string | null;
   download_url: string | null;
   direct_access?: boolean;
+  direct_download?: boolean;
   download_strategy?: "direct" | "direct_or_accelerated" | "accelerated";
   storage_backend?: "telegram_single" | "telegram_multipart" | "hls_package";
   chunk_size?: number | null;
   chunk_count?: number | null;
+  hls_download?: HlsDownloadSummary | null;
   thumbnail_file_id?: string | null;
   thumbnail_file_unique_id?: string | null;
   thumbnail_file_path?: string | null;
@@ -74,6 +76,39 @@ export interface FileItem {
   thumbnail_height?: number | null;
   thumbnail_status?: "none" | "ready" | "failed";
   thumbnail_url?: string | null;
+}
+
+export interface HlsDownloadSummary {
+  segment_count: number;
+  part_count: number;
+  direct_access: boolean;
+  direct_access_max_parts: number;
+  downloadable: boolean;
+}
+
+export interface HlsDownloadPart {
+  index: number;
+  segment_index: number;
+  chunk_index: number | null;
+  offset: number;
+  size: number;
+  url: string;
+}
+
+export interface HlsDownloadPlan {
+  file_id: string;
+  file_name: string;
+  total_size: number;
+  segment_count: number;
+  part_count: number;
+  direct_access: boolean;
+  direct_access_max_parts: number;
+  parts: HlsDownloadPart[];
+}
+
+export interface HlsDownloadPlanResponse {
+  ok: boolean;
+  hls_download: HlsDownloadPlan;
 }
 
 export interface DirectoryItem {
@@ -522,6 +557,10 @@ export function listFiles(params: {
   }
 
   return requestJson<FileListResponse>(`/api/admin/files?${search.toString()}`);
+}
+
+export function getHlsDownloadPlan(fileId: string) {
+  return requestJson<HlsDownloadPlanResponse>(`/api/admin/files/${encodeURIComponent(fileId)}/hls-download`);
 }
 
 export function uploadFile(formData: FormData, conflictAction?: FileNameConflictAction) {

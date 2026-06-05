@@ -13,6 +13,21 @@ export interface HlsSegmentPlan {
   uri: string;
   rawUri: string;
   duration: number;
+  encryption: HlsSegmentEncryption | null;
+}
+
+export interface HlsSegmentEncryption {
+  method: "AES-128";
+  keyUri: string;
+  rawKeyUri: string;
+  ivHex: string;
+}
+
+interface HlsEncryptionState {
+  method: "AES-128";
+  keyUri: string;
+  rawKeyUri: string;
+  ivHex?: string;
 }
 
 export interface HlsMediaPlan {
@@ -112,10 +127,6 @@ export function buildRewrittenMediaPlaylist(params: {
 }
 
 function rejectUnsupportedHlsTags(lines: string[]): void {
-  if (lines.some((line) => line.startsWith("#EXT-X-KEY") && !/METHOD=NONE(?:,|$)/i.test(line))) {
-    throw new AppError(400, "UnsupportedHlsEncryption", "暂不支持加密 HLS");
-  }
-
   if (lines.some((line) => line.startsWith("#EXT-X-BYTERANGE"))) {
     throw new AppError(400, "UnsupportedHlsByteRange", "暂不支持 byte-range HLS");
   }
@@ -172,6 +183,8 @@ function parseMediaPlaylist(lines: string[], playlistUrl: URL, playlistText: str
 
   const segments: HlsSegmentPlan[] = [];
   let targetDuration = 0;
+  let mediaSequence = 0;
+  let currentEncryption: HlsEncryptionState | null = null;
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
@@ -185,6 +198,17 @@ function parseMediaPlaylist(lines: string[], playlistUrl: URL, playlistText: str
       continue;
     }
 
+    if (line.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
+      const parsed = Number(line.slice("#EXT-X-MEDIA-SEQUENCE:".length));
+      mediaSequence = Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : mediaSequence;
+      continue;
+    }
+
+    if (line.startsWith("#EXT-X-KEY")) {
+      currentEncryption = parseHlsKey(line, playlistUrl);
+      continue;
+    }
+
     if (!line.startsWith("#EXTINF:")) {
       continue;
     }
@@ -194,12 +218,19 @@ function parseMediaPlaylist(lines: string[], playlistUrl: URL, playlistText: str
     if (!uri) {
       throw new AppError(400, "InvalidHlsPlaylist", "#EXTINF 后缺少 segment URI");
     }
+    const segmentSequence = mediaSequence + segments.length;
 
     segments.push({
       index: segments.length,
       uri: new URL(uri, playlistUrl).toString(),
       rawUri: uri,
-      duration
+      duration,
+      encryption: currentEncryption
+        ? {
+            ...currentEncryption,
+            ivHex: currentEncryption.ivHex ?? mediaSequenceToIvHex(segmentSequence)
+          }
+        : null
     });
   }
 
@@ -233,6 +264,10 @@ function rewriteMediaPlaylistUris(
       pendingSegmentIndex = nextSegmentIndex;
       nextSegmentIndex += 1;
       output.push(rawLine);
+      continue;
+    }
+
+    if (line.startsWith("#EXT-X-KEY")) {
       continue;
     }
 
@@ -301,6 +336,54 @@ function parseHlsAttributes(value: string): Record<string, string> {
   }
 
   return attrs;
+}
+
+function parseHlsKey(line: string, playlistUrl: URL): HlsEncryptionState | null {
+  const attrs = parseHlsAttributes(line.slice(line.indexOf(":") + 1));
+  const method = attrs.METHOD?.toUpperCase();
+
+  if (!method || method === "NONE") {
+    return null;
+  }
+
+  if (method !== "AES-128") {
+    throw new AppError(400, "UnsupportedHlsEncryption", "暂只支持 AES-128 加密 HLS");
+  }
+
+  if (!attrs.URI) {
+    throw new AppError(400, "InvalidHlsPlaylist", "AES-128 HLS 缺少 key URI");
+  }
+
+  if (attrs.KEYFORMAT && attrs.KEYFORMAT.toLowerCase() !== "identity") {
+    throw new AppError(400, "UnsupportedHlsEncryption", "暂只支持 identity KEYFORMAT 的 AES-128 HLS");
+  }
+
+  return {
+    method: "AES-128",
+    keyUri: new URL(attrs.URI, playlistUrl).toString(),
+    rawKeyUri: attrs.URI,
+    ...(attrs.IV ? { ivHex: normalizeHlsIv(attrs.IV) } : {})
+  };
+}
+
+function normalizeHlsIv(value: string): string {
+  const normalized = value.trim().replace(/^0x/i, "").toLowerCase();
+  if (!/^[0-9a-f]{1,32}$/.test(normalized)) {
+    throw new AppError(400, "InvalidHlsPlaylist", "AES-128 HLS IV 必须是不超过 16 字节的十六进制值");
+  }
+
+  return normalized.padStart(32, "0");
+}
+
+function mediaSequenceToIvHex(segmentSequence: number): string {
+  let value = BigInt(segmentSequence);
+  const bytes = new Uint8Array(16);
+  for (let index = bytes.length - 1; index >= 0; index -= 1) {
+    bytes[index] = Number(value & 0xffn);
+    value >>= 8n;
+  }
+
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function numberAttr(value: string | undefined): number | undefined {
