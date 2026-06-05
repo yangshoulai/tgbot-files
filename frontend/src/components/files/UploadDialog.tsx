@@ -1,5 +1,5 @@
 import { ChangeEvent, FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, Check, CheckCircle2, ClipboardPaste, FilePlus2, FolderOpen, FolderTree, ImageOff, ImagePlus, Layers3, Link2, Pencil, Trash2, UploadCloud, X } from "lucide-react";
+import { AlertTriangle, Check, CheckCircle2, ClipboardPaste, FilePlus2, FolderOpen, FolderTree, ImageOff, ImagePlus, Layers3, Link2, Pencil, Plus, Trash2, UploadCloud, X } from "lucide-react";
 import {
   ApiError,
   cancelHlsUpload,
@@ -82,6 +82,12 @@ interface UploadChunkState {
   status: UploadChunkStatus;
   attempts: number;
   errorMessage?: string;
+}
+
+interface SourceHeaderRow {
+  id: string;
+  name: string;
+  value: string;
 }
 
 interface MultipartRetryState {
@@ -225,6 +231,15 @@ function makeItem(file: File, options: { relativePath?: string } = {}): QueueIte
   };
 }
 
+function makeSourceHeaderRow(name = "", value = ""): SourceHeaderRow {
+  counter += 1;
+  return {
+    id: `source-header-${Date.now()}-${counter}`,
+    name: normalizeHeaderKeyInput(name),
+    value
+  };
+}
+
 function isLocalItemAwaitingDecision(item: QueueItem): boolean {
   return item.status === "pending" || item.status === "error";
 }
@@ -247,7 +262,7 @@ export function UploadDialog({
   const [mode, setMode] = useState<UploadMode>("file");
   const [items, setItems] = useState<QueueItem[]>([]);
   const [sourceUrl, setSourceUrl] = useState("");
-  const [sourceHeadersText, setSourceHeadersText] = useState("");
+  const [sourceHeaderRows, setSourceHeaderRows] = useState<SourceHeaderRow[]>([]);
   const [curlImportOpen, setCurlImportOpen] = useState(false);
   const [curlImportText, setCurlImportText] = useState("");
   const [curlImportError, setCurlImportError] = useState<string>();
@@ -303,7 +318,7 @@ export function UploadDialog({
       });
       setMode("file");
       setSourceUrl("");
-      setSourceHeadersText("");
+      setSourceHeaderRows([]);
       setCurlImportOpen(false);
       setCurlImportText("");
       setCurlImportError(undefined);
@@ -321,7 +336,7 @@ export function UploadDialog({
       return initialFiles.map((file) => makeItem(file));
     });
     setSourceUrl("");
-    setSourceHeadersText("");
+    setSourceHeaderRows([]);
     setCurlImportOpen(false);
     setCurlImportText("");
     setCurlImportError(undefined);
@@ -541,8 +556,7 @@ export function UploadDialog({
     });
   }
 
-  function handleSourceHeadersChange(value: string) {
-    setSourceHeadersText(value);
+  function resetUrlRemoteStateForHeaderChange() {
     setUrlUpload((current) => {
       if (current.status === "uploading" || current.status === "done") {
         return current;
@@ -571,6 +585,31 @@ export function UploadDialog({
     });
   }
 
+  function updateSourceHeaderRow(id: string, patch: Partial<Pick<SourceHeaderRow, "name" | "value">>) {
+    setSourceHeaderRows((current) =>
+      current.map((row) =>
+        row.id === id
+          ? {
+              ...row,
+              ...("name" in patch ? { name: normalizeHeaderKeyInput(patch.name ?? "") } : {}),
+              ...("value" in patch ? { value: patch.value ?? "" } : {})
+            }
+          : row
+      )
+    );
+    resetUrlRemoteStateForHeaderChange();
+  }
+
+  function addSourceHeaderRow() {
+    setSourceHeaderRows((current) => [...current, makeSourceHeaderRow()]);
+    resetUrlRemoteStateForHeaderChange();
+  }
+
+  function removeSourceHeaderRow(id: string) {
+    setSourceHeaderRows((current) => current.filter((row) => row.id !== id));
+    resetUrlRemoteStateForHeaderChange();
+  }
+
   function openCurlImport() {
     setCurlImportError(undefined);
     setCurlImportOpen(true);
@@ -584,14 +623,15 @@ export function UploadDialog({
   function applyCurlImport() {
     try {
       const parsed = parseCurlCommand(curlImportText);
-      const headerResult = sourceHeadersTextFromCurlHeaders(parsed.headers);
+      const headerResult = sourceHeaderRowsFromCurlHeaders(parsed.headers);
 
-      if (headerResult.text) {
-        parseSourceHeadersText(headerResult.text);
+      if (headerResult.rows.length > 0) {
+        parseSourceHeaderRows(headerResult.rows);
       }
 
       handleSourceUrlChange(parsed.url);
-      handleSourceHeadersChange(headerResult.text);
+      setSourceHeaderRows(headerResult.rows);
+      resetUrlRemoteStateForHeaderChange();
       setMode("url");
       setCurlImportOpen(false);
       setCurlImportError(undefined);
@@ -806,7 +846,7 @@ export function UploadDialog({
 
   function readSourceHeadersForUpload(): { ok: true; headers?: SourceRequestHeaders } | { ok: false } {
     try {
-      const headers = parseSourceHeadersText(sourceHeadersText);
+      const headers = parseSourceHeaderRows(sourceHeaderRows);
       return headers ? { ok: true, headers } : { ok: true };
     } catch (error) {
       const message = errorMessage(error);
@@ -2579,15 +2619,14 @@ export function UploadDialog({
                 <label htmlFor="upload-source-url" className="text-xs font-medium text-muted">
                   粘贴文件 URL
                 </label>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  leadingIcon={<ClipboardPaste size={14} />}
+                <button
+                  type="button"
                   disabled={uploadBusy}
+                  className="rounded-md px-1.5 py-1 text-xs font-medium text-primary-strong transition-colors hover:bg-primary-soft hover:text-primary disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:focus-ring"
                   onClick={openCurlImport}
                 >
                   从 cURL 解析
-                </Button>
+                </button>
               </div>
               <Input
                 id="upload-source-url"
@@ -2597,6 +2636,7 @@ export function UploadDialog({
                 disabled={uploadBusy}
                 invalid={urlUpload.status === "error"}
                 leadingIcon={<ClipboardPaste size={15} />}
+                inputClassName="!text-sm !text-muted"
                 onChange={(event) => handleSourceUrlChange(event.target.value)}
                 onPaste={(event) => {
                   const pasted = event.clipboardData.getData("text");
@@ -2612,20 +2652,76 @@ export function UploadDialog({
               </p>
             </div>
 
-            <div className="flex flex-col gap-1.5">
-              <label htmlFor="upload-source-headers" className="text-xs font-medium text-muted">
-                请求头（可选）
-              </label>
-              <Textarea
-                id="upload-source-headers"
-                rows={3}
-                placeholder={"Referer: https://example.com/\nCookie: session=...\nAuthorization: Bearer ..."}
-                value={sourceHeadersText}
-                disabled={uploadBusy}
-                onChange={(event) => handleSourceHeadersChange(event.target.value)}
-              />
+            <div className="flex flex-col gap-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <label className="text-xs font-medium text-muted">
+                  请求头（可选）
+                </label>
+                <button
+                  type="button"
+                  disabled={uploadBusy}
+                  className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs font-medium text-primary-strong transition-colors hover:bg-primary-soft hover:text-primary disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:focus-ring"
+                  onClick={addSourceHeaderRow}
+                >
+                  <Plus size={13} />
+                  新增请求头
+                </button>
+              </div>
+              <div className="rounded-xl border border-border bg-surface/70 p-2 shadow-card">
+                {sourceHeaderRows.length > 0 ? (
+                  <div className="flex flex-col gap-2">
+                    {sourceHeaderRows.map((row, index) => (
+                      <div
+                        key={row.id}
+                        className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(8rem,0.38fr)_minmax(12rem,1fr)_2rem]"
+                      >
+                        <Input
+                          aria-label={`请求头 ${index + 1} 名称`}
+                          placeholder="referer"
+                          value={row.name}
+                          disabled={uploadBusy}
+                          className="!h-9 !px-2 !shadow-none"
+                          inputClassName="font-mono !text-[13px] !text-muted"
+                          onChange={(event) => updateSourceHeaderRow(row.id, { name: event.target.value })}
+                        />
+                        <Input
+                          aria-label={`请求头 ${index + 1} 值`}
+                          placeholder="https://example.com/"
+                          value={row.value}
+                          disabled={uploadBusy}
+                          className="!h-9 !px-2 !shadow-none"
+                          inputClassName="font-mono !text-[13px] !text-muted"
+                          onChange={(event) => updateSourceHeaderRow(row.id, { value: event.target.value })}
+                        />
+                        <button
+                          type="button"
+                          aria-label={`删除请求头 ${row.name || index + 1}`}
+                          title="删除请求头"
+                          disabled={uploadBusy}
+                          className="grid size-9 place-items-center rounded-lg text-muted transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:focus-ring"
+                          onClick={() => removeSourceHeaderRow(row.id)}
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="flex min-h-10 items-center justify-between gap-3 rounded-lg bg-background/70 px-3 py-2 text-xs text-subtle">
+                    <span>暂无自定义请求头，可从 cURL 解析或手动新增。</span>
+                    <button
+                      type="button"
+                      disabled={uploadBusy}
+                      className="shrink-0 font-medium text-primary-strong transition-colors hover:text-primary disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:focus-ring"
+                      onClick={addSourceHeaderRow}
+                    >
+                      新增
+                    </button>
+                  </div>
+                )}
+              </div>
               <p className="text-xs leading-5 text-muted">
-                每行一个 <span className="font-mono">Header-Name: value</span>。Worker 会自动设置 Range；不要填写 Range、Host、Content-Length 等连接控制头。
+                key 会自动保存为小写。Worker 会自动设置 Range；不要填写 Range、Host、Content-Length 等连接控制头。
               </p>
             </div>
 
@@ -2674,6 +2770,7 @@ export function UploadDialog({
             value={remark}
             maxLength={1000}
             disabled={uploadBusy}
+            className="!text-sm !leading-6 !text-muted"
             onChange={(event) => setRemark(event.target.value)}
           />
         </div>
@@ -2713,6 +2810,7 @@ export function UploadDialog({
               placeholder={"curl 'https://example.com/video.m3u8' \\\n  -H 'Referer: https://example.com/' \\\n  -H 'Cookie: session=...' \\\n  -H 'Authorization: Bearer ...' \\\n  --compressed"}
               value={curlImportText}
               invalid={Boolean(curlImportError)}
+              className="font-mono !text-[13px] !leading-6 !text-muted"
               onChange={(event) => {
                 setCurlImportText(event.target.value);
                 setCurlImportError(undefined);
@@ -2780,12 +2878,12 @@ function errorMessage(error: unknown): string {
   return "上传失败";
 }
 
-function sourceHeadersTextFromCurlHeaders(headers: Record<string, string>): {
-  text: string;
+function sourceHeaderRowsFromCurlHeaders(headers: Record<string, string>): {
+  rows: SourceHeaderRow[];
   headerCount: number;
   skippedHeaders: string[];
 } {
-  const lines: string[] = [];
+  const rows: SourceHeaderRow[] = [];
   const skippedHeaders: string[] = [];
   const skipped = new Set<string>();
 
@@ -2799,7 +2897,7 @@ function sourceHeadersTextFromCurlHeaders(headers: Record<string, string>): {
   };
 
   for (const [rawName, rawValue] of Object.entries(headers)) {
-    const name = rawName.trim();
+    const name = normalizeHeaderKeyInput(rawName);
     const value = rawValue.trim();
 
     if (!value) {
@@ -2807,16 +2905,16 @@ function sourceHeadersTextFromCurlHeaders(headers: Record<string, string>): {
     }
 
     if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name) || /[\r\n]/.test(value) || isBlockedSourceHeaderName(name)) {
-      addSkipped(name);
+      addSkipped(rawName.trim());
       continue;
     }
 
-    lines.push(`${name}: ${value}`);
+    rows.push(makeSourceHeaderRow(name, value));
   }
 
   return {
-    text: lines.join("\n"),
-    headerCount: lines.length,
+    rows,
+    headerCount: rows.length,
     skippedHeaders
   };
 }
@@ -2834,43 +2932,53 @@ function curlImportSummary(headerCount: number, warnings: string[]): string {
   return `${base}${warningText}${overflowText}`;
 }
 
-function parseSourceHeadersText(value: string): SourceRequestHeaders | undefined {
-  const lines = value
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line && !line.startsWith("#"));
-
-  if (lines.length === 0) {
-    return undefined;
-  }
-
+function parseSourceHeaderRows(rows: SourceHeaderRow[]): SourceRequestHeaders | undefined {
   const headers: SourceRequestHeaders = {};
+  const seen = new Set<string>();
 
-  for (const line of lines) {
-    const separator = line.indexOf(":");
-    if (separator <= 0) {
-      throw new Error("请求头必须按 Header-Name: value 格式填写");
+  for (const [index, row] of rows.entries()) {
+    const name = normalizeHeaderKeyInput(row.name);
+    const headerValue = row.value.trim();
+    const hasName = name.length > 0;
+    const hasValue = headerValue.length > 0;
+
+    if (!hasName && !hasValue) {
+      continue;
     }
 
-    const name = line.slice(0, separator).trim();
-    const headerValue = line.slice(separator + 1).trim();
+    if (!hasName) {
+      throw new Error(`第 ${index + 1} 个请求头缺少 key`);
+    }
+
+    if (!hasValue) {
+      throw new Error(`请求头 ${name} 缺少 value`);
+    }
 
     if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name)) {
-      throw new Error(`请求头名称无效：${name || line}`);
+      throw new Error(`请求头 key 无效：${row.name || `第 ${index + 1} 行`}`);
     }
 
     if (isBlockedSourceHeaderName(name)) {
       throw new Error(`不允许自定义请求头：${name}`);
     }
 
-    if (!headerValue) {
-      continue;
+    if (/[\r\n]/.test(headerValue)) {
+      throw new Error(`请求头 ${name} 的 value 不能包含换行`);
     }
 
+    if (seen.has(name)) {
+      throw new Error(`请求头 ${name} 重复`);
+    }
+
+    seen.add(name);
     headers[name] = headerValue;
   }
 
   return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
+function normalizeHeaderKeyInput(value: string): string {
+  return value.trim().toLowerCase();
 }
 
 function isBlockedSourceHeaderName(name: string): boolean {
