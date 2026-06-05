@@ -44,10 +44,21 @@ export function AudioPreview({ file, fullscreen, onToggleFullscreen }: AudioPrev
   }
 
   return (
-    <div className={cn("flex w-full items-center justify-center overflow-hidden bg-surface p-4 text-foreground sm:p-6", fullscreen ? "h-full" : "min-h-72") }>
-      <div className="flex w-full max-w-3xl flex-col gap-4">
+    <div
+      className={cn(
+        "relative isolate flex w-full items-center justify-center overflow-hidden bg-[linear-gradient(180deg,rgba(255,255,255,0.98),rgba(239,251,246,0.92))] p-4 text-foreground sm:p-6",
+        fullscreen ? "h-full" : "min-h-72"
+      )}
+    >
+      <div aria-hidden className="pointer-events-none absolute inset-0 overflow-hidden">
+        <span className="absolute -top-14 left-[8%] h-[24rem] w-32 -rotate-12 bg-[linear-gradient(180deg,rgba(16,185,129,0.22),rgba(16,185,129,0.045)_62%,transparent)] blur-sm [clip-path:polygon(34%_0,66%_0,100%_100%,0_100%)] sm:w-44" />
+        <span className="absolute -top-16 right-[10%] h-[25rem] w-36 rotate-12 bg-[linear-gradient(180deg,rgba(59,130,246,0.14),rgba(16,185,129,0.04)_58%,transparent)] blur-sm [clip-path:polygon(34%_0,66%_0,100%_100%,0_100%)] sm:w-48" />
+        <span className="absolute inset-x-0 bottom-0 h-28 bg-[linear-gradient(180deg,transparent,rgba(16,185,129,0.08))]" />
+      </div>
+
+      <div className="relative flex w-full max-w-3xl flex-col gap-4">
         <div className="flex min-w-0 items-center gap-4">
-          <div className="size-20 shrink-0 overflow-hidden rounded-2xl border border-border bg-background shadow-card sm:size-24">
+          <div className="size-20 shrink-0 overflow-hidden rounded-2xl border border-white/80 bg-background shadow-[0_18px_42px_rgba(15,23,42,0.16)] ring-1 ring-border/70 sm:size-24">
             {coverUrl ? (
               <img
                 src={coverUrl}

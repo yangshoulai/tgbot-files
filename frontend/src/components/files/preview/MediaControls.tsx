@@ -162,7 +162,7 @@ export function MediaControls({
         floating
           ? "w-full drop-shadow-[0_2px_12px_rgba(0,0,0,0.65)]"
           : inline
-            ? "rounded-2xl border border-border bg-background p-3 shadow-card"
+            ? "rounded-2xl border border-white/80 bg-white/[0.85] p-3 shadow-[0_18px_44px_rgba(15,23,42,0.12)] ring-1 ring-border/70 backdrop-blur-md"
             : "rounded-2xl border border-white/10 bg-black/70 p-3 shadow-dialog backdrop-blur-md",
         !floating && !inline && dense ? "p-2.5" : null,
         !floating && !inline && tiny ? "p-2" : null,
@@ -244,10 +244,10 @@ export function MediaControls({
 
         <div
           className={cn(
-            "shrink-0 text-center font-mono text-xs text-white/75",
+            "shrink-0 text-center font-mono text-xs",
+            inline ? "text-foreground/70" : "text-white/75",
             dense ? "min-w-[5.75rem]" : "min-w-[6.75rem]",
             floating && "min-w-[5.1rem] text-white/90 sm:min-w-[6.5rem]",
-            inline && "text-muted",
             tiny && "min-w-[3.5rem] text-[11px]"
           )}
         >
@@ -330,17 +330,15 @@ function MediaButton({ label, onClick, children, emphasis = false, dense = false
       className={cn(
         "inline-flex shrink-0 items-center justify-center gap-1.5 border text-xs font-medium transition-colors focus-visible:outline-none focus-visible:focus-ring",
         dense ? "size-8 rounded-lg px-0" : "h-9 rounded-lg px-2.5",
-        floating && "size-8 rounded-full border-transparent bg-transparent text-white/92 hover:bg-white/15 hover:text-white active:bg-white/20 sm:size-9",
-        inline && "border-border bg-surface text-muted hover:bg-primary-soft/50 hover:text-primary-strong",
-        emphasis && !floating
-          ? inline
-            ? "border-primary bg-primary text-white hover:bg-primary-strong"
-            : "border-primary bg-primary text-white hover:bg-primary-strong"
-          : !floating
-            ? inline
-              ? null
-              : "border-white/10 bg-white/10 text-white/85 hover:bg-white/15 hover:text-white"
-            : null,
+        floating
+          ? "size-8 rounded-full border-transparent bg-transparent text-white/92 hover:bg-white/15 hover:text-white active:bg-white/20 sm:size-9"
+          : inline
+            ? emphasis
+              ? "border-primary bg-primary text-white shadow-[0_10px_24px_rgba(16,185,129,0.32)] hover:bg-primary-strong hover:text-white active:bg-primary-strong"
+              : "border-border bg-surface text-foreground/70 hover:bg-primary-soft/70 hover:text-primary-strong"
+            : emphasis
+              ? "border-primary bg-primary text-white hover:bg-primary-strong"
+              : "border-white/10 bg-white/10 text-white/85 hover:bg-white/15 hover:text-white",
         emphasis && floating && "text-white",
         className
       )}
