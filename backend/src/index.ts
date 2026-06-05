@@ -232,6 +232,7 @@ const VIDEO_THUMBNAIL_SOURCE_MAX_BYTES = MAX_TELEGRAM_MULTIPART_BYTES;
 const VIDEO_THUMBNAIL_PROXY_DEFAULT_RANGE_BYTES = 2 * 1024 * 1024;
 const ALLOWED_THUMBNAIL_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const HLS_PLAYLIST_MIME_TYPE = "application/vnd.apple.mpegurl";
+const HLS_PUBLIC_ROUTE_PREFIX = "/api/hls";
 const HLS_MAX_PLAYLIST_BYTES = 2 * 1024 * 1024;
 const HLS_MAX_SEGMENTS = 2000;
 const HLS_SEGMENT_IMPORT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -696,7 +697,7 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
     return handleFileAccess(request, env);
   }
 
-  if (isReadRequest(request) && url.pathname.startsWith("/hls/")) {
+  if (isReadRequest(request) && (url.pathname.startsWith("/hls/") || url.pathname.startsWith(`${HLS_PUBLIC_ROUTE_PREFIX}/`))) {
     return handleHlsAccess(request, env);
   }
 
@@ -2012,7 +2013,7 @@ async function completeHlsUpload(params: {
     },
     signingSecret
   );
-  const filePath = `/hls/${token}/${encodeURIComponent(params.asset.file_name)}`;
+  const filePath = hlsPublicFilePath(token, params.asset.file_name);
   const publicUrl = `${getPublicBaseUrl(params.request, params.env)}${filePath}`;
   const thumbnail = await uploadOptionalThumbnail({
     request: params.request,
@@ -4708,7 +4709,7 @@ async function createFilePathForRecord(record: FileRecord, fileName: string, env
       signingSecret
     );
 
-    return `/hls/${token}/${encodeURIComponent(fileName)}`;
+    return hlsPublicFilePath(token, fileName);
   }
 
   const token = storageBackend === "telegram_multipart"
@@ -4858,7 +4859,7 @@ async function handleHlsAccess(request: Request, env: Env): Promise<Response> {
     segments: segments.map((segment) => ({
       index: segment.segment_index,
       duration: segment.duration_seconds,
-      path: `${baseUrl}/hls/${encodeURIComponent(access.token)}/segments/${segment.segment_index}/${encodeURIComponent(hlsSegmentFileName(new URL(segment.source_url), segment.segment_index))}`
+      path: `${baseUrl}${hlsPublicSegmentPath(access.token, segment)}`
     }))
   });
   const headers = withSecurityHeaders();
@@ -5558,13 +5559,15 @@ function isFormContentType(contentType: string | null): boolean {
 function serializeFileRecord(file: FileRecord, baseUrl: string): Record<string, unknown> {
   const storageBackend = fileStorageBackend(file);
   const directAccess = canDirectlyAccessFileRecord(file);
-  const url = directAccess ? `${baseUrl}${file.file_path}` : null;
+  const filePath = publicFilePathForResponse(file.file_path, storageBackend);
+  const url = directAccess ? `${baseUrl}${filePath}` : null;
   const thumbnailUrl = file.thumbnail_file_path && file.thumbnail_status === "ready"
     ? `${baseUrl}${file.thumbnail_file_path}`
     : null;
 
   return {
     ...file,
+    file_path: filePath,
     directory_id: file.directory_id ?? null,
     directory_path: file.directory_path ?? "/",
     storage_backend: storageBackend,
@@ -5663,7 +5666,9 @@ function serializeChunk(record: Awaited<ReturnType<typeof uploadChunkToTelegram>
 
 function serializeUploadedFileResult(result: UploadResult, username: string | null): Record<string, unknown> {
   const directAccess = canDirectlyAccessUploadResult(result);
-  const url = directAccess ? result.publicUrl : null;
+  const filePath = publicUploadFilePathForResponse(result);
+  const publicUrl = `${new URL(result.publicUrl).origin}${filePath}`;
+  const url = directAccess ? publicUrl : null;
   const thumbnailUrl = result.thumbnail?.status === "ready" && result.thumbnail.filePath
     ? `${new URL(result.publicUrl).origin}${result.thumbnail.filePath}`
     : null;
@@ -5677,7 +5682,7 @@ function serializeUploadedFileResult(result: UploadResult, username: string | nu
     telegram_file_id: result.telegramFileId,
     telegram_file_unique_id: result.telegramFileUniqueId ?? null,
     telegram_channel_id: result.telegramChannelId ?? "default",
-    file_path: result.filePath,
+    file_path: filePath,
     remark: result.remark ?? null,
     url,
     download_url: url ? appendDownloadParam(url) : null,
@@ -6229,6 +6234,29 @@ function appendDownloadParam(url: string): string {
   return `${url}${url.includes("?") ? "&" : "?"}download=1`;
 }
 
+function hlsPublicFilePath(token: string, fileName: string): string {
+  return `${HLS_PUBLIC_ROUTE_PREFIX}/${encodeURIComponent(token)}/${encodeURIComponent(fileName)}`;
+}
+
+function hlsPublicSegmentPath(token: string, segment: HlsSegmentRecord): string {
+  return `${HLS_PUBLIC_ROUTE_PREFIX}/${encodeURIComponent(token)}/segments/${segment.segment_index}/${encodeURIComponent(hlsSegmentFileName(new URL(segment.source_url), segment.segment_index))}`;
+}
+
+function publicFilePathForResponse(
+  filePath: string,
+  storageBackend: "telegram_single" | "telegram_multipart" | "hls_package"
+): string {
+  if (storageBackend === "hls_package" && filePath.startsWith("/hls/")) {
+    return `${HLS_PUBLIC_ROUTE_PREFIX}${filePath.slice("/hls".length)}`;
+  }
+
+  return filePath;
+}
+
+function publicUploadFilePathForResponse(result: UploadResult): string {
+  return publicFilePathForResponse(result.filePath, result.storageBackend);
+}
+
 function getPublicBaseUrl(request: Request, env: Env): string {
   return normalizeBaseUrl(env.PUBLIC_BASE_URL || new URL(request.url).origin);
 }
@@ -6333,17 +6361,23 @@ function extractMultipartChunkAccess(pathname: string): { token: string; chunkIn
 
 function extractHlsAccess(pathname: string): { token: string; segmentIndex?: number } {
   const parts = pathname.split("/").filter(Boolean);
-  const token = parts[0] === "hls" && parts[1] ? decodeURIComponent(parts[1]) : "";
+  const tokenPartIndex = parts[0] === "hls"
+    ? 1
+    : parts[0] === "api" && parts[1] === "hls"
+      ? 2
+      : -1;
+  const token = tokenPartIndex >= 0 && parts[tokenPartIndex] ? decodeURIComponent(parts[tokenPartIndex]) : "";
 
   if (!token) {
     throw new AppError(404, "NotFound", "HLS route not found");
   }
 
-  if (parts[2] !== "segments") {
+  const segmentsPartIndex = tokenPartIndex + 1;
+  if (parts[segmentsPartIndex] !== "segments") {
     return { token };
   }
 
-  const segmentIndex = Number(parts[3]);
+  const segmentIndex = Number(parts[segmentsPartIndex + 1]);
   if (!Number.isSafeInteger(segmentIndex) || segmentIndex < 0) {
     throw new AppError(400, "InvalidSegmentIndex", "HLS segment index must be a non-negative integer");
   }
