@@ -50,6 +50,11 @@ type ItemStatus = "pending" | "uploading" | "done" | "error" | "skipped";
 type UploadMode = "file" | "url";
 type UploadChunkStatus = "queued" | "uploading" | "completed" | "failed";
 
+interface DroppedFileEntry {
+  file: File;
+  relativePath?: string;
+}
+
 interface ChunkProgress {
   completed: number;
   total: number;
@@ -100,6 +105,7 @@ interface QueueItem {
   conflict?: FileNameConflictState;
   conflictAction?: FileNameConflictAction;
   thumbnail?: UploadThumbnailState;
+  chunksExpanded?: boolean;
 }
 
 interface UrlUploadState {
@@ -170,6 +176,14 @@ function makeItem(file: File, options: { relativePath?: string } = {}): QueueIte
     status: "pending",
     thumbnail: canAutoGenerateThumbnail(file) ? { status: "idle" } : undefined
   };
+}
+
+function isLocalItemAwaitingDecision(item: QueueItem): boolean {
+  return item.status === "pending" || item.status === "error";
+}
+
+function isUploadableLocalItem(item: QueueItem): boolean {
+  return isLocalItemAwaitingDecision(item) && !item.conflict;
 }
 
 export function UploadDialog({
@@ -291,6 +305,15 @@ export function UploadDialog({
     ]);
   }, []);
 
+  const addDroppedFiles = useCallback((entries: DroppedFileEntry[]) => {
+    if (entries.length === 0) return;
+    setMode("file");
+    setItems((current) => [
+      ...current,
+      ...entries.map((entry) => makeItem(entry.file, { relativePath: entry.relativePath }))
+    ]);
+  }, []);
+
   const handlePick = (event: ChangeEvent<HTMLInputElement>) => {
     const list = event.target.files;
     if (!list) return;
@@ -365,18 +388,17 @@ export function UploadDialog({
   };
 
   const uploadBusy = submitting || checkingConflicts;
-  const filePendingCount = items.filter((item) => item.status === "pending" || item.status === "error").length;
+  const filePendingCount = items.filter(isUploadableLocalItem).length;
   const folderItemCount = items.filter((item) => item.relativePath).length;
   const conflictItemCount = items.filter((item) =>
-    (item.status === "pending" || item.status === "error") && Boolean(item.conflict)
+    isLocalItemAwaitingDecision(item) && Boolean(item.conflict)
   ).length;
-  const skippedItemCount = items.filter((item) => item.status === "skipped").length;
   const normalizedSourceUrl = sourceUrl.trim();
   const urlPendingCount = normalizedSourceUrl && urlUpload.status !== "uploading" && urlUpload.status !== "done" ? 1 : 0;
   const pendingCount = mode === "url" ? urlPendingCount : filePendingCount;
   const hasUnresolvedConflict = mode === "url"
     ? Boolean(urlUpload.conflict)
-    : items.some((item) => (item.status === "pending" || item.status === "error") && Boolean(item.conflict));
+    : items.some((item) => isLocalItemAwaitingDecision(item) && Boolean(item.conflict));
   const hasInvalidFileName = mode === "url"
     ? Boolean(
         normalizedSourceUrl &&
@@ -385,12 +407,12 @@ export function UploadDialog({
         urlUpload.fileNameOverride.trim().length === 0
       )
     : items.some((item) =>
-        (item.status === "pending" || item.status === "error") &&
+        isLocalItemAwaitingDecision(item) &&
         (item.editingFileName || item.conflict) &&
         item.fileNameOverride !== undefined &&
         item.fileNameOverride.trim().length === 0
       );
-  const hasDone = urlUpload.status === "done" || items.some((item) => item.status === "done" || item.status === "skipped");
+  const hasDone = urlUpload.status === "done" || items.some((item) => item.status === "done");
 
   useEffect(() => {
     if (!open) return;
@@ -520,10 +542,10 @@ export function UploadDialog({
         return {
           ...item,
           status: "pending",
-          message: action === "overwrite" ? "将覆盖当前目录中的同名文件索引" : undefined,
+          message: undefined,
           progress: undefined,
           retry: undefined,
-          fileNameOverride: fileName,
+          fileNameOverride: fileName === item.file.name ? undefined : fileName,
           editingFileName: false,
           conflict: undefined,
           conflictAction: action
@@ -533,57 +555,42 @@ export function UploadDialog({
   }
 
   function skipItemConflict(id: string) {
-    setItems((current) =>
-      current.map((item) =>
-        item.id === id && item.conflict
-          ? {
-              ...item,
-              status: "skipped",
-              message: "已忽略",
-              progress: undefined,
-              retry: undefined,
-              conflict: undefined,
-              conflictAction: "error",
-              editingFileName: false
-            }
-          : item
-      )
-    );
+    setItems((current) => {
+      const target = current.find((item) => item.id === id);
+      revokeThumbnail(target?.thumbnail?.generated);
+      return current.filter((item) => item.id !== id);
+    });
   }
 
   function resolveAllItemConflicts(action: "overwrite" | "skip") {
-    setItems((current) =>
-      current.map((item) => {
-        if (!item.conflict || (item.status !== "pending" && item.status !== "error")) {
-          return item;
-        }
+    setItems((current) => {
+      if (action === "skip") {
+        current.forEach((item) => {
+          if (item.conflict && isLocalItemAwaitingDecision(item)) {
+            revokeThumbnail(item.thumbnail?.generated);
+          }
+        });
+        return current.filter((item) => !item.conflict || !isLocalItemAwaitingDecision(item));
+      }
 
-        if (action === "skip") {
-          return {
-            ...item,
-            status: "skipped",
-            message: "已忽略",
-            progress: undefined,
-            retry: undefined,
-            conflict: undefined,
-            conflictAction: "error",
-            editingFileName: false
-          };
+      return current.map((item) => {
+        if (!item.conflict || !isLocalItemAwaitingDecision(item)) {
+          return item;
         }
 
         return {
           ...item,
           status: "pending",
-          message: "将覆盖当前目录中的同名文件索引",
+          message: undefined,
           progress: undefined,
           retry: undefined,
-          fileNameOverride: item.conflict.fileName,
+          fileNameOverride: item.conflict.fileName === item.file.name ? undefined : item.conflict.fileName,
           editingFileName: false,
           conflict: undefined,
           conflictAction: "overwrite"
         };
-      })
-    );
+      });
+    });
   }
 
   function resolveUrlConflict(action: FileNameConflictAction) {
@@ -739,9 +746,9 @@ export function UploadDialog({
             progress: undefined,
             retry: undefined,
             conflict: fileNameConflictFromPreflight(conflict),
-            fileNameOverride: conflict.suggested_name ?? suggestAlternativeFileName(conflict.file_name),
+            fileNameOverride: conflict.file_name === item.file.name ? undefined : conflict.file_name,
             conflictAction: "error",
-            editingFileName: true
+            editingFileName: false
           };
         })
       );
@@ -766,7 +773,7 @@ export function UploadDialog({
       onError("请选择要上传的文件");
       return;
     }
-    const targets = items.filter((item) => item.status === "pending" || item.status === "error");
+    const targets = items.filter(isUploadableLocalItem);
     if (targets.length === 0) {
       onClose();
       return;
@@ -837,9 +844,11 @@ export function UploadDialog({
                   message: conflict ? undefined : message,
                   retry: conflict ? undefined : retry,
                   conflict,
-                  fileNameOverride: conflict?.suggestedName ?? item.fileNameOverride,
+                  fileNameOverride: conflict
+                    ? conflict.fileName === item.file.name ? undefined : conflict.fileName
+                    : item.fileNameOverride,
                   conflictAction: "error",
-                  editingFileName: conflict ? true : item.editingFileName,
+                  editingFileName: conflict ? false : item.editingFileName,
                   progress: retry && !conflict
                     ? retryFailureProgress(retry, stopped ? "已停止，可重试未完成分片" : "分片上传失败，可手动重试")
                     : undefined
@@ -1311,6 +1320,12 @@ export function UploadDialog({
     }));
   }
 
+  function toggleItemChunks(id: string) {
+    setItems((current) =>
+      current.map((item) => (item.id === id ? { ...item, chunksExpanded: !item.chunksExpanded } : item))
+    );
+  }
+
   async function submitUrlUpload() {
     if (urlUpload.retry?.kind === "url") {
       await retryUrlMultipart(urlUpload.retry);
@@ -1621,9 +1636,20 @@ export function UploadDialog({
     }
   }
 
-  function handleDropFiles(event: React.DragEvent<HTMLLabelElement>) {
+  async function handleDropFiles(event: React.DragEvent<HTMLLabelElement>) {
     event.preventDefault();
     setDragOver(false);
+    try {
+      const dropped = await collectDroppedFiles(event.dataTransfer);
+      if (dropped.length > 0) {
+        addDroppedFiles(dropped);
+        return;
+      }
+    } catch (error) {
+      onError(`读取拖拽文件失败：${errorMessage(error)}`);
+      return;
+    }
+
     const files = Array.from(event.dataTransfer?.files ?? []);
     if (files.length === 0) return;
     addFiles(files);
@@ -1746,7 +1772,7 @@ export function UploadDialog({
               <span className="grid size-12 place-items-center rounded-2xl bg-primary-soft text-primary-strong">
                 <UploadCloud size={22} />
               </span>
-              <p className="text-sm font-medium text-foreground">点击选择文件，或拖拽到这里</p>
+              <p className="text-sm font-medium text-foreground">点击选择文件，或拖拽文件/文件夹到这里</p>
               <p className="text-xs text-muted">
                 统一按 {formatBytes(multipartChunkBytes)} 分片，最多 {MULTIPART_UPLOAD_CONCURRENCY} 并发，每片最多 {MULTIPART_UPLOAD_MAX_ATTEMPTS} 次
               </p>
@@ -1763,7 +1789,6 @@ export function UploadDialog({
               <div className="min-w-0 text-xs leading-5 text-muted">
                 <span className="font-medium text-foreground">{items.length}</span> 个文件
                 {folderItemCount > 0 ? <span> · {folderItemCount} 个来自文件夹</span> : null}
-                {skippedItemCount > 0 ? <span> · 已忽略 {skippedItemCount} 个</span> : null}
               </div>
               <Button
                 variant="secondary"
@@ -1815,6 +1840,7 @@ export function UploadDialog({
                     onSkipConflict={item.conflict ? () => skipItemConflict(item.id) : undefined}
                     onThumbnailChange={(file) => void handleManualItemThumbnail(item.id, file)}
                     onThumbnailRemove={() => removeItemThumbnail(item.id)}
+                    onToggleChunks={() => toggleItemChunks(item.id)}
                     disabled={uploadBusy}
                   />
                 ))}
@@ -1972,6 +1998,90 @@ function effectiveDirectoryPath(item: QueueItem, baseDirectoryPath: string): str
   return joinDirectoryPath(baseDirectoryPath, item.relativeDirectoryPath);
 }
 
+interface WebkitFileSystemEntryLike {
+  isFile: boolean;
+  isDirectory: boolean;
+  name: string;
+}
+
+interface WebkitFileSystemFileEntryLike extends WebkitFileSystemEntryLike {
+  isFile: true;
+  file: (success: (file: File) => void, failure?: (error: DOMException) => void) => void;
+}
+
+interface WebkitFileSystemDirectoryEntryLike extends WebkitFileSystemEntryLike {
+  isDirectory: true;
+  createReader: () => {
+    readEntries: (
+      success: (entries: WebkitFileSystemEntryLike[]) => void,
+      failure?: (error: DOMException) => void
+    ) => void;
+  };
+}
+
+interface OptionalWebkitEntryGetter {
+  webkitGetAsEntry?: () => WebkitFileSystemEntryLike | null;
+}
+
+async function collectDroppedFiles(dataTransfer: DataTransfer): Promise<DroppedFileEntry[]> {
+  const entries = Array.from(dataTransfer.items ?? [])
+    .map((item) => {
+      const getter = (item as unknown as OptionalWebkitEntryGetter).webkitGetAsEntry;
+      return typeof getter === "function" ? getter.call(item) : null;
+    })
+    .filter((entry): entry is WebkitFileSystemEntryLike => Boolean(entry));
+
+  if (entries.length === 0) {
+    return [];
+  }
+
+  const nested = await Promise.all(entries.map((entry) => readDroppedEntry(entry, "")));
+  return nested.flat();
+}
+
+async function readDroppedEntry(entry: WebkitFileSystemEntryLike, parentPath: string): Promise<DroppedFileEntry[]> {
+  if (entry.isFile) {
+    const file = await readDroppedFile(entry as WebkitFileSystemFileEntryLike);
+    return [{
+      file,
+      ...(parentPath ? { relativePath: normalizeRelativePath(`${parentPath}/${file.name}`) } : {})
+    }];
+  }
+
+  if (!entry.isDirectory) {
+    return [];
+  }
+
+  const directory = entry as WebkitFileSystemDirectoryEntryLike;
+  const directoryPath = parentPath ? `${parentPath}/${directory.name}` : directory.name;
+  const children = await readDroppedDirectoryEntries(directory);
+  const nested = await Promise.all(children.map((child) => readDroppedEntry(child, directoryPath)));
+  return nested.flat();
+}
+
+function readDroppedFile(entry: WebkitFileSystemFileEntryLike): Promise<File> {
+  return new Promise((resolve, reject) => {
+    entry.file(resolve, reject);
+  });
+}
+
+async function readDroppedDirectoryEntries(directory: WebkitFileSystemDirectoryEntryLike): Promise<WebkitFileSystemEntryLike[]> {
+  const reader = directory.createReader();
+  const entries: WebkitFileSystemEntryLike[] = [];
+
+  while (true) {
+    const batch = await new Promise<WebkitFileSystemEntryLike[]>((resolve, reject) => {
+      reader.readEntries(resolve, reject);
+    });
+    if (batch.length === 0) {
+      break;
+    }
+    entries.push(...batch);
+  }
+
+  return entries;
+}
+
 function browserRelativePath(file: File): string | undefined {
   const value = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
   return normalizeRelativePath(value);
@@ -2106,6 +2216,9 @@ function buildFolderTree(items: QueueItem[]): FolderTreeNode {
       if (isFile) {
         child.name = effectiveFileName(item);
         child.status = item.status;
+        child.conflict = Boolean(item.conflict);
+        child.conflictAction = item.conflictAction;
+        child.renamed = Boolean(item.fileNameOverride);
       }
 
       current = child;
@@ -2138,10 +2251,14 @@ function countFolderTreeDirectories(node: FolderTreeNode): number {
   return count;
 }
 
-function folderNodeStatusClass(status: ItemStatus | undefined, isFile: boolean): string {
+function folderNodeStatusClass(node: FolderTreeNode, isFile: boolean): string {
   if (!isFile) return "bg-primary";
 
-  switch (status) {
+  if (node.conflict) return "bg-warning";
+  if (node.conflictAction === "overwrite") return "bg-warning";
+  if (node.renamed) return "bg-primary";
+
+  switch (node.status) {
     case "done":
       return "bg-success";
     case "error":
@@ -2155,8 +2272,12 @@ function folderNodeStatusClass(status: ItemStatus | undefined, isFile: boolean):
   }
 }
 
-function folderNodeStatusLabel(status: ItemStatus): string {
-  switch (status) {
+function folderNodeStatusLabel(node: FolderTreeNode): string {
+  if (node.conflict) return "冲突";
+  if (node.conflictAction === "overwrite") return "覆盖";
+  if (node.renamed) return "改名";
+
+  switch (node.status) {
     case "done":
       return "完成";
     case "error":
@@ -2258,6 +2379,9 @@ interface FolderTreeNode {
   path: string;
   kind: "directory" | "file";
   status?: ItemStatus;
+  conflict?: boolean;
+  conflictAction?: FileNameConflictAction;
+  renamed?: boolean;
   children: Map<string, FolderTreeNode>;
 }
 
@@ -2311,10 +2435,10 @@ function FolderTreeNodeRow({ node, depth }: { node: FolderTreeNode; depth: numbe
         )}
         style={{ paddingLeft: `${8 + depth * 16}px` }}
       >
-        <span className={cn("size-1.5 shrink-0 rounded-full", folderNodeStatusClass(node.status, isFile))} />
+        <span className={cn("size-1.5 shrink-0 rounded-full", folderNodeStatusClass(node, isFile))} />
         <span className="min-w-0 flex-1 truncate" title={node.path}>{node.name}</span>
         {isFile && node.status ? (
-          <span className="shrink-0 text-[11px] text-subtle">{folderNodeStatusLabel(node.status)}</span>
+          <span className="shrink-0 text-[11px] text-subtle">{folderNodeStatusLabel(node)}</span>
         ) : null}
       </div>
       {children.map((child) => (
@@ -2338,6 +2462,7 @@ interface QueueRowProps {
   onSkipConflict?: () => void;
   onThumbnailChange: (file: File) => void;
   onThumbnailRemove: () => void;
+  onToggleChunks: () => void;
   disabled: boolean;
 }
 
@@ -2355,6 +2480,7 @@ function QueueRow({
   onSkipConflict,
   onThumbnailChange,
   onThumbnailRemove,
+  onToggleChunks,
   disabled
 }: QueueRowProps) {
   const status = item.status;
@@ -2378,6 +2504,8 @@ function QueueRow({
           />
           <p className="truncate text-xs text-muted">
             {formatBytes(item.file.size)} · 上传到 {targetDirectoryPath} · 分片上传
+            {item.conflict ? <span className="text-warning"> · 目标已有同名文件</span> : null}
+            {!item.conflict && item.conflictAction === "overwrite" ? <span className="text-warning"> · 将覆盖同名文件</span> : null}
             {thumbnailHint(item.thumbnail) ? <span> · {thumbnailHint(item.thumbnail)}</span> : null}
             {item.message ? <span className={status === "error" ? "text-danger" : "text-muted"}> · {item.message}</span> : null}
           </p>
@@ -2387,52 +2515,56 @@ function QueueRow({
             </p>
           ) : null}
           {item.progress ? <ProgressBar progress={item.progress} /> : null}
-          <ConflictResolutionActions
+        </div>
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-1 self-center">
+          <QueueStateBadge item={item} multipart={Boolean(item.progress)} />
+          <CompactConflictActions
             conflict={item.conflict}
             disabled={disabled}
             onRename={onRenameConflict}
             onOverwrite={onOverwriteConflict}
             onSkip={onSkipConflict}
           />
+          <ThumbnailPicker
+            disabled={disabled || status === "uploading"}
+            onChange={onThumbnailChange}
+            onRemove={onThumbnailRemove}
+            hasThumbnail={item.thumbnail?.status === "ready"}
+          />
+          {onRetry ? (
+            <button
+              type="button"
+              onClick={onRetry}
+              disabled={disabled}
+              className="shrink-0 rounded-md border border-primary/30 px-2.5 py-1 text-xs font-medium text-primary-strong transition-colors hover:bg-primary-soft disabled:pointer-events-none disabled:opacity-40"
+            >
+              {item.retry?.failedChunks.length === 0 ? "继续完成上传" : "重试失败分片"}
+            </button>
+          ) : null}
+          {onStop && status === "uploading" ? (
+            <button
+              type="button"
+              onClick={onStop}
+              disabled={stopping}
+              className="shrink-0 rounded-md border border-danger/30 px-2.5 py-1 text-xs font-medium text-danger transition-colors hover:bg-danger-soft disabled:pointer-events-none disabled:opacity-40"
+            >
+              {stopping ? "正在停止" : "停止上传"}
+            </button>
+          ) : null}
+          <button
+            type="button"
+            aria-label="移除"
+            onClick={onRemove}
+            disabled={disabled || status === "uploading"}
+            className="grid size-7 place-items-center rounded-md text-subtle transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-40"
+          >
+            {status === "done" ? <CheckCircle2 size={14} className="text-success" /> : <X size={14} />}
+          </button>
         </div>
-        <ThumbnailPicker
-          disabled={disabled || status === "uploading"}
-          onChange={onThumbnailChange}
-          onRemove={onThumbnailRemove}
-          hasThumbnail={item.thumbnail?.status === "ready"}
-        />
-        {onRetry ? (
-          <button
-            type="button"
-            onClick={onRetry}
-            disabled={disabled}
-            className="shrink-0 rounded-md border border-primary/30 px-2.5 py-1 text-xs font-medium text-primary-strong transition-colors hover:bg-primary-soft disabled:pointer-events-none disabled:opacity-40"
-          >
-            {item.retry?.failedChunks.length === 0 ? "继续完成上传" : "重试失败分片"}
-          </button>
-        ) : null}
-        {onStop && status === "uploading" ? (
-          <button
-            type="button"
-            onClick={onStop}
-            disabled={stopping}
-            className="shrink-0 rounded-md border border-danger/30 px-2.5 py-1 text-xs font-medium text-danger transition-colors hover:bg-danger-soft disabled:pointer-events-none disabled:opacity-40"
-          >
-            {stopping ? "正在停止" : "停止上传"}
-          </button>
-        ) : null}
-        <StatusBadge status={status} multipart={Boolean(item.progress)} />
-        <button
-          type="button"
-          aria-label="移除"
-          onClick={onRemove}
-          disabled={disabled || status === "uploading"}
-          className="grid size-7 place-items-center rounded-md text-subtle transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-40"
-        >
-          {status === "done" ? <CheckCircle2 size={14} className="text-success" /> : <X size={14} />}
-        </button>
       </div>
-      {item.chunks ? <UploadChunkList chunks={item.chunks} /> : null}
+      {item.chunks ? (
+        <UploadChunkPanel chunks={item.chunks} expanded={Boolean(item.chunksExpanded)} onToggle={onToggleChunks} />
+      ) : null}
     </div>
   );
 }
@@ -2517,46 +2649,134 @@ function UrlUploadRow({
             onOverwrite={onOverwriteConflict}
           />
         </div>
-        <ThumbnailPicker
-          disabled={disabled || status === "uploading"}
-          onChange={onThumbnailChange}
-          onRemove={onThumbnailRemove}
-          hasThumbnail={thumbnail?.status === "ready"}
-        />
-        {onRetry ? (
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-1 self-center">
+          <ThumbnailPicker
+            disabled={disabled || status === "uploading"}
+            onChange={onThumbnailChange}
+            onRemove={onThumbnailRemove}
+            hasThumbnail={thumbnail?.status === "ready"}
+          />
+          {onRetry ? (
+            <button
+              type="button"
+              onClick={onRetry}
+              disabled={disabled}
+              className="shrink-0 rounded-md border border-primary/30 px-2.5 py-1 text-xs font-medium text-primary-strong transition-colors hover:bg-primary-soft disabled:pointer-events-none disabled:opacity-40"
+            >
+              {progress && progress.failed === 0 ? "继续完成上传" : "重试失败分片"}
+            </button>
+          ) : null}
+          {onStop && status === "uploading" ? (
+            <button
+              type="button"
+              onClick={onStop}
+              disabled={stopping}
+              className="shrink-0 rounded-md border border-danger/30 px-2.5 py-1 text-xs font-medium text-danger transition-colors hover:bg-danger-soft disabled:pointer-events-none disabled:opacity-40"
+            >
+              {stopping ? "正在停止" : "停止导入"}
+            </button>
+          ) : null}
+          <StatusBadge status={status} multipart={Boolean(progress)} />
           <button
             type="button"
-            onClick={onRetry}
-            disabled={disabled}
-            className="shrink-0 rounded-md border border-primary/30 px-2.5 py-1 text-xs font-medium text-primary-strong transition-colors hover:bg-primary-soft disabled:pointer-events-none disabled:opacity-40"
+            aria-label="清空 URL"
+            onClick={onClear}
+            disabled={disabled || status === "uploading"}
+            className="grid size-7 place-items-center rounded-md text-subtle transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-40"
           >
-            {progress && progress.failed === 0 ? "继续完成上传" : "重试失败分片"}
+            {status === "done" ? <CheckCircle2 size={14} className="text-success" /> : <X size={14} />}
           </button>
-        ) : null}
-        {onStop && status === "uploading" ? (
-          <button
-            type="button"
-            onClick={onStop}
-            disabled={stopping}
-            className="shrink-0 rounded-md border border-danger/30 px-2.5 py-1 text-xs font-medium text-danger transition-colors hover:bg-danger-soft disabled:pointer-events-none disabled:opacity-40"
-          >
-            {stopping ? "正在停止" : "停止导入"}
-          </button>
-        ) : null}
-        <StatusBadge status={status} multipart={Boolean(progress)} />
-        <button
-          type="button"
-          aria-label="清空 URL"
-          onClick={onClear}
-          disabled={disabled || status === "uploading"}
-          className="grid size-7 place-items-center rounded-md text-subtle transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-40"
-        >
-          {status === "done" ? <CheckCircle2 size={14} className="text-success" /> : <X size={14} />}
-        </button>
+        </div>
       </div>
       {chunks ? <UploadChunkList chunks={chunks} /> : null}
     </div>
   );
+}
+
+function QueueStateBadge({ item, multipart }: { item: QueueItem; multipart?: boolean }) {
+  if (item.conflict) {
+    return (
+      <span
+        className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md border border-warning/35 bg-warning-soft px-2 text-xs font-medium text-warning"
+        title={conflictTitle(item.conflict)}
+      >
+        <AlertTriangle size={13} />
+        冲突
+      </span>
+    );
+  }
+
+  if (item.conflictAction === "overwrite") {
+    return (
+      <span className="inline-flex h-7 shrink-0 items-center rounded-md border border-warning/35 bg-warning-soft px-2 text-xs font-medium text-warning">
+        将覆盖
+      </span>
+    );
+  }
+
+  if (item.fileNameOverride && item.status !== "done" && item.status !== "uploading") {
+    return (
+      <span className="inline-flex h-7 shrink-0 items-center rounded-md border border-primary/25 bg-primary-soft px-2 text-xs font-medium text-primary-strong">
+        已改名
+      </span>
+    );
+  }
+
+  return <StatusBadge status={item.status} multipart={multipart} />;
+}
+
+function CompactConflictActions({
+  conflict,
+  disabled,
+  onRename,
+  onOverwrite,
+  onSkip
+}: {
+  conflict?: FileNameConflictState;
+  disabled: boolean;
+  onRename?: () => void;
+  onOverwrite?: () => void;
+  onSkip?: () => void;
+}) {
+  if (!conflict) {
+    return null;
+  }
+
+  return (
+    <span className="inline-flex shrink-0 items-center gap-1">
+      <button
+        type="button"
+        onClick={onOverwrite}
+        title={`覆盖 ${conflict.fileName}`}
+        disabled={disabled || !onOverwrite}
+        className="h-7 rounded-md border border-warning/35 px-2 text-xs font-medium text-warning transition-colors hover:bg-warning-soft disabled:pointer-events-none disabled:opacity-40"
+      >
+        覆盖
+      </button>
+      <button
+        type="button"
+        onClick={onRename}
+        title={`改名为 ${conflict.suggestedName}`}
+        disabled={disabled || !onRename}
+        className="h-7 rounded-md border border-primary/25 px-2 text-xs font-medium text-primary-strong transition-colors hover:bg-primary-soft disabled:pointer-events-none disabled:opacity-40"
+      >
+        改名
+      </button>
+      <button
+        type="button"
+        onClick={onSkip}
+        disabled={disabled || !onSkip}
+        className="h-7 rounded-md border border-border px-2 text-xs font-medium text-muted transition-colors hover:bg-background hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+      >
+        忽略
+      </button>
+    </span>
+  );
+}
+
+function conflictTitle(conflict: FileNameConflictState): string {
+  const separator = conflict.directoryPath.endsWith("/") ? "" : "/";
+  return `${conflict.source === "batch" ? "本次队列重复" : "目标目录已存在"}：${conflict.directoryPath}${separator}${conflict.fileName}`;
 }
 
 function ConflictResolutionActions({
@@ -2892,13 +3112,50 @@ function EditableFileName({
   );
 }
 
-function UploadChunkList({ chunks }: { chunks: UploadChunkState[] }) {
+function UploadChunkPanel({
+  chunks,
+  expanded,
+  onToggle
+}: {
+  chunks: UploadChunkState[];
+  expanded: boolean;
+  onToggle: () => void;
+}) {
   const completed = chunks.filter((chunk) => chunk.status === "completed").length;
   const failed = chunks.filter((chunk) => chunk.status === "failed").length;
   const uploading = chunks.filter((chunk) => chunk.status === "uploading").length;
 
   return (
     <div className="rounded-lg border border-border bg-background/70 p-2">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex w-full items-center justify-between gap-3 text-left text-[11px] text-muted transition-colors hover:text-foreground focus-visible:outline-none focus-visible:focus-ring"
+      >
+        <span className="inline-flex min-w-0 items-center gap-1.5">
+          <Layers3 size={13} className="shrink-0 text-primary-strong" />
+          <span className="truncate">
+            分片：{completed}/{chunks.length} 完成
+            {uploading > 0 ? ` · ${uploading} 上传中` : ""}
+            {failed > 0 ? ` · ${failed} 失败` : ""}
+          </span>
+        </span>
+        <span className="shrink-0 font-medium text-primary-strong">
+          {expanded ? "收起详情" : "分片详情"}
+        </span>
+      </button>
+      {expanded ? <UploadChunkList chunks={chunks} /> : null}
+    </div>
+  );
+}
+
+function UploadChunkList({ chunks }: { chunks: UploadChunkState[] }) {
+  const completed = chunks.filter((chunk) => chunk.status === "completed").length;
+  const failed = chunks.filter((chunk) => chunk.status === "failed").length;
+  const uploading = chunks.filter((chunk) => chunk.status === "uploading").length;
+
+  return (
+    <div className="mt-2 border-t border-border pt-2">
       <div className="mb-2 flex items-center justify-between gap-3 text-[11px] text-muted">
         <span>
           分片明细：{completed}/{chunks.length} 完成

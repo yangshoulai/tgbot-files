@@ -3165,6 +3165,52 @@ describe("admin file manager", () => {
     expect(db.multipartUploads).toHaveLength(0);
   });
 
+  it("preflights every existing file conflict in a repeated folder upload", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    db.files.push(
+      fileRecord({ id: "existing-folder-a", file_name: "a.txt", directory_path: "/uploads/project" }),
+      fileRecord({ id: "existing-folder-b", file_name: "b.txt", directory_path: "/uploads/project" }),
+      fileRecord({ id: "existing-folder-c", file_name: "c.txt", directory_path: "/uploads/project" })
+    );
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const response = await worker.fetch(
+      new Request("https://files.example.com/api/admin/uploads/preflight", {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          entries: [
+            { client_id: "folder-a", directory_path: "/uploads/project", file_name: "a.txt", relative_path: "project/a.txt" },
+            { client_id: "folder-b", directory_path: "/uploads/project", file_name: "b.txt", relative_path: "project/b.txt" },
+            { client_id: "folder-c", directory_path: "/uploads/project", file_name: "c.txt", relative_path: "project/c.txt" }
+          ]
+        })
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      summary: { total: number; ready: number; conflicts: number };
+      entries: Array<{ client_id: string; status: string; source?: string; file_name: string; suggested_name?: string }>;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.summary).toEqual({ total: 3, ready: 0, conflicts: 3 });
+    expect(body.entries).toEqual([
+      expect.objectContaining({ client_id: "folder-a", status: "conflict", source: "file", file_name: "a.txt", suggested_name: "a (1).txt" }),
+      expect.objectContaining({ client_id: "folder-b", status: "conflict", source: "file", file_name: "b.txt", suggested_name: "b (1).txt" }),
+      expect.objectContaining({ client_id: "folder-c", status: "conflict", source: "file", file_name: "c.txt", suggested_name: "c (1).txt" })
+    ]);
+  });
+
   it("rejects multipart upload sessions that reuse an active file name", async () => {
     const db = new FakeD1();
     const adminEnv: Env = {
