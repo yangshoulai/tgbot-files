@@ -104,6 +104,7 @@ import { extensionForMimeType, mimeTypeForFileName, resolveStoredMimeType } from
 import { fetchTelegramFile, getTelegramFileUrl, uploadDocumentToTelegram } from "./telegram";
 
 export interface Env {
+  ASSETS?: Fetcher;
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_STORAGE_CHAT_ID: string;
   LINK_SIGNING_SECRET: string;
@@ -630,23 +631,15 @@ function delayMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isReadRequest(request: Request): boolean {
+  return request.method === "GET" || request.method === "HEAD";
+}
+
 async function routeRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
 
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: withSecurityHeaders() });
-  }
-
-  if (request.method === "GET" && url.pathname === "/") {
-    return jsonResponse({
-      ok: true,
-      service: "tgbot-files",
-      endpoints: {
-        upload: "POST /api/v1/files",
-        file: "GET /f/:token/:filename?",
-        admin: "GET /admin"
-      }
-    });
   }
 
   if (request.method === "POST" && url.pathname === "/api/admin/login") {
@@ -699,12 +692,24 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
     return handleApiMultipartUploads(request, env);
   }
 
-  if (request.method === "GET" && url.pathname.startsWith("/f/")) {
+  if (isReadRequest(request) && url.pathname.startsWith("/f/")) {
     return handleFileAccess(request, env);
   }
 
-  if (request.method === "GET" && url.pathname.startsWith("/hls/")) {
+  if (isReadRequest(request) && url.pathname.startsWith("/hls/")) {
     return handleHlsAccess(request, env);
+  }
+
+  if (url.pathname === "/api" || url.pathname.startsWith("/api/")) {
+    return errorResponse(new AppError(404, "NotFound", "Route not found"));
+  }
+
+  if (url.pathname === "/f" || url.pathname === "/hls" || url.pathname.startsWith("/f/") || url.pathname.startsWith("/hls/")) {
+    return errorResponse(new AppError(404, "NotFound", "Route not found"));
+  }
+
+  if (isReadRequest(request) && env.ASSETS) {
+    return env.ASSETS.fetch(request);
   }
 
   return errorResponse(new AppError(404, "NotFound", "Route not found"));

@@ -1,5 +1,5 @@
 import type { ThumbnailUploadPayload } from "../api";
-import Hls from "hls.js";
+import Hls, { Events, type ErrorData } from "hls.js";
 
 export type ThumbnailKind = "image" | "video" | "audio";
 
@@ -18,6 +18,7 @@ const MAX_SIDE = 320;
 const JPEG_QUALITY = 0.82;
 const VIDEO_SEEK_SECONDS = 0.75;
 const VIDEO_FRAME_WAIT_TIMEOUT_MS = 800;
+const HLS_THUMBNAIL_BUFFER_TIMEOUT_MS = 18000;
 const VIDEO_BLANK_VARIANCE_THRESHOLD = 4;
 const VIDEO_BLANK_WHITE_LUMA = 246;
 const VIDEO_BLANK_BLACK_LUMA = 10;
@@ -93,22 +94,28 @@ export async function generateThumbnailFromHlsPlaylist(playlistUrl: string, file
 
   try {
     const metadataReady = waitForVideoMetadata(video);
+    let bufferReady: Promise<void>;
 
     if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      bufferReady = waitForVideoReadyState(video, 2, "HLS 首帧加载超时");
       video.src = playlistUrl;
     } else if (Hls.isSupported()) {
       hls = new Hls({
+        maxBufferLength: 8,
+        maxMaxBufferLength: 8,
         xhrSetup(xhr) {
           xhr.withCredentials = true;
         }
       });
-      hls.loadSource(playlistUrl);
+      bufferReady = waitForHlsFirstFragment(video, hls);
       hls.attachMedia(video);
+      hls.loadSource(playlistUrl);
     } else {
       throw new Error("当前浏览器不支持 HLS 预览");
     }
 
     await metadataReady;
+    await bufferReady;
     return renderLoadedVideoThumbnail(video, fileName, "auto");
   } finally {
     hls?.destroy();
@@ -253,6 +260,91 @@ function waitForVideoMetadata(video: HTMLVideoElement): Promise<void> {
 
     video.addEventListener("loadedmetadata", onLoaded, { once: true });
     video.addEventListener("error", onError, { once: true });
+  });
+}
+
+function waitForVideoReadyState(video: HTMLVideoElement, readyState: number, timeoutMessage: string): Promise<void> {
+  if (video.readyState >= readyState) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      cleanup();
+      reject(new Error(timeoutMessage));
+    }, HLS_THUMBNAIL_BUFFER_TIMEOUT_MS);
+    const cleanup = () => {
+      window.clearTimeout(timeout);
+      video.removeEventListener("loadeddata", onReady);
+      video.removeEventListener("canplay", onReady);
+      video.removeEventListener("error", onError);
+    };
+    const onReady = () => {
+      if (video.readyState < readyState) {
+        return;
+      }
+      cleanup();
+      resolve();
+    };
+    const onError = () => {
+      cleanup();
+      reject(new Error("HLS 视频加载失败"));
+    };
+
+    video.addEventListener("loadeddata", onReady);
+    video.addEventListener("canplay", onReady);
+    video.addEventListener("error", onError, { once: true });
+  });
+}
+
+function waitForHlsFirstFragment(video: HTMLVideoElement, hls: Hls): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("HLS 首个片段缓冲超时"));
+    }, HLS_THUMBNAIL_BUFFER_TIMEOUT_MS);
+    const cleanup = () => {
+      window.clearTimeout(timeout);
+      hls.off(Events.FRAG_BUFFERED, onFragmentBuffered);
+      hls.off(Events.ERROR, onHlsError);
+      video.removeEventListener("loadeddata", onVideoReady);
+      video.removeEventListener("canplay", onVideoReady);
+      video.removeEventListener("error", onVideoError);
+    };
+    const finish = () => {
+      cleanup();
+      resolve();
+    };
+    const onVideoReady = () => {
+      if (video.readyState >= 2) {
+        finish();
+      }
+    };
+    const onFragmentBuffered = () => {
+      finish();
+    };
+    const onHlsError = (_event: Events.ERROR, data: ErrorData) => {
+      if (!data.fatal) {
+        return;
+      }
+      cleanup();
+      reject(new Error(data.error?.message || "HLS 视频加载失败"));
+    };
+    const onVideoError = () => {
+      cleanup();
+      reject(new Error("HLS 视频加载失败"));
+    };
+
+    if (video.readyState >= 2) {
+      finish();
+      return;
+    }
+
+    hls.on(Events.FRAG_BUFFERED, onFragmentBuffered);
+    hls.on(Events.ERROR, onHlsError);
+    video.addEventListener("loadeddata", onVideoReady);
+    video.addEventListener("canplay", onVideoReady);
+    video.addEventListener("error", onVideoError, { once: true });
   });
 }
 
