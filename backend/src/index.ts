@@ -200,11 +200,14 @@ interface UploadedThumbnailResult {
 interface ThumbnailSourceTokenPayload {
   purpose: "thumbnail_source";
   url: string;
+  upload_id?: string;
   mime_type: string;
   kind: "image" | "video";
   size: number;
   exp: number;
 }
+
+type RemoteRequestHeaders = Record<string, string>;
 
 interface ParsedByteRange {
   start: number;
@@ -231,6 +234,10 @@ const THUMBNAIL_SOURCE_TOKEN_TTL_SECONDS = 10 * 60;
 const IMAGE_THUMBNAIL_SOURCE_MAX_BYTES = 100 * 1024 * 1024;
 const VIDEO_THUMBNAIL_SOURCE_MAX_BYTES = MAX_TELEGRAM_MULTIPART_BYTES;
 const VIDEO_THUMBNAIL_PROXY_DEFAULT_RANGE_BYTES = 2 * 1024 * 1024;
+const MAX_REMOTE_REQUEST_HEADER_COUNT = 32;
+const MAX_REMOTE_REQUEST_HEADER_NAME_BYTES = 128;
+const MAX_REMOTE_REQUEST_HEADER_VALUE_BYTES = 8 * 1024;
+const MAX_REMOTE_REQUEST_HEADERS_BYTES = 16 * 1024;
 const ALLOWED_THUMBNAIL_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const HLS_PLAYLIST_MIME_TYPE = "application/vnd.apple.mpegurl";
 const HLS_PUBLIC_ROUTE_PREFIX = "/api/hls";
@@ -1314,6 +1321,7 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
   if (request.method === "POST" && url.pathname === "/api/admin/uploads/url/init") {
     const body = await readJsonObject(request);
     const sourceUrl = normalizeSourceUrl(body.url);
+    const sourceHeaders = normalizeRemoteRequestHeaders(body.headers ?? body.source_headers ?? body.request_headers);
     const remark = normalizeRemark(body.remark);
     const fileNameOverride = normalizeOptionalFileName(body.file_name);
     const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
@@ -1325,17 +1333,20 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
     }
 
     const probe = await probeRemoteSourceForMultipart(sourceUrl, parseMaxFileBytes(env.MAX_FILE_BYTES), {
-      forceMultipart: true
+      forceMultipart: true,
+      ...(sourceHeaders ? { sourceHeaders } : {})
     });
 
     if (probe.mode === "single") {
       throw new AppError(500, "InternalError", "Forced URL multipart probe returned single mode");
     }
 
+    const sourceHeadersJson = remoteRequestHeadersJson(sourceHeaders);
     const result = await createMultipartUpload({
       db,
       sourceKind: "url",
       sourceUrl: sourceUrl.toString(),
+      ...(sourceHeadersJson ? { sourceHeadersJson } : {}),
       fileName: fileNameOverride ?? probe.fileName,
       mimeType: probe.mimeType,
       size: probe.size,
@@ -1348,6 +1359,7 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
     const thumbnailSource = await createThumbnailSourceInfo({
       request,
       env,
+      uploadId: result.id,
       sourceUrl,
       mimeType: probe.mimeType,
       size: probe.size
@@ -1457,19 +1469,21 @@ async function handleAdminHlsUploads(request: Request, env: Env, username: strin
   if (request.method === "POST" && url.pathname === "/api/admin/uploads/hls/probe") {
     const body = await readJsonObject(request);
     const sourceUrl = normalizeSourceUrl(body.url);
+    const sourceHeaders = normalizeRemoteRequestHeaders(body.headers ?? body.source_headers ?? body.request_headers);
     const variantId = optionalTrimmedString(body.variant_id, 80);
 
     if (!sourceUrl) {
       throw new AppError(400, "MissingUrl", "JSON field 'url' is required");
     }
 
-    const result = await probeHlsSource(sourceUrl, variantId);
+    const result = await probeHlsSource(sourceUrl, variantId, sourceHeaders);
     return jsonResponse({ ok: true, hls: serializeHlsProbeResult(result) });
   }
 
   if (request.method === "POST" && url.pathname === "/api/admin/uploads/hls/init") {
     const body = await readJsonObject(request);
     const sourceUrl = normalizeSourceUrl(body.url);
+    const sourceHeaders = normalizeRemoteRequestHeaders(body.headers ?? body.source_headers ?? body.request_headers);
 
     if (!sourceUrl) {
       throw new AppError(400, "MissingUrl", "JSON field 'url' is required");
@@ -1480,6 +1494,7 @@ async function handleAdminHlsUploads(request: Request, env: Env, username: strin
     const result = await createHlsUpload({
       db,
       sourceUrl,
+      ...(sourceHeaders ? { sourceHeaders } : {}),
       selectedVariantId: optionalTrimmedString(body.variant_id, 80),
       fileNameOverride: normalizeOptionalFileName(body.file_name),
       conflictAction: normalizeFileNameConflictAction(body.on_conflict),
@@ -1649,6 +1664,7 @@ async function handleApiMultipartUploads(request: Request, env: Env): Promise<Re
   if (request.method === "POST" && url.pathname === "/api/v1/uploads/url/init") {
     const body = await readJsonObject(request);
     const sourceUrl = normalizeSourceUrl(body.url);
+    const sourceHeaders = normalizeRemoteRequestHeaders(body.headers ?? body.source_headers ?? body.request_headers);
     const remark = normalizeRemark(body.remark);
     const fileNameOverride = normalizeOptionalFileName(body.file_name);
     const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
@@ -1660,17 +1676,20 @@ async function handleApiMultipartUploads(request: Request, env: Env): Promise<Re
     }
 
     const probe = await probeRemoteSourceForMultipart(sourceUrl, parseMaxFileBytes(env.MAX_FILE_BYTES), {
-      forceMultipart: true
+      forceMultipart: true,
+      ...(sourceHeaders ? { sourceHeaders } : {})
     });
 
     if (probe.mode === "single") {
       throw new AppError(500, "InternalError", "Forced URL multipart probe returned single mode");
     }
 
+    const sourceHeadersJson = remoteRequestHeadersJson(sourceHeaders);
     const result = await createMultipartUpload({
       db,
       sourceKind: "url",
       sourceUrl: sourceUrl.toString(),
+      ...(sourceHeadersJson ? { sourceHeadersJson } : {}),
       fileName: fileNameOverride ?? probe.fileName,
       mimeType: probe.mimeType,
       size: probe.size,
@@ -1682,6 +1701,7 @@ async function handleApiMultipartUploads(request: Request, env: Env): Promise<Re
     const thumbnailSource = await createThumbnailSourceInfo({
       request,
       env,
+      uploadId: result.id,
       sourceUrl,
       mimeType: probe.mimeType,
       size: probe.size
@@ -1766,8 +1786,12 @@ async function handleApiMultipartUploads(request: Request, env: Env): Promise<Re
   return errorResponse(new AppError(404, "NotFound", "API multipart upload route not found"));
 }
 
-async function probeHlsSource(sourceUrl: URL, selectedVariantId: string | undefined): Promise<HlsProbeResult> {
-  const plan = await fetchHlsPlaylistPlan(sourceUrl);
+async function probeHlsSource(
+  sourceUrl: URL,
+  selectedVariantId: string | undefined,
+  sourceHeaders?: RemoteRequestHeaders
+): Promise<HlsProbeResult> {
+  const plan = await fetchHlsPlaylistPlan(sourceUrl, sourceHeaders);
   const fileName = hlsFileNameFromUrl(sourceUrl);
 
   if (plan.kind === "media") {
@@ -1788,7 +1812,7 @@ async function probeHlsSource(sourceUrl: URL, selectedVariantId: string | undefi
   }
 
   const variant = selectHlsVariant(plan.variants, selectedVariantId);
-  const mediaPlan = await fetchHlsMediaPlaylist(new URL(variant.uri));
+  const mediaPlan = await fetchHlsMediaPlaylist(new URL(variant.uri), sourceHeaders);
 
   return {
     playlistUrl: sourceUrl.toString(),
@@ -1802,6 +1826,7 @@ async function probeHlsSource(sourceUrl: URL, selectedVariantId: string | undefi
 async function createHlsUpload(params: {
   db: D1Database;
   sourceUrl: URL;
+  sourceHeaders?: RemoteRequestHeaders;
   selectedVariantId: string | undefined;
   fileNameOverride: string | undefined;
   conflictAction: FileNameConflictAction;
@@ -1810,7 +1835,7 @@ async function createHlsUpload(params: {
   directoryId: string | null;
   directoryPath: string;
 }): Promise<HlsInitResult> {
-  const resolved = await resolveHlsMediaPlan(params.sourceUrl, params.selectedVariantId);
+  const resolved = await resolveHlsMediaPlan(params.sourceUrl, params.selectedVariantId, params.sourceHeaders);
   validateHlsMediaPlan(resolved.mediaPlan);
   const fileName = params.fileNameOverride ?? hlsFileNameFromUrl(new URL(resolved.mediaPlan.playlistUrl));
 
@@ -1823,9 +1848,11 @@ async function createHlsUpload(params: {
 
   const now = new Date().toISOString();
   const assetId = crypto.randomUUID();
+  const sourceHeadersJson = remoteRequestHeadersJson(params.sourceHeaders);
   const asset = await insertHlsAssetRecord(params.db, {
     id: assetId,
     sourceUrl: params.sourceUrl.toString(),
+    ...(sourceHeadersJson ? { sourceHeadersJson } : {}),
     mediaPlaylistUrl: resolved.mediaPlan.playlistUrl,
     fileName,
     mimeType: HLS_PLAYLIST_MIME_TYPE,
@@ -1882,8 +1909,9 @@ async function importHlsSegment(params: {
 
   try {
     const sourceUrl = new URL(segment.source_url);
+    const sourceHeaders = storedRemoteRequestHeaders(params.asset.source_headers_json);
     const encryption = hlsSegmentEncryptionForAsset(params.asset, params.segmentIndex);
-    const probe = await probeHlsSegmentSource(sourceUrl);
+    const probe = await probeHlsSegmentSource(sourceUrl, sourceHeaders);
     const mimeType = hlsMimeTypeForSegment(sourceUrl, probe.contentType);
 
     if (probe.size !== undefined && probe.size > MAX_TELEGRAM_MULTIPART_BYTES) {
@@ -1902,9 +1930,10 @@ async function importHlsSegment(params: {
       const encryptedBlob = await downloadHlsSegmentBlob(
         sourceUrl,
         TELEGRAM_CHUNK_SIZE_BYTES + HLS_AES_128_KEY_BYTES,
-        probe.size
+        probe.size,
+        sourceHeaders
       );
-      const blob = await decryptHlsSegmentBlob(encryptedBlob, encryption);
+      const blob = await decryptHlsSegmentBlob(encryptedBlob, encryption, sourceHeaders);
       if (blob.size > TELEGRAM_CHUNK_SIZE_BYTES) {
         throw new AppError(
           400,
@@ -1959,7 +1988,7 @@ async function importHlsSegment(params: {
       };
     }
 
-    const blob = await downloadHlsSegmentBlob(sourceUrl, TELEGRAM_CHUNK_SIZE_BYTES, probe.size);
+    const blob = await downloadHlsSegmentBlob(sourceUrl, TELEGRAM_CHUNK_SIZE_BYTES, probe.size, sourceHeaders);
     const fileName = hlsSegmentFileName(sourceUrl, segment.segment_index);
     const { telegramDocument, channel } = await uploadTelegramDocumentWithChannel({
       env: params.env,
@@ -2134,26 +2163,26 @@ async function completeHlsUpload(params: {
   };
 }
 
-async function fetchHlsPlaylistPlan(sourceUrl: URL): Promise<HlsPlaylistPlan> {
-  return parseHlsPlaylist(await fetchHlsPlaylistText(sourceUrl), sourceUrl);
+async function fetchHlsPlaylistPlan(sourceUrl: URL, sourceHeaders?: RemoteRequestHeaders): Promise<HlsPlaylistPlan> {
+  return parseHlsPlaylist(await fetchHlsPlaylistText(sourceUrl, sourceHeaders), sourceUrl);
 }
 
-async function fetchHlsMediaPlaylist(sourceUrl: URL): Promise<HlsMediaPlan> {
-  const plan = await fetchHlsPlaylistPlan(sourceUrl);
+async function fetchHlsMediaPlaylist(sourceUrl: URL, sourceHeaders?: RemoteRequestHeaders): Promise<HlsMediaPlan> {
+  const plan = await fetchHlsPlaylistPlan(sourceUrl, sourceHeaders);
   if (plan.kind !== "media") {
     throw new AppError(400, "InvalidHlsPlaylist", "variant URI 必须指向 media playlist");
   }
   return plan;
 }
 
-async function fetchHlsPlaylistText(sourceUrl: URL): Promise<string> {
+async function fetchHlsPlaylistText(sourceUrl: URL, sourceHeaders?: RemoteRequestHeaders): Promise<string> {
   let response: Response;
   try {
     response = await fetch(sourceUrl.toString(), {
       redirect: "follow",
-      headers: {
+      headers: remoteFetchHeaders(sourceHeaders, {
         Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*"
-      }
+      })
     });
   } catch {
     throw new AppError(502, "HlsPlaylistFetchFailed", "m3u8 文件获取失败");
@@ -2186,9 +2215,10 @@ async function fetchHlsPlaylistText(sourceUrl: URL): Promise<string> {
 
 async function resolveHlsMediaPlan(
   sourceUrl: URL,
-  selectedVariantId: string | undefined
+  selectedVariantId: string | undefined,
+  sourceHeaders?: RemoteRequestHeaders
 ): Promise<{ sourcePlan: HlsPlaylistPlan; mediaPlan: HlsMediaPlan; selectedVariantId?: string }> {
-  const sourcePlan = await fetchHlsPlaylistPlan(sourceUrl);
+  const sourcePlan = await fetchHlsPlaylistPlan(sourceUrl, sourceHeaders);
 
   if (sourcePlan.kind === "media") {
     return { sourcePlan, mediaPlan: sourcePlan };
@@ -2201,7 +2231,7 @@ async function resolveHlsMediaPlan(
   }
 
   const variant = selectHlsVariant(sourcePlan.variants, selectedVariantId ?? sourcePlan.variants[0]?.id ?? "");
-  const mediaPlan = await fetchHlsMediaPlaylist(new URL(variant.uri));
+  const mediaPlan = await fetchHlsMediaPlaylist(new URL(variant.uri), sourceHeaders);
   return { sourcePlan, mediaPlan, selectedVariantId: variant.id };
 }
 
@@ -2222,12 +2252,12 @@ function validateHlsMediaPlan(plan: HlsMediaPlan): void {
   }
 }
 
-async function probeHlsSegmentSource(sourceUrl: URL): Promise<{
+async function probeHlsSegmentSource(sourceUrl: URL, sourceHeaders?: RemoteRequestHeaders): Promise<{
   size?: number;
   contentType?: string | null;
   supportsRange: boolean;
 }> {
-  const head = await fetchRemoteHead(sourceUrl);
+  const head = await fetchRemoteHead(sourceUrl, sourceHeaders);
   const contentType = head?.headers.get("Content-Type") ?? null;
   const size = parseContentLength(head?.headers.get("Content-Length") ?? null);
   const headSupportsRange = (head?.headers.get("Accept-Ranges") ?? "").toLowerCase().includes("bytes");
@@ -2237,7 +2267,7 @@ async function probeHlsSegmentSource(sourceUrl: URL): Promise<{
   }
 
   try {
-    const rangeProbe = await fetchRemoteRange(sourceUrl, 0, 0);
+    const rangeProbe = await fetchRemoteRange(sourceUrl, 0, 0, sourceHeaders);
     if (rangeProbe.status === 206) {
       const contentRange = parseContentRange(rangeProbe.headers.get("Content-Range"));
       const probedSize = contentRange?.size ?? size;
@@ -2256,12 +2286,17 @@ async function probeHlsSegmentSource(sourceUrl: URL): Promise<{
   return { ...(size !== undefined ? { size } : {}), contentType, supportsRange: headSupportsRange };
 }
 
-async function downloadHlsSegmentBlob(sourceUrl: URL, maxBytes: number, expectedSize: number | undefined): Promise<Blob> {
+async function downloadHlsSegmentBlob(
+  sourceUrl: URL,
+  maxBytes: number,
+  expectedSize: number | undefined,
+  sourceHeaders?: RemoteRequestHeaders
+): Promise<Blob> {
   let response: Response;
   try {
     response = await fetch(sourceUrl.toString(), {
       redirect: "follow",
-      headers: { Accept: "video/*, audio/*, application/octet-stream, */*" }
+      headers: remoteFetchHeaders(sourceHeaders, { Accept: "video/*, audio/*, application/octet-stream, */*" })
     });
   } catch {
     throw new AppError(502, "HlsSegmentFetchFailed", "HLS segment 获取失败");
@@ -2302,9 +2337,13 @@ function hlsSegmentEncryptionForAsset(asset: HlsAssetRecord, segmentIndex: numbe
   return plan.segments[segmentIndex]?.encryption ?? null;
 }
 
-async function decryptHlsSegmentBlob(blob: Blob, encryption: HlsSegmentEncryption): Promise<Blob> {
+async function decryptHlsSegmentBlob(
+  blob: Blob,
+  encryption: HlsSegmentEncryption,
+  sourceHeaders?: RemoteRequestHeaders
+): Promise<Blob> {
   const [keyBytes, encryptedBytes] = await Promise.all([
-    fetchHlsAes128Key(new URL(encryption.keyUri)),
+    fetchHlsAes128Key(new URL(encryption.keyUri), sourceHeaders),
     blob.arrayBuffer().catch(() => {
       throw new AppError(502, "HlsSegmentReadFailed", "HLS segment 读取失败");
     })
@@ -2337,12 +2376,12 @@ async function decryptHlsSegmentBlob(blob: Blob, encryption: HlsSegmentEncryptio
   return new Blob([decrypted], { type: blob.type || "video/mp2t" });
 }
 
-async function fetchHlsAes128Key(keyUrl: URL): Promise<ArrayBuffer> {
+async function fetchHlsAes128Key(keyUrl: URL, sourceHeaders?: RemoteRequestHeaders): Promise<ArrayBuffer> {
   let response: Response;
   try {
     response = await fetch(keyUrl.toString(), {
       redirect: "follow",
-      headers: { Accept: "application/octet-stream, */*" }
+      headers: remoteFetchHeaders(sourceHeaders, { Accept: "application/octet-stream, */*" })
     });
   } catch {
     throw new AppError(502, "HlsKeyFetchFailed", "HLS key 获取失败");
@@ -2410,6 +2449,7 @@ async function ensureHlsSegmentMultipartUpload(params: {
     id: crypto.randomUUID(),
     sourceKind: "url",
     sourceUrl: params.segment.source_url,
+    ...(params.asset.source_headers_json ? { sourceHeadersJson: params.asset.source_headers_json } : {}),
     fileName: hlsSegmentFileName(sourceUrl, params.segment.segment_index),
     mimeType: params.mimeType,
     size: params.size,
@@ -2944,6 +2984,11 @@ async function readUploadInput(request: Request, env: Env): Promise<{
   const formData = await request.formData();
   const formFile = formData.get("file");
   const fileNameOverride = normalizeOptionalFileName(formData.get("file_name"));
+  const sourceHeaders = normalizeRemoteRequestHeaders(
+    formData.get("headers") ??
+    formData.get("source_headers") ??
+    formData.get("request_headers")
+  );
   const remark = normalizeRemark(formData.get("remark"));
   const directoryPath = normalizeDirectoryPath(formData.get("directory_path") ?? formData.get("dir") ?? "/");
   const conflictAction = normalizeFileNameConflictAction(formData.get("on_conflict"));
@@ -2966,6 +3011,7 @@ async function readUploadInput(request: Request, env: Env): Promise<{
       sourceUrl,
       env,
       maxFileBytes,
+      ...(sourceHeaders ? { sourceHeaders } : {}),
       ...(fileNameOverride ? { fileName: fileNameOverride } : {})
     });
 
@@ -2989,6 +3035,7 @@ async function readUrlUploadJson(request: Request, env: Env): Promise<{
   const maxFileBytes = parseMaxFileBytes(env.MAX_FILE_BYTES);
   const body = await readJsonObject(request);
   const sourceUrl = normalizeSourceUrl(body.url);
+  const sourceHeaders = normalizeRemoteRequestHeaders(body.headers ?? body.source_headers ?? body.request_headers);
   const fileNameOverride = normalizeOptionalFileName(body.file_name);
   const conflictAction = normalizeFileNameConflictAction(body.on_conflict);
 
@@ -3001,6 +3048,7 @@ async function readUrlUploadJson(request: Request, env: Env): Promise<{
     sourceUrl,
     env,
     maxFileBytes,
+    ...(sourceHeaders ? { sourceHeaders } : {}),
     ...(fileNameOverride ? { fileName: fileNameOverride } : {})
   });
   const remark = normalizeRemark(body.remark);
@@ -3167,11 +3215,214 @@ function normalizeSourceUrl(value: unknown): URL | undefined {
   return url;
 }
 
+function normalizeRemoteRequestHeaders(value: unknown): RemoteRequestHeaders | undefined {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+
+  const entries = remoteHeaderEntries(value);
+  if (entries.length === 0) {
+    return undefined;
+  }
+
+  if (entries.length > MAX_REMOTE_REQUEST_HEADER_COUNT) {
+    throw new AppError(400, "TooManySourceHeaders", `远端请求头最多支持 ${MAX_REMOTE_REQUEST_HEADER_COUNT} 个`);
+  }
+
+  const encoder = new TextEncoder();
+  const result: RemoteRequestHeaders = {};
+  const names = new Map<string, string>();
+  let totalBytes = 0;
+
+  for (const [rawName, rawValue] of entries) {
+    const name = normalizeRemoteRequestHeaderName(rawName);
+    const valueText = normalizeRemoteRequestHeaderValue(rawValue, name);
+
+    if (!valueText) {
+      continue;
+    }
+
+    const lowerName = name.toLowerCase();
+    const previousName = names.get(lowerName);
+    if (previousName) {
+      delete result[previousName];
+    }
+
+    names.set(lowerName, name);
+    result[name] = valueText;
+    totalBytes += encoder.encode(name).byteLength + encoder.encode(valueText).byteLength;
+  }
+
+  if (Object.keys(result).length > MAX_REMOTE_REQUEST_HEADER_COUNT) {
+    throw new AppError(400, "TooManySourceHeaders", `远端请求头最多支持 ${MAX_REMOTE_REQUEST_HEADER_COUNT} 个`);
+  }
+
+  if (totalBytes > MAX_REMOTE_REQUEST_HEADERS_BYTES) {
+    throw new AppError(400, "SourceHeadersTooLarge", "远端请求头总大小过大");
+  }
+
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+function remoteHeaderEntries(value: unknown): Array<[string, unknown]> {
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) {
+      return [];
+    }
+
+    if (text.startsWith("{") || text.startsWith("[")) {
+      try {
+        return remoteHeaderEntries(JSON.parse(text) as unknown);
+      } catch {
+        throw new AppError(400, "InvalidSourceHeaders", "远端请求头 JSON 无效");
+      }
+    }
+
+    return text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"))
+      .map((line) => {
+        const separator = line.indexOf(":");
+        if (separator <= 0) {
+          throw new AppError(400, "InvalidSourceHeaders", "远端请求头每行必须是 Header-Name: value 格式");
+        }
+        return [line.slice(0, separator), line.slice(separator + 1)] satisfies [string, string];
+      });
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => {
+      if (Array.isArray(entry) && entry.length >= 2) {
+        return [String(entry[0]), entry[1]] satisfies [string, unknown];
+      }
+
+      if (isPlainRecord(entry) && typeof entry.name === "string") {
+        return [entry.name, entry.value] satisfies [string, unknown];
+      }
+
+      throw new AppError(400, "InvalidSourceHeaders", "远端请求头数组必须包含 {name, value}");
+    });
+  }
+
+  if (isPlainRecord(value)) {
+    return Object.entries(value);
+  }
+
+  throw new AppError(400, "InvalidSourceHeaders", "headers 必须是对象、数组或 Header-Name: value 文本");
+}
+
+function normalizeRemoteRequestHeaderName(value: string): string {
+  const name = value.trim();
+  const nameBytes = new TextEncoder().encode(name).byteLength;
+
+  if (!name || nameBytes > MAX_REMOTE_REQUEST_HEADER_NAME_BYTES || !/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name)) {
+    throw new AppError(400, "InvalidSourceHeaderName", `无效的远端请求头名称：${value}`);
+  }
+
+  const lowerName = name.toLowerCase();
+  if (isBlockedRemoteRequestHeader(lowerName)) {
+    throw new AppError(400, "UnsupportedSourceHeader", `不允许自定义远端请求头：${name}`);
+  }
+
+  return name;
+}
+
+function normalizeRemoteRequestHeaderValue(value: unknown, name: string): string {
+  if (typeof value !== "string") {
+    throw new AppError(400, "InvalidSourceHeaderValue", `远端请求头 ${name} 的值必须是字符串`);
+  }
+
+  const normalized = value.trim();
+  if (!normalized) {
+    return "";
+  }
+
+  if (/[\r\n]/.test(normalized)) {
+    throw new AppError(400, "InvalidSourceHeaderValue", `远端请求头 ${name} 的值不能包含换行`);
+  }
+
+  if (new TextEncoder().encode(normalized).byteLength > MAX_REMOTE_REQUEST_HEADER_VALUE_BYTES) {
+    throw new AppError(400, "SourceHeaderTooLarge", `远端请求头 ${name} 的值过大`);
+  }
+
+  return normalized;
+}
+
+function isBlockedRemoteRequestHeader(lowerName: string): boolean {
+  return lowerName === "host" ||
+    lowerName === "range" ||
+    lowerName === "content-length" ||
+    lowerName === "connection" ||
+    lowerName === "keep-alive" ||
+    lowerName === "proxy-authenticate" ||
+    lowerName === "proxy-authorization" ||
+    lowerName === "te" ||
+    lowerName === "trailer" ||
+    lowerName === "transfer-encoding" ||
+    lowerName === "upgrade" ||
+    lowerName === "accept-encoding" ||
+    lowerName === "cf-connecting-ip" ||
+    lowerName === "cf-ipcountry" ||
+    lowerName === "cf-ray" ||
+    lowerName === "cf-visitor" ||
+    lowerName === "true-client-ip" ||
+    lowerName === "x-forwarded-for" ||
+    lowerName === "x-forwarded-host" ||
+    lowerName === "x-forwarded-proto" ||
+    lowerName === "x-real-ip";
+}
+
+function remoteRequestHeadersJson(headers: RemoteRequestHeaders | undefined): string | undefined {
+  if (!headers || Object.keys(headers).length === 0) {
+    return undefined;
+  }
+
+  return JSON.stringify(Object.fromEntries(
+    Object.entries(headers).sort(([left], [right]) => left.localeCompare(right, "en", { sensitivity: "base" }))
+  ));
+}
+
+function storedRemoteRequestHeaders(value: string | null | undefined): RemoteRequestHeaders | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  try {
+    return normalizeRemoteRequestHeaders(JSON.parse(value) as unknown);
+  } catch (error) {
+    if (error instanceof AppError) {
+      throw new AppError(500, "InvalidStoredSourceHeaders", "保存的远端请求头无效");
+    }
+    throw new AppError(500, "InvalidStoredSourceHeaders", "保存的远端请求头 JSON 无效");
+  }
+}
+
+function remoteFetchHeaders(
+  sourceHeaders: RemoteRequestHeaders | undefined,
+  defaults: Record<string, string>,
+  overrides: Record<string, string> = {}
+): Headers {
+  const headers = new Headers(defaults);
+
+  for (const [name, value] of Object.entries(sourceHeaders ?? {})) {
+    headers.set(name, value);
+  }
+
+  for (const [name, value] of Object.entries(overrides)) {
+    headers.set(name, value);
+  }
+
+  return headers;
+}
+
 async function downloadFileFromUrl(params: {
   sourceUrl: URL;
   env: Env;
   maxFileBytes: number;
   fileName?: string;
+  sourceHeaders?: RemoteRequestHeaders;
 }): Promise<File> {
   const signedFile = await downloadSignedFileUrl(params);
   if (signedFile) {
@@ -3183,9 +3434,7 @@ async function downloadFileFromUrl(params: {
   try {
     response = await fetch(params.sourceUrl.toString(), {
       redirect: "follow",
-      headers: {
-        Accept: "*/*"
-      }
+      headers: remoteFetchHeaders(params.sourceHeaders, { Accept: "*/*" })
     });
   } catch {
     throw new AppError(502, "UrlFetchFailed", "Failed to fetch source URL");
@@ -3782,6 +4031,7 @@ async function createMultipartUpload(params: {
   db: D1Database;
   sourceKind: "local" | "url";
   sourceUrl?: string;
+  sourceHeadersJson?: string;
   fileName: string;
   mimeType: string;
   size: number;
@@ -3804,6 +4054,7 @@ async function createMultipartUpload(params: {
     id: crypto.randomUUID(),
     sourceKind: params.sourceKind,
     ...(params.sourceUrl ? { sourceUrl: params.sourceUrl } : {}),
+    ...(params.sourceHeadersJson ? { sourceHeadersJson: params.sourceHeadersJson } : {}),
     fileName: params.fileName,
     mimeType: params.mimeType,
     size: params.size,
@@ -3844,12 +4095,12 @@ function validateMultipartFileSize(size: number): void {
 async function probeRemoteSourceForMultipart(
   sourceUrl: URL,
   singleMaxFileBytes: number,
-  options: { forceMultipart?: boolean } = {}
+  options: { forceMultipart?: boolean; sourceHeaders?: RemoteRequestHeaders } = {}
 ): Promise<
   | { mode: "single" }
   | { mode: "multipart"; fileName: string; mimeType: string; size: number }
 > {
-  const head = await fetchRemoteHead(sourceUrl);
+  const head = await fetchRemoteHead(sourceUrl, options.sourceHeaders);
   let size = parseContentLength(head?.headers.get("Content-Length") ?? null);
   const initialFileName = inferRemoteFileName(sourceUrl, head?.headers ?? new Headers());
   const remoteMimeHint = pickRemoteMimeHint(head?.headers.get("Content-Type") ?? null, initialFileName);
@@ -3862,7 +4113,7 @@ async function probeRemoteSourceForMultipart(
     throw fileTooLargeError(MAX_TELEGRAM_MULTIPART_BYTES, size);
   }
 
-  const rangeProbe = await fetchRemoteRange(sourceUrl, 0, 0);
+  const rangeProbe = await fetchRemoteRange(sourceUrl, 0, 0, options.sourceHeaders);
   if (rangeProbe.status !== 206) {
     throw new AppError(400, "RangeNotSupported", "Source URL must support Range requests for large URL uploads");
   }
@@ -3896,12 +4147,12 @@ async function probeRemoteSourceForMultipart(
   };
 }
 
-async function fetchRemoteHead(sourceUrl: URL): Promise<Response | undefined> {
+async function fetchRemoteHead(sourceUrl: URL, sourceHeaders?: RemoteRequestHeaders): Promise<Response | undefined> {
   try {
     const response = await fetch(sourceUrl.toString(), {
       method: "HEAD",
       redirect: "follow",
-      headers: { Accept: "*/*" }
+      headers: remoteFetchHeaders(sourceHeaders, { Accept: "*/*" })
     });
 
     return response.ok ? response : undefined;
@@ -3910,14 +4161,16 @@ async function fetchRemoteHead(sourceUrl: URL): Promise<Response | undefined> {
   }
 }
 
-async function fetchRemoteRange(sourceUrl: URL, start: number, end: number): Promise<Response> {
+async function fetchRemoteRange(
+  sourceUrl: URL,
+  start: number,
+  end: number,
+  sourceHeaders?: RemoteRequestHeaders
+): Promise<Response> {
   try {
     const response = await fetch(sourceUrl.toString(), {
       redirect: "follow",
-      headers: {
-        Accept: "*/*",
-        Range: `bytes=${start}-${end}`
-      }
+      headers: remoteFetchHeaders(sourceHeaders, { Accept: "*/*" }, { Range: `bytes=${start}-${end}` })
     });
 
     if (!response.ok && response.status !== 206) {
@@ -3942,6 +4195,7 @@ async function fetchRemoteRange(sourceUrl: URL, start: number, end: number): Pro
 async function createThumbnailSourceInfo(params: {
   request: Request;
   env: Env;
+  uploadId?: string;
   sourceUrl: URL;
   mimeType: string;
   size: number;
@@ -3957,6 +4211,7 @@ async function createThumbnailSourceInfo(params: {
     {
       purpose: "thumbnail_source",
       url: params.sourceUrl.toString(),
+      ...(params.uploadId ? { upload_id: params.uploadId } : {}),
       mime_type: params.mimeType,
       kind,
       size: params.size,
@@ -4022,16 +4277,18 @@ async function handleThumbnailSourceProxy(request: Request, env: Env): Promise<R
     throw new AppError(400, "InvalidThumbnailSource", "Thumbnail source URL must use HTTP or HTTPS");
   }
 
+  const sourceHeaders = await thumbnailSourceRequestHeaders(env, payload);
   const rangeHeader = thumbnailProxyRangeHeader(request, payload);
   let response: Response;
 
   try {
     response = await fetch(sourceUrl.toString(), {
       redirect: "follow",
-      headers: {
-        Accept: payload.kind === "image" ? "image/*" : "video/*",
-        ...(rangeHeader ? { Range: rangeHeader } : {})
-      }
+      headers: remoteFetchHeaders(
+        sourceHeaders,
+        { Accept: payload.kind === "image" ? "image/*" : "video/*" },
+        rangeHeader ? { Range: rangeHeader } : {}
+      )
     });
   } catch {
     throw new AppError(502, "ThumbnailSourceFetchFailed", "Failed to fetch thumbnail source");
@@ -4060,6 +4317,23 @@ async function handleThumbnailSourceProxy(request: Request, env: Env): Promise<R
   });
 }
 
+async function thumbnailSourceRequestHeaders(
+  env: Env,
+  payload: ThumbnailSourceTokenPayload
+): Promise<RemoteRequestHeaders | undefined> {
+  if (!payload.upload_id) {
+    return undefined;
+  }
+
+  const db = requireDb(env);
+  const upload = await getMultipartUploadRecord(db, payload.upload_id);
+  if (!upload || upload.source_kind !== "url" || upload.source_url !== payload.url) {
+    return undefined;
+  }
+
+  return storedRemoteRequestHeaders(upload.source_headers_json);
+}
+
 function thumbnailProxyRangeHeader(request: Request, payload: ThumbnailSourceTokenPayload): string | undefined {
   const requestedRange = request.headers.get("Range");
 
@@ -4083,6 +4357,7 @@ function parseThumbnailSourcePayload(value: unknown): ThumbnailSourceTokenPayloa
   if (
     value.purpose !== "thumbnail_source" ||
     typeof value.url !== "string" ||
+    (value.upload_id !== undefined && typeof value.upload_id !== "string") ||
     typeof value.mime_type !== "string" ||
     (value.kind !== "image" && value.kind !== "video") ||
     typeof value.size !== "number" ||
@@ -4097,6 +4372,7 @@ function parseThumbnailSourcePayload(value: unknown): ThumbnailSourceTokenPayloa
   return {
     purpose: "thumbnail_source",
     url: value.url,
+    ...(value.upload_id ? { upload_id: value.upload_id.slice(0, 128) } : {}),
     mime_type: value.mime_type,
     kind: value.kind,
     size: value.size,
@@ -4367,10 +4643,11 @@ async function downloadRemoteChunk(upload: MultipartUploadRecord, chunkIndex: nu
   }
 
   const sourceUrl = new URL(upload.source_url);
+  const sourceHeaders = storedRemoteRequestHeaders(upload.source_headers_json);
   const expectedSize = expectedChunkSize(upload, chunkIndex);
   const start = chunkIndex * upload.chunk_size;
   const end = start + expectedSize - 1;
-  const response = await fetchRemoteRange(sourceUrl, start, end);
+  const response = await fetchRemoteRange(sourceUrl, start, end, sourceHeaders);
 
   validateRemoteChunkResponse({ response, upload, start, end, expectedSize });
 

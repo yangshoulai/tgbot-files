@@ -21,6 +21,7 @@ const env: Env = {
   MAX_FILE_BYTES: "20971520"
 };
 const directAccessMaxChunks = 20;
+const telegramChunkSizeBytes = 10 * 1024 * 1024;
 const maxMultipartFileBytes = 5 * 1024 * 1024 * 1024;
 
 class FakeD1 {
@@ -144,6 +145,7 @@ class FakeD1Statement {
         id,
         sourceKind,
         sourceUrl,
+        sourceHeadersJson,
         fileName,
         mimeType,
         size,
@@ -158,6 +160,7 @@ class FakeD1Statement {
         id: String(id),
         source_kind: sourceKind as MultipartUploadRecord["source_kind"],
         source_url: sourceUrl === null ? null : String(sourceUrl),
+        source_headers_json: sourceHeadersJson === null ? null : String(sourceHeadersJson),
         file_name: String(fileName),
         mime_type: String(mimeType),
         size: Number(size),
@@ -166,9 +169,9 @@ class FakeD1Statement {
         remark: remark === null ? null : String(remark),
         uploaded_by: uploadedBy === null ? null : String(uploadedBy),
         created_at: String(createdAt),
-        directory_id: this.bindings[11] === null ? null : String(this.bindings[11]),
-        directory_path: String(this.bindings[12] || "/"),
-        telegram_channel_group: String(this.bindings[13] || "default"),
+        directory_id: this.bindings[12] === null ? null : String(this.bindings[12]),
+        directory_path: String(this.bindings[13] || "/"),
+        telegram_channel_group: String(this.bindings[14] || "default"),
         completed_at: null
       });
       changes = 1;
@@ -375,6 +378,37 @@ class FakeD1Statement {
       }
     }
 
+    if (normalizedSql.startsWith("UPDATE HLS_SEGMENTS") && normalizedSql.includes("STORAGE_BACKEND = 'TELEGRAM_MULTIPART'")) {
+      if (normalizedSql.includes("SET STATUS = 'DONE'")) {
+        const [multipartUploadId, chunkSize, chunkCount, updatedAt, completedAt, id] = this.bindings;
+        const segment = this.db.hlsSegments.find((item) => item.id === id);
+        if (segment) {
+          segment.status = "done";
+          segment.storage_backend = "telegram_multipart";
+          segment.multipart_upload_id = String(multipartUploadId);
+          segment.chunk_size = Number(chunkSize);
+          segment.chunk_count = Number(chunkCount);
+          segment.error_message = null;
+          segment.updated_at = String(updatedAt);
+          segment.completed_at = String(completedAt);
+          changes = 1;
+        }
+      } else {
+        const [mimeType, multipartUploadId, size, chunkSize, chunkCount, updatedAt, id] = this.bindings;
+        const segment = this.db.hlsSegments.find((item) => item.id === id);
+        if (segment) {
+          segment.storage_backend = "telegram_multipart";
+          segment.mime_type = String(mimeType);
+          segment.multipart_upload_id = String(multipartUploadId);
+          segment.size = Number(size);
+          segment.chunk_size = Number(chunkSize);
+          segment.chunk_count = Number(chunkCount);
+          segment.updated_at = String(updatedAt);
+          changes = 1;
+        }
+      }
+    }
+
     if (normalizedSql.startsWith("UPDATE HLS_SEGMENTS") && normalizedSql.includes("SET STATUS = 'FAILED'")) {
       const [message, updatedAt, id] = this.bindings;
       const segment = this.db.hlsSegments.find((item) => item.id === id);
@@ -509,6 +543,7 @@ class FakeD1Statement {
       const upload = this.db.multipartUploads.find((item) => item.id === id && item.completed_at === null);
       if (upload) {
         upload.completed_at = String(completedAt);
+        upload.source_headers_json = null;
         changes = 1;
       }
     }
@@ -1051,6 +1086,7 @@ function hlsAssetRecord(overrides: Partial<HlsAssetRecord> = {}): HlsAssetRecord
   return {
     id: "hls-asset",
     source_url: "https://media.example.com/master.m3u8",
+    source_headers_json: null,
     media_playlist_url: "https://media.example.com/playlist.m3u8",
     file_name: "movie.m3u8",
     mime_type: "application/vnd.apple.mpegurl",
@@ -1781,14 +1817,32 @@ describe("API key multipart endpoints", () => {
     addApiKey(db);
     const apiEnv = envWithDb(db);
     const sourceUrl = "https://source.example.com/small.txt";
-    const fetchCalls: Array<{ input: string; method: string | undefined; range: string | null }> = [];
+    const sourceHeaders = {
+      Referer: "https://app.example.com/watch/42",
+      Cookie: "sid=source-cookie",
+      Authorization: "Bearer upstream-token",
+      "X-Source-Token": "custom-token"
+    };
+    const fetchCalls: Array<{
+      input: string;
+      method: string | undefined;
+      range: string | null;
+      referer: string | null;
+      cookie: string | null;
+      authorization: string | null;
+      sourceToken: string | null;
+    }> = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const inputUrl = String(input);
       const headers = new Headers(init?.headers);
       fetchCalls.push({
         input: inputUrl,
         method: init?.method,
-        range: headers.get("Range")
+        range: headers.get("Range"),
+        referer: headers.get("Referer"),
+        cookie: headers.get("Cookie"),
+        authorization: headers.get("Authorization"),
+        sourceToken: headers.get("X-Source-Token")
       });
 
       if (inputUrl === sourceUrl && init?.method === "HEAD") {
@@ -1845,7 +1899,7 @@ describe("API key multipart endpoints", () => {
           Authorization: `Bearer ${uploadApiKey}`,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ url: sourceUrl, remark: "URL 小文件分片" })
+        body: JSON.stringify({ url: sourceUrl, remark: "URL 小文件分片", headers: sourceHeaders })
       }),
       apiEnv
     );
@@ -1859,6 +1913,7 @@ describe("API key multipart endpoints", () => {
     expect(initBody.upload.file_name).toBe("small.txt");
     expect(initBody.upload.size).toBe(5);
     expect(initBody.upload.chunk_count).toBe(1);
+    expect(JSON.parse(db.multipartUploads[0]?.source_headers_json || "{}")).toMatchObject(sourceHeaders);
 
     const chunkResponse = await worker.fetch(
       new Request(`https://files.example.com/api/v1/uploads/${initBody.upload.id}/url-chunks/0`, {
@@ -1884,7 +1939,33 @@ describe("API key multipart endpoints", () => {
     expect(completeBody.file.storage_backend).toBe("telegram_multipart");
     expect(completeBody.file.chunk_count).toBe(1);
     expect(completeBody.file.remark).toBe("URL 小文件分片");
+    expect(db.multipartUploads[0]?.source_headers_json).toBeNull();
     expect(fetchCalls.some((call) => call.range === "bytes=0-4")).toBe(true);
+    expect(fetchCalls.filter((call) => call.input === sourceUrl)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          method: "HEAD",
+          referer: sourceHeaders.Referer,
+          cookie: sourceHeaders.Cookie,
+          authorization: sourceHeaders.Authorization,
+          sourceToken: sourceHeaders["X-Source-Token"]
+        }),
+        expect.objectContaining({
+          range: "bytes=0-0",
+          referer: sourceHeaders.Referer,
+          cookie: sourceHeaders.Cookie,
+          authorization: sourceHeaders.Authorization,
+          sourceToken: sourceHeaders["X-Source-Token"]
+        }),
+        expect.objectContaining({
+          range: "bytes=0-4",
+          referer: sourceHeaders.Referer,
+          cookie: sourceHeaders.Cookie,
+          authorization: sourceHeaders.Authorization,
+          sourceToken: sourceHeaders["X-Source-Token"]
+        })
+      ])
+    );
   });
 
   it("rejects URL multipart chunks that return a mismatched Content-Range before uploading to Telegram", async () => {
@@ -3733,6 +3814,11 @@ seg-0.ts
       final_file_id: null,
       status: "pending",
       source_url: "https://media.example.com/index.m3u8",
+      source_headers_json: JSON.stringify({
+        Referer: "https://app.example.com/hls",
+        Cookie: "hls_sid=abc",
+        "X-HLS-Token": "hls-token"
+      }),
       media_playlist_url: "https://media.example.com/path/index.m3u8",
       playlist_text: playlistText,
       segment_count: 1,
@@ -3759,12 +3845,23 @@ seg-0.ts
     const plainBytes = new TextEncoder().encode("decrypted ts payload");
     const encryptedBytes = await aesCbcEncrypt(plainBytes, keyBytes, ivBytes);
     let uploadedBytes: Uint8Array | null = null;
-    const fetchCalls: string[] = [];
+    const fetchCalls: Array<{
+      input: string;
+      referer: string | null;
+      cookie: string | null;
+      hlsToken: string | null;
+    }> = [];
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const inputUrl = String(input);
-        fetchCalls.push(inputUrl);
+        const headers = new Headers(init?.headers);
+        fetchCalls.push({
+          input: inputUrl,
+          referer: headers.get("Referer"),
+          cookie: headers.get("Cookie"),
+          hlsToken: headers.get("X-HLS-Token")
+        });
 
         if (inputUrl === "https://media.example.com/path/seg-0.ts" && init?.method === "HEAD") {
           return new Response(null, {
@@ -3841,10 +3938,202 @@ seg-0.ts
       telegram_file_id: "tg-decrypted-hls-segment"
     });
     expect(fetchCalls).toEqual([
-      "https://media.example.com/path/seg-0.ts",
-      "https://media.example.com/path/seg-0.ts",
-      "https://media.example.com/path/enc.key",
-      "https://api.telegram.org/bot123456:test-token/sendDocument"
+      {
+        input: "https://media.example.com/path/seg-0.ts",
+        referer: "https://app.example.com/hls",
+        cookie: "hls_sid=abc",
+        hlsToken: "hls-token"
+      },
+      {
+        input: "https://media.example.com/path/seg-0.ts",
+        referer: "https://app.example.com/hls",
+        cookie: "hls_sid=abc",
+        hlsToken: "hls-token"
+      },
+      {
+        input: "https://media.example.com/path/enc.key",
+        referer: "https://app.example.com/hls",
+        cookie: "hls_sid=abc",
+        hlsToken: "hls-token"
+      },
+      {
+        input: "https://api.telegram.org/bot123456:test-token/sendDocument",
+        referer: null,
+        cookie: null,
+        hlsToken: null
+      }
+    ]);
+  });
+
+  it("uses stored source headers for HLS multipart segment chunk imports", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const sourceHeaders = {
+      Referer: "https://app.example.com/hls-large",
+      Cookie: "large_hls_sid=abc",
+      "X-HLS-Token": "large-hls-token"
+    };
+    const segmentSize = telegramChunkSizeBytes + 4;
+    const segmentUrl = "https://media.example.com/path/large-0.ts";
+    db.hlsAssets.push(hlsAssetRecord({
+      id: "hls-large",
+      final_file_id: null,
+      status: "pending",
+      source_url: "https://media.example.com/index.m3u8",
+      source_headers_json: JSON.stringify(sourceHeaders),
+      media_playlist_url: "https://media.example.com/path/index.m3u8",
+      playlist_text: "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.000,\nlarge-0.ts\n#EXT-X-ENDLIST\n",
+      segment_count: 1,
+      estimated_size: null
+    }));
+    db.hlsSegments.push(hlsSegmentRecord(0, {
+      id: "hls-large-segment-0",
+      asset_id: "hls-large",
+      source_url: segmentUrl,
+      status: "pending",
+      size: null,
+      storage_backend: null,
+      telegram_file_id: null,
+      completed_at: null
+    }));
+    const sourceFetchCalls: Array<{
+      range: string | null;
+      referer: string | null;
+      cookie: string | null;
+      hlsToken: string | null;
+    }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const inputUrl = String(input);
+        const headers = new Headers(init?.headers);
+
+        if (inputUrl === segmentUrl) {
+          sourceFetchCalls.push({
+            range: headers.get("Range"),
+            referer: headers.get("Referer"),
+            cookie: headers.get("Cookie"),
+            hlsToken: headers.get("X-HLS-Token")
+          });
+
+          if (init?.method === "HEAD") {
+            return new Response(null, {
+              headers: {
+                "Content-Length": String(segmentSize),
+                "Content-Type": "video/mp2t",
+                "Accept-Ranges": "bytes"
+              }
+            });
+          }
+
+          if (headers.get("Range") === "bytes=0-0") {
+            return new Response("x", {
+              status: 206,
+              headers: {
+                "Content-Length": "1",
+                "Content-Range": `bytes 0-0/${segmentSize}`,
+                "Content-Type": "video/mp2t"
+              }
+            });
+          }
+
+          if (headers.get("Range") === `bytes=${telegramChunkSizeBytes}-${segmentSize - 1}`) {
+            return new Response("tail", {
+              status: 206,
+              headers: {
+                "Content-Length": "4",
+                "Content-Range": `bytes ${telegramChunkSizeBytes}-${segmentSize - 1}/${segmentSize}`,
+                "Content-Type": "video/mp2t"
+              }
+            });
+          }
+        }
+
+        if (inputUrl === "https://api.telegram.org/bot123456:test-token/sendDocument") {
+          const formData = init?.body as FormData;
+          const document = formData.get("document");
+          if (!(document instanceof Blob)) {
+            throw new Error("Expected Telegram document Blob");
+          }
+          expect(document.size).toBe(4);
+          return jsonResponse({
+            ok: true,
+            result: {
+              document: {
+                file_id: "tg-hls-large-chunk-1",
+                file_unique_id: "tg-hls-large-chunk-1-unique",
+                file_name: "large-0.ts.part-2-of-2",
+                mime_type: "video/mp2t",
+                file_size: document.size
+              }
+            }
+          });
+        }
+
+        throw new Error(`Unexpected fetch ${inputUrl}`);
+      })
+    );
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const initResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/uploads/hls/hls-large/segments/0/import", {
+        method: "POST",
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const initBody = await initResponse.json() as {
+      segment: { storage_backend: string; chunk_count: number };
+      missing_chunks: number[];
+    };
+
+    expect(initResponse.status).toBe(200);
+    expect(initBody.segment).toMatchObject({
+      storage_backend: "telegram_multipart",
+      chunk_count: 2
+    });
+    expect(initBody.missing_chunks).toEqual([0, 1]);
+    expect(JSON.parse(db.multipartUploads[0]?.source_headers_json || "{}")).toMatchObject(sourceHeaders);
+
+    const chunkResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/uploads/hls/hls-large/segments/0/chunks/1/import", {
+        method: "POST",
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+
+    expect(chunkResponse.status).toBe(200);
+    expect(db.fileChunks[0]).toMatchObject({
+      file_id: db.multipartUploads[0]?.id,
+      chunk_index: 1,
+      size: 4,
+      telegram_file_id: "tg-hls-large-chunk-1"
+    });
+    expect(sourceFetchCalls).toEqual([
+      {
+        range: null,
+        referer: sourceHeaders.Referer,
+        cookie: sourceHeaders.Cookie,
+        hlsToken: sourceHeaders["X-HLS-Token"]
+      },
+      {
+        range: "bytes=0-0",
+        referer: sourceHeaders.Referer,
+        cookie: sourceHeaders.Cookie,
+        hlsToken: sourceHeaders["X-HLS-Token"]
+      },
+      {
+        range: `bytes=${telegramChunkSizeBytes}-${segmentSize - 1}`,
+        referer: sourceHeaders.Referer,
+        cookie: sourceHeaders.Cookie,
+        hlsToken: sourceHeaders["X-HLS-Token"]
+      }
     ]);
   });
 

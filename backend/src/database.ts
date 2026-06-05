@@ -117,6 +117,7 @@ export interface MultipartUploadRecord {
   id: string;
   source_kind: MultipartSourceKind;
   source_url: string | null;
+  source_headers_json?: string | null;
   file_name: string;
   mime_type: string;
   size: number;
@@ -135,6 +136,7 @@ export interface NewMultipartUploadRecord {
   id: string;
   sourceKind: MultipartSourceKind;
   sourceUrl?: string;
+  sourceHeadersJson?: string;
   fileName: string;
   mimeType: string;
   size: number;
@@ -219,6 +221,7 @@ export interface MultipartCleanupResult {
 export interface HlsAssetRecord {
   id: string;
   source_url: string;
+  source_headers_json?: string | null;
   media_playlist_url: string;
   file_name: string;
   mime_type: string;
@@ -245,6 +248,7 @@ export interface HlsAssetRecord {
 export interface NewHlsAssetRecord {
   id: string;
   sourceUrl: string;
+  sourceHeadersJson?: string;
   mediaPlaylistUrl: string;
   fileName: string;
   mimeType: string;
@@ -1127,6 +1131,7 @@ export async function insertMultipartUploadRecord(
         id,
         source_kind,
         source_url,
+        source_headers_json,
         file_name,
         mime_type,
         size,
@@ -1139,12 +1144,13 @@ export async function insertMultipartUploadRecord(
         directory_path,
         telegram_channel_group,
         completed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
     )
     .bind(
       record.id,
       record.sourceKind,
       record.sourceUrl ?? null,
+      record.sourceHeadersJson ?? null,
       record.fileName,
       record.mimeType,
       record.size,
@@ -1163,6 +1169,7 @@ export async function insertMultipartUploadRecord(
     id: record.id,
     source_kind: record.sourceKind,
     source_url: record.sourceUrl ?? null,
+    source_headers_json: record.sourceHeadersJson ?? null,
     file_name: record.fileName,
     mime_type: record.mimeType,
     size: record.size,
@@ -1185,6 +1192,7 @@ export async function getMultipartUploadRecord(db: D1Database, id: string): Prom
         id,
         source_kind,
         source_url,
+        source_headers_json,
         file_name,
         mime_type,
         size,
@@ -1218,7 +1226,7 @@ function prepareCompleteMultipartUploadRecord(
   completedAt: string
 ): D1PreparedStatement {
   return db
-    .prepare("UPDATE multipart_uploads SET completed_at = ? WHERE id = ? AND completed_at IS NULL")
+    .prepare("UPDATE multipart_uploads SET completed_at = ?, source_headers_json = NULL WHERE id = ? AND completed_at IS NULL")
     .bind(completedAt, id);
 }
 
@@ -1566,6 +1574,7 @@ export async function insertHlsAssetRecord(db: D1Database, record: NewHlsAssetRe
       `INSERT INTO hls_assets (
         id,
         source_url,
+        source_headers_json,
         media_playlist_url,
         file_name,
         mime_type,
@@ -1584,11 +1593,12 @@ export async function insertHlsAssetRecord(db: D1Database, record: NewHlsAssetRe
         updated_at,
         completed_at,
         deleted_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`
     )
     .bind(
       record.id,
       record.sourceUrl,
+      record.sourceHeadersJson ?? null,
       record.mediaPlaylistUrl,
       record.fileName,
       record.mimeType,
@@ -1659,6 +1669,7 @@ export async function getHlsAssetRecord(db: D1Database, id: string): Promise<Hls
       `SELECT
         id,
         source_url,
+        source_headers_json,
         media_playlist_url,
         file_name,
         mime_type,
@@ -1693,6 +1704,7 @@ export async function getHlsAssetRecordByFinalFileId(db: D1Database, finalFileId
       `SELECT
         id,
         source_url,
+        source_headers_json,
         media_playlist_url,
         file_name,
         mime_type,
@@ -1975,6 +1987,7 @@ export async function completeHlsAssetWithFileRecord(params: {
         `UPDATE hls_assets
         SET status = 'done',
           final_file_id = ?,
+          source_headers_json = NULL,
           updated_at = ?,
           completed_at = ?
         WHERE id = ? AND deleted_at IS NULL`

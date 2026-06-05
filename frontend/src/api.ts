@@ -111,6 +111,8 @@ export interface HlsDownloadPlanResponse {
   hls_download: HlsDownloadPlan;
 }
 
+export type SourceRequestHeaders = Record<string, string>;
+
 export interface DirectoryItem {
   id: string;
   parent_id: string | null;
@@ -579,7 +581,8 @@ export function uploadFileFromUrl(
   remark?: string,
   directoryPath = "/",
   fileName?: string,
-  conflictAction?: FileNameConflictAction
+  conflictAction?: FileNameConflictAction,
+  headers?: SourceRequestHeaders
 ) {
   return requestJson<AdminUploadResponse>("/api/admin/files", {
     method: "POST",
@@ -589,6 +592,7 @@ export function uploadFileFromUrl(
     body: JSON.stringify({
       url,
       directory_path: directoryPath,
+      ...(headers && Object.keys(headers).length > 0 ? { headers } : {}),
       ...(fileName ? { file_name: fileName } : {}),
       ...(conflictAction && conflictAction !== "error" ? { on_conflict: conflictAction } : {}),
       ...(remark ? { remark } : {})
@@ -631,6 +635,7 @@ export function initUrlMultipartUpload(
   forceMultipart = false,
   fileName?: string,
   conflictAction?: FileNameConflictAction,
+  headers?: SourceRequestHeaders,
   signal?: AbortSignal
 ) {
   return requestJson<UrlMultipartInitResponse>("/api/admin/uploads/url/init", {
@@ -642,6 +647,7 @@ export function initUrlMultipartUpload(
     body: JSON.stringify({
       url,
       directory_path: directoryPath,
+      ...(headers && Object.keys(headers).length > 0 ? { headers } : {}),
       ...(forceMultipart ? { force_multipart: true } : {}),
       ...(fileName ? { file_name: fileName } : {}),
       ...(conflictAction && conflictAction !== "error" ? { on_conflict: conflictAction } : {}),
@@ -675,7 +681,12 @@ export function preflightUploads(entries: UploadPreflightRequestEntry[], signal?
   });
 }
 
-export function probeHlsUpload(url: string, variantId?: string, signal?: AbortSignal) {
+export function probeHlsUpload(
+  url: string,
+  variantId?: string,
+  headers?: SourceRequestHeaders,
+  signal?: AbortSignal
+) {
   return requestJson<HlsProbeResponse>("/api/admin/uploads/hls/probe", {
     method: "POST",
     signal,
@@ -684,6 +695,7 @@ export function probeHlsUpload(url: string, variantId?: string, signal?: AbortSi
     },
     body: JSON.stringify({
       url,
+      ...(headers && Object.keys(headers).length > 0 ? { headers } : {}),
       ...(variantId ? { variant_id: variantId } : {})
     })
   });
@@ -696,6 +708,7 @@ export function initHlsUpload(params: {
   directory_path?: string;
   remark?: string;
   on_conflict?: FileNameConflictAction;
+  headers?: SourceRequestHeaders;
 }, signal?: AbortSignal) {
   return requestJson<HlsInitResponse>("/api/admin/uploads/hls/init", {
     method: "POST",

@@ -24,6 +24,7 @@ import {
   type HlsProbeInfo,
   type HlsSegment,
   type MultipartUpload,
+  type SourceRequestHeaders,
   type ThumbnailUploadPayload,
   type UploadPreflightResultEntry
 } from "../../api";
@@ -245,6 +246,7 @@ export function UploadDialog({
   const [mode, setMode] = useState<UploadMode>("file");
   const [items, setItems] = useState<QueueItem[]>([]);
   const [sourceUrl, setSourceUrl] = useState("");
+  const [sourceHeadersText, setSourceHeadersText] = useState("");
   const [urlUpload, setUrlUpload] = useState<UrlUploadState>({ status: "pending" });
   const [remark, setRemark] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -297,6 +299,7 @@ export function UploadDialog({
       });
       setMode("file");
       setSourceUrl("");
+      setSourceHeadersText("");
       setRemark("");
       setSubmitting(false);
       setCheckingConflicts(false);
@@ -311,6 +314,7 @@ export function UploadDialog({
       return initialFiles.map((file) => makeItem(file));
     });
     setSourceUrl("");
+    setSourceHeadersText("");
     setUrlUpload((current) => {
       cleanupTemporaryHlsUpload(current);
       revokeThumbnail(current.thumbnail?.generated);
@@ -527,6 +531,36 @@ export function UploadDialog({
     });
   }
 
+  function handleSourceHeadersChange(value: string) {
+    setSourceHeadersText(value);
+    setUrlUpload((current) => {
+      if (current.status === "uploading" || current.status === "done") {
+        return current;
+      }
+
+      const shouldResetRemoteState = current.retry || current.hls || current.thumbnail;
+      if (!shouldResetRemoteState) {
+        return current;
+      }
+
+      cleanupTemporaryHlsUpload(current);
+      revokeThumbnail(current.thumbnail?.generated);
+      hlsThumbnailGeneratingRef.current = false;
+      hlsThumbnailPromiseRef.current = null;
+
+      return {
+        ...current,
+        message: undefined,
+        progress: undefined,
+        chunks: undefined,
+        retry: undefined,
+        conflict: undefined,
+        thumbnail: undefined,
+        hls: undefined
+      };
+    });
+  }
+
   function handleUploadDirectoryPathChange(path: string) {
     setUploadDirectoryPath(path);
     setItems((current) =>
@@ -717,6 +751,23 @@ export function UploadDialog({
     }
 
     return undefined;
+  }
+
+  function readSourceHeadersForUpload(): { ok: true; headers?: SourceRequestHeaders } | { ok: false } {
+    try {
+      const headers = parseSourceHeadersText(sourceHeadersText);
+      return headers ? { ok: true, headers } : { ok: true };
+    } catch (error) {
+      const message = errorMessage(error);
+      setUrlUpload((current) => ({
+        ...current,
+        status: "error",
+        message,
+        progress: undefined
+      }));
+      onError(message);
+      return { ok: false };
+    }
   }
 
   function startUploadTask(kind: "local" | "url", itemId?: string): UploadAbortContext {
@@ -1426,8 +1477,14 @@ export function UploadDialog({
       return;
     }
 
+    const sourceHeadersResult = readSourceHeadersForUpload();
+    if (!sourceHeadersResult.ok) {
+      return;
+    }
+    const sourceHeaders = sourceHeadersResult.headers;
+
     if (isLikelyHlsUrl(normalizedSourceUrl) || urlUpload.hls?.probe) {
-      await submitHlsUpload();
+      await submitHlsUpload(sourceHeaders);
       return;
     }
 
@@ -1451,6 +1508,7 @@ export function UploadDialog({
         true,
         fileNameOverride,
         conflictAction,
+        sourceHeaders,
         task.abortController.signal
       );
       if (init.mode === "multipart" && init.upload) {
@@ -1568,7 +1626,7 @@ export function UploadDialog({
     }
   }
 
-  async function submitHlsUpload() {
+  async function submitHlsUpload(sourceHeaders?: SourceRequestHeaders) {
     const error = validateSourceUrl(sourceUrl);
     if (error) {
       setUrlUpload({ status: "error", message: error });
@@ -1594,13 +1652,13 @@ export function UploadDialog({
       let variantId = urlUpload.hls?.variantId;
 
       if (!probe || (probe.kind === "master" && variantId && probe.selected_variant_id !== variantId)) {
-        probe = (await probeHlsUpload(normalizedSourceUrl, variantId, task.abortController.signal)).hls;
+        probe = (await probeHlsUpload(normalizedSourceUrl, variantId, sourceHeaders, task.abortController.signal)).hls;
       }
 
       if (probe.kind === "master" && !probe.media) {
         if (probe.variants.length === 1) {
           variantId = probe.variants[0]?.id;
-          probe = (await probeHlsUpload(normalizedSourceUrl, variantId, task.abortController.signal)).hls;
+          probe = (await probeHlsUpload(normalizedSourceUrl, variantId, sourceHeaders, task.abortController.signal)).hls;
         } else if (!variantId) {
           setUrlUpload((current) => ({
             ...current,
@@ -1612,7 +1670,7 @@ export function UploadDialog({
           }));
           return;
         } else {
-          probe = (await probeHlsUpload(normalizedSourceUrl, variantId, task.abortController.signal)).hls;
+          probe = (await probeHlsUpload(normalizedSourceUrl, variantId, sourceHeaders, task.abortController.signal)).hls;
         }
       }
 
@@ -1642,6 +1700,7 @@ export function UploadDialog({
         ...(selectedVariantId ? { variant_id: selectedVariantId } : {}),
         file_name: fileName,
         directory_path: uploadDirectoryPath,
+        ...(sourceHeaders ? { headers: sourceHeaders } : {}),
         ...(remark.trim() ? { remark: remark.trim() } : {}),
         ...(conflictAction !== "error" ? { on_conflict: conflictAction } : {})
       }, task.abortController.signal);
@@ -2489,6 +2548,23 @@ export function UploadDialog({
               </p>
             </div>
 
+            <div className="flex flex-col gap-1.5">
+              <label htmlFor="upload-source-headers" className="text-xs font-medium text-muted">
+                请求头（可选）
+              </label>
+              <Textarea
+                id="upload-source-headers"
+                rows={3}
+                placeholder={"Referer: https://example.com/\nCookie: session=...\nAuthorization: Bearer ..."}
+                value={sourceHeadersText}
+                disabled={uploadBusy}
+                onChange={(event) => handleSourceHeadersChange(event.target.value)}
+              />
+              <p className="text-xs leading-5 text-muted">
+                每行一个 <span className="font-mono">Header-Name: value</span>。Worker 会自动设置 Range；不要填写 Range、Host、Content-Length 等连接控制头。
+              </p>
+            </div>
+
             {normalizedSourceUrl ? (
               <UrlUploadRow
                 url={normalizedSourceUrl}
@@ -2577,6 +2653,61 @@ function errorMessage(error: unknown): string {
   }
 
   return "上传失败";
+}
+
+function parseSourceHeadersText(value: string): SourceRequestHeaders | undefined {
+  const lines = value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
+
+  if (lines.length === 0) {
+    return undefined;
+  }
+
+  const headers: SourceRequestHeaders = {};
+
+  for (const line of lines) {
+    const separator = line.indexOf(":");
+    if (separator <= 0) {
+      throw new Error("请求头必须按 Header-Name: value 格式填写");
+    }
+
+    const name = line.slice(0, separator).trim();
+    const headerValue = line.slice(separator + 1).trim();
+
+    if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name)) {
+      throw new Error(`请求头名称无效：${name || line}`);
+    }
+
+    if (isBlockedSourceHeaderName(name)) {
+      throw new Error(`不允许自定义请求头：${name}`);
+    }
+
+    if (!headerValue) {
+      continue;
+    }
+
+    headers[name] = headerValue;
+  }
+
+  return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
+function isBlockedSourceHeaderName(name: string): boolean {
+  const lowerName = name.toLowerCase();
+  return lowerName === "host" ||
+    lowerName === "range" ||
+    lowerName === "content-length" ||
+    lowerName === "connection" ||
+    lowerName === "keep-alive" ||
+    lowerName === "proxy-authenticate" ||
+    lowerName === "proxy-authorization" ||
+    lowerName === "te" ||
+    lowerName === "trailer" ||
+    lowerName === "transfer-encoding" ||
+    lowerName === "upgrade" ||
+    lowerName === "accept-encoding";
 }
 
 function retryDelayMs(failedAttempt: number, error: unknown): number {
