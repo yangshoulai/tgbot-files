@@ -18,6 +18,7 @@ interface ModalProps {
   closeOnEscape?: boolean;
   hideClose?: boolean;
   initialFocus?: "first" | "none";
+  trapFocus?: boolean;
   className?: string;
   bodyClassName?: string;
 }
@@ -45,6 +46,7 @@ export function Modal({
   closeOnEscape = true,
   hideClose = false,
   initialFocus = "first",
+  trapFocus = true,
   className,
   bodyClassName
 }: ModalProps) {
@@ -69,7 +71,7 @@ export function Modal({
         onClose();
       }
 
-      if (event.key === "Tab" && dialogRef.current) {
+      if (event.key === "Tab" && trapFocus && dialogRef.current) {
         const focusables = dialogRef.current.querySelectorAll<HTMLElement>(FOCUSABLE);
         if (focusables.length === 0) return;
         const first = focusables[0];
@@ -86,7 +88,7 @@ export function Modal({
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, onClose, closeOnEscape]);
+  }, [open, onClose, closeOnEscape, trapFocus]);
 
   useEffect(() => {
     if (!open || initialFocus === "none") return;

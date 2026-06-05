@@ -38,6 +38,7 @@ import { Segmented } from "../ui/Segmented";
 import { Input } from "../ui/Input";
 import { DirectoryTreeSelect } from "./DirectoryTreeSelect";
 import { cn } from "../../lib/cn";
+import { parseCurlCommand } from "../../lib/curl";
 import {
   canAutoGenerateThumbnail,
   generateThumbnailFromFile,
@@ -247,6 +248,9 @@ export function UploadDialog({
   const [items, setItems] = useState<QueueItem[]>([]);
   const [sourceUrl, setSourceUrl] = useState("");
   const [sourceHeadersText, setSourceHeadersText] = useState("");
+  const [curlImportOpen, setCurlImportOpen] = useState(false);
+  const [curlImportText, setCurlImportText] = useState("");
+  const [curlImportError, setCurlImportError] = useState<string>();
   const [urlUpload, setUrlUpload] = useState<UrlUploadState>({ status: "pending" });
   const [remark, setRemark] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -300,6 +304,9 @@ export function UploadDialog({
       setMode("file");
       setSourceUrl("");
       setSourceHeadersText("");
+      setCurlImportOpen(false);
+      setCurlImportText("");
+      setCurlImportError(undefined);
       setRemark("");
       setSubmitting(false);
       setCheckingConflicts(false);
@@ -315,6 +322,9 @@ export function UploadDialog({
     });
     setSourceUrl("");
     setSourceHeadersText("");
+    setCurlImportOpen(false);
+    setCurlImportText("");
+    setCurlImportError(undefined);
     setUrlUpload((current) => {
       cleanupTemporaryHlsUpload(current);
       revokeThumbnail(current.thumbnail?.generated);
@@ -559,6 +569,47 @@ export function UploadDialog({
         hls: undefined
       };
     });
+  }
+
+  function openCurlImport() {
+    setCurlImportError(undefined);
+    setCurlImportOpen(true);
+  }
+
+  function closeCurlImport() {
+    setCurlImportOpen(false);
+    setCurlImportError(undefined);
+  }
+
+  function applyCurlImport() {
+    try {
+      const parsed = parseCurlCommand(curlImportText);
+      const headerResult = sourceHeadersTextFromCurlHeaders(parsed.headers);
+
+      if (headerResult.text) {
+        parseSourceHeadersText(headerResult.text);
+      }
+
+      handleSourceUrlChange(parsed.url);
+      handleSourceHeadersChange(headerResult.text);
+      setMode("url");
+      setCurlImportOpen(false);
+      setCurlImportError(undefined);
+
+      const warnings = [...parsed.warnings];
+      if (headerResult.skippedHeaders.length > 0) {
+        warnings.push(`已忽略 ${headerResult.skippedHeaders.length} 个不支持的请求头：${headerResult.skippedHeaders.join("、")}`);
+      }
+
+      setUrlUpload((current) => ({
+        ...current,
+        status: current.status === "error" ? "pending" : current.status,
+        message: curlImportSummary(headerResult.headerCount, warnings),
+        progress: undefined
+      }));
+    } catch (error) {
+      setCurlImportError(errorMessage(error));
+    }
   }
 
   function handleUploadDirectoryPathChange(path: string) {
@@ -2328,56 +2379,58 @@ export function UploadDialog({
   }
 
   return (
-    <Modal
-      open={open}
-      onClose={onClose}
-      title="上传文件"
-      description={`上传到 ${uploadDirectoryPath}；所有文件统一按 ${formatBytes(multipartChunkBytes)} 分片上传，单文件上限 ${formatBytes(maxMultipartBytes)}，最多 ${MULTIPART_UPLOAD_CONCURRENCY} 分片并发`}
-      size="lg"
-      closeOnBackdrop={!uploadBusy}
-      closeOnEscape={!uploadBusy}
-      footer={
-        <>
-          {activeUploadKind ? (
-            <Button
-              variant="danger-ghost"
-              disabled={stopRequested}
-              leadingIcon={<X size={15} />}
-              onClick={stopCurrentUpload}
-            >
-              {stopRequested
-                ? "正在停止"
-                : activeUploadKind === "url"
-                  ? "停止导入"
-                  : "停止上传"}
+    <>
+      <Modal
+        open={open}
+        onClose={onClose}
+        title="上传文件"
+        description={`上传到 ${uploadDirectoryPath}；所有文件统一按 ${formatBytes(multipartChunkBytes)} 分片上传，单文件上限 ${formatBytes(maxMultipartBytes)}，最多 ${MULTIPART_UPLOAD_CONCURRENCY} 分片并发`}
+        size="lg"
+        closeOnBackdrop={!uploadBusy && !curlImportOpen}
+        closeOnEscape={!uploadBusy && !curlImportOpen}
+        trapFocus={!curlImportOpen}
+        footer={
+          <>
+            {activeUploadKind ? (
+              <Button
+                variant="danger-ghost"
+                disabled={stopRequested}
+                leadingIcon={<X size={15} />}
+                onClick={stopCurrentUpload}
+              >
+                {stopRequested
+                  ? "正在停止"
+                  : activeUploadKind === "url"
+                    ? "停止导入"
+                    : "停止上传"}
+              </Button>
+            ) : null}
+            <Button variant="secondary" disabled={uploadBusy} onClick={onClose}>
+              {hasDone ? "关闭" : "取消"}
             </Button>
-          ) : null}
-          <Button variant="secondary" disabled={uploadBusy} onClick={onClose}>
-            {hasDone ? "关闭" : "取消"}
-          </Button>
-          <Button
-            type="submit"
-            form="upload-form"
-            variant="primary"
-            loading={uploadBusy}
-            leadingIcon={mode === "url" ? <Link2 size={16} /> : <FilePlus2 size={16} />}
-            disabled={pendingCount === 0 || hasInvalidFileName || hasUnresolvedConflict}
-          >
-            {checkingConflicts
-              ? "检测重复项"
-              : submitting
-              ? mode === "url" ? "导入中" : "上传中"
-              : hasInvalidFileName
-                ? "文件名不能为空"
-                : hasUnresolvedConflict
-                  ? "请选择处理方式"
-                : pendingCount > 0
-                  ? mode === "url" ? "上传 URL" : `开始上传 ${pendingCount} 个`
-                  : "无待传文件"}
-          </Button>
-        </>
-      }
-    >
+            <Button
+              type="submit"
+              form="upload-form"
+              variant="primary"
+              loading={uploadBusy}
+              leadingIcon={mode === "url" ? <Link2 size={16} /> : <FilePlus2 size={16} />}
+              disabled={pendingCount === 0 || hasInvalidFileName || hasUnresolvedConflict}
+            >
+              {checkingConflicts
+                ? "检测重复项"
+                : submitting
+                ? mode === "url" ? "导入中" : "上传中"
+                : hasInvalidFileName
+                  ? "文件名不能为空"
+                  : hasUnresolvedConflict
+                    ? "请选择处理方式"
+                  : pendingCount > 0
+                    ? mode === "url" ? "上传 URL" : `开始上传 ${pendingCount} 个`
+                    : "无待传文件"}
+            </Button>
+          </>
+        }
+      >
       <form id="upload-form" className="flex flex-col gap-4" onSubmit={onSubmit}>
         <div className="flex items-center justify-between gap-3">
           <Segmented<UploadMode>
@@ -2522,9 +2575,20 @@ export function UploadDialog({
         ) : (
           <div className="flex flex-col gap-3 rounded-xl border border-border bg-background p-4">
             <div className="flex flex-col gap-1.5">
-              <label htmlFor="upload-source-url" className="text-xs font-medium text-muted">
-                粘贴文件 URL
-              </label>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <label htmlFor="upload-source-url" className="text-xs font-medium text-muted">
+                  粘贴文件 URL
+                </label>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  leadingIcon={<ClipboardPaste size={14} />}
+                  disabled={uploadBusy}
+                  onClick={openCurlImport}
+                >
+                  从 cURL 解析
+                </Button>
+              </div>
               <Input
                 id="upload-source-url"
                 type="url"
@@ -2614,7 +2678,68 @@ export function UploadDialog({
           />
         </div>
       </form>
-    </Modal>
+      </Modal>
+
+      <Modal
+        open={curlImportOpen}
+        onClose={closeCurlImport}
+        title="从 cURL 解析"
+        description="粘贴浏览器 DevTools 复制的 cURL，请求 URL 和可用请求头会自动填入 URL 上传表单。"
+        size="lg"
+        footer={
+          <>
+            <Button variant="secondary" onClick={closeCurlImport}>
+              取消
+            </Button>
+            <Button
+              variant="primary"
+              leadingIcon={<Check size={15} />}
+              disabled={!curlImportText.trim()}
+              onClick={applyCurlImport}
+            >
+              解析并填入
+            </Button>
+          </>
+        }
+      >
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="upload-curl-import" className="text-xs font-medium text-muted">
+              cURL 命令
+            </label>
+            <Textarea
+              id="upload-curl-import"
+              rows={9}
+              placeholder={"curl 'https://example.com/video.m3u8' \\\n  -H 'Referer: https://example.com/' \\\n  -H 'Cookie: session=...' \\\n  -H 'Authorization: Bearer ...' \\\n  --compressed"}
+              value={curlImportText}
+              invalid={Boolean(curlImportError)}
+              onChange={(event) => {
+                setCurlImportText(event.target.value);
+                setCurlImportError(undefined);
+              }}
+              onKeyDown={(event) => {
+                if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && curlImportText.trim()) {
+                  event.preventDefault();
+                  applyCurlImport();
+                }
+              }}
+            />
+          </div>
+
+          {curlImportError ? (
+            <div className="rounded-xl border border-danger/30 bg-danger-soft px-3 py-2 text-sm leading-6 text-danger">
+              {curlImportError}
+            </div>
+          ) : null}
+
+          <div className="rounded-xl border border-border bg-background px-3 py-2.5 text-xs leading-5 text-muted">
+            支持 <span className="font-mono">-H/--header</span>、<span className="font-mono">-A/--user-agent</span>、
+            <span className="font-mono">-e/--referer</span>、<span className="font-mono">-b/--cookie</span>、
+            <span className="font-mono">-u/--user</span>。解析结果会覆盖当前 URL 和请求头；POST/body 参数不会转发，URL 上传仍要求源站支持 GET/HEAD/Range。
+          </div>
+        </div>
+      </Modal>
+    </>
   );
 }
 
@@ -2653,6 +2778,60 @@ function errorMessage(error: unknown): string {
   }
 
   return "上传失败";
+}
+
+function sourceHeadersTextFromCurlHeaders(headers: Record<string, string>): {
+  text: string;
+  headerCount: number;
+  skippedHeaders: string[];
+} {
+  const lines: string[] = [];
+  const skippedHeaders: string[] = [];
+  const skipped = new Set<string>();
+
+  const addSkipped = (name: string) => {
+    const label = name || "空名称";
+    const lowerName = label.toLowerCase();
+    if (!skipped.has(lowerName)) {
+      skipped.add(lowerName);
+      skippedHeaders.push(label);
+    }
+  };
+
+  for (const [rawName, rawValue] of Object.entries(headers)) {
+    const name = rawName.trim();
+    const value = rawValue.trim();
+
+    if (!value) {
+      continue;
+    }
+
+    if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name) || /[\r\n]/.test(value) || isBlockedSourceHeaderName(name)) {
+      addSkipped(name);
+      continue;
+    }
+
+    lines.push(`${name}: ${value}`);
+  }
+
+  return {
+    text: lines.join("\n"),
+    headerCount: lines.length,
+    skippedHeaders
+  };
+}
+
+function curlImportSummary(headerCount: number, warnings: string[]): string {
+  const base = headerCount > 0
+    ? `已从 cURL 填入 URL 和 ${headerCount} 个请求头`
+    : "已从 cURL 填入 URL";
+  const visibleWarnings = warnings.slice(0, 2);
+  const warningText = visibleWarnings.length > 0 ? `；${visibleWarnings.join("；")}` : "";
+  const overflowText = warnings.length > visibleWarnings.length
+    ? `；另有 ${warnings.length - visibleWarnings.length} 条提示`
+    : "";
+
+  return `${base}${warningText}${overflowText}`;
 }
 
 function parseSourceHeadersText(value: string): SourceRequestHeaders | undefined {
@@ -2707,7 +2886,16 @@ function isBlockedSourceHeaderName(name: string): boolean {
     lowerName === "trailer" ||
     lowerName === "transfer-encoding" ||
     lowerName === "upgrade" ||
-    lowerName === "accept-encoding";
+    lowerName === "accept-encoding" ||
+    lowerName === "cf-connecting-ip" ||
+    lowerName === "cf-ipcountry" ||
+    lowerName === "cf-ray" ||
+    lowerName === "cf-visitor" ||
+    lowerName === "true-client-ip" ||
+    lowerName === "x-forwarded-for" ||
+    lowerName === "x-forwarded-host" ||
+    lowerName === "x-forwarded-proto" ||
+    lowerName === "x-real-ip";
 }
 
 function retryDelayMs(failedAttempt: number, error: unknown): number {
