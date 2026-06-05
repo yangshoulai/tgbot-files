@@ -2488,10 +2488,12 @@ function QueueRow({
   return (
     <div className="flex flex-col gap-2 rounded-xl border border-border bg-surface px-3 py-2.5">
       <div className="flex items-start gap-3">
-        <UploadThumbnailVisual
-          thumbnail={item.thumbnail}
-          fallback={<FileTypeIcon mimeType={item.file.type || "application/octet-stream"} fileName={item.file.name} size="sm" />}
-        />
+        <span className="self-center">
+          <UploadThumbnailVisual
+            thumbnail={item.thumbnail}
+            fallback={<FileTypeIcon mimeType={item.file.type || "application/octet-stream"} fileName={item.file.name} size="sm" />}
+          />
+        </span>
         <div className="min-w-0 flex-1">
           <EditableFileName
             value={fileName}
@@ -2516,7 +2518,7 @@ function QueueRow({
           ) : null}
           {item.progress ? <ProgressBar progress={item.progress} /> : null}
         </div>
-        <div className="flex shrink-0 flex-wrap items-center justify-end gap-1 self-center">
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-0.5 self-center">
           <QueueStateBadge item={item} multipart={Boolean(item.progress)} />
           <CompactConflictActions
             conflict={item.conflict}
@@ -2536,7 +2538,7 @@ function QueueRow({
               type="button"
               onClick={onRetry}
               disabled={disabled}
-              className="shrink-0 rounded-md border border-primary/30 px-2.5 py-1 text-xs font-medium text-primary-strong transition-colors hover:bg-primary-soft disabled:pointer-events-none disabled:opacity-40"
+              className="h-6 shrink-0 rounded-md border border-primary/30 px-2 text-[11px] font-medium text-primary-strong transition-colors hover:bg-primary-soft disabled:pointer-events-none disabled:opacity-40"
             >
               {item.retry?.failedChunks.length === 0 ? "继续完成上传" : "重试失败分片"}
             </button>
@@ -2546,7 +2548,7 @@ function QueueRow({
               type="button"
               onClick={onStop}
               disabled={stopping}
-              className="shrink-0 rounded-md border border-danger/30 px-2.5 py-1 text-xs font-medium text-danger transition-colors hover:bg-danger-soft disabled:pointer-events-none disabled:opacity-40"
+              className="h-6 shrink-0 rounded-md border border-danger/30 px-2 text-[11px] font-medium text-danger transition-colors hover:bg-danger-soft disabled:pointer-events-none disabled:opacity-40"
             >
               {stopping ? "正在停止" : "停止上传"}
             </button>
@@ -2556,9 +2558,9 @@ function QueueRow({
             aria-label="移除"
             onClick={onRemove}
             disabled={disabled || status === "uploading"}
-            className="grid size-7 place-items-center rounded-md text-subtle transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-40"
+            className="grid size-6 place-items-center rounded-md text-subtle transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-40"
           >
-            {status === "done" ? <CheckCircle2 size={14} className="text-success" /> : <X size={14} />}
+            {status === "done" ? <CheckCircle2 size={13} className="text-success" /> : <X size={13} />}
           </button>
         </div>
       </div>
@@ -2618,14 +2620,16 @@ function UrlUploadRow({
   return (
     <div className="flex flex-col gap-2 rounded-xl border border-border bg-surface px-3 py-2.5">
       <div className="flex items-start gap-3">
-        <UploadThumbnailVisual
-          thumbnail={thumbnail}
-          fallback={
-            <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-primary-soft text-primary-strong">
-              <Link2 size={16} />
-            </span>
-          }
-        />
+        <span className="self-center">
+          <UploadThumbnailVisual
+            thumbnail={thumbnail}
+            fallback={
+              <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-primary-soft text-primary-strong">
+                <Link2 size={16} />
+              </span>
+            }
+          />
+        </span>
         <div className="min-w-0 flex-1">
           <EditableFileName
             value={fileName}
@@ -2649,7 +2653,7 @@ function UrlUploadRow({
             onOverwrite={onOverwriteConflict}
           />
         </div>
-        <div className="flex shrink-0 flex-wrap items-center justify-end gap-1 self-center">
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-0.5 self-center">
           <ThumbnailPicker
             disabled={disabled || status === "uploading"}
             onChange={onThumbnailChange}
@@ -2661,7 +2665,7 @@ function UrlUploadRow({
               type="button"
               onClick={onRetry}
               disabled={disabled}
-              className="shrink-0 rounded-md border border-primary/30 px-2.5 py-1 text-xs font-medium text-primary-strong transition-colors hover:bg-primary-soft disabled:pointer-events-none disabled:opacity-40"
+              className="h-6 shrink-0 rounded-md border border-primary/30 px-2 text-[11px] font-medium text-primary-strong transition-colors hover:bg-primary-soft disabled:pointer-events-none disabled:opacity-40"
             >
               {progress && progress.failed === 0 ? "继续完成上传" : "重试失败分片"}
             </button>
@@ -2671,7 +2675,7 @@ function UrlUploadRow({
               type="button"
               onClick={onStop}
               disabled={stopping}
-              className="shrink-0 rounded-md border border-danger/30 px-2.5 py-1 text-xs font-medium text-danger transition-colors hover:bg-danger-soft disabled:pointer-events-none disabled:opacity-40"
+              className="h-6 shrink-0 rounded-md border border-danger/30 px-2 text-[11px] font-medium text-danger transition-colors hover:bg-danger-soft disabled:pointer-events-none disabled:opacity-40"
             >
               {stopping ? "正在停止" : "停止导入"}
             </button>
@@ -2682,9 +2686,9 @@ function UrlUploadRow({
             aria-label="清空 URL"
             onClick={onClear}
             disabled={disabled || status === "uploading"}
-            className="grid size-7 place-items-center rounded-md text-subtle transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-40"
+            className="grid size-6 place-items-center rounded-md text-subtle transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-40"
           >
-            {status === "done" ? <CheckCircle2 size={14} className="text-success" /> : <X size={14} />}
+            {status === "done" ? <CheckCircle2 size={13} className="text-success" /> : <X size={13} />}
           </button>
         </div>
       </div>
@@ -2697,10 +2701,10 @@ function QueueStateBadge({ item, multipart }: { item: QueueItem; multipart?: boo
   if (item.conflict) {
     return (
       <span
-        className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md border border-warning/35 bg-warning-soft px-2 text-xs font-medium text-warning"
+        className="inline-flex h-5 shrink-0 items-center gap-1 rounded-full bg-warning-soft px-1.5 text-[11px] font-medium text-warning"
         title={conflictTitle(item.conflict)}
       >
-        <AlertTriangle size={13} />
+        <AlertTriangle size={11} />
         冲突
       </span>
     );
@@ -2708,7 +2712,7 @@ function QueueStateBadge({ item, multipart }: { item: QueueItem; multipart?: boo
 
   if (item.conflictAction === "overwrite") {
     return (
-      <span className="inline-flex h-7 shrink-0 items-center rounded-md border border-warning/35 bg-warning-soft px-2 text-xs font-medium text-warning">
+      <span className="inline-flex h-5 shrink-0 items-center rounded-full bg-warning-soft px-1.5 text-[11px] font-medium text-warning">
         将覆盖
       </span>
     );
@@ -2716,7 +2720,7 @@ function QueueStateBadge({ item, multipart }: { item: QueueItem; multipart?: boo
 
   if (item.fileNameOverride && item.status !== "done" && item.status !== "uploading") {
     return (
-      <span className="inline-flex h-7 shrink-0 items-center rounded-md border border-primary/25 bg-primary-soft px-2 text-xs font-medium text-primary-strong">
+      <span className="inline-flex h-5 shrink-0 items-center rounded-full bg-primary-soft px-1.5 text-[11px] font-medium text-primary-strong">
         已改名
       </span>
     );
@@ -2743,13 +2747,13 @@ function CompactConflictActions({
   }
 
   return (
-    <span className="inline-flex shrink-0 items-center gap-1">
+    <span className="inline-flex shrink-0 items-center gap-0.5">
       <button
         type="button"
         onClick={onOverwrite}
         title={`覆盖 ${conflict.fileName}`}
         disabled={disabled || !onOverwrite}
-        className="h-7 rounded-md border border-warning/35 px-2 text-xs font-medium text-warning transition-colors hover:bg-warning-soft disabled:pointer-events-none disabled:opacity-40"
+        className="h-6 rounded px-1.5 text-[11px] font-medium text-warning transition-colors hover:bg-warning-soft disabled:pointer-events-none disabled:opacity-40"
       >
         覆盖
       </button>
@@ -2758,7 +2762,7 @@ function CompactConflictActions({
         onClick={onRename}
         title={`改名为 ${conflict.suggestedName}`}
         disabled={disabled || !onRename}
-        className="h-7 rounded-md border border-primary/25 px-2 text-xs font-medium text-primary-strong transition-colors hover:bg-primary-soft disabled:pointer-events-none disabled:opacity-40"
+        className="h-6 rounded px-1.5 text-[11px] font-medium text-primary-strong transition-colors hover:bg-primary-soft disabled:pointer-events-none disabled:opacity-40"
       >
         改名
       </button>
@@ -2766,7 +2770,7 @@ function CompactConflictActions({
         type="button"
         onClick={onSkip}
         disabled={disabled || !onSkip}
-        className="h-7 rounded-md border border-border px-2 text-xs font-medium text-muted transition-colors hover:bg-background hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+        className="h-6 rounded px-1.5 text-[11px] font-medium text-muted transition-colors hover:bg-background hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
       >
         忽略
       </button>
@@ -2888,15 +2892,15 @@ function ThumbnailPicker({
   hasThumbnail: boolean;
 }) {
   return (
-    <span className="hidden shrink-0 items-center gap-1 sm:inline-flex">
+    <span className="hidden shrink-0 items-center gap-0.5 sm:inline-flex">
       <label
         className={cn(
-          "grid size-7 cursor-pointer place-items-center rounded-md text-subtle transition-colors hover:bg-primary-soft hover:text-primary-strong",
+          "grid size-6 cursor-pointer place-items-center rounded-md text-subtle transition-colors hover:bg-primary-soft hover:text-primary-strong",
           disabled && "pointer-events-none opacity-40"
         )}
         title={hasThumbnail ? "更换缩略图" : "选择缩略图"}
       >
-        <ImagePlus size={14} />
+        <ImagePlus size={13} />
         <input
           type="file"
           accept="image/jpeg,image/png,image/webp"
@@ -2912,12 +2916,12 @@ function ThumbnailPicker({
       {hasThumbnail ? (
         <button
           type="button"
-          className="grid size-7 place-items-center rounded-md text-subtle transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-40"
+          className="grid size-6 place-items-center rounded-md text-subtle transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-40"
           disabled={disabled}
           title="移除缩略图"
           onClick={onRemove}
         >
-          <ImageOff size={14} />
+          <ImageOff size={13} />
         </button>
       ) : null}
     </span>
@@ -3255,8 +3259,8 @@ function StatusBadge({ status, multipart }: { status: ItemStatus; multipart?: bo
     case "error":
       return <Trash2 size={14} className="text-danger" />;
     case "skipped":
-      return <span className="text-xs text-muted">跳过</span>;
+      return <span className="text-[11px] text-muted">跳过</span>;
     default:
-      return <span className="text-xs text-muted">待上传</span>;
+      return <span className="text-[11px] text-muted">待传</span>;
   }
 }
