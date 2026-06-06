@@ -20,6 +20,7 @@ const VIDEO_SEEK_SECONDS = 0.75;
 const VIDEO_FRAME_WAIT_TIMEOUT_MS = 800;
 const VIDEO_FORCED_FRAME_WAIT_TIMEOUT_MS = 2500;
 const HLS_THUMBNAIL_BUFFER_TIMEOUT_MS = 18000;
+const HLS_PLAYER_THUMBNAIL_TIMEOUT_MS = 10000;
 const VIDEO_BLANK_VARIANCE_THRESHOLD = 12;
 const VIDEO_BLANK_WHITE_LUMA = 246;
 const VIDEO_BLANK_BLACK_LUMA = 22;
@@ -29,6 +30,7 @@ const ID3_MAX_TAG_BYTES = 32 * 1024 * 1024;
 interface VideoThumbnailRenderOptions {
   forceFrameDecode?: boolean;
   captureCurrentFrameFirst?: boolean;
+  acceptBlankFrame?: boolean;
 }
 
 export function canAutoGenerateThumbnail(file: File): boolean {
@@ -91,6 +93,20 @@ export async function generateThumbnailFromRemoteSource(source: RemoteThumbnailS
 }
 
 export async function generateThumbnailFromHlsPlaylist(playlistUrl: string, fileName = "hls-video.m3u8"): Promise<GeneratedThumbnail> {
+  try {
+    return await generateThumbnailFromHlsFirstSegment(playlistUrl, fileName);
+  } catch {
+    // Fall back to the browser/Hls.js player path for non-TS or unusual playlists.
+  }
+
+  return withTimeout(
+    generateThumbnailFromHlsPlayer(playlistUrl, fileName),
+    HLS_PLAYER_THUMBNAIL_TIMEOUT_MS,
+    "HLS 缩略图生成超时"
+  );
+}
+
+async function generateThumbnailFromHlsPlayer(playlistUrl: string, fileName: string): Promise<GeneratedThumbnail> {
   const video = document.createElement("video");
   let hls: Hls | null = null;
   const detachVideo = attachHiddenCaptureVideo(video);
@@ -127,7 +143,8 @@ export async function generateThumbnailFromHlsPlaylist(playlistUrl: string, file
     await waitForVideoDimensions(video);
     return renderLoadedVideoThumbnail(video, fileName, "auto", undefined, undefined, undefined, {
       forceFrameDecode: true,
-      captureCurrentFrameFirst: true
+      captureCurrentFrameFirst: true,
+      acceptBlankFrame: true
     });
   } finally {
     hls?.destroy();
@@ -135,6 +152,29 @@ export async function generateThumbnailFromHlsPlaylist(playlistUrl: string, file
     video.removeAttribute("src");
     video.load();
   }
+}
+
+async function generateThumbnailFromHlsFirstSegment(playlistUrl: string, fileName: string): Promise<GeneratedThumbnail> {
+  const playlist = await fetchTextWithTimeout(playlistUrl, HLS_THUMBNAIL_BUFFER_TIMEOUT_MS);
+  const segmentUrl = firstHlsSegmentUrl(playlist, playlistUrl);
+  const response = await fetchWithTimeout(segmentUrl, { credentials: "include" }, HLS_THUMBNAIL_BUFFER_TIMEOUT_MS);
+
+  if (!response.ok) {
+    throw new Error(`HLS 片段读取失败（HTTP ${response.status}）`);
+  }
+
+  const contentType = response.headers.get("Content-Type") || "";
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const segmentBlob = isMp4Bytes(bytes, contentType)
+    ? new Blob([bytes], { type: contentType || "video/mp4" })
+    : await transmuxTsSegmentToMp4(bytes);
+  const objectUrl = URL.createObjectURL(segmentBlob);
+
+  return renderVideoThumbnail(objectUrl, fileName, "auto", true, {
+    forceFrameDecode: true,
+    captureCurrentFrameFirst: true,
+    acceptBlankFrame: true
+  });
 }
 
 export function revokeThumbnail(thumbnail: GeneratedThumbnail | undefined): void {
@@ -168,7 +208,8 @@ async function renderVideoThumbnail(
   sourceUrl: string,
   fileName: string,
   generatedSource: "auto" | "manual",
-  revokeSourceUrl: boolean
+  revokeSourceUrl: boolean,
+  options: VideoThumbnailRenderOptions = {}
 ): Promise<GeneratedThumbnail> {
   const video = document.createElement("video");
   video.preload = "auto";
@@ -188,7 +229,7 @@ async function renderVideoThumbnail(
       throw new Error("无法读取视频画面尺寸");
     }
 
-    return await renderLoadedVideoThumbnail(video, fileName, generatedSource, duration, width, height);
+    return await renderLoadedVideoThumbnail(video, fileName, generatedSource, duration, width, height, options);
   } finally {
     video.removeAttribute("src");
     video.load();
@@ -237,7 +278,7 @@ async function renderLoadedVideoThumbnail(
         { fillBackground: false }
       );
 
-      if (!isProbablyBlankVideoFrame(canvas)) {
+      if (options.acceptBlankFrame || !isProbablyBlankVideoFrame(canvas)) {
         return await canvasToGeneratedThumbnail(canvas, fileName, generatedSource);
       }
       sawBlankFrame = true;
@@ -271,6 +312,111 @@ function loadImage(src: string): Promise<HTMLImageElement> {
     image.onerror = () => reject(new Error("图片缩略图生成失败"));
     image.src = src;
   });
+}
+
+async function fetchTextWithTimeout(url: string, timeoutMs: number): Promise<string> {
+  const response = await fetchWithTimeout(url, { credentials: "include" }, timeoutMs);
+
+  if (!response.ok) {
+    throw new Error(`HLS playlist 读取失败（HTTP ${response.status}）`);
+  }
+
+  return response.text();
+}
+
+function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+
+  return fetch(input, {
+    ...init,
+    signal: controller.signal
+  }).finally(() => {
+    window.clearTimeout(timeoutId);
+  });
+}
+
+function firstHlsSegmentUrl(playlistText: string, playlistUrl: string): string {
+  const baseUrl = absoluteUrl(playlistUrl);
+  let pendingSegment = false;
+
+  for (const rawLine of playlistText.replace(/^\uFEFF/, "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) {
+      continue;
+    }
+
+    if (line.startsWith("#EXT-X-MAP")) {
+      throw new Error("当前 HLS 缩略图不支持 fMP4 init segment");
+    }
+
+    if (line.startsWith("#EXTINF:")) {
+      pendingSegment = true;
+      continue;
+    }
+
+    if (pendingSegment && !line.startsWith("#")) {
+      return new URL(line, baseUrl).toString();
+    }
+  }
+
+  throw new Error("HLS playlist 缺少可截帧片段");
+}
+
+function absoluteUrl(value: string): string {
+  if (typeof window === "undefined") {
+    return value;
+  }
+
+  return new URL(value, window.location.origin).toString();
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timeoutId: number | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timeoutId = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timeoutId !== undefined) {
+      window.clearTimeout(timeoutId);
+    }
+  });
+}
+
+function isMp4Bytes(bytes: Uint8Array, contentType: string): boolean {
+  const normalized = contentType.split(";")[0]?.trim().toLowerCase();
+  if (normalized === "video/mp4" || normalized === "audio/mp4") {
+    return true;
+  }
+
+  return bytesToAscii(bytes, 4, 4) === "ftyp";
+}
+
+async function transmuxTsSegmentToMp4(bytes: Uint8Array): Promise<Blob> {
+  if (bytes[0] !== 0x47) {
+    throw new Error("HLS segment 不是可转封装的 TS 数据");
+  }
+
+  const mp4 = await import("mux.js/lib/mp4");
+  const transmuxer = new mp4.Transmuxer();
+  const chunks: Uint8Array[] = [];
+
+  transmuxer.setBaseMediaDecodeTime(0);
+  transmuxer.on("data", (data) => {
+    if (data.initSegment) {
+      chunks.push(data.initSegment);
+    }
+    chunks.push(data.data);
+  });
+  transmuxer.push(bytes);
+  transmuxer.flush();
+
+  if (chunks.length === 0) {
+    throw new Error("HLS segment 转封装失败");
+  }
+
+  return new Blob(chunks.map(arrayBufferFromBytes), { type: "video/mp4" });
 }
 
 function waitForVideoMetadata(video: HTMLVideoElement): Promise<void> {
