@@ -48,6 +48,7 @@ interface FileTableProps {
   onEdit: (file: FileItem) => void;
   onMoveFile: (file: FileItem) => void;
   onPreview: (file: FileItem) => void;
+  onThumbnailPreview: (file: FileItem) => void;
   onCopy: (file: FileItem) => void;
   onAcceleratedDownload: (file: FileItem) => void;
   onDelete: (file: FileItem) => void;
@@ -154,6 +155,7 @@ export function FileTable({
   onEdit,
   onMoveFile,
   onPreview,
+  onThumbnailPreview,
   onCopy,
   onAcceleratedDownload,
   onDelete
@@ -239,7 +241,7 @@ export function FileTable({
           const canPreviewFile = canPreviewThroughAvailableAccess(file);
           const kind = fileKind(file);
           const mimeLabel = file.mime_type || "未知 MIME";
-          const previewFromThumbnail = file.thumbnail_url && canPreviewFile ? () => onPreview(file) : undefined;
+          const previewFromThumbnail = file.thumbnail_url ? () => onThumbnailPreview(file) : undefined;
 
           return (
             <div key={file.id} className="p-3">
@@ -260,7 +262,7 @@ export function FileTable({
                     size="sm"
                     className="size-11 rounded-xl"
                     onClick={previewFromThumbnail}
-                    actionLabel={`预览 ${file.file_name}`}
+                    actionLabel={`预览缩略图 ${file.file_name}`}
                   />
                   <div className="min-w-0 flex-1">
                     <p className="truncate text-sm font-medium text-foreground" title={file.file_name}>
@@ -488,7 +490,7 @@ export function FileTable({
               const canPreviewFile = canPreviewThroughAvailableAccess(file);
               const kind = fileKind(file);
               const mimeLabel = file.mime_type || "未知 MIME";
-              const previewFromThumbnail = file.thumbnail_url && canPreviewFile ? () => onPreview(file) : undefined;
+              const previewFromThumbnail = file.thumbnail_url ? () => onThumbnailPreview(file) : undefined;
 
               return (
                 <tr
@@ -513,7 +515,7 @@ export function FileTable({
                         thumbnailUrl={file.thumbnail_url}
                         size="sm"
                         onClick={previewFromThumbnail}
-                        actionLabel={`预览 ${file.file_name}`}
+                        actionLabel={`预览缩略图 ${file.file_name}`}
                       />
                       <div className="flex min-w-0 flex-col gap-0.5">
                         <span className="truncate text-sm font-medium text-foreground" title={file.file_name}>

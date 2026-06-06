@@ -30,6 +30,7 @@ import { Spinner } from "../components/ui/Spinner";
 import { MetricsRow, Metric } from "../components/files/MetricsRow";
 import { FileTable } from "../components/files/FileTable";
 import { PreviewDialog } from "../components/files/PreviewDialog";
+import { ThumbnailPreviewDialog } from "../components/files/ThumbnailPreviewDialog";
 import { FileDetailDialog } from "../components/files/FileDetailDialog";
 import { DirectoryTreeSelect } from "../components/files/DirectoryTreeSelect";
 import { DirectoryTree } from "../components/files/DirectoryTree";
@@ -215,6 +216,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   const [loading, setLoading] = useState(false);
   const [operationLabel, setOperationLabel] = useState<string | null>(null);
   const [previewFile, setPreviewFile] = useState<FileItem | null>(null);
+  const [thumbnailPreviewFile, setThumbnailPreviewFile] = useState<FileItem | null>(null);
   const [detailFile, setDetailFile] = useState<FileItem | null>(null);
   const [editingFile, setEditingFile] = useState<FileItem | null>(null);
   const [editFileName, setEditFileName] = useState("");
@@ -358,6 +360,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       await deleteFile(file.id);
       toast.success("索引已删除");
       if (previewFile?.id === file.id) setPreviewFile(null);
+      if (thumbnailPreviewFile?.id === file.id) setThumbnailPreviewFile(null);
       if (detailFile?.id === file.id) setDetailFile(null);
       setSelectedFileIds((current) => {
         const next = new Set(current);
@@ -399,6 +402,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       });
       toast.success(`已删除 ${result.deleted_directories} 个目录、${result.deleted_files} 个文件索引`);
       if (previewFile && targetFiles.some((file) => file.id === previewFile.id)) setPreviewFile(null);
+      if (thumbnailPreviewFile && targetFiles.some((file) => file.id === thumbnailPreviewFile.id)) setThumbnailPreviewFile(null);
       if (detailFile && targetFiles.some((file) => file.id === detailFile.id)) setDetailFile(null);
       setSelectedFileIds(new Set());
       setSelectedDirectoryIds(new Set());
@@ -563,6 +567,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       const updated = response.file;
       setFiles((current) => current.map((file) => (file.id === updated.id ? updated : file)));
       if (previewFile?.id === updated.id) setPreviewFile(updated);
+      if (thumbnailPreviewFile?.id === updated.id) setThumbnailPreviewFile(updated.thumbnail_url ? updated : null);
       if (detailFile?.id === updated.id) setDetailFile(updated);
       setEditingFile(null);
       toast.success(updated.file_path !== editingFile.file_path ? "文件信息已保存，链接已更新" : "文件信息已保存");
@@ -1306,6 +1311,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
               onEdit={openEditDialog}
               onMoveFile={openMoveDialog}
               onPreview={setPreviewFile}
+              onThumbnailPreview={setThumbnailPreviewFile}
               onCopy={onCopy}
               onAcceleratedDownload={(file) => void onAcceleratedDownload(file)}
               onDelete={onDelete}
@@ -1320,6 +1326,10 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         onClose={() => setPreviewFile(null)}
         onCopy={copyText}
         onAcceleratedDownload={(file) => void onAcceleratedDownload(file)}
+      />
+      <ThumbnailPreviewDialog
+        file={thumbnailPreviewFile}
+        onClose={() => setThumbnailPreviewFile(null)}
       />
       <FileDetailDialog
         file={detailFile}
