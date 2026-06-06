@@ -2425,8 +2425,8 @@ export function UploadDialog({
         onClose={onClose}
         title="上传文件"
         description={`上传到 ${uploadDirectoryPath}；所有文件统一按 ${formatBytes(multipartChunkBytes)} 分片上传，单文件上限 ${formatBytes(maxMultipartBytes)}，最多 ${MULTIPART_UPLOAD_CONCURRENCY} 分片并发`}
-        size="lg"
-        closeOnBackdrop={!uploadBusy && !curlImportOpen}
+        size="wide"
+        closeOnBackdrop={false}
         closeOnEscape={!uploadBusy && !curlImportOpen}
         trapFocus={!curlImportOpen}
         footer={

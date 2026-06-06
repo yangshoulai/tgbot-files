@@ -4,7 +4,7 @@ import { X } from "lucide-react";
 import { cn } from "../../lib/cn";
 import { IconButton } from "./IconButton";
 
-type Size = "sm" | "md" | "lg" | "xl" | "full";
+type Size = "sm" | "md" | "lg" | "wide" | "xl" | "full";
 
 interface ModalProps {
   open: boolean;
@@ -27,6 +27,7 @@ const sizes: Record<Size, string> = {
   sm: "sm:max-w-md",
   md: "sm:max-w-lg",
   lg: "sm:max-w-2xl",
+  wide: "sm:max-w-3xl",
   xl: "sm:max-w-4xl",
   full: "sm:max-w-none"
 };

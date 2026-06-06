@@ -79,12 +79,28 @@ export function DirectoryTreeSelect({
     setExpandedPaths((current) => {
       const next = new Set(current);
       next.add("/");
+      next.add(value);
       for (const path of ancestorPaths(value)) {
         next.add(path);
       }
       return next;
     });
   }, [value]);
+
+  useEffect(() => {
+    if (!open) return;
+
+    setQuery("");
+    setExpandedPaths((current) => {
+      const next = new Set(current);
+      next.add("/");
+      next.add(value);
+      for (const path of ancestorPaths(value)) {
+        next.add(path);
+      }
+      return next;
+    });
+  }, [open, value]);
 
   const selectedLabel = value === "/" ? "/ 根目录" : value || placeholder;
 
@@ -151,7 +167,7 @@ export function DirectoryTreeSelect({
             </div>
           </div>
 
-          <div role="tree" aria-label={ariaLabel} className="max-h-[min(24rem,52dvh)] overflow-auto p-1.5 scroll-thin">
+          <div role="tree" aria-label={ariaLabel} className="max-h-[min(30rem,64dvh)] overflow-auto p-1.5 scroll-thin">
             <DirectoryTreeRow
               node={tree}
               selectedPath={value}

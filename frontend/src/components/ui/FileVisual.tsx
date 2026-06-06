@@ -12,6 +12,8 @@ interface FileVisualProps {
   thumbnailUrl?: string | null;
   size?: Size;
   className?: string;
+  onClick?: () => void;
+  actionLabel?: string;
 }
 
 const sizes: Record<Size, string> = {
@@ -26,7 +28,16 @@ const iconSizes: Record<Size, "sm" | "md" | "lg"> = {
   lg: "lg"
 };
 
-export function FileVisual({ mimeType, fileName, url, thumbnailUrl, size = "md", className }: FileVisualProps) {
+export function FileVisual({
+  mimeType,
+  fileName,
+  url,
+  thumbnailUrl,
+  size = "md",
+  className,
+  onClick,
+  actionLabel
+}: FileVisualProps) {
   const [imageFailed, setImageFailed] = useState(false);
 
   useEffect(() => {
@@ -36,27 +47,43 @@ export function FileVisual({ mimeType, fileName, url, thumbnailUrl, size = "md",
   const kind = fileKind({ mime_type: mimeType, file_name: fileName });
   const visualUrl = thumbnailUrl || (kind.tone === "image" ? url : undefined);
   const showImage = Boolean(visualUrl) && !imageFailed;
+  const visualClassName = cn(
+    "relative inline-grid shrink-0 place-items-center overflow-hidden rounded-xl bg-background ring-1 ring-border",
+    sizes[size],
+    onClick && "transition-[box-shadow,transform] duration-150 hover:ring-primary/45 focus-visible:outline-none focus-visible:focus-ring active:translate-y-px",
+    className
+  );
+  const content = showImage ? (
+    <img
+      src={visualUrl}
+      alt={fileName}
+      loading="lazy"
+      onError={() => setImageFailed(true)}
+      className="h-full w-full object-cover"
+    />
+  ) : (
+    <FileTypeIcon mimeType={mimeType} fileName={fileName} size={iconSizes[size]} className="rounded-none ring-0" />
+  );
+
+  if (onClick) {
+    const label = actionLabel || `预览 ${fileName}`;
+
+    return (
+      <button
+        type="button"
+        aria-label={label}
+        title={label}
+        onClick={onClick}
+        className={visualClassName}
+      >
+        {content}
+      </button>
+    );
+  }
 
   return (
-    <span
-      className={cn(
-        "relative inline-grid shrink-0 place-items-center overflow-hidden rounded-xl bg-background ring-1 ring-border",
-        sizes[size],
-        className
-      )}
-      aria-label={kind.label}
-    >
-      {showImage ? (
-        <img
-          src={visualUrl}
-          alt={fileName}
-          loading="lazy"
-          onError={() => setImageFailed(true)}
-          className="h-full w-full object-cover"
-        />
-      ) : (
-        <FileTypeIcon mimeType={mimeType} fileName={fileName} size={iconSizes[size]} className="rounded-none ring-0" />
-      )}
+    <span className={visualClassName} aria-label={kind.label}>
+      {content}
     </span>
   );
 }

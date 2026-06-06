@@ -60,6 +60,7 @@ export function DirectoryTree({
     setExpandedPaths((current) => {
       const next = new Set(current);
       next.add("/");
+      next.add(value);
       for (const path of ancestorPaths(value)) {
         next.add(path);
       }
@@ -106,7 +107,7 @@ export function DirectoryTree({
         role="tree"
         aria-label={ariaLabel}
         aria-disabled={disabled || undefined}
-        className={cn("max-h-[min(26rem,54dvh)] overflow-auto p-1.5 scroll-thin", treeClassName)}
+        className={cn("max-h-[min(30rem,64dvh)] overflow-auto p-1.5 scroll-thin", treeClassName)}
       >
         <DirectoryTreeRow
           node={tree}

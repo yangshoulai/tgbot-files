@@ -324,14 +324,6 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
           }
         }}
       >
-        {poster ? (
-          <img
-            src={poster}
-            alt="视频缩略图"
-            className={cn("absolute inset-0 h-full w-full object-cover transition-opacity duration-300", loading ? "opacity-70" : "opacity-0")}
-            aria-hidden={!loading}
-          />
-        ) : null}
         <video
           ref={videoRef}
           src={isHlsPackage ? undefined : videoSrc ?? undefined}

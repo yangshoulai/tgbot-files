@@ -14,8 +14,11 @@ export interface RemoteThumbnailSource {
   mime_type?: string;
 }
 
-const MAX_SIDE = 320;
+const IMAGE_THUMBNAIL_MAX_SIDE = 320;
+const MAX_STORED_THUMBNAIL_SIDE = 8192;
+const MAX_GENERATED_THUMBNAIL_BYTES = 512 * 1024;
 const JPEG_QUALITY = 0.82;
+const VIDEO_JPEG_QUALITY = 0.95;
 const VIDEO_SEEK_SECONDS = 0.75;
 const VIDEO_FRAME_WAIT_TIMEOUT_MS = 800;
 const VIDEO_FORCED_FRAME_WAIT_TIMEOUT_MS = 2500;
@@ -31,6 +34,16 @@ interface VideoThumbnailRenderOptions {
   forceFrameDecode?: boolean;
   captureCurrentFrameFirst?: boolean;
   acceptBlankFrame?: boolean;
+}
+
+interface DrawCanvasOptions {
+  fillBackground?: boolean;
+  maxSide?: number;
+}
+
+interface ThumbnailEncodeOptions {
+  quality?: number;
+  maxBytes?: number;
 }
 
 export function canAutoGenerateThumbnail(file: File): boolean {
@@ -275,11 +288,17 @@ async function renderLoadedVideoThumbnail(
         (context, targetWidth, targetHeight) => {
           context.drawImage(video, 0, 0, targetWidth, targetHeight);
         },
-        { fillBackground: false }
+        {
+          fillBackground: false,
+          maxSide: MAX_STORED_THUMBNAIL_SIDE
+        }
       );
 
       if (options.acceptBlankFrame || !isProbablyBlankVideoFrame(canvas)) {
-        return await canvasToGeneratedThumbnail(canvas, fileName, generatedSource);
+        return await canvasToGeneratedThumbnail(canvas, fileName, generatedSource, {
+          quality: VIDEO_JPEG_QUALITY,
+          maxBytes: MAX_GENERATED_THUMBNAIL_BYTES
+        });
       }
       sawBlankFrame = true;
     } catch (error) {
@@ -640,9 +659,10 @@ function drawToCanvas(
   sourceWidth: number,
   sourceHeight: number,
   draw: (context: CanvasRenderingContext2D, width: number, height: number) => void,
-  options: { fillBackground?: boolean } = { fillBackground: true }
+  options: DrawCanvasOptions = { fillBackground: true }
 ): HTMLCanvasElement {
-  const scale = Math.min(1, MAX_SIDE / Math.max(sourceWidth, sourceHeight));
+  const maxSide = options.maxSide ?? IMAGE_THUMBNAIL_MAX_SIDE;
+  const scale = Math.min(1, maxSide / Math.max(sourceWidth, sourceHeight));
   const width = Math.max(1, Math.round(sourceWidth * scale));
   const height = Math.max(1, Math.round(sourceHeight * scale));
   const canvas = document.createElement("canvas");
@@ -1050,22 +1070,73 @@ function imageBlobFromBytes(bytes: Uint8Array, mimeType?: string): Blob | undefi
 async function canvasToGeneratedThumbnail(
   canvas: HTMLCanvasElement,
   sourceFileName: string,
-  generatedSource: "auto" | "manual"
+  generatedSource: "auto" | "manual",
+  options: ThumbnailEncodeOptions = {}
 ): Promise<GeneratedThumbnail> {
-  const blob = await canvasToBlob(canvas);
+  const output = await canvasToThumbnailBlob(canvas, options);
+  const blob = output.blob;
   const objectUrl = URL.createObjectURL(blob);
 
   return {
     blob,
     fileName: thumbnailFileName(sourceFileName),
-    width: canvas.width,
-    height: canvas.height,
+    width: output.width,
+    height: output.height,
     objectUrl,
     source: generatedSource
   };
 }
 
-function canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob> {
+async function canvasToThumbnailBlob(
+  canvas: HTMLCanvasElement,
+  options: ThumbnailEncodeOptions
+): Promise<{ blob: Blob; width: number; height: number }> {
+  const initialQuality = options.quality ?? JPEG_QUALITY;
+  const maxBytes = options.maxBytes;
+  let outputCanvas = canvas;
+  let quality = initialQuality;
+
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const blob = await canvasToBlob(outputCanvas, quality);
+
+    if (!maxBytes || blob.size <= maxBytes) {
+      return {
+        blob,
+        width: outputCanvas.width,
+        height: outputCanvas.height
+      };
+    }
+
+    if (quality > 0.62) {
+      quality = Math.max(0.62, quality - 0.11);
+      continue;
+    }
+
+    const scale = Math.max(0.5, Math.sqrt(maxBytes / blob.size) * 0.92);
+    const nextWidth = Math.max(1, Math.round(outputCanvas.width * scale));
+    const nextHeight = Math.max(1, Math.round(outputCanvas.height * scale));
+
+    if (nextWidth === outputCanvas.width && nextHeight === outputCanvas.height) {
+      break;
+    }
+
+    outputCanvas = resizeCanvas(outputCanvas, nextWidth, nextHeight);
+    quality = initialQuality;
+  }
+
+  const blob = await canvasToBlob(outputCanvas, 0.62);
+  if (maxBytes && blob.size > maxBytes) {
+    throw new Error("缩略图编码后仍超过上传限制");
+  }
+
+  return {
+    blob,
+    width: outputCanvas.width,
+    height: outputCanvas.height
+  };
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, quality: number): Promise<Blob> {
   return new Promise((resolve, reject) => {
     canvas.toBlob(
       (blob) => {
@@ -1076,9 +1147,24 @@ function canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob> {
         }
       },
       "image/jpeg",
-      JPEG_QUALITY
+      quality
     );
   });
+}
+
+function resizeCanvas(source: HTMLCanvasElement, width: number, height: number): HTMLCanvasElement {
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+
+  if (!context) {
+    throw new Error("当前浏览器不支持 Canvas");
+  }
+
+  canvas.width = width;
+  canvas.height = height;
+  context.drawImage(source, 0, 0, width, height);
+
+  return canvas;
 }
 
 function thumbnailFileName(fileName: string): string {

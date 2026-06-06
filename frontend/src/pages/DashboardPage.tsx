@@ -1449,7 +1449,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
               directories={directoryOptions}
               disabled={creatingDir}
               onChange={setCreateDirParentPath}
-              treeClassName="max-h-[min(24rem,48dvh)]"
+              treeClassName="max-h-[min(30rem,64dvh)]"
             />
           </div>
           <div className="flex flex-col gap-1.5">
@@ -1516,7 +1516,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
               directories={directoryMoveTargets}
               disabled={movingDirectorySaving}
               onChange={setDirectoryMoveTargetPath}
-              treeClassName="max-h-[min(24rem,48dvh)]"
+              treeClassName="max-h-[min(30rem,64dvh)]"
             />
           </div>
           {movingDirectory ? (
@@ -1664,7 +1664,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
                   directories={bulkMoveTargets}
                   disabled={movingFiles}
                   onChange={setMoveNewParentPath}
-                  treeClassName="max-h-[min(24rem,46dvh)]"
+                  treeClassName="max-h-[min(30rem,62dvh)]"
                 />
               </div>
             </div>
@@ -1680,7 +1680,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
                 directories={bulkMoveTargets}
                 disabled={movingFiles}
                 onChange={setMoveTargetPath}
-                treeClassName="max-h-[min(26rem,52dvh)]"
+                treeClassName="max-h-[min(30rem,64dvh)]"
               />
             </div>
           )}
