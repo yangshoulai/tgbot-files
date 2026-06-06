@@ -28,6 +28,7 @@ const ID3_MAX_TAG_BYTES = 32 * 1024 * 1024;
 
 interface VideoThumbnailRenderOptions {
   forceFrameDecode?: boolean;
+  captureCurrentFrameFirst?: boolean;
 }
 
 export function canAutoGenerateThumbnail(file: File): boolean {
@@ -123,7 +124,11 @@ export async function generateThumbnailFromHlsPlaylist(playlistUrl: string, file
 
     await metadataReady;
     await bufferReady;
-    return renderLoadedVideoThumbnail(video, fileName, "auto", undefined, undefined, undefined, { forceFrameDecode: true });
+    await waitForVideoDimensions(video);
+    return renderLoadedVideoThumbnail(video, fileName, "auto", undefined, undefined, undefined, {
+      forceFrameDecode: true,
+      captureCurrentFrameFirst: true
+    });
   } finally {
     hls?.destroy();
     detachVideo();
@@ -203,21 +208,29 @@ async function renderLoadedVideoThumbnail(
   options: VideoThumbnailRenderOptions = {}
 ): Promise<GeneratedThumbnail> {
   if (!width || !height) {
-    throw new Error("无法读取视频画面尺寸");
+    const dimensions = await waitForVideoDimensions(video);
+    width = dimensions.width;
+    height = dimensions.height;
   }
 
   let lastError: Error | undefined;
   let sawBlankFrame = false;
+  const targetTimes: Array<number | null> = options.captureCurrentFrameFirst
+    ? [null, ...videoCaptureTimes(duration)]
+    : videoCaptureTimes(duration);
 
-  for (const targetTime of videoCaptureTimes(duration)) {
+  for (const targetTime of targetTimes) {
     try {
-      await seekVideo(video, targetTime);
+      if (targetTime !== null) {
+        await seekVideo(video, targetTime);
+      }
       await waitForVideoReadyState(video, 2, "视频帧读取超时");
+      const dimensions = await waitForVideoDimensions(video);
       await waitForVideoPaint(video, options);
 
       const canvas = drawToCanvas(
-        width,
-        height,
+        dimensions.width,
+        dimensions.height,
         (context, targetWidth, targetHeight) => {
           context.drawImage(video, 0, 0, targetWidth, targetHeight);
         },
@@ -282,6 +295,45 @@ function waitForVideoMetadata(video: HTMLVideoElement): Promise<void> {
 
     video.addEventListener("loadedmetadata", onLoaded, { once: true });
     video.addEventListener("error", onError, { once: true });
+  });
+}
+
+function waitForVideoDimensions(video: HTMLVideoElement): Promise<{ width: number; height: number }> {
+  if (video.videoWidth > 0 && video.videoHeight > 0) {
+    return Promise.resolve({ width: video.videoWidth, height: video.videoHeight });
+  }
+
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("无法读取视频画面尺寸"));
+    }, HLS_THUMBNAIL_BUFFER_TIMEOUT_MS);
+    const cleanup = () => {
+      window.clearTimeout(timeout);
+      video.removeEventListener("resize", onReady);
+      video.removeEventListener("loadedmetadata", onReady);
+      video.removeEventListener("loadeddata", onReady);
+      video.removeEventListener("canplay", onReady);
+      video.removeEventListener("error", onError);
+    };
+    const onReady = () => {
+      if (video.videoWidth <= 0 || video.videoHeight <= 0) {
+        return;
+      }
+      cleanup();
+      resolve({ width: video.videoWidth, height: video.videoHeight });
+    };
+    const onError = () => {
+      cleanup();
+      reject(new Error("视频缩略图生成失败"));
+    };
+
+    video.addEventListener("resize", onReady);
+    video.addEventListener("loadedmetadata", onReady);
+    video.addEventListener("loadeddata", onReady);
+    video.addEventListener("canplay", onReady);
+    video.addEventListener("error", onError, { once: true });
+    onReady();
   });
 }
 
@@ -541,14 +593,16 @@ function attachHiddenCaptureVideo(video: HTMLVideoElement): () => void {
 
   video.setAttribute("aria-hidden", "true");
   video.tabIndex = -1;
+  video.autoplay = true;
   Object.assign(video.style, {
     position: "fixed",
-    left: "-1px",
-    top: "-1px",
-    width: "1px",
-    height: "1px",
-    opacity: "0",
-    pointerEvents: "none"
+    left: "0",
+    top: "0",
+    width: "320px",
+    height: "180px",
+    opacity: "0.01",
+    pointerEvents: "none",
+    zIndex: "-1"
   });
   document.body.append(video);
 
@@ -556,6 +610,7 @@ function attachHiddenCaptureVideo(video: HTMLVideoElement): () => void {
     video.remove();
   };
 }
+
 function nextAnimationFrame(): Promise<void> {
   return new Promise((resolve) => {
     window.requestAnimationFrame(() => resolve());
