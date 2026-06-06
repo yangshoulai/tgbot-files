@@ -18,12 +18,17 @@ const MAX_SIDE = 320;
 const JPEG_QUALITY = 0.82;
 const VIDEO_SEEK_SECONDS = 0.75;
 const VIDEO_FRAME_WAIT_TIMEOUT_MS = 800;
+const VIDEO_FORCED_FRAME_WAIT_TIMEOUT_MS = 2500;
 const HLS_THUMBNAIL_BUFFER_TIMEOUT_MS = 18000;
-const VIDEO_BLANK_VARIANCE_THRESHOLD = 4;
+const VIDEO_BLANK_VARIANCE_THRESHOLD = 12;
 const VIDEO_BLANK_WHITE_LUMA = 246;
-const VIDEO_BLANK_BLACK_LUMA = 10;
+const VIDEO_BLANK_BLACK_LUMA = 22;
 const AUDIO_METADATA_SCAN_BYTES = 16 * 1024 * 1024;
 const ID3_MAX_TAG_BYTES = 32 * 1024 * 1024;
+
+interface VideoThumbnailRenderOptions {
+  forceFrameDecode?: boolean;
+}
 
 export function canAutoGenerateThumbnail(file: File): boolean {
   return thumbnailKindForFile(file) !== null;
@@ -87,6 +92,7 @@ export async function generateThumbnailFromRemoteSource(source: RemoteThumbnailS
 export async function generateThumbnailFromHlsPlaylist(playlistUrl: string, fileName = "hls-video.m3u8"): Promise<GeneratedThumbnail> {
   const video = document.createElement("video");
   let hls: Hls | null = null;
+  const detachVideo = attachHiddenCaptureVideo(video);
 
   video.preload = "auto";
   video.muted = true;
@@ -97,8 +103,9 @@ export async function generateThumbnailFromHlsPlaylist(playlistUrl: string, file
     let bufferReady: Promise<void>;
 
     if (video.canPlayType("application/vnd.apple.mpegurl")) {
-      bufferReady = waitForVideoReadyState(video, 2, "HLS 首帧加载超时");
       video.src = playlistUrl;
+      video.load();
+      bufferReady = waitForVideoReadyState(video, 2, "HLS 首帧加载超时", { startMutedPlayback: true });
     } else if (Hls.isSupported()) {
       hls = new Hls({
         maxBufferLength: 8,
@@ -107,7 +114,7 @@ export async function generateThumbnailFromHlsPlaylist(playlistUrl: string, file
           xhr.withCredentials = true;
         }
       });
-      bufferReady = waitForHlsFirstFragment(video, hls);
+      bufferReady = waitForHlsFirstFrame(video, hls);
       hls.attachMedia(video);
       hls.loadSource(playlistUrl);
     } else {
@@ -116,9 +123,10 @@ export async function generateThumbnailFromHlsPlaylist(playlistUrl: string, file
 
     await metadataReady;
     await bufferReady;
-    return renderLoadedVideoThumbnail(video, fileName, "auto");
+    return renderLoadedVideoThumbnail(video, fileName, "auto", undefined, undefined, undefined, { forceFrameDecode: true });
   } finally {
     hls?.destroy();
+    detachVideo();
     video.removeAttribute("src");
     video.load();
   }
@@ -191,31 +199,45 @@ async function renderLoadedVideoThumbnail(
   generatedSource: "auto" | "manual",
   duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : VIDEO_SEEK_SECONDS,
   width = video.videoWidth,
-  height = video.videoHeight
+  height = video.videoHeight,
+  options: VideoThumbnailRenderOptions = {}
 ): Promise<GeneratedThumbnail> {
   if (!width || !height) {
     throw new Error("无法读取视频画面尺寸");
   }
 
+  let lastError: Error | undefined;
+  let sawBlankFrame = false;
+
   for (const targetTime of videoCaptureTimes(duration)) {
-    await seekVideo(video, targetTime);
-    await waitForVideoPaint(video);
+    try {
+      await seekVideo(video, targetTime);
+      await waitForVideoReadyState(video, 2, "视频帧读取超时");
+      await waitForVideoPaint(video, options);
 
-    const canvas = drawToCanvas(
-      width,
-      height,
-      (context, targetWidth, targetHeight) => {
-        context.drawImage(video, 0, 0, targetWidth, targetHeight);
-      },
-      { fillBackground: false }
-    );
+      const canvas = drawToCanvas(
+        width,
+        height,
+        (context, targetWidth, targetHeight) => {
+          context.drawImage(video, 0, 0, targetWidth, targetHeight);
+        },
+        { fillBackground: false }
+      );
 
-    if (!isProbablyBlankVideoFrame(canvas)) {
-      return await canvasToGeneratedThumbnail(canvas, fileName, generatedSource);
+      if (!isProbablyBlankVideoFrame(canvas)) {
+        return await canvasToGeneratedThumbnail(canvas, fileName, generatedSource);
+      }
+      sawBlankFrame = true;
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error("视频帧读取失败");
     }
   }
 
-  throw new Error("视频截帧为空白，请手动选择缩略图");
+  if (sawBlankFrame) {
+    throw new Error("视频截帧为空白，请手动选择缩略图");
+  }
+
+  throw lastError ?? new Error("视频截帧为空白，请手动选择缩略图");
 }
 
 async function renderAudioCoverThumbnail(file: File, generatedSource: "auto" | "manual"): Promise<GeneratedThumbnail> {
@@ -263,12 +285,18 @@ function waitForVideoMetadata(video: HTMLVideoElement): Promise<void> {
   });
 }
 
-function waitForVideoReadyState(video: HTMLVideoElement, readyState: number, timeoutMessage: string): Promise<void> {
+function waitForVideoReadyState(
+  video: HTMLVideoElement,
+  readyState: number,
+  timeoutMessage: string,
+  options: { startMutedPlayback?: boolean } = {}
+): Promise<void> {
   if (video.readyState >= readyState) {
     return Promise.resolve();
   }
 
   return new Promise((resolve, reject) => {
+    let playbackStarted = false;
     const timeout = window.setTimeout(() => {
       cleanup();
       reject(new Error(timeoutMessage));
@@ -278,6 +306,16 @@ function waitForVideoReadyState(video: HTMLVideoElement, readyState: number, tim
       video.removeEventListener("loadeddata", onReady);
       video.removeEventListener("canplay", onReady);
       video.removeEventListener("error", onError);
+      if (playbackStarted) {
+        video.pause();
+      }
+    };
+    const startPlayback = () => {
+      if (!options.startMutedPlayback || playbackStarted || !video.paused) {
+        return;
+      }
+      playbackStarted = true;
+      void video.play().catch(() => undefined);
     };
     const onReady = () => {
       if (video.readyState < readyState) {
@@ -294,14 +332,16 @@ function waitForVideoReadyState(video: HTMLVideoElement, readyState: number, tim
     video.addEventListener("loadeddata", onReady);
     video.addEventListener("canplay", onReady);
     video.addEventListener("error", onError, { once: true });
+    startPlayback();
   });
 }
 
-function waitForHlsFirstFragment(video: HTMLVideoElement, hls: Hls): Promise<void> {
+function waitForHlsFirstFrame(video: HTMLVideoElement, hls: Hls): Promise<void> {
   return new Promise((resolve, reject) => {
+    let playbackStarted = false;
     const timeout = window.setTimeout(() => {
       cleanup();
-      reject(new Error("HLS 首个片段缓冲超时"));
+      reject(new Error("HLS 首帧加载超时"));
     }, HLS_THUMBNAIL_BUFFER_TIMEOUT_MS);
     const cleanup = () => {
       window.clearTimeout(timeout);
@@ -310,6 +350,9 @@ function waitForHlsFirstFragment(video: HTMLVideoElement, hls: Hls): Promise<voi
       video.removeEventListener("loadeddata", onVideoReady);
       video.removeEventListener("canplay", onVideoReady);
       video.removeEventListener("error", onVideoError);
+      if (playbackStarted) {
+        video.pause();
+      }
     };
     const finish = () => {
       cleanup();
@@ -321,7 +364,15 @@ function waitForHlsFirstFragment(video: HTMLVideoElement, hls: Hls): Promise<voi
       }
     };
     const onFragmentBuffered = () => {
-      finish();
+      startPlayback();
+      onVideoReady();
+    };
+    const startPlayback = () => {
+      if (playbackStarted || !video.paused) {
+        return;
+      }
+      playbackStarted = true;
+      void video.play().catch(() => undefined);
     };
     const onHlsError = (_event: Events.ERROR, data: ErrorData) => {
       if (!data.fatal) {
@@ -435,35 +486,76 @@ function videoCaptureTimes(duration: number): number[] {
   return Array.from(unique).sort((left, right) => left - right);
 }
 
-async function waitForVideoPaint(video: HTMLVideoElement): Promise<void> {
+async function waitForVideoPaint(
+  video: HTMLVideoElement,
+  options: VideoThumbnailRenderOptions = {}
+): Promise<void> {
   const frameVideo = video as HTMLVideoElement & {
     requestVideoFrameCallback?: (callback: () => void) => number;
     cancelVideoFrameCallback?: (handle: number) => void;
   };
+  let playbackStarted = false;
 
-  await new Promise<void>((resolve) => {
-    let settled = false;
-    let handle: number | undefined;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      if (handle !== undefined && typeof frameVideo.cancelVideoFrameCallback === "function") {
-        frameVideo.cancelVideoFrameCallback(handle);
-      }
-      resolve();
-    };
-
-    if (typeof frameVideo.requestVideoFrameCallback === "function") {
-      handle = frameVideo.requestVideoFrameCallback(finish);
+  const startPlayback = () => {
+    if (!options.forceFrameDecode || playbackStarted || !video.paused) {
+      return;
     }
+    playbackStarted = true;
+    void video.play().catch(() => undefined);
+  };
 
-    window.setTimeout(finish, VIDEO_FRAME_WAIT_TIMEOUT_MS);
-  });
+  try {
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      let handle: number | undefined;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        if (handle !== undefined && typeof frameVideo.cancelVideoFrameCallback === "function") {
+          frameVideo.cancelVideoFrameCallback(handle);
+        }
+        resolve();
+      };
+
+      if (typeof frameVideo.requestVideoFrameCallback === "function") {
+        handle = frameVideo.requestVideoFrameCallback(finish);
+      }
+
+      window.setTimeout(finish, options.forceFrameDecode ? VIDEO_FORCED_FRAME_WAIT_TIMEOUT_MS : VIDEO_FRAME_WAIT_TIMEOUT_MS);
+      startPlayback();
+    });
+  } finally {
+    if (playbackStarted) {
+      video.pause();
+    }
+  }
 
   await nextAnimationFrame();
   await nextAnimationFrame();
 }
 
+function attachHiddenCaptureVideo(video: HTMLVideoElement): () => void {
+  if (!document.body) {
+    return () => undefined;
+  }
+
+  video.setAttribute("aria-hidden", "true");
+  video.tabIndex = -1;
+  Object.assign(video.style, {
+    position: "fixed",
+    left: "-1px",
+    top: "-1px",
+    width: "1px",
+    height: "1px",
+    opacity: "0",
+    pointerEvents: "none"
+  });
+  document.body.append(video);
+
+  return () => {
+    video.remove();
+  };
+}
 function nextAnimationFrame(): Promise<void> {
   return new Promise((resolve) => {
     window.requestAnimationFrame(() => resolve());
