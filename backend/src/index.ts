@@ -250,7 +250,6 @@ const HLS_PLAYLIST_MIME_TYPE = "application/vnd.apple.mpegurl";
 const HLS_PUBLIC_ROUTE_PREFIX = "/api/hls";
 const HLS_MAX_PLAYLIST_BYTES = 2 * 1024 * 1024;
 const HLS_AES_128_KEY_BYTES = 16;
-const HLS_MAX_SEGMENTS = 2000;
 const HLS_SEGMENT_IMPORT_TIMEOUT_MS = 10 * 60 * 1000;
 const HLS_PREVIEW_SEGMENT_COUNT = 4;
 
@@ -1855,7 +1854,6 @@ async function createHlsUpload(params: {
   directoryPath: string;
 }): Promise<HlsInitResult> {
   const resolved = await resolveHlsMediaPlan(params.sourceUrl, params.selectedVariantId, params.sourceHeaders);
-  validateHlsMediaPlan(resolved.mediaPlan);
   const fileName = params.fileNameOverride ?? hlsFileNameFromUrl(new URL(resolved.mediaPlan.playlistUrl));
 
   await requireFileNameWritable({
@@ -2366,15 +2364,6 @@ function selectHlsVariant(variants: HlsVariantPlan[], selectedVariantId: string)
     throw new AppError(400, "InvalidHlsVariant", "选择的 HLS variant 不存在");
   }
   return variant;
-}
-
-function validateHlsMediaPlan(plan: HlsMediaPlan): void {
-  if (plan.segments.length > HLS_MAX_SEGMENTS) {
-    throw new AppError(400, "TooManyHlsSegments", `HLS playlist 最多支持 ${HLS_MAX_SEGMENTS} 个 segment`, {
-      max_segments: HLS_MAX_SEGMENTS,
-      actual_segments: plan.segments.length
-    });
-  }
 }
 
 async function probeHlsSegmentSource(sourceUrl: URL, sourceHeaders?: RemoteRequestHeaders): Promise<{

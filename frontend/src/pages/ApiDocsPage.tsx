@@ -396,7 +396,7 @@ function buildDocs(session: SessionResponse): Record<DocAudience, DocGroup> {
     p("hls.asset.id", "Response", "是", "string", "UUID", "HLS 导入任务 id。"),
     p("hls.asset.status", "Response", "是", "string", "pending / importing / done / failed / cancelled", "任务状态。"),
     p("hls.asset.preview_playlist_url", "Response", "是", "string", "管理员 Cookie", "已导入片段的预览 playlist 地址。"),
-    p("hls.segments", "Response", "是", "array", "最多 2000 个", "每个 HLS segment 的导入状态和分片情况。")
+    p("hls.segments", "Response", "是", "array", "按实际 playlist 返回", "每个 HLS segment 的导入状态和分片情况。")
   ];
 
   const statusResponseFields = [
@@ -1665,7 +1665,7 @@ Content-Range: bytes 0-2097151/104857600`
               summary: "创建 HLS 导入任务和 segment 记录。",
               functionality: "解析目标 media playlist，写入 hls_assets 和 hls_segments 临时记录。",
               useCases: ["开始导入 HLS 视频。", "保存用户选择的 variant_id、目录和备注。"],
-              limits: ["segment 数最多 2000。", "文件名必须 1-180 字符。", "目录路径最长 512 字符。"],
+              limits: ["不限制 segment 数量。", "文件名必须 1-180 字符。", "目录路径最长 512 字符。"],
               specialHandling: ["HLS 最终会保存为 storage_backend=hls_package。", "同名冲突在初始化和完成阶段都会校验。"],
               requestParams: [
                 adminCookie,
