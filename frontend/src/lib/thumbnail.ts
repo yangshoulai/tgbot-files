@@ -169,18 +169,17 @@ async function generateThumbnailFromHlsPlayer(playlistUrl: string, fileName: str
 
 async function generateThumbnailFromHlsFirstSegment(playlistUrl: string, fileName: string): Promise<GeneratedThumbnail> {
   const playlist = await fetchTextWithTimeout(playlistUrl, HLS_THUMBNAIL_BUFFER_TIMEOUT_MS);
-  const segmentUrl = firstHlsSegmentUrl(playlist, playlistUrl);
-  const response = await fetchWithTimeout(segmentUrl, { credentials: "include" }, HLS_THUMBNAIL_BUFFER_TIMEOUT_MS);
+  const source = firstHlsMediaSource(playlist, playlistUrl);
+  const [segment, initSegment] = await Promise.all([
+    fetchBytesWithTimeout(source.segmentUrl, "HLS 片段读取失败"),
+    source.initUrl ? fetchBytesWithTimeout(source.initUrl, "HLS init segment 读取失败") : Promise.resolve(undefined)
+  ]);
 
-  if (!response.ok) {
-    throw new Error(`HLS 片段读取失败（HTTP ${response.status}）`);
-  }
-
-  const contentType = response.headers.get("Content-Type") || "";
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  const segmentBlob = isMp4Bytes(bytes, contentType)
-    ? new Blob([bytes], { type: contentType || "video/mp4" })
-    : await transmuxTsSegmentToMp4(bytes);
+  const segmentBlob = initSegment
+    ? new Blob([arrayBufferFromBytes(initSegment.bytes), arrayBufferFromBytes(segment.bytes)], { type: "video/mp4" })
+    : isMp4Bytes(segment.bytes, segment.contentType)
+      ? new Blob([arrayBufferFromBytes(segment.bytes)], { type: segment.contentType || "video/mp4" })
+      : await transmuxTsSegmentToMp4(segment.bytes);
   const objectUrl = URL.createObjectURL(segmentBlob);
 
   return renderVideoThumbnail(objectUrl, fileName, "auto", true, {
@@ -188,6 +187,19 @@ async function generateThumbnailFromHlsFirstSegment(playlistUrl: string, fileNam
     captureCurrentFrameFirst: true,
     acceptBlankFrame: true
   });
+}
+
+async function fetchBytesWithTimeout(url: string, label: string): Promise<{ bytes: Uint8Array; contentType: string }> {
+  const response = await fetchWithTimeout(url, { credentials: "include" }, HLS_THUMBNAIL_BUFFER_TIMEOUT_MS);
+
+  if (!response.ok) {
+    throw new Error(`${label}（HTTP ${response.status}）`);
+  }
+
+  return {
+    bytes: new Uint8Array(await response.arrayBuffer()),
+    contentType: response.headers.get("Content-Type") || ""
+  };
 }
 
 export function revokeThumbnail(thumbnail: GeneratedThumbnail | undefined): void {
@@ -355,9 +367,10 @@ function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit, timeoutMs
   });
 }
 
-function firstHlsSegmentUrl(playlistText: string, playlistUrl: string): string {
+function firstHlsMediaSource(playlistText: string, playlistUrl: string): { initUrl?: string; segmentUrl: string } {
   const baseUrl = absoluteUrl(playlistUrl);
   let pendingSegment = false;
+  let initUrl: string | undefined;
 
   for (const rawLine of playlistText.replace(/^\uFEFF/, "").split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -366,7 +379,11 @@ function firstHlsSegmentUrl(playlistText: string, playlistUrl: string): string {
     }
 
     if (line.startsWith("#EXT-X-MAP")) {
-      throw new Error("当前 HLS 缩略图不支持 fMP4 init segment");
+      const uri = hlsAttributeValue(line, "URI");
+      if (uri) {
+        initUrl = new URL(uri, baseUrl).toString();
+      }
+      continue;
     }
 
     if (line.startsWith("#EXTINF:")) {
@@ -375,11 +392,29 @@ function firstHlsSegmentUrl(playlistText: string, playlistUrl: string): string {
     }
 
     if (pendingSegment && !line.startsWith("#")) {
-      return new URL(line, baseUrl).toString();
+      return {
+        ...(initUrl ? { initUrl } : {}),
+        segmentUrl: new URL(line, baseUrl).toString()
+      };
     }
   }
 
   throw new Error("HLS playlist 缺少可截帧片段");
+}
+
+function hlsAttributeValue(line: string, key: string): string | undefined {
+  const body = line.slice(line.indexOf(":") + 1);
+  const pattern = new RegExp(`(?:^|,)${key}=((?:"[^"]*")|[^,]*)`, "i");
+  const match = pattern.exec(body);
+  const value = match?.[1]?.trim();
+
+  if (!value) {
+    return undefined;
+  }
+
+  return value.startsWith('"') && value.endsWith('"')
+    ? value.slice(1, -1)
+    : value;
 }
 
 function absoluteUrl(value: string): string {
