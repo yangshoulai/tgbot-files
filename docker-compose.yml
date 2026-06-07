@@ -1,0 +1,25 @@
+services:
+  tgbot-files:
+    image: "${IMAGE_NAME:-ghcr.io/yangshoulai/tgbot-files:latest}"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./data:/data
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8787"
+      SQLITE_DB_PATH: "/data/tgbot-files.sqlite"
+      PUBLIC_BASE_URL: "http://localhost:8787"
+      MAX_FILE_BYTES: "20971520"
+      STALE_MULTIPART_UPLOAD_TTL_HOURS: "24"
+      CLEANUP_INTERVAL_MINUTES: "360"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
+      TELEGRAM_STORAGE_CHAT_ID: "${TELEGRAM_STORAGE_CHAT_ID}"
+      LINK_SIGNING_SECRET: "${LINK_SIGNING_SECRET}"
+      ADMIN_USERNAME: "${ADMIN_USERNAME}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
+      ADMIN_SESSION_SECRET: "${ADMIN_SESSION_SECRET}"
+      TG_CHANNEL_SECRET: "${TG_CHANNEL_SECRET:-}"

@@ -1,64 +1,32 @@
 # tgbot-files
 
-基于 **Cloudflare Worker**、**D1** 和 **Telegram Bot API** 的轻量文件存储后台。
-
-上传接口把文件发送到 Telegram 私有频道/群，Worker 使用 Telegram 返回的 `file_id` 生成签名访问路径，并把文件元数据写入 D1。前端由 Vite + React 构建，部署产物通过 Worker 静态资源能力托管；`/api/*` 和 `/f/*` 继续由 Worker 运行时代码处理。
+基于 **Node.js + SQLite + Telegram Bot API** 的文件存储服务。后端把文件转存到 Telegram 私有频道或群组，数据库保存文件索引、API key、目录、分片上传状态和系统设置；前端是 React + Vite 管理后台，由同一个 Node 服务托管。
 
 ## 功能
 
-- `POST /api/v1/files`：上传本地文件或 URL 文件，返回可直接访问的 HTTPS 链接。
-- `GET /f/:token/:filename?`：访问文件，链接自带 HMAC 签名鉴权。
-- `GET /f/:token/:filename?download=1`：强制以附件方式下载文件。
-- `/admin`：管理员后台，支持登录、本地上传、粘贴 URL 上传、分片大文件上传、备注、搜索、分页、预览、复制链接、下载和删除索引。
-- `/settings`：上传 API key 管理，支持新增、查看、启用、禁用和删除。
-- 上传接口继续使用 `Authorization: Bearer <API_KEY>`，API key 明文保存在 D1 的 `api_keys` 表。
-- D1 保存文件元数据、备注 `remark` 和相对访问路径 `file_path`。
-- 默认直传限制为 `20MiB`；后台大文件使用 `18MiB` Telegram 分片，Cloudflare Free 下限制为 `432MiB`，并支持 `/f/*` Range 访问。
+- `/admin`：管理员后台，支持登录、本地上传、URL 上传、HLS/m3u8 导入、分片大文件上传、暂停重试、备注、搜索、分页、预览、复制链接、下载和删除索引。
+- `/settings`：管理 Telegram 存储渠道、外部上传 API key、分片并发数量和运行配置状态。
+- `/docs`：内置 API 文档。
+- `POST /api/v1/files`：外部客户端使用 `Authorization: Bearer <API_KEY>` 上传文件或导入 URL。
+- `GET /f/:token/:filename?`：访问签名文件链接，`?download=1` 强制下载。
+- 默认直传限制为 `20MiB`，大文件使用 `10MiB` Telegram 分片，分片总上限为 `5GiB`。
+- 上传并发数量保存在 `app_settings` 表，默认 `5`，可在设置页调整。
 
-## API 示例
-
-先登录后台 `/settings` 创建上传 API key，然后调用：
-
-```bash
-curl -X POST "https://<your-worker-domain>/api/v1/files" \
-  -H "Authorization: Bearer <API_KEY>" \
-  -F "file=@./example.txt"
-```
-
-也可以让 Worker 从 URL 拉取文件并自动识别文件类型：
-
-```bash
-curl -X POST "https://<your-worker-domain>/api/v1/files" \
-  -H "Authorization: Bearer <API_KEY>" \
-  -H "Content-Type: application/json" \
-  -d '{"url":"https://example.com/report.pdf"}'
-```
-
-响应：
-
-```json
-{
-  "ok": true,
-  "url": "https://<your-worker-domain>/f/<signed-token>/example.txt",
-  "name": "example.txt",
-  "size": 12345,
-  "mime_type": "text/plain"
-}
-```
-
-后台删除只会软删除 D1 中的索引记录，不会删除 Telegram 存储聊天里的原始文件消息，也不会让已经生成的签名链接失效。
+后台删除是软删除：只删除数据库中的索引记录，不删除 Telegram 中的原始文件消息，也不会让已经生成的签名链接失效。
 
 ## 本地开发
 
 ```bash
 pnpm install
-cp backend/.dev.vars.example backend/.dev.vars
-# 编辑 backend/.dev.vars，填入真实 Telegram、管理员和签名密钥
-pnpm --filter backend exec wrangler d1 migrations apply tgbot-files --local
-pnpm dev
+cp .env.example .env
+# 编辑 .env，填入真实 Telegram、管理员和签名密钥
+pnpm build
+pnpm start
 ```
 
-`pnpm dev` 会先构建前端，再启动后端目录下的 `wrangler dev`。如果只开发前端界面，也可以运行：
+`pnpm start` 会启动同一个 Node 服务，默认监听 `http://localhost:8787`，并自动执行 `backend/migrations` 中尚未应用的 SQLite 迁移。
+
+如果只开发前端界面，可以运行：
 
 ```bash
 pnpm dev:frontend
@@ -67,9 +35,29 @@ pnpm dev:frontend
 常用检查：
 
 ```bash
-pnpm test
 pnpm typecheck
+pnpm test
 pnpm build
 ```
 
-完整部署说明见 [docs/deployment.md](docs/deployment.md)。
+## Docker
+
+GitHub Actions 会在推送到 `main`、`master` 或 `v*` tag 时构建并推送镜像：
+
+```text
+ghcr.io/<owner>/<repo>:latest
+ghcr.io/<owner>/<repo>:<branch-or-tag>
+ghcr.io/<owner>/<repo>:sha-<commit>
+```
+
+使用 Compose：
+
+```bash
+cp .env.example .env
+# 编辑 .env
+docker compose up -d
+```
+
+SQLite 文件默认挂载到 `./data/tgbot-files.sqlite`，容器内路径是 `/data/tgbot-files.sqlite`。
+
+更多部署参数见 [docs/deployment.md](docs/deployment.md)。

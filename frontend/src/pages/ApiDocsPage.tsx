@@ -348,7 +348,7 @@ function buildDocs(session: SessionResponse): Record<DocAudience, DocGroup> {
   const directMax = formatBytes(session.direct_access_max_bytes);
 
   const bearer = p("Authorization", "Header", "是", "string", "Bearer <API_KEY>", "外部上传 API Key，禁用或删除后立即不可用。");
-  const adminCookie = p("admin_session", "Cookie", "是", "string", "HttpOnly", "管理员登录后由 Worker 设置，成功请求会自动续期。");
+  const adminCookie = p("admin_session", "Cookie", "是", "string", "HttpOnly", "管理员登录后由服务端设置，成功请求会自动续期。");
   const signedToken = p("token", "Path", "是", "string", "签名载荷", "由文件记录生成的签名访问令牌。");
   const okResponse = p("ok", "Response", "是", "boolean", "true", "请求成功标志。");
 
@@ -465,7 +465,7 @@ function buildDocs(session: SessionResponse): Record<DocAudience, DocGroup> {
               title: "获取文件信息",
               auth: "Bearer API Key",
               summary: "返回文件元数据、访问链接、下载策略和分片信息。",
-              functionality: "按文件 id 读取 D1 文件索引，并根据存储后端生成公开访问字段。",
+              functionality: "按文件 id 读取数据库文件索引，并根据存储后端生成公开访问字段。",
               useCases: ["下载前判断 direct_access。", "外部客户端获取 chunk_count 后并发下载。", "同步本地文件清单。"],
               limits: ["fileId 必须指向未删除文件。", "超大分片文件的 url/download_url 可能为 null。"],
               specialHandling: ["HLS 文件会额外返回 hls_download 摘要。", "telegram_channel_id 缺失时序列化为 default。"],
@@ -660,7 +660,7 @@ curl -X POST '${baseUrl}/api/v1/uploads/<UPLOAD_ID>/complete' \\
         {
           id: "api-key-url",
           title: "URL 分片导入",
-          description: "Worker 从远程 URL 按 Range 拉取分片，再转存到 Telegram。",
+          description: "服务端从远程 URL 按 Range 拉取分片，再转存到 Telegram。",
           endpoints: [
             {
               id: "api-v1-url-init",
@@ -719,7 +719,7 @@ curl -X POST '${baseUrl}/api/v1/uploads/<UPLOAD_ID>/complete' \\
               path: "/api/v1/uploads/:uploadId/url-chunks/:index",
               title: "导入 URL 指定分片",
               auth: "Bearer API Key",
-              summary: "让 Worker 拉取并上传一个远程分片。",
+              summary: "让服务端拉取并上传一个远程分片。",
               functionality: "按初始化时保存的 source_url 和 headers 发起 Range 请求，校验大小后上传到 Telegram。",
               useCases: ["服务端代理导入远程大文件。", "客户端只负责调度分片序号。"],
               limits: ["uploadId 必须是 url 上传会话。", "远端响应必须匹配期望 Range 和大小。"],
@@ -846,7 +846,7 @@ Set-Cookie: admin_session=...; HttpOnly; SameSite=Lax
   "max_multipart_file_bytes": ${session.max_multipart_file_bytes},
   "direct_access_max_chunks": ${session.direct_access_max_chunks},
   "base_url": "${baseUrl}",
-  "config": { "files_db": true, "telegram_bot_token": true }
+  "config": { "database": true, "telegram_bot_token": true }
 }`
             },
             {
@@ -1977,7 +1977,7 @@ Content-Length: 5242880`
               title: "创建 API Key",
               auth: "Admin Cookie",
               summary: "创建外部客户端 API Key，并在本次响应返回明文。",
-              functionality: "生成 tgf_ 前缀随机密钥，明文存储到 D1。",
+              functionality: "生成 tgf_ 前缀随机密钥，明文存储到数据库。",
               useCases: ["为备份脚本、CLI 或第三方服务创建独立密钥。"],
               limits: ["name 必须 1-80 字符。"],
               specialHandling: ["只有创建响应和显式 reveal 会返回 key 明文。", "数据库泄露时 API Key 会直接暴露，这是当前项目的已知权衡。"],

@@ -1,4 +1,5 @@
 import { AppError } from "./http";
+import type { AppDatabase, AppPreparedStatement } from "./runtime";
 
 export type StorageBackend = "telegram_single" | "telegram_multipart" | "hls_package";
 export type MultipartSourceKind = "local" | "url";
@@ -334,20 +335,25 @@ export interface HlsCleanupResult {
   deletedChunks: number;
 }
 
-export function requireDb(env: { FILES_DB?: D1Database }): D1Database {
-  if (!env.FILES_DB) {
-    throw new AppError(500, "ServerMisconfigured", "Missing required D1 binding: FILES_DB");
+export const UPLOAD_CONCURRENCY_SETTING_KEY = "upload_concurrency";
+export const DEFAULT_UPLOAD_CONCURRENCY = 5;
+export const MIN_UPLOAD_CONCURRENCY = 1;
+export const MAX_UPLOAD_CONCURRENCY = 32;
+
+export function requireDb(env: { DATABASE?: AppDatabase }): AppDatabase {
+  if (!env.DATABASE) {
+    throw new AppError(500, "ServerMisconfigured", "Missing configured database");
   }
 
-  return env.FILES_DB;
+  return env.DATABASE;
 }
 
-export async function insertFileRecord(db: D1Database, record: NewFileRecord): Promise<void> {
+export async function insertFileRecord(db: AppDatabase, record: NewFileRecord): Promise<void> {
   await prepareInsertFileRecord(db, record).run();
 }
 
 export async function insertFileRecordWithConflictAction(params: {
-  db: D1Database;
+  db: AppDatabase;
   record: NewFileRecord;
   conflictAction: FileNameConflictAction;
 }): Promise<void> {
@@ -367,7 +373,7 @@ export async function insertFileRecordWithConflictAction(params: {
   await insertFileRecord(params.db, params.record);
 }
 
-function prepareInsertFileRecord(db: D1Database, record: NewFileRecord): D1PreparedStatement {
+function prepareInsertFileRecord(db: AppDatabase, record: NewFileRecord): AppPreparedStatement {
   return db
     .prepare(
       `INSERT INTO files (
@@ -429,7 +435,7 @@ function prepareInsertFileRecord(db: D1Database, record: NewFileRecord): D1Prepa
 }
 
 export async function listFileRecords(params: {
-  db: D1Database;
+  db: AppDatabase;
   query: string;
   type?: FileTypeFilter;
   createdFrom?: string;
@@ -520,7 +526,7 @@ export async function listFileRecords(params: {
   };
 }
 
-export async function getFileRecord(db: D1Database, id: string): Promise<FileRecord | null> {
+export async function getFileRecord(db: AppDatabase, id: string): Promise<FileRecord | null> {
   return await db
     .prepare(
       `SELECT
@@ -558,7 +564,7 @@ export async function getFileRecord(db: D1Database, id: string): Promise<FileRec
 }
 
 export async function findActiveFileNameConflict(params: {
-  db: D1Database;
+  db: AppDatabase;
   directoryPath: string;
   fileName: string;
   excludeId?: string;
@@ -586,7 +592,7 @@ export async function findActiveFileNameConflict(params: {
   return null;
 }
 
-export async function deleteFileRecord(db: D1Database, id: string): Promise<boolean> {
+export async function deleteFileRecord(db: AppDatabase, id: string): Promise<boolean> {
   const existing = await db
     .prepare("SELECT id, COALESCE(storage_backend, 'telegram_single') AS storage_backend FROM files WHERE id = ? AND deleted_at IS NULL")
     .bind(id)
@@ -642,7 +648,7 @@ export async function deleteFileRecord(db: D1Database, id: string): Promise<bool
 }
 
 export async function updateFileRecordMetadata(params: {
-  db: D1Database;
+  db: AppDatabase;
   id: string;
   fileName: string;
   remark: string | null;
@@ -671,7 +677,7 @@ export async function updateFileRecordMetadata(params: {
   };
 }
 
-export async function getDirectoryRecord(db: D1Database, id: string): Promise<DirectoryRecord | null> {
+export async function getDirectoryRecord(db: AppDatabase, id: string): Promise<DirectoryRecord | null> {
   return await db
     .prepare(
       `SELECT id, parent_id, name, path, created_at, deleted_at
@@ -682,7 +688,7 @@ export async function getDirectoryRecord(db: D1Database, id: string): Promise<Di
     .first<DirectoryRecord>();
 }
 
-export async function getDirectoryRecordByPath(db: D1Database, path: string): Promise<DirectoryRecord | null> {
+export async function getDirectoryRecordByPath(db: AppDatabase, path: string): Promise<DirectoryRecord | null> {
   if (path === "/") {
     return null;
   }
@@ -697,8 +703,8 @@ export async function getDirectoryRecordByPath(db: D1Database, path: string): Pr
     .first<DirectoryRecord>();
 }
 
-export async function listDirectoryChildren(db: D1Database, parentPath: string): Promise<DirectoryRecord[]> {
-  let statement: D1PreparedStatement;
+export async function listDirectoryChildren(db: AppDatabase, parentPath: string): Promise<DirectoryRecord[]> {
+  let statement: AppPreparedStatement;
 
   if (parentPath === "/") {
     statement = db.prepare(
@@ -726,7 +732,7 @@ export async function listDirectoryChildren(db: D1Database, parentPath: string):
   return result.results ?? [];
 }
 
-export async function listAllDirectoryRecords(db: D1Database): Promise<DirectoryRecord[]> {
+export async function listAllDirectoryRecords(db: AppDatabase): Promise<DirectoryRecord[]> {
   const result = await db
     .prepare(
       `SELECT id, parent_id, name, path, created_at, deleted_at
@@ -739,7 +745,7 @@ export async function listAllDirectoryRecords(db: D1Database): Promise<Directory
   return result.results ?? [];
 }
 
-async function listAllDirectoryRecordsIncludingDeleted(db: D1Database): Promise<DirectoryRecord[]> {
+async function listAllDirectoryRecordsIncludingDeleted(db: AppDatabase): Promise<DirectoryRecord[]> {
   const result = await db
     .prepare(
       `SELECT id, parent_id, name, path, created_at, deleted_at
@@ -751,7 +757,7 @@ async function listAllDirectoryRecordsIncludingDeleted(db: D1Database): Promise<
   return result.results ?? [];
 }
 
-export async function getGlobalFileUsageStats(db: D1Database): Promise<FileUsageStats> {
+export async function getGlobalFileUsageStats(db: AppDatabase): Promise<FileUsageStats> {
   const row = await db
     .prepare(
       `SELECT COUNT(*) AS file_count, COALESCE(SUM(size), 0) AS total_size
@@ -767,7 +773,7 @@ export async function getGlobalFileUsageStats(db: D1Database): Promise<FileUsage
 }
 
 export async function getDirectoryUsageStats(
-  db: D1Database,
+  db: AppDatabase,
   directories: DirectoryRecord[]
 ): Promise<Map<string, FileUsageStats>> {
   const result = new Map<string, FileUsageStats>();
@@ -807,7 +813,7 @@ export async function getDirectoryUsageStats(
 }
 
 export async function insertDirectoryRecord(params: {
-  db: D1Database;
+  db: AppDatabase;
   parentPath: string;
   name: string;
   createdAt: string;
@@ -852,7 +858,7 @@ export async function insertDirectoryRecord(params: {
 }
 
 export async function deleteDirectoryTree(params: {
-  db: D1Database;
+  db: AppDatabase;
   id: string;
 }): Promise<{ directory: DirectoryRecord; deletedDirectories: number; deletedFiles: number } | null> {
   const directory = await getDirectoryRecord(params.db, params.id);
@@ -925,7 +931,7 @@ export async function deleteDirectoryTree(params: {
 }
 
 export async function moveDirectoryTree(params: {
-  db: D1Database;
+  db: AppDatabase;
   id: string;
   parentPath: string;
 }): Promise<{ directory: DirectoryRecord; movedDirectories: number; movedFiles: number } | null> {
@@ -1023,7 +1029,7 @@ export async function moveDirectoryTree(params: {
 }
 
 export async function renameDirectoryTree(params: {
-  db: D1Database;
+  db: AppDatabase;
   id: string;
   name: string;
 }): Promise<{ directory: DirectoryRecord; renamedDirectories: number; updatedFiles: number } | null> {
@@ -1109,7 +1115,7 @@ export async function renameDirectoryTree(params: {
 }
 
 export async function moveFileRecords(params: {
-  db: D1Database;
+  db: AppDatabase;
   ids: string[];
   directoryPath: string;
 }): Promise<number> {
@@ -1144,7 +1150,7 @@ export async function moveFileRecords(params: {
 }
 
 export async function insertMultipartUploadRecord(
-  db: D1Database,
+  db: AppDatabase,
   record: NewMultipartUploadRecord
 ): Promise<MultipartUploadRecord> {
   await db
@@ -1210,7 +1216,7 @@ export async function insertMultipartUploadRecord(
   };
 }
 
-export async function getMultipartUploadRecord(db: D1Database, id: string): Promise<MultipartUploadRecord | null> {
+export async function getMultipartUploadRecord(db: AppDatabase, id: string): Promise<MultipartUploadRecord | null> {
   return await db
     .prepare(
       `SELECT
@@ -1239,7 +1245,7 @@ export async function getMultipartUploadRecord(db: D1Database, id: string): Prom
 }
 
 export async function completeMultipartUploadRecord(
-  db: D1Database,
+  db: AppDatabase,
   id: string,
   completedAt: string
 ): Promise<void> {
@@ -1247,17 +1253,17 @@ export async function completeMultipartUploadRecord(
 }
 
 function prepareCompleteMultipartUploadRecord(
-  db: D1Database,
+  db: AppDatabase,
   id: string,
   completedAt: string
-): D1PreparedStatement {
+): AppPreparedStatement {
   return db
     .prepare("UPDATE multipart_uploads SET completed_at = ?, source_headers_json = NULL WHERE id = ? AND completed_at IS NULL")
     .bind(completedAt, id);
 }
 
 export async function completeMultipartUploadWithFileRecord(params: {
-  db: D1Database;
+  db: AppDatabase;
   file: NewFileRecord;
   uploadId: string;
   completedAt: string;
@@ -1278,11 +1284,11 @@ export async function completeMultipartUploadWithFileRecord(params: {
 }
 
 function prepareDeleteActiveFileRecordsByName(
-  db: D1Database,
+  db: AppDatabase,
   directoryPath: string,
   fileName: string,
   excludeId?: string
-): D1PreparedStatement[] {
+): AppPreparedStatement[] {
   const whereClause = [
     "deleted_at IS NULL",
     "COALESCE(directory_path, '/') = ?",
@@ -1344,7 +1350,7 @@ function prepareDeleteActiveFileRecordsByName(
   ];
 }
 
-export async function upsertFileChunkRecord(db: D1Database, record: NewFileChunkRecord): Promise<void> {
+export async function upsertFileChunkRecord(db: AppDatabase, record: NewFileChunkRecord): Promise<void> {
   await db
     .prepare(
       `INSERT OR REPLACE INTO file_chunks (
@@ -1371,7 +1377,7 @@ export async function upsertFileChunkRecord(db: D1Database, record: NewFileChunk
     .run();
 }
 
-export async function listFileChunkRecords(db: D1Database, fileId: string): Promise<FileChunkRecord[]> {
+export async function listFileChunkRecords(db: AppDatabase, fileId: string): Promise<FileChunkRecord[]> {
   const result = await db
     .prepare(
       `SELECT
@@ -1394,7 +1400,7 @@ export async function listFileChunkRecords(db: D1Database, fileId: string): Prom
 }
 
 export async function getFileChunkRecord(
-  db: D1Database,
+  db: AppDatabase,
   fileId: string,
   chunkIndex: number
 ): Promise<FileChunkRecord | null> {
@@ -1417,7 +1423,7 @@ export async function getFileChunkRecord(
     .first<FileChunkRecord>();
 }
 
-export async function listTelegramChannelRecords(db: D1Database): Promise<TelegramChannelRecord[]> {
+export async function listTelegramChannelRecords(db: AppDatabase): Promise<TelegramChannelRecord[]> {
   const result = await db
     .prepare(
       `SELECT
@@ -1438,7 +1444,7 @@ export async function listTelegramChannelRecords(db: D1Database): Promise<Telegr
   return result.results ?? [];
 }
 
-export async function listActiveTelegramChannelRecords(db: D1Database): Promise<TelegramChannelRecord[]> {
+export async function listActiveTelegramChannelRecords(db: AppDatabase): Promise<TelegramChannelRecord[]> {
   const result = await db
     .prepare(
       `SELECT
@@ -1460,7 +1466,7 @@ export async function listActiveTelegramChannelRecords(db: D1Database): Promise<
   return result.results ?? [];
 }
 
-export async function getTelegramChannelRecord(db: D1Database, id: string): Promise<TelegramChannelRecord | null> {
+export async function getTelegramChannelRecord(db: AppDatabase, id: string): Promise<TelegramChannelRecord | null> {
   return db
     .prepare(
       `SELECT
@@ -1481,7 +1487,7 @@ export async function getTelegramChannelRecord(db: D1Database, id: string): Prom
     .first<TelegramChannelRecord>();
 }
 
-export async function insertTelegramChannelRecord(db: D1Database, record: NewTelegramChannelRecord): Promise<void> {
+export async function insertTelegramChannelRecord(db: AppDatabase, record: NewTelegramChannelRecord): Promise<void> {
   await db
     .prepare(
       `INSERT INTO telegram_channels (
@@ -1510,7 +1516,7 @@ export async function insertTelegramChannelRecord(db: D1Database, record: NewTel
     .run();
 }
 
-export async function updateTelegramChannelRecord(db: D1Database, record: UpdateTelegramChannelRecord): Promise<TelegramChannelRecord | null> {
+export async function updateTelegramChannelRecord(db: AppDatabase, record: UpdateTelegramChannelRecord): Promise<TelegramChannelRecord | null> {
   const result = await db
     .prepare(
       `UPDATE telegram_channels
@@ -1535,12 +1541,12 @@ export async function updateTelegramChannelRecord(db: D1Database, record: Update
   return getTelegramChannelRecord(db, record.id);
 }
 
-export async function deleteTelegramChannelRecord(db: D1Database, id: string): Promise<boolean> {
+export async function deleteTelegramChannelRecord(db: AppDatabase, id: string): Promise<boolean> {
   const result = await db.prepare("DELETE FROM telegram_channels WHERE id = ? AND is_default = 0").bind(id).run();
   return ((result.meta as { changes?: number }).changes ?? 0) > 0;
 }
 
-export async function getTelegramChannelUsage(db: D1Database, id: string): Promise<TelegramChannelUsage> {
+export async function getTelegramChannelUsage(db: AppDatabase, id: string): Promise<TelegramChannelUsage> {
   const files = await db
     .prepare("SELECT COUNT(*) AS total FROM files WHERE COALESCE(telegram_channel_id, 'default') = ?")
     .bind(id)
@@ -1557,7 +1563,7 @@ export async function getTelegramChannelUsage(db: D1Database, id: string): Promi
 }
 
 export async function deleteStaleMultipartUploadData(
-  db: D1Database,
+  db: AppDatabase,
   expiredBefore: string
 ): Promise<MultipartCleanupResult> {
   const [chunkResult, uploadResult] = await db.batch([
@@ -1594,7 +1600,7 @@ export async function deleteStaleMultipartUploadData(
   };
 }
 
-export async function insertHlsAssetRecord(db: D1Database, record: NewHlsAssetRecord): Promise<HlsAssetRecord> {
+export async function insertHlsAssetRecord(db: AppDatabase, record: NewHlsAssetRecord): Promise<HlsAssetRecord> {
   await db
     .prepare(
       `INSERT INTO hls_assets (
@@ -1661,7 +1667,7 @@ export async function insertHlsAssetRecord(db: D1Database, record: NewHlsAssetRe
   return created;
 }
 
-export async function insertHlsSegmentRecords(db: D1Database, records: NewHlsSegmentRecord[]): Promise<void> {
+export async function insertHlsSegmentRecords(db: AppDatabase, records: NewHlsSegmentRecord[]): Promise<void> {
   if (records.length === 0) {
     return;
   }
@@ -1703,7 +1709,7 @@ export async function insertHlsSegmentRecords(db: D1Database, records: NewHlsSeg
   ));
 }
 
-export async function getHlsAssetRecord(db: D1Database, id: string): Promise<HlsAssetRecord | null> {
+export async function getHlsAssetRecord(db: AppDatabase, id: string): Promise<HlsAssetRecord | null> {
   return db
     .prepare(
       `SELECT
@@ -1750,7 +1756,7 @@ export async function getHlsAssetRecord(db: D1Database, id: string): Promise<Hls
     .first<HlsAssetRecord>();
 }
 
-export async function getHlsAssetRecordByFinalFileId(db: D1Database, finalFileId: string): Promise<HlsAssetRecord | null> {
+export async function getHlsAssetRecordByFinalFileId(db: AppDatabase, finalFileId: string): Promise<HlsAssetRecord | null> {
   return db
     .prepare(
       `SELECT
@@ -1798,7 +1804,7 @@ export async function getHlsAssetRecordByFinalFileId(db: D1Database, finalFileId
     .first<HlsAssetRecord>();
 }
 
-export async function listHlsSegmentRecords(db: D1Database, assetId: string): Promise<HlsSegmentRecord[]> {
+export async function listHlsSegmentRecords(db: AppDatabase, assetId: string): Promise<HlsSegmentRecord[]> {
   const result = await db
     .prepare(
       `SELECT
@@ -1836,7 +1842,7 @@ export async function listHlsSegmentRecords(db: D1Database, assetId: string): Pr
 }
 
 export async function getHlsSegmentRecordByIndex(
-  db: D1Database,
+  db: AppDatabase,
   assetId: string,
   segmentIndex: number
 ): Promise<HlsSegmentRecord | null> {
@@ -1875,7 +1881,7 @@ export async function getHlsSegmentRecordByIndex(
 }
 
 export async function markHlsAssetStatus(
-  db: D1Database,
+  db: AppDatabase,
   id: string,
   status: HlsAssetStatus,
   updatedAt: string
@@ -1891,7 +1897,7 @@ export async function markHlsAssetStatus(
 }
 
 export async function markHlsSegmentImporting(
-  db: D1Database,
+  db: AppDatabase,
   id: string,
   updatedAt: string
 ): Promise<void> {
@@ -1909,7 +1915,7 @@ export async function markHlsSegmentImporting(
 }
 
 export async function markHlsInitSegmentImporting(
-  db: D1Database,
+  db: AppDatabase,
   assetId: string,
   updatedAt: string
 ): Promise<void> {
@@ -1926,7 +1932,7 @@ export async function markHlsInitSegmentImporting(
 }
 
 export async function completeHlsInitSegmentSingle(params: {
-  db: D1Database;
+  db: AppDatabase;
   assetId: string;
   mimeType: string;
   size: number;
@@ -1964,7 +1970,7 @@ export async function completeHlsInitSegmentSingle(params: {
 }
 
 export async function completeHlsSegmentSingle(params: {
-  db: D1Database;
+  db: AppDatabase;
   id: string;
   mimeType: string;
   size: number;
@@ -2005,7 +2011,7 @@ export async function completeHlsSegmentSingle(params: {
 }
 
 export async function attachHlsSegmentMultipartUpload(params: {
-  db: D1Database;
+  db: AppDatabase;
   id: string;
   multipartUploadId: string;
   mimeType: string;
@@ -2039,7 +2045,7 @@ export async function attachHlsSegmentMultipartUpload(params: {
 }
 
 export async function completeHlsSegmentMultipart(params: {
-  db: D1Database;
+  db: AppDatabase;
   id: string;
   multipartUploadId: string;
   chunkSize: number;
@@ -2071,7 +2077,7 @@ export async function completeHlsSegmentMultipart(params: {
 }
 
 export async function failHlsSegment(
-  db: D1Database,
+  db: AppDatabase,
   id: string,
   message: string,
   updatedAt: string
@@ -2089,7 +2095,7 @@ export async function failHlsSegment(
 }
 
 export async function failHlsInitSegment(
-  db: D1Database,
+  db: AppDatabase,
   assetId: string,
   message: string,
   updatedAt: string
@@ -2107,7 +2113,7 @@ export async function failHlsInitSegment(
 }
 
 export async function completeHlsAssetWithFileRecord(params: {
-  db: D1Database;
+  db: AppDatabase;
   assetId: string;
   file: NewFileRecord;
   completedAt: string;
@@ -2138,7 +2144,7 @@ export async function completeHlsAssetWithFileRecord(params: {
 }
 
 export async function deleteHlsAssetTempData(
-  db: D1Database,
+  db: AppDatabase,
   assetId: string
 ): Promise<HlsCleanupResult> {
   const [chunkResult, uploadResult, segmentResult, assetResult] = await db.batch([
@@ -2183,7 +2189,7 @@ export async function deleteHlsAssetTempData(
 }
 
 export async function deleteStaleHlsUploadData(
-  db: D1Database,
+  db: AppDatabase,
   expiredBefore: string
 ): Promise<HlsCleanupResult> {
   const [chunkResult, uploadResult, segmentResult, assetResult] = await db.batch([
@@ -2244,7 +2250,7 @@ export async function deleteStaleHlsUploadData(
   };
 }
 
-export async function insertApiKeyRecord(db: D1Database, record: NewApiKeyRecord): Promise<ApiKeyRecord> {
+export async function insertApiKeyRecord(db: AppDatabase, record: NewApiKeyRecord): Promise<ApiKeyRecord> {
   await db
     .prepare(
       `INSERT INTO api_keys (
@@ -2273,7 +2279,7 @@ export async function insertApiKeyRecord(db: D1Database, record: NewApiKeyRecord
   };
 }
 
-export async function listApiKeyRecords(db: D1Database): Promise<ApiKeyRecord[]> {
+export async function listApiKeyRecords(db: AppDatabase): Promise<ApiKeyRecord[]> {
   const result = await db
     .prepare(
       `SELECT
@@ -2294,7 +2300,7 @@ export async function listApiKeyRecords(db: D1Database): Promise<ApiKeyRecord[]>
   return result.results ?? [];
 }
 
-export async function getApiKeyRecord(db: D1Database, id: string): Promise<ApiKeyRecord | null> {
+export async function getApiKeyRecord(db: AppDatabase, id: string): Promise<ApiKeyRecord | null> {
   return await db
     .prepare(
       `SELECT
@@ -2313,7 +2319,7 @@ export async function getApiKeyRecord(db: D1Database, id: string): Promise<ApiKe
     .first<ApiKeyRecord>();
 }
 
-export async function findActiveApiKeyRecord(db: D1Database, key: string): Promise<ApiKeyRecord | null> {
+export async function findActiveApiKeyRecord(db: AppDatabase, key: string): Promise<ApiKeyRecord | null> {
   return await db
     .prepare(
       `SELECT
@@ -2332,7 +2338,7 @@ export async function findActiveApiKeyRecord(db: D1Database, key: string): Promi
     .first<ApiKeyRecord>();
 }
 
-export async function touchApiKeyRecord(db: D1Database, id: string, lastUsedAt: string): Promise<void> {
+export async function touchApiKeyRecord(db: AppDatabase, id: string, lastUsedAt: string): Promise<void> {
   await db
     .prepare("UPDATE api_keys SET last_used_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL")
     .bind(lastUsedAt, lastUsedAt, id)
@@ -2340,7 +2346,7 @@ export async function touchApiKeyRecord(db: D1Database, id: string, lastUsedAt: 
 }
 
 export async function updateApiKeyRecord(params: {
-  db: D1Database;
+  db: AppDatabase;
   id: string;
   updatedAt: string;
   name?: string;
@@ -2368,7 +2374,7 @@ export async function updateApiKeyRecord(params: {
   };
 }
 
-export async function softDeleteApiKeyRecord(db: D1Database, id: string, deletedAt: string): Promise<boolean> {
+export async function softDeleteApiKeyRecord(db: AppDatabase, id: string, deletedAt: string): Promise<boolean> {
   const existing = await getApiKeyRecord(db, id);
 
   if (!existing) {
@@ -2380,6 +2386,43 @@ export async function softDeleteApiKeyRecord(db: D1Database, id: string, deleted
     .bind(deletedAt, deletedAt, id)
     .run();
   return true;
+}
+
+export async function getUploadConcurrencySetting(db: AppDatabase): Promise<number> {
+  let row: { value: string } | null = null;
+  try {
+    row = await db
+      .prepare("SELECT value FROM app_settings WHERE key = ?")
+      .bind(UPLOAD_CONCURRENCY_SETTING_KEY)
+      .first<{ value: string }>();
+  } catch {
+    return DEFAULT_UPLOAD_CONCURRENCY;
+  }
+  const parsed = row ? Number(row.value) : DEFAULT_UPLOAD_CONCURRENCY;
+
+  if (!Number.isSafeInteger(parsed)) {
+    return DEFAULT_UPLOAD_CONCURRENCY;
+  }
+
+  return clampUploadConcurrency(parsed);
+}
+
+export async function setUploadConcurrencySetting(db: AppDatabase, value: number, updatedAt: string): Promise<number> {
+  const normalized = clampUploadConcurrency(value);
+  await db
+    .prepare(
+      `INSERT INTO app_settings (key, value, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+    )
+    .bind(UPLOAD_CONCURRENCY_SETTING_KEY, String(normalized), updatedAt)
+    .run();
+
+  return normalized;
+}
+
+function clampUploadConcurrency(value: number): number {
+  return Math.min(MAX_UPLOAD_CONCURRENCY, Math.max(MIN_UPLOAD_CONCURRENCY, value));
 }
 
 function escapeLikePattern(value: string): string {

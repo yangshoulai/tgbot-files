@@ -54,6 +54,7 @@ interface UploadDialogProps {
   maxBytes: number;
   multipartChunkBytes: number;
   maxMultipartBytes: number;
+  uploadConcurrency: number;
   directoryPath: string;
   onClose: () => void;
   onUploaded: (uploadedCount: number) => void;
@@ -184,9 +185,7 @@ interface UploadAbortContext {
 }
 
 let counter = 0;
-const MULTIPART_UPLOAD_CONCURRENCY = 5;
-const URL_MULTIPART_UPLOAD_CONCURRENCY = 5;
-const HLS_SEGMENT_UPLOAD_CONCURRENCY = 5;
+const DEFAULT_UPLOAD_CONCURRENCY = 5;
 const MULTIPART_UPLOAD_MAX_ATTEMPTS = 3;
 const MULTIPART_UPLOAD_RETRY_DELAY_MS = 800;
 const LOCAL_CHUNK_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
@@ -248,12 +247,20 @@ function isUploadableLocalItem(item: QueueItem): boolean {
   return isLocalItemAwaitingDecision(item) && !item.conflict;
 }
 
+function normalizeUploadConcurrency(value: number): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    return DEFAULT_UPLOAD_CONCURRENCY;
+  }
+  return value;
+}
+
 export function UploadDialog({
   open,
   initialFiles,
   maxBytes,
   multipartChunkBytes,
   maxMultipartBytes,
+  uploadConcurrency,
   directoryPath,
   onClose,
   onUploaded,
@@ -284,6 +291,7 @@ export function UploadDialog({
   const [activeUploadKind, setActiveUploadKind] = useState<"local" | "url" | null>(null);
   const [activeUploadItemId, setActiveUploadItemId] = useState<string | null>(null);
   const [stopRequested, setStopRequested] = useState(false);
+  const effectiveUploadConcurrency = normalizeUploadConcurrency(uploadConcurrency);
 
   useEffect(() => {
     folderInput.current?.setAttribute("webkitdirectory", "");
@@ -1295,7 +1303,7 @@ export function UploadDialog({
     const chunkIndexes = params.chunkIndexes ?? chunkRange(params.total);
     const completedSet = new Set(params.completedChunks ?? []);
     const failedChunks: number[] = [];
-    const concurrency = Math.min(params.concurrency ?? MULTIPART_UPLOAD_CONCURRENCY, Math.max(1, chunkIndexes.length));
+    const concurrency = Math.min(params.concurrency ?? effectiveUploadConcurrency, Math.max(1, chunkIndexes.length));
     let nextIndex = 0;
 
     const suffix = concurrency > 1 ? `（${concurrency} 并发）` : "";
@@ -1614,7 +1622,7 @@ export function UploadDialog({
           total: upload.chunk_count,
           taskLabel: "导入分片",
           doneLabel: "已导入",
-          concurrency: URL_MULTIPART_UPLOAD_CONCURRENCY,
+          concurrency: effectiveUploadConcurrency,
           task,
           requestTimeoutMs: URL_CHUNK_REQUEST_TIMEOUT_MS,
           onProgress: (progress) => {
@@ -1805,7 +1813,7 @@ export function UploadDialog({
         status: "uploading",
         message: `HLS 视频 · ${asset.segment_count} 个片段`,
         chunks: createHlsSegmentStates(segments),
-        progress: { completed: 0, total: asset.segment_count, label: `开始导入 HLS 片段（${HLS_SEGMENT_UPLOAD_CONCURRENCY} 并发）` },
+        progress: { completed: 0, total: asset.segment_count, label: `开始导入 HLS 片段（${effectiveUploadConcurrency} 并发）` },
         hls: {
           probe,
           assetId: asset.id,
@@ -1819,7 +1827,7 @@ export function UploadDialog({
         total: asset.segment_count,
         taskLabel: "导入 HLS 片段",
         doneLabel: "已导入 HLS 片段",
-        concurrency: HLS_SEGMENT_UPLOAD_CONCURRENCY,
+        concurrency: effectiveUploadConcurrency,
         task,
         requestTimeoutMs: HLS_SEGMENT_REQUEST_TIMEOUT_MS,
         onProgress: (progress) => {
@@ -1948,7 +1956,7 @@ export function UploadDialog({
           completedChunks: syncedRetry.completedSegments,
           taskLabel: "重试 HLS 片段",
           doneLabel: "已导入 HLS 片段",
-          concurrency: HLS_SEGMENT_UPLOAD_CONCURRENCY,
+          concurrency: effectiveUploadConcurrency,
           task,
           requestTimeoutMs: HLS_SEGMENT_REQUEST_TIMEOUT_MS,
           onProgress: (progress) => {
@@ -2258,7 +2266,7 @@ export function UploadDialog({
         completedChunks: syncedRetry.completedChunks,
         taskLabel: "重试导入分片",
         doneLabel: "已导入",
-        concurrency: URL_MULTIPART_UPLOAD_CONCURRENCY,
+        concurrency: effectiveUploadConcurrency,
         task,
         requestTimeoutMs: URL_CHUNK_REQUEST_TIMEOUT_MS,
         onProgress: (progress) => {
@@ -2424,7 +2432,7 @@ export function UploadDialog({
         open={open}
         onClose={onClose}
         title="上传文件"
-        description={`上传到 ${uploadDirectoryPath}；所有文件统一按 ${formatBytes(multipartChunkBytes)} 分片上传，单文件上限 ${formatBytes(maxMultipartBytes)}，最多 ${MULTIPART_UPLOAD_CONCURRENCY} 分片并发`}
+        description={`上传到 ${uploadDirectoryPath}；所有文件统一按 ${formatBytes(multipartChunkBytes)} 分片上传，单文件上限 ${formatBytes(maxMultipartBytes)}，最多 ${effectiveUploadConcurrency} 分片并发`}
         size="wide"
         closeOnBackdrop={false}
         closeOnEscape={!uploadBusy && !curlImportOpen}
@@ -2539,7 +2547,7 @@ export function UploadDialog({
               </span>
               <p className="text-sm font-medium text-foreground">点击选择文件，或拖拽文件/文件夹到这里</p>
               <p className="text-xs text-muted">
-                统一按 {formatBytes(multipartChunkBytes)} 分片，最多 {MULTIPART_UPLOAD_CONCURRENCY} 并发，每片最多 {MULTIPART_UPLOAD_MAX_ATTEMPTS} 次
+                统一按 {formatBytes(multipartChunkBytes)} 分片，最多 {effectiveUploadConcurrency} 并发，每片最多 {MULTIPART_UPLOAD_MAX_ATTEMPTS} 次
               </p>
               <input
                 ref={fileInput}
@@ -2721,7 +2729,7 @@ export function UploadDialog({
                 )}
               </div>
               <p className="text-xs leading-5 text-muted">
-                key 会自动保存为小写。Worker 会自动设置 Range；不要填写 Range、Host、Content-Length 等连接控制头。
+                key 会自动保存为小写。服务端会自动设置 Range；不要填写 Range、Host、Content-Length 等连接控制头。
               </p>
             </div>
 

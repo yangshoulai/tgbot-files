@@ -1,0 +1,14 @@
+node_modules/
+**/node_modules/
+frontend/dist/
+backend/dist/
+.git/
+.github/
+.env
+.env.*
+coverage/
+.pnpm-store/
+.superpowers/
+Dockerfile
+docker-compose*.yml
+*.log

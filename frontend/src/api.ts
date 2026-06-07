@@ -6,9 +6,12 @@ export interface SessionResponse {
   max_multipart_file_bytes: number;
   direct_access_max_chunks: number;
   direct_access_max_bytes: number;
+  upload_concurrency: number;
+  upload_concurrency_min: number;
+  upload_concurrency_max: number;
   base_url: string;
   config: {
-    files_db: boolean;
+    database: boolean;
     telegram_bot_token: boolean;
     telegram_storage_chat_id: boolean;
     telegram_channels: boolean;
@@ -19,7 +22,7 @@ export interface SessionResponse {
     admin_session_secret: boolean;
   };
   config_values: {
-    files_db: string;
+    database: string;
     telegram_bot_token: string;
     telegram_storage_chat_id: string;
     telegram_channels: string;
@@ -76,6 +79,15 @@ export interface FileItem {
   thumbnail_height?: number | null;
   thumbnail_status?: "none" | "ready" | "failed";
   thumbnail_url?: string | null;
+}
+
+export interface SettingsUpdateResponse {
+  ok: boolean;
+  settings: {
+    upload_concurrency: number;
+    upload_concurrency_min: number;
+    upload_concurrency_max: number;
+  };
 }
 
 export interface HlsDownloadSummary {
@@ -519,6 +531,16 @@ export function login(username: string, password: string, rememberMe: boolean) {
 export function logout() {
   return requestJson<LoginResponse>("/api/admin/logout", {
     method: "POST"
+  });
+}
+
+export function updateSettings(body: { upload_concurrency: number }) {
+  return requestJson<SettingsUpdateResponse>("/api/admin/settings", {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
   });
 }
 

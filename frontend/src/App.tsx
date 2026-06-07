@@ -152,7 +152,7 @@ function AppShell() {
         onUpload={() => openUpload([])}
       >
         {active === "settings" ? (
-          <SettingsPage session={session} copyText={copyText} />
+          <SettingsPage session={session} onSessionChange={setSession} copyText={copyText} />
         ) : active === "docs" ? (
           <ApiDocsPage session={session} />
         ) : (
@@ -171,6 +171,7 @@ function AppShell() {
         maxBytes={session.max_file_bytes}
         multipartChunkBytes={session.multipart_chunk_bytes}
         maxMultipartBytes={session.max_multipart_file_bytes}
+        uploadConcurrency={session.upload_concurrency}
         directoryPath={dashboardDirectoryPath}
         onClose={() => setUploadOpen(false)}
         onUploaded={(count) => {

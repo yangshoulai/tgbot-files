@@ -3,24 +3,17 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Cloudflare Worker + Telegram Bot API 文件存储服务 monorepo",
+  "description": "Telegram Bot API 文件存储服务 monorepo",
   "scripts": {
-    "build": "pnpm build:frontend",
+    "build": "pnpm build:server",
     "build:frontend": "pnpm --filter frontend build",
-    "dev": "pnpm build:frontend && pnpm --filter backend dev",
+    "build:server": "pnpm build:frontend && pnpm --filter backend build",
+    "dev": "pnpm build:server && pnpm --filter backend start",
     "dev:frontend": "pnpm --filter frontend dev",
-    "dev:worker": "pnpm --filter backend dev",
-    "deploy": "pnpm build:frontend && pnpm --filter backend deploy",
+    "start": "pnpm --filter backend start",
     "test": "pnpm --filter backend test",
     "test:watch": "pnpm --filter backend test:watch",
     "typecheck": "pnpm --filter backend typecheck && pnpm --filter frontend typecheck"
   },
-  "packageManager": "pnpm@10.26.0",
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild",
-      "sharp",
-      "workerd"
-    ]
-  }
+  "packageManager": "pnpm@10.26.0"
 }

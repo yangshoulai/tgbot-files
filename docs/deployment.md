@@ -1,296 +1,97 @@
-# Cloudflare Worker + Telegram Bot 文件存储部署说明
+# 部署说明
 
-本文档说明如何部署 `tgbot-files`：一个基于 Cloudflare Worker、D1、Worker 静态资源和 Telegram Bot API 的轻量文件存储后台。
+本项目使用同一个 Docker 镜像运行 Node.js 后端和已构建的 React 前端，默认使用 SQLite 文件保存数据。
 
-## 1. 前置条件
+部署后仍然受服务器 CPU/内存/带宽、源 URL 限速和 Telegram Bot API 限速影响。
 
-- Cloudflare 账号。
-- Node.js 20+ 和 pnpm。
-- Telegram 账号。
-- 项目依赖已安装：
+## 镜像
+
+GitHub Actions 会在推送到 `main`、`master` 或 `v*` tag 时构建并推送镜像：
+
+```text
+ghcr.io/<owner>/<repo>:latest
+ghcr.io/<owner>/<repo>:<branch-or-tag>
+ghcr.io/<owner>/<repo>:sha-<commit>
+```
+
+workflow 文件在 `.github/workflows/docker.yml`。如果仓库的 Package 可见性不是公开的，需要在 GitHub Packages 里调整访问权限，或者登录 GHCR 后拉取。
+
+## 环境变量
+
+| 变量 | 默认值 | 说明 |
+|---|---:|---|
+| `HOST` | `0.0.0.0` | Node 服务监听地址 |
+| `PORT` | `8787` | Node 服务监听端口 |
+| `SQLITE_DB_PATH` | `/data/tgbot-files.sqlite` | SQLite 数据库文件路径 |
+| `DATABASE_PATH` | - | `SQLITE_DB_PATH` 的兼容别名 |
+| `PUBLIC_BASE_URL` | 请求来源 | 生成公开链接时使用的外部访问地址 |
+| `MAX_FILE_BYTES` | `20971520` | 小文件直传上限 |
+| `STALE_MULTIPART_UPLOAD_TTL_HOURS` | `24` | 未完成上传清理 TTL |
+| `CLEANUP_INTERVAL_MINUTES` | `360` | 定时清理间隔 |
+| `TELEGRAM_BOT_TOKEN` | - | 默认 Telegram bot token |
+| `TELEGRAM_STORAGE_CHAT_ID` | - | 默认 Telegram 存储频道或群 ID |
+| `LINK_SIGNING_SECRET` | - | 文件链接签名密钥 |
+| `ADMIN_USERNAME` | - | 管理员用户名 |
+| `ADMIN_PASSWORD` | - | 管理员密码 |
+| `ADMIN_SESSION_SECRET` | 回退到 `LINK_SIGNING_SECRET` | 管理后台 Cookie 签名密钥 |
+| `TG_CHANNEL_SECRET` | 回退到 `LINK_SIGNING_SECRET` | 多 Telegram 渠道 token 加密密钥 |
+| `ENV_FILE` | 自动查找 `.env` | 指定本地环境变量文件 |
+| `STATIC_DIR` / `ASSETS_DIR` | `frontend/dist` | 前端静态资源目录 |
+| `SQLITE_MIGRATIONS_DIR` | `backend/migrations` | SQLite 迁移目录 |
+
+## Docker Compose
+
+复制 `.env`，填入真实密钥：
 
 ```bash
-cd /Users/yangshoulai/Development/PersonalProjects/tgbot-files
+cp .env.example .env
+```
+
+启动：
+
+```bash
+docker compose up -d
+```
+
+SQLite 文件默认挂载到 `./data/tgbot-files.sqlite`，容器内路径是 `/data/tgbot-files.sqlite`。
+
+查看日志：
+
+```bash
+docker compose logs -f
+```
+
+## 本地 Node 运行
+
+```bash
 pnpm install
-```
-
-## 2. 准备 Telegram Bot
-
-1. 在 Telegram 中打开 `@BotFather`。
-2. 发送 `/newbot`。
-3. 按提示创建 bot。
-4. 保存 BotFather 返回的 token，后续作为 `TELEGRAM_BOT_TOKEN`。
-
-> Bot token 是高权限密钥，不要提交到 Git，也不要写进公开文档。
-
-## 3. 准备 Telegram 存储聊天
-
-推荐使用私有频道或私有群作为文件存储区。
-
-私有频道：
-
-1. 新建 Telegram 私有频道。
-2. 把 bot 添加为频道管理员。
-3. 给 bot 开启发送消息/发布消息权限。
-4. 获取频道 `chat_id`，私有频道 ID 通常形如 `-1001234567890`。
-
-私有群：
-
-1. 新建私有群。
-2. 把 bot 拉入群。
-3. 在群里发送一条消息。
-4. 调用以下接口查看更新，并从返回 JSON 中找到 `message.chat.id`：
-
-```bash
-curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getUpdates"
-```
-
-## 4. 配置 Wrangler
-
-首次使用 Wrangler 时登录 Cloudflare：
-
-```bash
-pnpm --filter backend exec wrangler login
-```
-
-`backend/wrangler.jsonc` 中需要保留：
-
-- `main`: Worker 入口 `src/index.ts`
-- `assets.directory`: 前端构建产物 `../frontend/dist`
-- `assets.run_worker_first`: `/api/*` 和 `/f/*` 先进入 Worker
-- `d1_databases`: `FILES_DB` 绑定
-
-如果你使用自己的 D1 数据库，需要把 `database_id` 替换为实际值。
-
-## 5. 创建并迁移 D1
-
-创建数据库：
-
-```bash
-pnpm --filter backend exec wrangler d1 create tgbot-files
-```
-
-本地应用迁移：
-
-```bash
-pnpm --filter backend exec wrangler d1 migrations apply tgbot-files --local
-```
-
-生产应用迁移：
-
-```bash
-pnpm --filter backend exec wrangler d1 migrations apply tgbot-files --remote
-```
-
-当前迁移包含：
-
-- `0001_create_files.sql`：文件元数据表，包含 `remark TEXT` 备注字段。
-- `0002_create_api_keys.sql`：上传 API key 表，明文保存 key。
-- `0003_add_multipart_files.sql`：分片上传会话、分片索引和文件存储类型字段。
-
-## 6. 设置 Secrets 和变量
-
-生产环境 secrets：
-
-```bash
-pnpm --filter backend exec wrangler secret put TELEGRAM_BOT_TOKEN
-pnpm --filter backend exec wrangler secret put TELEGRAM_STORAGE_CHAT_ID
-pnpm --filter backend exec wrangler secret put LINK_SIGNING_SECRET
-pnpm --filter backend exec wrangler secret put ADMIN_USERNAME
-pnpm --filter backend exec wrangler secret put ADMIN_PASSWORD
-pnpm --filter backend exec wrangler secret put ADMIN_SESSION_SECRET
-```
-
-变量含义：
-
-| 名称 | 必填 | 说明 |
-| --- | --- | --- |
-| `TELEGRAM_BOT_TOKEN` | 是 | BotFather 返回的 Telegram bot token |
-| `TELEGRAM_STORAGE_CHAT_ID` | 是 | 用于保存文件的频道/群/聊天 ID |
-| `LINK_SIGNING_SECRET` | 是 | 文件访问链接 HMAC 签名密钥 |
-| `ADMIN_USERNAME` | 是 | 管理员后台用户名 |
-| `ADMIN_PASSWORD` | 是 | 管理员后台密码 |
-| `ADMIN_SESSION_SECRET` | 建议 | 管理员登录 Cookie 签名密钥；未设置时回退使用 `LINK_SIGNING_SECRET` |
-| `PUBLIC_BASE_URL` | 否 | 自定义公开访问域名，例如 `https://files.example.com` |
-| `MAX_FILE_BYTES` | 否 | 单文件直传大小，默认 `20971520`；后台分片上传固定使用 18MiB 分片和 432MiB 上限 |
-
-`UPLOAD_API_KEY` 已废弃，不再作为上传鉴权来源。上传 API key 需要在后台 `/settings` 创建，并写入 D1 的 `api_keys` 表。
-
-本地 `backend/.dev.vars` 示例：
-
-```dotenv
-TELEGRAM_BOT_TOKEN="123456789:replace-with-your-bot-token"
-TELEGRAM_STORAGE_CHAT_ID="-1001234567890"
-LINK_SIGNING_SECRET="replace-with-a-long-random-link-signing-secret"
-ADMIN_USERNAME="admin"
-ADMIN_PASSWORD="replace-with-a-long-random-admin-password"
-ADMIN_SESSION_SECRET="replace-with-a-long-random-admin-session-secret"
-PUBLIC_BASE_URL="http://localhost:8787"
-MAX_FILE_BYTES="20971520"
-```
-
-## 7. 本地运行
-
-```bash
-pnpm dev
-```
-
-打开：
-
-```text
-http://localhost:8787/admin
-```
-
-首次使用流程：
-
-1. 使用 `backend/.dev.vars` 中的管理员账号登录。
-2. 进入 `/settings`。
-3. 创建上传 API key。
-4. 使用该 key 调用 `POST /api/v1/files`。
-
-上传测试：
-
-```bash
-curl -X POST "http://localhost:8787/api/v1/files" \
-  -H "Authorization: Bearer <API_KEY>" \
-  -F "file=@./README.md"
-```
-
-URL 上传测试：
-
-```bash
-curl -X POST "http://localhost:8787/api/v1/files" \
-  -H "Authorization: Bearer <API_KEY>" \
-  -H "Content-Type: application/json" \
-  -d '{"url":"https://example.com/report.pdf"}'
-```
-
-## 8. 部署
-
-部署前检查：
-
-```bash
-pnpm test
-pnpm typecheck
+cp .env.example .env
 pnpm build
+pnpm start
 ```
 
-应用远程迁移并部署：
+`pnpm start` 默认监听 `http://localhost:8787`。服务启动时会自动执行 `backend/migrations` 里的迁移，并记录到 `schema_migrations` 表。迁移器会跳过常见的“表已存在、列已存在、索引已存在”错误，方便挂载已有 SQLite 数据库文件。
+
+## 使用已有 SQLite 数据
+
+如果你已经有 SQLite 数据库文件，直接挂载到容器的 `SQLITE_DB_PATH` 即可：
 
 ```bash
-pnpm --filter backend exec wrangler d1 migrations apply tgbot-files --remote
-pnpm deploy
+mkdir -p data
+cp /path/to/existing.sqlite data/tgbot-files.sqlite
+docker compose up -d
 ```
 
-部署完成后：
-
-1. 打开 `https://<your-worker-domain>/admin`。
-2. 登录后台。
-3. 在 `/settings` 创建生产上传 API key。
-4. 更新所有调用 `POST /api/v1/files` 的脚本。
-
-注意：当前版本不再读取 `UPLOAD_API_KEY`。部署后到新 key 配置完成前，旧上传脚本会返回 `401 Unauthorized`。
-
-## 9. 自定义域名
-
-1. 在 Cloudflare Dashboard 中进入对应 Worker。
-2. 打开 `Triggers` / `触发器`。
-3. 添加自定义域名，例如 `files.example.com`。
-4. 在 `backend/wrangler.jsonc` 的 `vars.PUBLIC_BASE_URL` 中设置同一个域名。
-5. 重新部署：
+如果你手上是 SQL dump，可以先导入 SQLite 文件：
 
 ```bash
-pnpm deploy
+mkdir -p data
+sqlite3 data/tgbot-files.sqlite < export.sql
+docker compose up -d
 ```
 
-这样上传接口返回的 URL 会固定使用自定义域名。
+## 上传并发
 
-## 10. 鉴权与安全说明
+系统设置页提供“分片并发”配置，默认值是 `5`。保存后会写入 `app_settings` 表，并影响下一次本地文件、URL 和 HLS 上传。
 
-上传接口必须带：
-
-```http
-Authorization: Bearer <API_KEY>
-```
-
-API key 由后台创建，明文保存在 D1。这是当前项目的明确取舍；数据库泄露时 API key 会直接暴露。生产环境应限制后台账号访问，并避免在日志中输出 key 明文。
-
-文件访问链接本身就是授权凭证：
-
-- 链接包含 HMAC 签名 token。
-- D1 保存的是后台索引记录和相对访问路径，不是文件本体。
-- 后台删除只会软删除 D1 记录，不会删除 Telegram 消息，也不会让已生成链接失效。
-- 如需让所有旧链接失效，轮换 `LINK_SIGNING_SECRET` 后重新部署。
-
-管理员登录使用 HttpOnly Cookie，生产环境建议单独设置 `ADMIN_SESSION_SECRET`。
-
-## 11. 文件访问流程
-
-```text
-校验签名 token -> 调用 Telegram getFile -> 代理下载 Telegram 文件内容
-```
-
-文件访问接口默认使用 `Content-Disposition: inline`。如果需要强制下载，可以在链接后追加：
-
-```text
-?download=1
-```
-
-## 12. 常见问题排查
-
-### 上传返回 `401 Unauthorized`
-
-检查请求头格式：
-
-```http
-Authorization: Bearer your-upload-api-key
-```
-
-同时确认后台 `/settings` 中存在该 key，且状态为启用。
-
-### 上传返回 `413 FileTooLarge`
-
-小文件直传超过当前 `MAX_FILE_BYTES` 时会返回该错误。默认直传上限是 `20971520` 字节，即 20MiB。
-
-后台上传页会对更大的本地文件启用 Telegram 分片上传：每片 18MiB，最多 24 片，最大 432MiB。URL 大文件也可分片导入，但远端必须支持 HTTP Range；否则会返回 `RangeNotSupported`。
-
-### 上传返回 `TelegramUploadFailed`
-
-常见原因：
-
-- `TELEGRAM_BOT_TOKEN` 错误。
-- `TELEGRAM_STORAGE_CHAT_ID` 错误。
-- bot 没有被加入目标频道/群。
-- bot 在频道/群中没有发送消息权限。
-
-可以直接测试 Telegram API：
-
-```bash
-curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/sendMessage" \
-  -d "chat_id=<TELEGRAM_STORAGE_CHAT_ID>" \
-  -d "text=hello"
-```
-
-### 后台返回 `Missing required D1 binding: FILES_DB`
-
-检查 `backend/wrangler.jsonc` 是否配置了 `d1_databases`，并确认已经执行过 D1 迁移。
-
-### 后台无法登录
-
-检查 `ADMIN_USERNAME`、`ADMIN_PASSWORD` 是否已经通过 Cloudflare Secret 或 `backend/.dev.vars` 配置。生产环境如果轮换了 `ADMIN_SESSION_SECRET`，旧登录态会立即失效，需要重新登录。
-
-### 访问链接返回 `InvalidFileToken`
-
-说明 token 格式错误或签名校验失败。常见原因：
-
-- URL 被截断或复制不完整。
-- 修改过 `/f/<token>/...` 中的 token 部分。
-- 生产环境轮换过 `LINK_SIGNING_SECRET`。
-
-### 访问链接返回 `TelegramFileLookupFailed`
-
-说明 Worker 能验证链接，但 Telegram `getFile` 失败。常见原因：
-
-- Telegram 文件超过官方 `getFile` 可下载限制。
-- bot token 被轮换或失效。
-- Telegram 侧文件不可用。
+调大这个值能减少浏览器侧排队时间，但 Telegram 上传仍然会经过服务端限速器：同一个 Telegram 渠道一次只持有一个 `sendDocument` 上传槽位，并对 Telegram 429 `retry_after` 做惩罚等待。建议先保持 `5`，如果有多个 Telegram 渠道和足够服务器带宽，再逐步提高。

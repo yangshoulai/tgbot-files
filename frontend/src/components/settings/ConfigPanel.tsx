@@ -8,7 +8,7 @@ interface ConfigPanelProps {
 }
 
 const ITEMS: Array<{ key: keyof SessionResponse["config"]; label: string; hint?: string }> = [
-  { key: "files_db", label: "D1 数据库", hint: "存储文件索引与 API keys" },
+  { key: "database", label: "SQLite 数据库", hint: "存储文件索引与 API keys" },
   { key: "telegram_bot_token", label: "Telegram Bot Token", hint: "调用 Bot API 的鉴权" },
   { key: "telegram_storage_chat_id", label: "Telegram 存储会话", hint: "兼容旧链接的环境变量回退" },
   { key: "telegram_channels", label: "TG 渠道配置", hint: "设置页管理多个 bot-chat 渠道" },
@@ -25,7 +25,7 @@ export function ConfigPanel({ session }: ConfigPanelProps) {
       <header className="flex items-start justify-between gap-3">
         <div>
           <p className="text-xs font-medium uppercase tracking-wide text-muted">运行状态</p>
-          <h2 className="mt-1 text-lg font-semibold text-foreground">Worker 配置</h2>
+          <h2 className="mt-1 text-lg font-semibold text-foreground">服务配置</h2>
         </div>
         <Badge tone="success" icon={<CheckCircle2 size={12} />}>
           在线

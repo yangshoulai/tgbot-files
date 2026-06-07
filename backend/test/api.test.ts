@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import worker, { type Env } from "../src/index";
+import { handleRequest, runScheduledCleanup } from "../src/index";
+import type { AppDatabase, AppEnv, AppPreparedStatement, AppResult, AppResultMeta } from "../src/runtime";
 import { createSignedToken, verifySignedToken } from "../src/crypto";
 import type {
   ApiKeyRecord,
@@ -14,7 +15,7 @@ import type {
 } from "../src/database";
 
 const uploadApiKey = "upload-secret";
-const env: Env = {
+const AppEnv: AppEnv = {
   TELEGRAM_BOT_TOKEN: "123456:test-token",
   TELEGRAM_STORAGE_CHAT_ID: "-1001234567890",
   LINK_SIGNING_SECRET: "link-secret",
@@ -24,7 +25,7 @@ const directAccessMaxChunks = 20;
 const telegramChunkSizeBytes = 10 * 1024 * 1024;
 const maxMultipartFileBytes = 5 * 1024 * 1024 * 1024;
 
-class FakeD1 {
+class FakeDatabase {
   readonly directories: DirectoryRecord[] = [];
   readonly files: FileRecord[] = [];
   readonly apiKeys: ApiKeyRecord[] = [];
@@ -33,13 +34,14 @@ class FakeD1 {
   readonly fileChunks: FileChunkRecord[] = [];
   readonly hlsAssets: HlsAssetRecord[] = [];
   readonly hlsSegments: HlsSegmentRecord[] = [];
+  readonly appSettings = new Map<string, string>();
   batchCalls = 0;
 
-  prepare(sql: string): D1PreparedStatement {
-    return new FakeD1Statement(this, sql) as unknown as D1PreparedStatement;
+  prepare(sql: string): AppPreparedStatement {
+    return new FakeDatabaseStatement(this, sql) as unknown as AppPreparedStatement;
   }
 
-  async batch<T = unknown>(statements: D1PreparedStatement[]): Promise<D1Result<T>[]> {
+  async batch<T = unknown>(statements: AppPreparedStatement[]): Promise<AppResult<T>[]> {
     this.batchCalls += 1;
     const snapshots = {
       directories: this.directories.map((item) => ({ ...item })),
@@ -49,13 +51,14 @@ class FakeD1 {
       multipartUploads: this.multipartUploads.map((item) => ({ ...item })),
       fileChunks: this.fileChunks.map((item) => ({ ...item })),
       hlsAssets: this.hlsAssets.map((item) => ({ ...item })),
-      hlsSegments: this.hlsSegments.map((item) => ({ ...item }))
+      hlsSegments: this.hlsSegments.map((item) => ({ ...item })),
+      appSettings: new Map(this.appSettings)
     };
-    const results: D1Result<T>[] = [];
+    const results: AppResult<T>[] = [];
 
     try {
       for (const statement of statements) {
-        const result = await (statement as unknown as { run: () => Promise<D1Result<T>> }).run();
+        const result = await (statement as unknown as { run: () => Promise<AppResult<T>> }).run();
         results.push(result);
       }
     } catch (error) {
@@ -67,6 +70,8 @@ class FakeD1 {
       this.fileChunks.splice(0, this.fileChunks.length, ...snapshots.fileChunks);
       this.hlsAssets.splice(0, this.hlsAssets.length, ...snapshots.hlsAssets);
       this.hlsSegments.splice(0, this.hlsSegments.length, ...snapshots.hlsSegments);
+      this.appSettings.clear();
+      for (const [key, value] of snapshots.appSettings) this.appSettings.set(key, value);
       throw error;
     }
 
@@ -74,20 +79,20 @@ class FakeD1 {
   }
 }
 
-class FakeD1Statement {
+class FakeDatabaseStatement {
   private bindings: unknown[] = [];
 
   constructor(
-    private readonly db: FakeD1,
+    private readonly db: FakeDatabase,
     private readonly sql: string
   ) {}
 
-  bind(...values: unknown[]): FakeD1Statement {
+  bind(...values: unknown[]): FakeDatabaseStatement {
     this.bindings = values;
     return this;
   }
 
-  async run(): Promise<D1Result> {
+  async run(): Promise<AppResult> {
     const normalizedSql = this.sql.trim().toUpperCase();
     let changes = 0;
 
@@ -372,6 +377,12 @@ class FakeD1Statement {
       const before = this.db.telegramChannels.length;
       this.deleteWhere(this.db.telegramChannels, (channel) => channel.id === id && channel.is_default !== 1);
       changes = before - this.db.telegramChannels.length;
+    }
+
+    if (normalizedSql.startsWith("INSERT INTO APP_SETTINGS")) {
+      const [key, value] = this.bindings;
+      this.db.appSettings.set(String(key), String(value));
+      changes = 1;
     }
 
     if (normalizedSql.startsWith("INSERT INTO API_KEYS")) {
@@ -750,7 +761,7 @@ class FakeD1Statement {
       this.db.multipartUploads.splice(0, this.db.multipartUploads.length, ...remaining);
     }
 
-    return { success: true, meta: { ...fakeD1Meta(), changes }, results: [] };
+    return { success: true, meta: { ...fakeDatabaseMeta(), changes }, results: [] };
   }
 
   async first<T = unknown>(): Promise<T | null> {
@@ -875,6 +886,11 @@ class FakeD1Statement {
       return (channel ?? null) as T | null;
     }
 
+    if (normalizedSql.includes("FROM APP_SETTINGS")) {
+      const value = this.db.appSettings.get(String(this.bindings[0]));
+      return (value === undefined ? null : { value }) as T | null;
+    }
+
     if (normalizedSql.includes("FROM API_KEYS")) {
       const apiKey = this.matchingApiKey(normalizedSql);
       return (apiKey ?? null) as T | null;
@@ -883,7 +899,7 @@ class FakeD1Statement {
     return null;
   }
 
-  async all<T = unknown>(): Promise<D1Result<T>> {
+  async all<T = unknown>(): Promise<AppResult<T>> {
     const normalizedSql = this.sql.trim().toUpperCase();
     if (normalizedSql.includes("FROM TELEGRAM_CHANNELS")) {
       const results = normalizedSql.includes("WHERE STATUS = 'ACTIVE'")
@@ -891,7 +907,7 @@ class FakeD1Statement {
         : this.db.telegramChannels;
       return {
         success: true,
-        meta: fakeD1Meta(),
+        meta: fakeDatabaseMeta(),
         results: results.slice().sort((left, right) => right.is_default - left.is_default || left.created_at.localeCompare(right.created_at)) as T[]
       };
     }
@@ -899,7 +915,7 @@ class FakeD1Statement {
     if (normalizedSql.includes("FROM API_KEYS")) {
       return {
         success: true,
-        meta: fakeD1Meta(),
+        meta: fakeDatabaseMeta(),
         results: this.db.apiKeys.filter((item) => item.deleted_at === null) as T[]
       };
     }
@@ -908,7 +924,7 @@ class FakeD1Statement {
       const fileId = this.bindings[0];
       return {
         success: true,
-        meta: fakeD1Meta(),
+        meta: fakeDatabaseMeta(),
         results: this.db.fileChunks
           .filter((item) => item.file_id === fileId)
           .sort((left, right) => left.chunk_index - right.chunk_index) as T[]
@@ -919,7 +935,7 @@ class FakeD1Statement {
       const assetId = this.bindings[0];
       return {
         success: true,
-        meta: fakeD1Meta(),
+        meta: fakeDatabaseMeta(),
         results: this.db.hlsSegments
           .filter((item) => item.asset_id === assetId)
           .sort((left, right) => left.segment_index - right.segment_index) as T[]
@@ -935,7 +951,7 @@ class FakeD1Statement {
         : this.db.directories.slice().sort((left, right) => left.path.localeCompare(right.path));
       return {
         success: true,
-        meta: fakeD1Meta(),
+        meta: fakeDatabaseMeta(),
         results: directories as T[]
       };
     }
@@ -956,7 +972,7 @@ class FakeD1Statement {
 
       return {
         success: true,
-        meta: fakeD1Meta(),
+        meta: fakeDatabaseMeta(),
         results: Array.from(rows.values()) as T[]
       };
     }
@@ -968,7 +984,7 @@ class FakeD1Statement {
 
     return {
       success: true,
-      meta: fakeD1Meta(),
+      meta: fakeDatabaseMeta(),
       results: hasPagination
         ? files.slice(offset || 0, Number.isFinite(limit) ? (offset || 0) + limit : undefined) as T[]
         : files as T[]
@@ -1201,14 +1217,14 @@ class FakeD1Statement {
   }
 }
 
-function envWithDb(db: FakeD1): Env {
+function envWithDb(db: FakeDatabase): AppEnv {
   return {
-    ...env,
-    FILES_DB: db as unknown as D1Database
+    ...AppEnv,
+    DATABASE: db as unknown as AppDatabase
   };
 }
 
-function addApiKey(db: FakeD1, options?: { key?: string; status?: ApiKeyStatus }): ApiKeyRecord {
+function addApiKey(db: FakeDatabase, options?: { key?: string; status?: ApiKeyStatus }): ApiKeyRecord {
   const apiKey: ApiKeyRecord = {
     id: crypto.randomUUID(),
     name: "primary",
@@ -1327,7 +1343,7 @@ function hlsSegmentRecord(segmentIndex: number, overrides: Partial<HlsSegmentRec
   };
 }
 
-function fakeD1Meta(): D1Meta & Record<string, unknown> {
+function fakeDatabaseMeta(): AppResultMeta & Record<string, unknown> {
   return {
     duration: 0,
     size_after: 0,
@@ -1412,7 +1428,7 @@ describe("worker upload endpoint", () => {
   });
 
   it("rejects missing bearer auth", async () => {
-    const response = await worker.fetch(uploadRequest({ token: null }), envWithDb(new FakeD1()));
+    const response = await handleRequest(uploadRequest({ token: null }), envWithDb(new FakeDatabase()));
     const body = await response.json() as { error: string };
 
     expect(response.status).toBe(401);
@@ -1420,9 +1436,9 @@ describe("worker upload endpoint", () => {
   });
 
   it("rejects invalid bearer auth", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     addApiKey(db);
-    const response = await worker.fetch(uploadRequest({ token: "wrong" }), envWithDb(db));
+    const response = await handleRequest(uploadRequest({ token: "wrong" }), envWithDb(db));
     const body = await response.json() as { error: string };
 
     expect(response.status).toBe(401);
@@ -1430,9 +1446,9 @@ describe("worker upload endpoint", () => {
   });
 
   it("rejects disabled upload API keys", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     addApiKey(db, { status: "disabled" });
-    const response = await worker.fetch(uploadRequest(), envWithDb(db));
+    const response = await handleRequest(uploadRequest(), envWithDb(db));
     const body = await response.json() as { error: string };
 
     expect(response.status).toBe(401);
@@ -1440,9 +1456,9 @@ describe("worker upload endpoint", () => {
   });
 
   it("rejects missing file", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     addApiKey(db);
-    const response = await worker.fetch(uploadRequest({ file: null }), envWithDb(db));
+    const response = await handleRequest(uploadRequest({ file: null }), envWithDb(db));
     const body = await response.json() as { error: string };
 
     expect(response.status).toBe(400);
@@ -1450,9 +1466,9 @@ describe("worker upload endpoint", () => {
   });
 
   it("rejects empty file", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     addApiKey(db);
-    const response = await worker.fetch(
+    const response = await handleRequest(
       uploadRequest({ file: new File([""], "empty.txt", { type: "text/plain" }) }),
       envWithDb(db)
     );
@@ -1463,10 +1479,10 @@ describe("worker upload endpoint", () => {
   });
 
   it("rejects files over configured limit", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     addApiKey(db);
     const smallLimitEnv = { ...envWithDb(db), MAX_FILE_BYTES: "5" };
-    const response = await worker.fetch(
+    const response = await handleRequest(
       uploadRequest({ file: new File(["123456"], "too-large.txt", { type: "text/plain" }) }),
       smallLimitEnv
     );
@@ -1492,7 +1508,7 @@ describe("worker upload endpoint", () => {
   });
 
   it("uploads a file to Telegram and returns a signed public URL", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     const apiKey = addApiKey(db);
     const fetchCalls: string[] = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
@@ -1511,7 +1527,7 @@ describe("worker upload endpoint", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await worker.fetch(uploadRequest(), envWithDb(db));
+    const response = await handleRequest(uploadRequest(), envWithDb(db));
     const body = await response.json() as {
       ok: boolean;
       url: string;
@@ -1534,7 +1550,7 @@ describe("worker upload endpoint", () => {
   });
 
   it("auto-creates missing directory path for upload API requests", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     addApiKey(db);
     vi.stubGlobal(
       "fetch",
@@ -1553,7 +1569,7 @@ describe("worker upload endpoint", () => {
       )
     );
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       uploadRequest({ directoryPath: "/auto/nested" }),
       envWithDb(db)
     );
@@ -1569,7 +1585,7 @@ describe("worker upload endpoint", () => {
   });
 
   it("rejects duplicate file names only within the same upload API directory", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     addApiKey(db);
     db.files.push(fileRecord({
       id: "existing-hello",
@@ -1591,7 +1607,7 @@ describe("worker upload endpoint", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    const conflictResponse = await worker.fetch(
+    const conflictResponse = await handleRequest(
       uploadRequest({ directoryPath: "/docs" }),
       envWithDb(db)
     );
@@ -1610,7 +1626,7 @@ describe("worker upload endpoint", () => {
     });
     expect(fetchMock).not.toHaveBeenCalled();
 
-    const otherDirectoryResponse = await worker.fetch(
+    const otherDirectoryResponse = await handleRequest(
       uploadRequest({ directoryPath: "/archive" }),
       envWithDb(db)
     );
@@ -1624,7 +1640,7 @@ describe("worker upload endpoint", () => {
   });
 
   it("accepts small webp files when Telegram returns them as stickers", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     addApiKey(db);
     const fetchMock = vi.fn(async () =>
       jsonResponse({
@@ -1640,7 +1656,7 @@ describe("worker upload endpoint", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       uploadRequest({ file: new File(["webp"], "tiny.webp", { type: "image/webp" }) }),
       envWithDb(db)
     );
@@ -1661,7 +1677,7 @@ describe("worker upload endpoint", () => {
   });
 
   it("sniffs WebP MIME type from file bytes when upload headers are octet-stream", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     addApiKey(db);
     const webpBytes = new Uint8Array([
       0x52, 0x49, 0x46, 0x46,
@@ -1686,7 +1702,7 @@ describe("worker upload endpoint", () => {
       )
     );
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       uploadRequest({ file: new File([webpBytes], "tiny.webp", { type: "application/octet-stream" }) }),
       envWithDb(db)
     );
@@ -1702,14 +1718,14 @@ describe("worker upload endpoint", () => {
   });
 
   it("surfaces Telegram upload errors", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     addApiKey(db);
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => jsonResponse({ ok: false, description: "chat not found", error_code: 400 }, { status: 400 }))
     );
 
-    const response = await worker.fetch(uploadRequest(), envWithDb(db));
+    const response = await handleRequest(uploadRequest(), envWithDb(db));
     const body = await response.json() as { error: string; message: string };
 
     expect(response.status).toBe(502);
@@ -1724,7 +1740,7 @@ describe("API key multipart endpoints", () => {
   });
 
   it("uploads, inspects, and downloads a small multipart file", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     addApiKey(db);
     const apiEnv = envWithDb(db);
     const telegramFileRanges: Array<string | null> = [];
@@ -1783,7 +1799,7 @@ describe("API key multipart endpoints", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const initResponse = await worker.fetch(
+    const initResponse = await handleRequest(
       new Request("https://files.example.com/api/v1/uploads/init", {
         method: "POST",
         headers: {
@@ -1810,7 +1826,7 @@ describe("API key multipart endpoints", () => {
 
     const chunkForm = new FormData();
     chunkForm.set("chunk", new File(["hello"], "small.txt.part-1", { type: "text/plain" }));
-    const chunkResponse = await worker.fetch(
+    const chunkResponse = await handleRequest(
       new Request(`https://files.example.com/api/v1/uploads/${initBody.upload.id}/chunks/0`, {
         method: "POST",
         headers: { Authorization: `Bearer ${uploadApiKey}` },
@@ -1823,7 +1839,7 @@ describe("API key multipart endpoints", () => {
     expect(chunkResponse.status).toBe(200);
     expect(chunkBody.uploaded_chunks).toBe(1);
 
-    const completeResponse = await worker.fetch(
+    const completeResponse = await handleRequest(
       new Request(`https://files.example.com/api/v1/uploads/${initBody.upload.id}/complete`, {
         method: "POST",
         headers: { Authorization: `Bearer ${uploadApiKey}` }
@@ -1849,7 +1865,7 @@ describe("API key multipart endpoints", () => {
     expect(completeBody.file.url).toMatch(/^https:\/\/files\.example\.com\/f\//);
     expect(completeBody.file.uploaded_by).toBeNull();
 
-    const infoResponse = await worker.fetch(
+    const infoResponse = await handleRequest(
       new Request(`https://files.example.com/api/v1/files/${completeBody.file.id}`, {
         headers: { Authorization: `Bearer ${uploadApiKey}` }
       }),
@@ -1867,7 +1883,7 @@ describe("API key multipart endpoints", () => {
       download_strategy: "direct_or_accelerated"
     });
 
-    const downloadResponse = await worker.fetch(
+    const downloadResponse = await handleRequest(
       new Request(`https://files.example.com/api/v1/files/${completeBody.file.id}/chunks/0`, {
         headers: { Authorization: `Bearer ${uploadApiKey}` }
       }),
@@ -1881,7 +1897,7 @@ describe("API key multipart endpoints", () => {
 
     const publicPathParts = new URL(completeBody.file.url).pathname.split("/");
     const token = publicPathParts[2] ?? "";
-    const rangeResponse = await worker.fetch(
+    const rangeResponse = await handleRequest(
       new Request(`https://files.example.com/f/${token}/chunks/0`, {
         headers: { Range: "bytes=1-3" }
       }),
@@ -1895,7 +1911,7 @@ describe("API key multipart endpoints", () => {
     expect(await rangeResponse.text()).toBe("ell");
     expect(telegramFileRanges).toContain("bytes=1-3");
 
-    const unsatisfiableResponse = await worker.fetch(
+    const unsatisfiableResponse = await handleRequest(
       new Request(`https://files.example.com/f/${token}/chunks/0`, {
         headers: { Range: "bytes=5-6" }
       }),
@@ -1907,7 +1923,7 @@ describe("API key multipart endpoints", () => {
   });
 
   it("stores an optional thumbnail when completing an API multipart upload", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     addApiKey(db);
     const apiEnv = envWithDb(db);
     let sendDocumentCalls = 0;
@@ -1934,7 +1950,7 @@ describe("API key multipart endpoints", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const initResponse = await worker.fetch(
+    const initResponse = await handleRequest(
       new Request("https://files.example.com/api/v1/uploads/init", {
         method: "POST",
         headers: {
@@ -1952,7 +1968,7 @@ describe("API key multipart endpoints", () => {
     const initBody = await initResponse.json() as { upload: { id: string } };
     const chunkForm = new FormData();
     chunkForm.set("chunk", new File(["hello"], "photo.jpg.part-1", { type: "application/octet-stream" }));
-    await worker.fetch(
+    await handleRequest(
       new Request(`https://files.example.com/api/v1/uploads/${initBody.upload.id}/chunks/0`, {
         method: "POST",
         headers: { Authorization: `Bearer ${uploadApiKey}` },
@@ -1965,7 +1981,7 @@ describe("API key multipart endpoints", () => {
     completeForm.set("thumbnail", new File([new Uint8Array([0xff, 0xd8, 0xff, 0xd9])], "thumb.jpg", { type: "image/jpeg" }));
     completeForm.set("thumbnail_width", "320");
     completeForm.set("thumbnail_height", "180");
-    const completeResponse = await worker.fetch(
+    const completeResponse = await handleRequest(
       new Request(`https://files.example.com/api/v1/uploads/${initBody.upload.id}/complete`, {
         method: "POST",
         headers: { Authorization: `Bearer ${uploadApiKey}` },
@@ -2001,7 +2017,7 @@ describe("API key multipart endpoints", () => {
   });
 
   it("imports a small URL through the API key multipart URL flow", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     addApiKey(db);
     const apiEnv = envWithDb(db);
     const sourceUrl = "https://source.example.com/small.txt";
@@ -2080,7 +2096,7 @@ describe("API key multipart endpoints", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const initResponse = await worker.fetch(
+    const initResponse = await handleRequest(
       new Request("https://files.example.com/api/v1/uploads/url/init", {
         method: "POST",
         headers: {
@@ -2103,7 +2119,7 @@ describe("API key multipart endpoints", () => {
     expect(initBody.upload.chunk_count).toBe(1);
     expect(JSON.parse(db.multipartUploads[0]?.source_headers_json || "{}")).toMatchObject(sourceHeaders);
 
-    const chunkResponse = await worker.fetch(
+    const chunkResponse = await handleRequest(
       new Request(`https://files.example.com/api/v1/uploads/${initBody.upload.id}/url-chunks/0`, {
         method: "POST",
         headers: { Authorization: `Bearer ${uploadApiKey}` }
@@ -2112,7 +2128,7 @@ describe("API key multipart endpoints", () => {
     );
     expect(chunkResponse.status).toBe(200);
 
-    const completeResponse = await worker.fetch(
+    const completeResponse = await handleRequest(
       new Request(`https://files.example.com/api/v1/uploads/${initBody.upload.id}/complete`, {
         method: "POST",
         headers: { Authorization: `Bearer ${uploadApiKey}` }
@@ -2157,7 +2173,7 @@ describe("API key multipart endpoints", () => {
   });
 
   it("rejects URL multipart chunks that return a mismatched Content-Range before uploading to Telegram", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     addApiKey(db);
     const apiEnv = envWithDb(db);
     const sourceUrl = "https://source.example.com/small.txt";
@@ -2202,7 +2218,7 @@ describe("API key multipart endpoints", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const initResponse = await worker.fetch(
+    const initResponse = await handleRequest(
       new Request("https://files.example.com/api/v1/uploads/url/init", {
         method: "POST",
         headers: {
@@ -2217,7 +2233,7 @@ describe("API key multipart endpoints", () => {
       upload: { id: string };
     };
 
-    const chunkResponse = await worker.fetch(
+    const chunkResponse = await handleRequest(
       new Request(`https://files.example.com/api/v1/uploads/${initBody.upload.id}/url-chunks/0`, {
         method: "POST",
         headers: { Authorization: `Bearer ${uploadApiKey}` }
@@ -2236,7 +2252,7 @@ describe("API key multipart endpoints", () => {
   });
 
   it("rejects API key chunk downloads for non-multipart files", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     addApiKey(db);
     db.files.push({
       id: "single-file",
@@ -2260,7 +2276,7 @@ describe("API key multipart endpoints", () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/v1/files/single-file/chunks/0", {
         headers: { Authorization: `Bearer ${uploadApiKey}` }
       }),
@@ -2289,7 +2305,7 @@ describe("worker file access endpoint", () => {
         size: 5,
         iat: 1_768_566_400
       },
-      env.LINK_SIGNING_SECRET
+      AppEnv.LINK_SIGNING_SECRET
     );
     const fetchCalls: string[] = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
@@ -2317,7 +2333,7 @@ describe("worker file access endpoint", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await worker.fetch(new Request(`https://files.example.com/f/${token}/hello.txt`), env);
+    const response = await handleRequest(new Request(`https://files.example.com/f/${token}/hello.txt`), AppEnv);
 
     expect(response.status).toBe(200);
     expect(await response.text()).toBe("hello");
@@ -2342,7 +2358,7 @@ describe("worker file access endpoint", () => {
         size: 5,
         iat: 1_768_566_400
       },
-      env.LINK_SIGNING_SECRET
+      AppEnv.LINK_SIGNING_SECRET
     );
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       if (String(input).includes("/getFile?")) {
@@ -2367,10 +2383,10 @@ describe("worker file access endpoint", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const fileUrl = `https://files.example.com/f/${token}/hello.txt`;
-    const firstResponse = await worker.fetch(new Request(fileUrl), env);
+    const firstResponse = await handleRequest(new Request(fileUrl), AppEnv);
     expect(await firstResponse.text()).toBe("hello");
 
-    const secondResponse = await worker.fetch(new Request(fileUrl), env);
+    const secondResponse = await handleRequest(new Request(fileUrl), AppEnv);
     expect(await secondResponse.text()).toBe("hello");
     expect(fetchMock).toHaveBeenCalledTimes(4);
   });
@@ -2385,7 +2401,7 @@ describe("worker file access endpoint", () => {
         size: 5,
         iat: 1_768_566_400
       },
-      env.LINK_SIGNING_SECRET
+      AppEnv.LINK_SIGNING_SECRET
     );
     const fetchCalls: Array<{ input: string; range: string | undefined }> = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -2416,11 +2432,11 @@ describe("worker file access endpoint", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request(`https://files.example.com/f/${token}/hello.txt`, {
         headers: { Range: "bytes=0-1" }
       }),
-      env
+      AppEnv
     );
 
     expect(response.status).toBe(206);
@@ -2440,7 +2456,7 @@ describe("worker file access endpoint", () => {
         size: 5,
         iat: 1_768_566_400
       },
-      env.LINK_SIGNING_SECRET
+      AppEnv.LINK_SIGNING_SECRET
     );
     vi.stubGlobal(
       "fetch",
@@ -2466,13 +2482,13 @@ describe("worker file access endpoint", () => {
       })
     );
 
-    const response = await worker.fetch(new Request(`https://files.example.com/f/${token}/hello.txt?download=1`), env);
+    const response = await handleRequest(new Request(`https://files.example.com/f/${token}/hello.txt?download=1`), AppEnv);
 
     expect(response.headers.get("Content-Disposition")).toContain("attachment");
   });
 
   it("streams range requests across multipart Telegram chunks", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     db.fileChunks.push(
       {
         file_id: "file-multipart",
@@ -2504,7 +2520,7 @@ describe("worker file access endpoint", () => {
         chunk_count: 2,
         iat: 1_768_566_400
       },
-      env.LINK_SIGNING_SECRET
+      AppEnv.LINK_SIGNING_SECRET
     );
     const fetchCalls: Array<{ input: string; range: string | null }> = [];
     vi.stubGlobal(
@@ -2533,7 +2549,7 @@ describe("worker file access endpoint", () => {
       })
     );
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request(`https://files.example.com/f/${token}/letters.txt`, {
         headers: { Range: "bytes=2-4" }
       }),
@@ -2559,12 +2575,12 @@ describe("worker file access endpoint", () => {
         chunk_count: directAccessMaxChunks + 1,
         iat: 1_768_566_400
       },
-      env.LINK_SIGNING_SECRET
+      AppEnv.LINK_SIGNING_SECRET
     );
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await worker.fetch(new Request(`https://files.example.com/f/${token}/large.bin`), env);
+    const response = await handleRequest(new Request(`https://files.example.com/f/${token}/large.bin`), AppEnv);
     const body = await response.json() as {
       error: string;
       details: { chunk_count: number; direct_access_max_chunks: number };
@@ -2578,7 +2594,7 @@ describe("worker file access endpoint", () => {
   });
 
   it("rejects direct HLS package downloads when the part count exceeds the direct-link budget", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     db.hlsAssets.push(hlsAssetRecord({
       segment_count: directAccessMaxChunks + 1,
       duration_seconds: directAccessMaxChunks + 1,
@@ -2602,12 +2618,12 @@ describe("worker file access endpoint", () => {
         size: 123,
         iat: 1_768_566_400
       },
-      env.LINK_SIGNING_SECRET
+      AppEnv.LINK_SIGNING_SECRET
     );
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request(`https://files.example.com/api/hls/${token}/movie.m3u8?download=1`),
       envWithDb(db)
     );
@@ -2624,7 +2640,7 @@ describe("worker file access endpoint", () => {
   });
 
   it("downloads a single HLS multipart segment chunk without fetching sibling chunks", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     db.hlsAssets.push(hlsAssetRecord({
       segment_count: 1,
       estimated_size: 5
@@ -2668,7 +2684,7 @@ describe("worker file access endpoint", () => {
         size: 123,
         iat: 1_768_566_400
       },
-      env.LINK_SIGNING_SECRET
+      AppEnv.LINK_SIGNING_SECRET
     );
     const fetchCalls: Array<{ input: string; range: string | null }> = [];
     vi.stubGlobal(
@@ -2696,7 +2712,7 @@ describe("worker file access endpoint", () => {
       })
     );
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request(`https://files.example.com/api/hls/${token}/segments/0/chunks/1`, {
         headers: { Range: "bytes=0-0" }
       }),
@@ -2724,7 +2740,7 @@ describe("worker file access endpoint", () => {
   });
 
   it("downloads an existing multipart chunk without issuing Telegram range requests", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     db.fileChunks.push(
       {
         file_id: "file-multipart",
@@ -2756,7 +2772,7 @@ describe("worker file access endpoint", () => {
         chunk_count: 2,
         iat: 1_768_566_400
       },
-      env.LINK_SIGNING_SECRET
+      AppEnv.LINK_SIGNING_SECRET
     );
     const fetchCalls: Array<{ input: string; range: string | null }> = [];
     vi.stubGlobal(
@@ -2784,7 +2800,7 @@ describe("worker file access endpoint", () => {
       })
     );
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request(`https://files.example.com/f/${token}/chunks/1`),
       envWithDb(db)
     );
@@ -2810,7 +2826,7 @@ describe("worker file access endpoint", () => {
   });
 
   it("rejects out-of-range multipart chunk downloads before fetching Telegram", async () => {
-    const db = new FakeD1();
+    const db = new FakeDatabase();
     const token = await createSignedToken(
       {
         v: 2,
@@ -2822,12 +2838,12 @@ describe("worker file access endpoint", () => {
         chunk_count: 2,
         iat: 1_768_566_400
       },
-      env.LINK_SIGNING_SECRET
+      AppEnv.LINK_SIGNING_SECRET
     );
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request(`https://files.example.com/f/${token}/chunks/2`),
       envWithDb(db)
     );
@@ -2848,12 +2864,12 @@ describe("worker file access endpoint", () => {
         size: 5,
         iat: 1_768_566_400
       },
-      env.LINK_SIGNING_SECRET
+      AppEnv.LINK_SIGNING_SECRET
     );
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await worker.fetch(new Request(`https://files.example.com/f/${token}/chunks/0`), env);
+    const response = await handleRequest(new Request(`https://files.example.com/f/${token}/chunks/0`), AppEnv);
     const body = await response.json() as { error: string };
 
     expect(response.status).toBe(400);
@@ -2871,11 +2887,11 @@ describe("worker file access endpoint", () => {
         size: 5,
         iat: 1_768_566_400
       },
-      env.LINK_SIGNING_SECRET
+      AppEnv.LINK_SIGNING_SECRET
     );
     const tampered = `${token.slice(0, -1)}${token.endsWith("a") ? "b" : "a"}`;
 
-    const response = await worker.fetch(new Request(`https://files.example.com/f/${tampered}/hello.txt`), env);
+    const response = await handleRequest(new Request(`https://files.example.com/f/${tampered}/hello.txt`), AppEnv);
     const body = await response.json() as { error: string };
 
     expect(response.status).toBe(401);
@@ -2892,14 +2908,14 @@ describe("worker file access endpoint", () => {
         size: 5,
         iat: 1_768_566_400
       },
-      env.LINK_SIGNING_SECRET
+      AppEnv.LINK_SIGNING_SECRET
     );
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => jsonResponse({ ok: false, description: "file is too big", error_code: 400 }, { status: 400 }))
     );
 
-    const response = await worker.fetch(new Request(`https://files.example.com/f/${token}/hello.txt`), env);
+    const response = await handleRequest(new Request(`https://files.example.com/f/${token}/hello.txt`), AppEnv);
     const body = await response.json() as { error: string; message: string };
 
     expect(response.status).toBe(502);
@@ -2914,16 +2930,16 @@ describe("admin file manager", () => {
   });
 
   it("sets an admin session cookie after form login", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
     const form = new URLSearchParams({ username: "admin", password: "secret" });
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/login", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -2939,15 +2955,15 @@ describe("admin file manager", () => {
   });
 
   it("sets a browser session cookie when remember me is disabled", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2961,7 +2977,7 @@ describe("admin file manager", () => {
     expect(cookie).toContain("tgbot_admin=");
     expect(cookie).not.toContain("Max-Age");
 
-    const sessionResponse = await worker.fetch(
+    const sessionResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/session", {
         headers: { Cookie: cookie || "" }
       }),
@@ -2975,10 +2991,10 @@ describe("admin file manager", () => {
   });
 
   it("refreshes an admin session cookie after a valid protected request", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -2989,7 +3005,7 @@ describe("admin file manager", () => {
       const cookie = await loginAndGetCookie(adminEnv);
 
       now.mockReturnValue(Date.parse("2026-01-02T00:00:00.000Z"));
-      const response = await worker.fetch(
+      const response = await handleRequest(
         new Request("https://files.example.com/api/admin/session", {
           headers: { Cookie: cookie }
         }),
@@ -3007,16 +3023,16 @@ describe("admin file manager", () => {
   });
 
   it("expires the admin session cookie on manual logout", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/logout", {
         method: "POST",
         headers: { Cookie: cookie }
@@ -3029,7 +3045,7 @@ describe("admin file manager", () => {
     expect(expiredCookie).toContain("tgbot_admin=");
     expect(expiredCookie).toContain("Max-Age=0");
 
-    const sessionResponse = await worker.fetch(
+    const sessionResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/session", {
         headers: { Cookie: expiredCookie || "" }
       }),
@@ -3038,17 +3054,67 @@ describe("admin file manager", () => {
     expect(sessionResponse.status).toBe(401);
   });
 
-  it("creates, lists, reveals, disables, and deletes upload API keys", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+  it("updates upload concurrency settings", async () => {
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const createResponse = await worker.fetch(
+    const initialSession = await handleRequest(
+      new Request("https://files.example.com/api/admin/session", {
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const initialBody = await initialSession.json() as { upload_concurrency: number; upload_concurrency_min: number; upload_concurrency_max: number };
+
+    expect(initialSession.status).toBe(200);
+    expect(initialBody.upload_concurrency).toBe(5);
+    expect(initialBody.upload_concurrency_min).toBe(1);
+    expect(initialBody.upload_concurrency_max).toBe(32);
+
+    const updateResponse = await handleRequest(
+      new Request("https://files.example.com/api/admin/settings", {
+        method: "PATCH",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ upload_concurrency: 99 })
+      }),
+      adminEnv
+    );
+    const updateBody = await updateResponse.json() as { settings: { upload_concurrency: number } };
+
+    expect(updateResponse.status).toBe(200);
+    expect(updateBody.settings.upload_concurrency).toBe(32);
+
+    const sessionResponse = await handleRequest(
+      new Request("https://files.example.com/api/admin/session", {
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const sessionBody = await sessionResponse.json() as { upload_concurrency: number };
+
+    expect(sessionResponse.status).toBe(200);
+    expect(sessionBody.upload_concurrency).toBe(32);
+  });
+  it("creates, lists, reveals, disables, and deletes upload API keys", async () => {
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const createResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/api-keys", {
         method: "POST",
         headers: {
@@ -3068,7 +3134,7 @@ describe("admin file manager", () => {
     expect(createBody.api_key.key).toMatch(/^tgf_/);
     expect(createBody.api_key.masked_key).toContain("••••");
 
-    const listResponse = await worker.fetch(
+    const listResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/api-keys", {
         headers: { Cookie: cookie }
       }),
@@ -3080,7 +3146,7 @@ describe("admin file manager", () => {
     expect(listBody.api_keys).toHaveLength(1);
     expect(listBody.api_keys[0]?.key).toBeUndefined();
 
-    const detailResponse = await worker.fetch(
+    const detailResponse = await handleRequest(
       new Request(`https://files.example.com/api/admin/api-keys/${createBody.api_key.id}`, {
         headers: { Cookie: cookie }
       }),
@@ -3089,7 +3155,7 @@ describe("admin file manager", () => {
     const detailBody = await detailResponse.json() as { api_key: { key: string } };
     expect(detailBody.api_key.key).toBe(createBody.api_key.key);
 
-    const patchResponse = await worker.fetch(
+    const patchResponse = await handleRequest(
       new Request(`https://files.example.com/api/admin/api-keys/${createBody.api_key.id}`, {
         method: "PATCH",
         headers: {
@@ -3103,7 +3169,7 @@ describe("admin file manager", () => {
     const patchBody = await patchResponse.json() as { api_key: { status: string } };
     expect(patchBody.api_key.status).toBe("disabled");
 
-    const deleteResponse = await worker.fetch(
+    const deleteResponse = await handleRequest(
       new Request(`https://files.example.com/api/admin/api-keys/${createBody.api_key.id}`, {
         method: "DELETE",
         headers: { Cookie: cookie }
@@ -3115,12 +3181,12 @@ describe("admin file manager", () => {
     expect(db.apiKeys[0]?.deleted_at).not.toBeNull();
   });
 
-  it("uploads from admin UI and writes D1 metadata with a path-only file URL", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
+  it("uploads from admin UI and writes database metadata with a path-only file URL", async () => {
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
       PUBLIC_BASE_URL: "https://cdn.example.com",
-      FILES_DB: db as unknown as D1Database,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -3146,7 +3212,7 @@ describe("admin file manager", () => {
       token: null,
       remark: "季度报告归档"
     });
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/files", {
         method: "POST",
         headers: { Cookie: cookie },
@@ -3172,11 +3238,11 @@ describe("admin file manager", () => {
   });
 
   it("uploads from admin UI by source URL and infers remote file type", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
       PUBLIC_BASE_URL: "https://cdn.example.com",
-      FILES_DB: db as unknown as D1Database,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -3213,7 +3279,7 @@ describe("admin file manager", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/files", {
         method: "POST",
         headers: {
@@ -3245,11 +3311,11 @@ describe("admin file manager", () => {
   });
 
   it("rejects duplicate URL upload names and accepts an explicit replacement file name", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
       PUBLIC_BASE_URL: "https://cdn.example.com",
-      FILES_DB: db as unknown as D1Database,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -3291,7 +3357,7 @@ describe("admin file manager", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const conflictResponse = await worker.fetch(
+    const conflictResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/files", {
         method: "POST",
         headers: {
@@ -3320,7 +3386,7 @@ describe("admin file manager", () => {
     });
     expect(db.files).toHaveLength(1);
 
-    const renamedResponse = await worker.fetch(
+    const renamedResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/files", {
         method: "POST",
         headers: {
@@ -3349,11 +3415,11 @@ describe("admin file manager", () => {
   });
 
   it("overwrites an existing admin URL upload when requested", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
       PUBLIC_BASE_URL: "https://cdn.example.com",
-      FILES_DB: db as unknown as D1Database,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -3403,7 +3469,7 @@ describe("admin file manager", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/files", {
         method: "POST",
         headers: {
@@ -3436,10 +3502,10 @@ describe("admin file manager", () => {
   });
 
   it("initializes a range-based URL multipart upload", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -3473,7 +3539,7 @@ describe("admin file manager", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/uploads/url/init", {
         method: "POST",
         headers: {
@@ -3499,10 +3565,10 @@ describe("admin file manager", () => {
   });
 
   it("returns a thumbnail source for URL video uploads up to 5 GiB", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -3535,7 +3601,7 @@ describe("admin file manager", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/uploads/url/init", {
         method: "POST",
         headers: {
@@ -3575,10 +3641,10 @@ describe("admin file manager", () => {
   });
 
   it("can force a small admin URL upload into multipart mode", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -3610,7 +3676,7 @@ describe("admin file manager", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/uploads/url/init", {
         method: "POST",
         headers: {
@@ -3634,15 +3700,15 @@ describe("admin file manager", () => {
   });
 
   it("auto-creates missing directory path for multipart upload sessions", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
     const cookie = await loginAndGetCookie(adminEnv);
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/uploads/init", {
         method: "POST",
         headers: {
@@ -3668,10 +3734,10 @@ describe("admin file manager", () => {
   });
 
   it("preflights folder uploads and reports existing and queued file name conflicts", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -3682,7 +3748,7 @@ describe("admin file manager", () => {
     }));
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/uploads/preflight", {
         method: "POST",
         headers: {
@@ -3760,10 +3826,10 @@ describe("admin file manager", () => {
   });
 
   it("preflights every existing file conflict in a repeated folder upload", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -3774,7 +3840,7 @@ describe("admin file manager", () => {
     );
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/uploads/preflight", {
         method: "POST",
         headers: {
@@ -3806,10 +3872,10 @@ describe("admin file manager", () => {
   });
 
   it("rejects multipart upload sessions that reuse an active file name", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -3820,7 +3886,7 @@ describe("admin file manager", () => {
     }));
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/uploads/init", {
         method: "POST",
         headers: {
@@ -3853,10 +3919,10 @@ describe("admin file manager", () => {
   });
 
   it("allows restarting a multipart upload when an incomplete session has the same file name", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -3878,7 +3944,7 @@ describe("admin file manager", () => {
     });
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/uploads/init", {
         method: "POST",
         headers: {
@@ -3910,10 +3976,10 @@ describe("admin file manager", () => {
   });
 
   it("reports uploaded and missing chunks for an incomplete admin multipart upload", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -3956,7 +4022,7 @@ describe("admin file manager", () => {
     );
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request(`https://files.example.com/api/admin/uploads/${upload.id}/status`, {
         headers: { Cookie: cookie }
       }),
@@ -3983,10 +4049,10 @@ describe("admin file manager", () => {
   });
 
   it("decrypts AES-128 HLS segments before storing them in Telegram", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -4101,7 +4167,7 @@ seg-0.ts
     );
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/uploads/hls/hls-encrypted/segments/0/import", {
         method: "POST",
         headers: { Cookie: cookie }
@@ -4154,10 +4220,10 @@ seg-0.ts
   });
 
   it("imports fMP4 init and byte-range segments, then exposes playable and downloadable URLs", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -4290,7 +4356,7 @@ video.mp4
     );
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const importResponse = await worker.fetch(
+    const importResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/uploads/hls/hls-fmp4/segments/0/import", {
         method: "POST",
         headers: { Cookie: cookie }
@@ -4316,7 +4382,7 @@ video.mp4
       telegram_file_id: "tg-fmp4-segment-0"
     });
 
-    const previewResponse = await worker.fetch(
+    const previewResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/uploads/hls/hls-fmp4/preview.m3u8", {
         headers: { Cookie: cookie }
       }),
@@ -4328,7 +4394,7 @@ video.mp4
     expect(previewPlaylist).not.toContain("#EXT-X-BYTERANGE");
     expect(previewPlaylist).toContain("/preview-segments/0");
 
-    const completeResponse = await worker.fetch(
+    const completeResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/uploads/hls/hls-fmp4/complete", {
         method: "POST",
         headers: { Cookie: cookie }
@@ -4346,14 +4412,14 @@ video.mp4
       storage_backend: "hls_package"
     });
 
-    const publicPlaylistResponse = await worker.fetch(new Request(completeBody.file.url), adminEnv);
+    const publicPlaylistResponse = await handleRequest(new Request(completeBody.file.url), adminEnv);
     const publicPlaylist = await publicPlaylistResponse.text();
     expect(publicPlaylistResponse.status).toBe(200);
     expect(publicPlaylist).toMatch(/#EXT-X-MAP:URI="https:\/\/files\.example\.com\/api\/hls\/[^/]+\/init\/video\.mp4"/);
     expect(publicPlaylist).not.toContain("#EXT-X-BYTERANGE");
     expect(publicPlaylist).toMatch(/https:\/\/files\.example\.com\/api\/hls\/[^/]+\/segments\/0\/video\.mp4/);
 
-    const downloadPlanResponse = await worker.fetch(
+    const downloadPlanResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/files/hls-fmp4/hls-download", {
         headers: { Cookie: cookie }
       }),
@@ -4387,7 +4453,7 @@ video.mp4
     ]);
     expect(new URL(downloadPlanBody.hls_download.parts[0]?.url || "").pathname).toMatch(/^\/api\/hls\/[^/]+\/init\/video\.mp4$/);
 
-    const directDownloadResponse = await worker.fetch(new Request(`${completeBody.file.url}?download=1`), adminEnv);
+    const directDownloadResponse = await handleRequest(new Request(`${completeBody.file.url}?download=1`), adminEnv);
     expect(directDownloadResponse.status).toBe(200);
     expect(directDownloadResponse.headers.get("Content-Type")).toBe("video/mp4");
     expect(directDownloadResponse.headers.get("Content-Disposition")).toContain("movie.mp4");
@@ -4395,10 +4461,10 @@ video.mp4
   });
 
   it("uses stored source headers for HLS multipart segment chunk imports", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -4509,7 +4575,7 @@ video.mp4
     );
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const initResponse = await worker.fetch(
+    const initResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/uploads/hls/hls-large/segments/0/import", {
         method: "POST",
         headers: { Cookie: cookie }
@@ -4529,7 +4595,7 @@ video.mp4
     expect(initBody.missing_chunks).toEqual([0, 1]);
     expect(JSON.parse(db.multipartUploads[0]?.source_headers_json || "{}")).toMatchObject(sourceHeaders);
 
-    const chunkResponse = await worker.fetch(
+    const chunkResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/uploads/hls/hls-large/segments/0/chunks/1/import", {
         method: "POST",
         headers: { Cookie: cookie }
@@ -4567,11 +4633,11 @@ video.mp4
   });
 
   it("completes oversized-direct multipart uploads without returning a full file link", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
       PUBLIC_BASE_URL: "https://cdn.example.com",
-      FILES_DB: db as unknown as D1Database,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -4606,7 +4672,7 @@ video.mp4
       });
     }
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request(`https://files.example.com/api/admin/uploads/${upload.id}/complete`, {
         method: "POST",
         headers: { Cookie: cookie }
@@ -4641,10 +4707,10 @@ video.mp4
   });
 
   it("rejects multipart completion if the target file name was claimed during upload", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -4691,7 +4757,7 @@ video.mp4
     );
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/uploads/upload-race/complete", {
         method: "POST",
         headers: { Cookie: cookie }
@@ -4716,10 +4782,10 @@ video.mp4
   });
 
   it("overwrites a file claimed during multipart upload when requested", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -4767,7 +4833,7 @@ video.mp4
     );
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/uploads/upload-race/complete", {
         method: "POST",
         headers: {
@@ -4799,10 +4865,10 @@ video.mp4
   });
 
   it("cleans stale incomplete multipart uploads on the scheduled trigger", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       STALE_MULTIPART_UPLOAD_TTL_HOURS: "24"
     };
     const uploads: MultipartUploadRecord[] = [
@@ -4903,21 +4969,7 @@ video.mp4
       });
     }
 
-    const waitUntilPromises: Promise<unknown>[] = [];
-    await worker.scheduled(
-      {
-        cron: "0 */6 * * *",
-        scheduledTime: Date.parse("2026-06-02T00:00:00.000Z")
-      } as ScheduledController,
-      adminEnv,
-      {
-        waitUntil(promise: Promise<unknown>) {
-          waitUntilPromises.push(Promise.resolve(promise));
-        },
-        passThroughOnException() {}
-      } as ExecutionContext
-    );
-    await Promise.all(waitUntilPromises);
+    await runScheduledCleanup(adminEnv, Date.parse("2026-06-02T00:00:00.000Z"), "0 */6 * * *");
 
     expect(db.batchCalls).toBe(2);
     expect(db.multipartUploads.map((item) => item.id)).toEqual([
@@ -4933,16 +4985,16 @@ video.mp4
   });
 
   it("rejects multipart upload sessions over the limit with human-readable sizes", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
     const cookie = await loginAndGetCookie(adminEnv);
     const actualFileBytes = maxMultipartFileBytes + 1;
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/uploads/init", {
         method: "POST",
         headers: {
@@ -4981,10 +5033,10 @@ video.mp4
   });
 
   it("rejects oversized URL multipart sources with compact human-readable sizes", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -5005,7 +5057,7 @@ video.mp4
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/uploads/url/init", {
         method: "POST",
         headers: {
@@ -5039,10 +5091,10 @@ video.mp4
   });
 
   it("uploads an existing signed file URL without fetching the public source URL", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -5063,7 +5115,7 @@ video.mp4
         size: mp4Bytes.byteLength,
         iat: 1_768_566_400
       },
-      env.LINK_SIGNING_SECRET
+      AppEnv.LINK_SIGNING_SECRET
     );
     const sourceUrl = `https://files.example.com/f/${token}/movie.mp4`;
     const fetchCalls: string[] = [];
@@ -5105,7 +5157,7 @@ video.mp4
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/files", {
         method: "POST",
         headers: {
@@ -5135,10 +5187,10 @@ video.mp4
   });
 
   it("rejects unsupported source URL protocols before fetching", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -5146,7 +5198,7 @@ video.mp4
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/files", {
         method: "POST",
         headers: {
@@ -5164,12 +5216,12 @@ video.mp4
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("lists and hard-deletes D1 file records", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
+  it("lists and hard-deletes database file records", async () => {
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
       PUBLIC_BASE_URL: "https://cdn.example.com",
-      FILES_DB: db as unknown as D1Database,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -5214,7 +5266,7 @@ video.mp4
     });
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const listResponse = await worker.fetch(
+    const listResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/files?q=季度", {
         headers: { Cookie: cookie }
       }),
@@ -5228,7 +5280,7 @@ video.mp4
     expect(listBody.files[0]?.url).toBe("https://cdn.example.com/f/token/report.pdf");
     expect(listBody.files[0]?.remark).toBe("季度归档资料");
 
-    const deleteResponse = await worker.fetch(
+    const deleteResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/files/file-1", {
         method: "DELETE",
         headers: { Cookie: cookie }
@@ -5241,7 +5293,7 @@ video.mp4
     expect(db.fileChunks).toHaveLength(0);
     expect(db.multipartUploads).toHaveLength(0);
 
-    const afterDeleteResponse = await worker.fetch(
+    const afterDeleteResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/files", {
         headers: { Cookie: cookie }
       }),
@@ -5252,11 +5304,11 @@ video.mp4
   });
 
   it("keeps the HLS playback link but omits the direct download link when HLS parts exceed the direct-link budget", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
       PUBLIC_BASE_URL: "https://cdn.example.com",
-      FILES_DB: db as unknown as D1Database,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -5288,7 +5340,7 @@ video.mp4
     );
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/files", {
         headers: { Cookie: cookie }
       }),
@@ -5330,10 +5382,10 @@ video.mp4
   });
 
   it("returns an HLS accelerated download plan with contiguous part offsets", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -5370,7 +5422,7 @@ video.mp4
     );
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/files/file-hls/hls-download", {
         headers: { Cookie: cookie }
       }),
@@ -5422,11 +5474,11 @@ video.mp4
     expect(new URL(body.hls_download.parts[2]?.url || "").pathname).toMatch(/^\/api\/hls\/[^/]+\/segments\/1\/chunks\/1$/);
   });
 
-  it("filters D1 file records by filename, remark, type and upload time", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+  it("filters database file records by filename, remark, type and upload time", async () => {
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -5504,7 +5556,7 @@ video.mp4
     );
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const remarkResponse = await worker.fetch(
+    const remarkResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/files?q=季度", {
         headers: { Cookie: cookie }
       }),
@@ -5514,7 +5566,7 @@ video.mp4
     expect(remarkBody.pagination.total).toBe(1);
     expect(remarkBody.files[0]?.id).toBe("file-pdf");
 
-    const imageResponse = await worker.fetch(
+    const imageResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/files?type=image", {
         headers: { Cookie: cookie }
       }),
@@ -5524,7 +5576,7 @@ video.mp4
     expect(imageBody.pagination.total).toBe(1);
     expect(imageBody.files[0]?.id).toBe("file-image");
 
-    const videoResponse = await worker.fetch(
+    const videoResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/files?type=video", {
         headers: { Cookie: cookie }
       }),
@@ -5534,7 +5586,7 @@ video.mp4
     expect(videoBody.pagination.total).toBe(1);
     expect(videoBody.files[0]?.id).toBe("file-video");
 
-    const limitedResponse = await worker.fetch(
+    const limitedResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/files?limit=2", {
         headers: { Cookie: cookie }
       }),
@@ -5544,7 +5596,7 @@ video.mp4
     expect(limitedBody.pagination.total).toBe(5);
     expect(limitedBody.files).toHaveLength(2);
 
-    const allResponse = await worker.fetch(
+    const allResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/files?all=1&limit=2", {
         headers: { Cookie: cookie }
       }),
@@ -5555,7 +5607,7 @@ video.mp4
     expect(allBody.pagination.total_pages).toBe(1);
     expect(allBody.files).toHaveLength(5);
 
-    const dateResponse = await worker.fetch(
+    const dateResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/files?created_from=2026-05-28T00%3A00%3A00.000Z&type=text", {
         headers: { Cookie: cookie }
       }),
@@ -5567,11 +5619,11 @@ video.mp4
   });
 
   it("updates file name and remark, and regenerates the admin file link only when renamed", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
       PUBLIC_BASE_URL: "https://cdn.example.com",
-      FILES_DB: db as unknown as D1Database,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -5593,7 +5645,7 @@ video.mp4
     });
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const remarkResponse = await worker.fetch(
+    const remarkResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/files/file-edit", {
         method: "PATCH",
         headers: {
@@ -5615,7 +5667,7 @@ video.mp4
       url: "https://cdn.example.com/f/old-token/old.txt"
     });
 
-    const renameResponse = await worker.fetch(
+    const renameResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/files/file-edit", {
         method: "PATCH",
         headers: {
@@ -5630,7 +5682,7 @@ video.mp4
       file: { file_name: string; remark: string | null; file_path: string; url: string; download_url: string };
     };
     const token = renameBody.file.file_path.split("/")[2] || "";
-    const payload = await verifySignedToken(token, env.LINK_SIGNING_SECRET);
+    const payload = await verifySignedToken(token, AppEnv.LINK_SIGNING_SECRET);
 
     expect(renameResponse.status).toBe(200);
     expect(renameBody.file.file_name).toBe("new name.txt");
@@ -5655,10 +5707,10 @@ video.mp4
   });
 
   it("rejects moving a file into a directory that already has the same file name", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -5685,7 +5737,7 @@ video.mp4
     );
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/files/move", {
         method: "PATCH",
         headers: {
@@ -5716,10 +5768,10 @@ video.mp4
   });
 
   it("creates virtual directories, moves files, searches current directory, and recursively hard-deletes directories", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -5759,7 +5811,7 @@ video.mp4
     );
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const createResponse = await worker.fetch(
+    const createResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/directories", {
         method: "POST",
         headers: {
@@ -5783,7 +5835,7 @@ video.mp4
     expect(createResponse.status).toBe(201);
     expect(createBody.directory.path).toBe("/photos");
 
-    const rootListResponse = await worker.fetch(
+    const rootListResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/files?dir=/", {
         headers: { Cookie: cookie }
       }),
@@ -5807,7 +5859,7 @@ video.mp4
       total_size: 15
     });
 
-    const rootSearchResponse = await worker.fetch(
+    const rootSearchResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/files?dir=/&q=%E6%97%85%E8%A1%8C", {
         headers: { Cookie: cookie }
       }),
@@ -5820,7 +5872,7 @@ video.mp4
     expect(rootSearchBody.pagination.total).toBe(0);
     expect(rootSearchBody.files).toHaveLength(0);
 
-    const childSearchResponse = await worker.fetch(
+    const childSearchResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/files?dir=/photos/2026&q=%E6%97%85%E8%A1%8C", {
         headers: { Cookie: cookie }
       }),
@@ -5833,7 +5885,7 @@ video.mp4
     expect(childSearchBody.pagination.total).toBe(1);
     expect(childSearchBody.files[0]).toMatchObject({ id: "file-trip", directory_path: "/photos/2026" });
 
-    const moveResponse = await worker.fetch(
+    const moveResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/files/move", {
         method: "PATCH",
         headers: {
@@ -5848,7 +5900,7 @@ video.mp4
     expect(moveBody).toMatchObject({ moved: 1, directory_path: "/photos" });
     expect(db.files.find((item) => item.id === "file-root")?.directory_path).toBe("/photos");
 
-    const deleteResponse = await worker.fetch(
+    const deleteResponse = await handleRequest(
       new Request(`https://files.example.com/api/admin/directories/${createBody.directory.id}`, {
         method: "DELETE",
         headers: { Cookie: cookie }
@@ -5863,10 +5915,10 @@ video.mp4
   });
 
   it("deletes directory trees without touching case-different sibling paths", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -5992,7 +6044,7 @@ video.mp4
     );
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/directories/dir-upper", {
         method: "DELETE",
         headers: { Cookie: cookie }
@@ -6019,10 +6071,10 @@ video.mp4
   });
 
   it("moves a directory tree to another parent directory", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -6088,7 +6140,7 @@ video.mp4
     );
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const response = await worker.fetch(
+    const response = await handleRequest(
       new Request("https://files.example.com/api/admin/directories/dir-photos/move", {
         method: "PATCH",
         headers: {
@@ -6121,7 +6173,7 @@ video.mp4
     expect(db.files.find((item) => item.id === "file-root-photo")?.directory_path).toBe("/archive/photos");
     expect(db.files.find((item) => item.id === "file-child-photo")?.directory_path).toBe("/archive/photos/2026");
 
-    const invalidResponse = await worker.fetch(
+    const invalidResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/directories/dir-photos/move", {
         method: "PATCH",
         headers: {
@@ -6136,7 +6188,7 @@ video.mp4
     expect(invalidResponse.status).toBe(400);
     expect(invalidBody.error).toBe("InvalidDirectoryMove");
 
-    const renameResponse = await worker.fetch(
+    const renameResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/directories/dir-photos", {
         method: "PATCH",
         headers: {
@@ -6170,10 +6222,10 @@ video.mp4
   });
 
   it("moves and deletes selected files and directories together", async () => {
-    const db = new FakeD1();
-    const adminEnv: Env = {
-      ...env,
-      FILES_DB: db as unknown as D1Database,
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
       ADMIN_USERNAME: "admin",
       ADMIN_PASSWORD: "secret"
     };
@@ -6239,7 +6291,7 @@ video.mp4
     );
     const cookie = await loginAndGetCookie(adminEnv);
 
-    const moveResponse = await worker.fetch(
+    const moveResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/entries/move", {
         method: "PATCH",
         headers: {
@@ -6273,7 +6325,7 @@ video.mp4
     expect(db.files.find((item) => item.id === "file-root")?.directory_path).toBe("/archive");
     expect(db.files.find((item) => item.id === "file-draft")?.directory_path).toBe("/archive/docs/drafts");
 
-    const deleteResponse = await worker.fetch(
+    const deleteResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/entries/delete", {
         method: "POST",
         headers: {
@@ -6306,8 +6358,8 @@ video.mp4
 
 });
 
-async function loginAndGetCookie(envWithAdmin: Env): Promise<string> {
-  const response = await worker.fetch(
+async function loginAndGetCookie(envWithAdmin: AppEnv): Promise<string> {
+  const response = await handleRequest(
     new Request("https://files.example.com/api/admin/login", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },

@@ -59,12 +59,17 @@ import {
   softDeleteApiKeyRecord,
   deleteDirectoryTree,
   deleteFileRecord,
+  DEFAULT_UPLOAD_CONCURRENCY,
   touchApiKeyRecord,
   updateApiKeyRecord,
   updateFileRecordMetadata,
   updateTelegramChannelRecord,
   upsertFileChunkRecord,
   deleteTelegramChannelRecord,
+  getUploadConcurrencySetting,
+  setUploadConcurrencySetting,
+  MIN_UPLOAD_CONCURRENCY,
+  MAX_UPLOAD_CONCURRENCY,
   type ApiKeyRecord,
   type ApiKeyStatus,
   type DirectoryRecord,
@@ -110,22 +115,9 @@ import {
 } from "./hls";
 import { extensionForMimeType, mimeTypeForFileName, resolveStoredMimeType } from "./mime";
 import { fetchTelegramFile, getTelegramFileUrl, uploadDocumentToTelegram } from "./telegram";
+import type { AppDatabase, AppEnv } from "./runtime";
 
-export interface Env {
-  ASSETS?: Fetcher;
-  TELEGRAM_BOT_TOKEN: string;
-  TELEGRAM_STORAGE_CHAT_ID: string;
-  LINK_SIGNING_SECRET: string;
-  FILES_DB?: D1Database;
-  ADMIN_USERNAME?: string;
-  ADMIN_PASSWORD?: string;
-  ADMIN_SESSION_SECRET?: string;
-  PUBLIC_BASE_URL?: string;
-  MAX_FILE_BYTES?: string;
-  STALE_MULTIPART_UPLOAD_TTL_HOURS?: string;
-  TG_CHANNEL_SECRET?: string;
-  TELEGRAM_RATE_LIMITER?: DurableObjectNamespace;
-}
+
 
 interface UploadResult {
   id: string;
@@ -227,12 +219,6 @@ const DIRECT_MULTIPART_ACCESS_MAX_CHUNKS = 20;
 const DIRECT_MULTIPART_ACCESS_MAX_BYTES = TELEGRAM_CHUNK_SIZE_BYTES * DIRECT_MULTIPART_ACCESS_MAX_CHUNKS;
 const MAX_TELEGRAM_MULTIPART_BYTES = 5 * 1024 * 1024 * 1024;
 const MAX_TELEGRAM_MULTIPART_CHUNKS = Math.ceil(MAX_TELEGRAM_MULTIPART_BYTES / TELEGRAM_CHUNK_SIZE_BYTES);
-const TELEGRAM_RATE_LIMITER_OBJECT_NAME = "telegram-api-global";
-// Token bucket for sendDocument: capacity 1, refill every 1s. The upload lock below
-// still ensures only one Telegram file upload is in flight at a time.
-const TELEGRAM_SEND_DOCUMENT_RATE_LIMIT_MS = 1_000;
-const TELEGRAM_SEND_DOCUMENT_LOCK_LEASE_MS = 2 * 60 * 1000;
-const TELEGRAM_GET_FILE_RATE_LIMIT_MS = 100;
 const DEFAULT_STALE_MULTIPART_UPLOAD_TTL_HOURS = 24;
 const MIN_STALE_MULTIPART_UPLOAD_TTL_HOURS = 1;
 const MAX_STALE_MULTIPART_UPLOAD_TTL_HOURS = 24 * 30;
@@ -285,213 +271,25 @@ interface TelegramChannelFormInput {
   status: TelegramChannelStatus;
 }
 
-export class TelegramRateLimiter {
-  private queue: Promise<void> = Promise.resolve();
-
-  constructor(private readonly state: DurableObjectState) {}
-
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-
-    if (
-      request.method !== "POST" ||
-      (url.pathname !== "/acquire" && url.pathname !== "/release" && url.pathname !== "/penalize")
-    ) {
-      return new Response("Not found", { status: 404 });
+export async function handleRequest(request: Request, env: AppEnv): Promise<Response> {
+  try {
+    return await routeRequest(request, env);
+  } catch (error) {
+    if (error instanceof AppError) {
+      return errorResponse(error);
     }
 
-    const body = await readRateLimitRequestBody(request);
-    const scope = normalizeTelegramRateLimitScope(body.scope);
-
-    if (!scope) {
-      return new Response(JSON.stringify({ ok: false, error: "InvalidScope" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json; charset=utf-8" }
-      });
+    if (error instanceof TokenError) {
+      return errorResponse(new AppError(401, "InvalidFileToken", "Invalid or tampered file token"));
     }
 
-    if (url.pathname === "/penalize") {
-      const retryAfterMs = normalizeRetryAfterMs(body.retry_after_ms);
-      const channelId = normalizeTelegramRateLimitChannelId(body.channel_id);
-      await this.enqueue(() => this.penalize(scope, channelId, retryAfterMs));
-      return new Response(JSON.stringify({ ok: true }), {
-        headers: { "Content-Type": "application/json; charset=utf-8" }
-      });
-    }
-
-    if (url.pathname === "/release") {
-      const token = typeof body.token === "string" ? body.token : "";
-      const channelId = normalizeTelegramRateLimitChannelId(body.channel_id);
-      await this.enqueue(() => this.release(scope, channelId, token));
-      return new Response(JSON.stringify({ ok: true }), {
-        headers: { "Content-Type": "application/json; charset=utf-8" }
-      });
-    }
-
-    const channelIds = normalizeTelegramRateLimitChannelIds(body.channel_ids, body.channel_id);
-    const preferredChannelId = normalizeOptionalTelegramRateLimitChannelId(body.preferred_channel_id);
-    const result = scope === "sendDocument"
-      ? await this.acquireSendDocument(channelIds, preferredChannelId)
-      : await this.enqueue(() => this.reserve(scope, channelIds[0] ?? "default"));
-
-    if (!result.token && result.waitMs > 0) {
-      await delayMs(result.waitMs);
-    }
-
-    return new Response(JSON.stringify({
-      ok: true,
-      wait_ms: result.waitMs,
-      token: result.token,
-      channel_id: result.channelId
-    }), {
-      headers: { "Content-Type": "application/json; charset=utf-8" }
-    });
-  }
-
-  private enqueue<T>(task: () => Promise<T>): Promise<T> {
-    const next = this.queue.then(task, task);
-    this.queue = next.then(() => undefined, () => undefined);
-    return next;
-  }
-
-  private async acquireSendDocument(
-    channelIds: string[],
-    preferredChannelId?: string
-  ): Promise<{ waitMs: number; token: string; channelId: string }> {
-    let totalWaitMs = 0;
-
-    while (true) {
-      const result = await this.enqueue(() => this.tryAcquireSendDocument(channelIds, preferredChannelId));
-      if (result.token && result.channelId) {
-        return { waitMs: totalWaitMs, token: result.token, channelId: result.channelId };
-      }
-
-      totalWaitMs += result.waitMs;
-      await delayMs(result.waitMs);
-    }
-  }
-
-  private async tryAcquireSendDocument(
-    channelIds: string[],
-    preferredChannelId?: string
-  ): Promise<{ waitMs: number; token?: string; channelId?: string }> {
-    const now = Date.now();
-    const states = await Promise.all(channelIds.map(async (channelId, index) => {
-      const nextAvailableAt = await this.state.storage.get<number>(telegramRateLimitStorageKey("sendDocument", channelId)) ?? 0;
-      const lockToken = await this.state.storage.get<string>(telegramRateLimitLockTokenKey("sendDocument", channelId));
-      const lockedUntil = await this.state.storage.get<number>(telegramRateLimitLockUntilKey("sendDocument", channelId)) ?? 0;
-
-      if (lockToken && lockedUntil <= now) {
-        await this.clearLock("sendDocument", channelId);
-      }
-
-      const activeLockedUntil = lockToken && lockedUntil > now ? lockedUntil : 0;
-      return {
-        channelId,
-        index,
-        readyAt: Math.max(nextAvailableAt, activeLockedUntil)
-      };
-    }));
-
-    states.sort((left, right) => {
-      const readyDiff = left.readyAt - right.readyAt;
-      if (readyDiff !== 0) return readyDiff;
-      if (preferredChannelId) {
-        if (left.channelId === preferredChannelId) return -1;
-        if (right.channelId === preferredChannelId) return 1;
-      }
-      return left.index - right.index;
-    });
-
-    const selected = states[0];
-    if (!selected) {
-      return { waitMs: TELEGRAM_SEND_DOCUMENT_RATE_LIMIT_MS };
-    }
-
-    if (selected.readyAt > now) {
-      return { waitMs: Math.max(250, Math.min(1_000, selected.readyAt - now)) };
-    }
-
-    const token = crypto.randomUUID();
-    await this.state.storage.put(telegramRateLimitLockTokenKey("sendDocument", selected.channelId), token);
-    await this.state.storage.put(
-      telegramRateLimitLockUntilKey("sendDocument", selected.channelId),
-      now + TELEGRAM_SEND_DOCUMENT_LOCK_LEASE_MS
-    );
-    await this.state.storage.put(
-      telegramRateLimitStorageKey("sendDocument", selected.channelId),
-      now + telegramRateLimitIntervalMs("sendDocument")
-    );
-
-    return { waitMs: 0, token, channelId: selected.channelId };
-  }
-
-  private async reserve(scope: TelegramRateLimitScope, channelId: string): Promise<{ waitMs: number; token?: string; channelId: string }> {
-    const now = Date.now();
-    const key = telegramRateLimitStorageKey(scope, channelId);
-    const nextAvailableAt = await this.state.storage.get<number>(key) ?? 0;
-    const waitMs = Math.max(0, nextAvailableAt - now);
-    const reservedAt = now + waitMs;
-
-    await this.state.storage.put(key, reservedAt + telegramRateLimitIntervalMs(scope));
-    return { waitMs, channelId };
-  }
-
-  private async penalize(scope: TelegramRateLimitScope, channelId: string, retryAfterMs: number): Promise<void> {
-    const key = telegramRateLimitStorageKey(scope, channelId);
-    const current = await this.state.storage.get<number>(key) ?? 0;
-    const penalizedUntil = Date.now() + retryAfterMs;
-
-    await this.state.storage.put(key, Math.max(current, penalizedUntil));
-  }
-
-  private async release(scope: TelegramRateLimitScope, channelId: string, token: string): Promise<void> {
-    if (scope !== "sendDocument" || !token) {
-      return;
-    }
-
-    const currentToken = await this.state.storage.get<string>(telegramRateLimitLockTokenKey(scope, channelId));
-    if (currentToken !== token) {
-      return;
-    }
-
-    await this.clearLock(scope, channelId);
-  }
-
-  private async clearLock(scope: TelegramRateLimitScope, channelId: string): Promise<void> {
-    await this.state.storage.delete(telegramRateLimitLockTokenKey(scope, channelId));
-    await this.state.storage.delete(telegramRateLimitLockUntilKey(scope, channelId));
+    console.error("Unexpected server error", error);
+    return errorResponse(new AppError(500, "InternalError", "Internal server error"));
   }
 }
 
-const worker = {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    try {
-      return await routeRequest(request, env);
-    } catch (error) {
-      if (error instanceof AppError) {
-        return errorResponse(error);
-      }
-
-      if (error instanceof TokenError) {
-        return errorResponse(new AppError(401, "InvalidFileToken", "Invalid or tampered file token"));
-      }
-
-      console.error("Unexpected worker error", error);
-      return errorResponse(new AppError(500, "InternalError", "Internal server error"));
-    }
-  },
-
-  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(runScheduledCleanup(controller, env));
-  }
-};
-
-export default worker;
-
-async function runScheduledCleanup(controller: ScheduledController, env: Env): Promise<void> {
-  const scheduledTime = Number.isFinite(controller.scheduledTime) ? controller.scheduledTime : Date.now();
-  const result = await cleanupStaleUploads(env, scheduledTime);
+export async function runScheduledCleanup(env: AppEnv, nowMs = Date.now(), cron = "server"): Promise<void> {
+  const result = await cleanupStaleUploads(env, nowMs);
 
   if (
     result.deletedMultipartUploads > 0 ||
@@ -502,7 +300,7 @@ async function runScheduledCleanup(controller: ScheduledController, env: Env): P
     result.deletedHlsChunks > 0
   ) {
     console.log("Stale upload cleanup completed", {
-      cron: controller.cron,
+      cron,
       expired_before: result.expiredBefore,
       deleted_multipart_uploads: result.deletedMultipartUploads,
       deleted_multipart_chunks: result.deletedMultipartChunks,
@@ -513,9 +311,8 @@ async function runScheduledCleanup(controller: ScheduledController, env: Env): P
     });
   }
 }
-
 async function cleanupStaleUploads(
-  env: Env,
+  env: AppEnv,
   nowMs: number
 ): Promise<{
   expiredBefore: string;
@@ -546,7 +343,7 @@ async function cleanupStaleUploads(
 }
 
 async function cleanupStaleMultipartUploads(
-  env: Env,
+  env: AppEnv,
   nowMs: number
 ): Promise<{ expiredBefore: string; deletedUploads: number; deletedChunks: number }> {
   const db = requireDb(env);
@@ -573,85 +370,11 @@ function parseStaleMultipartUploadTtlMs(value: string | undefined): number {
   return boundedHours * 60 * 60 * 1000;
 }
 
-async function readRateLimitRequestBody(request: Request): Promise<Record<string, unknown>> {
-  try {
-    const body = await request.json();
-    return typeof body === "object" && body !== null && !Array.isArray(body)
-      ? body as Record<string, unknown>
-      : {};
-  } catch {
-    return {};
-  }
-}
-
-function normalizeTelegramRateLimitScope(value: unknown): TelegramRateLimitScope | undefined {
-  return value === "sendDocument" || value === "getFile" ? value : undefined;
-}
-
-function normalizeRetryAfterMs(value: unknown): number {
-  const parsed = typeof value === "number" ? value : Number(value);
-
-  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
-    return TELEGRAM_SEND_DOCUMENT_RATE_LIMIT_MS;
-  }
-
-  return Math.min(parsed, 5 * 60 * 1000);
-}
-
-function normalizeTelegramRateLimitChannelId(value: unknown): string {
-  return normalizeOptionalTelegramRateLimitChannelId(value) ?? "default";
-}
-
-function normalizeOptionalTelegramRateLimitChannelId(value: unknown): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-
-  const normalized = value.trim();
-  return normalized.length > 0 ? normalized : undefined;
-}
-
-function normalizeTelegramRateLimitChannelIds(value: unknown, fallback: unknown): string[] {
-  const values = Array.isArray(value) ? value : [fallback];
-  const seen = new Set<string>();
-  const result: string[] = [];
-
-  for (const item of values) {
-    const channelId = normalizeOptionalTelegramRateLimitChannelId(item);
-    if (channelId && !seen.has(channelId)) {
-      seen.add(channelId);
-      result.push(channelId);
-    }
-  }
-
-  return result.length > 0 ? result : ["default"];
-}
-
-function telegramRateLimitStorageKey(scope: TelegramRateLimitScope, channelId = "default"): string {
-  return `telegram-rate-limit:${scope}:${channelId}:next`;
-}
-
-function telegramRateLimitLockTokenKey(scope: TelegramRateLimitScope, channelId = "default"): string {
-  return `telegram-rate-limit:${scope}:${channelId}:lock-token`;
-}
-
-function telegramRateLimitLockUntilKey(scope: TelegramRateLimitScope, channelId = "default"): string {
-  return `telegram-rate-limit:${scope}:${channelId}:locked-until`;
-}
-
-function telegramRateLimitIntervalMs(scope: TelegramRateLimitScope): number {
-  return scope === "sendDocument" ? TELEGRAM_SEND_DOCUMENT_RATE_LIMIT_MS : TELEGRAM_GET_FILE_RATE_LIMIT_MS;
-}
-
-function delayMs(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function isReadRequest(request: Request): boolean {
   return request.method === "GET" || request.method === "HEAD";
 }
 
-async function routeRequest(request: Request, env: Env): Promise<Response> {
+async function routeRequest(request: Request, env: AppEnv): Promise<Response> {
   const url = new URL(request.url);
 
   if (request.method === "OPTIONS") {
@@ -700,6 +423,10 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
     return handleAuthenticatedAdminRequest(request, env, () => handleAdminApiKeys(request, env));
   }
 
+  if (url.pathname === "/api/admin/settings") {
+    return handleAuthenticatedAdminRequest(request, env, () => handleAdminSettings(request, env));
+  }
+
   if (url.pathname === "/api/v1/files" || url.pathname.startsWith("/api/v1/files/")) {
     return handleApiFiles(request, env);
   }
@@ -724,14 +451,14 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
     return errorResponse(new AppError(404, "NotFound", "Route not found"));
   }
 
-  if (isReadRequest(request) && env.ASSETS) {
-    return env.ASSETS.fetch(request);
+  if (isReadRequest(request) && env.STATIC_ASSETS) {
+    return env.STATIC_ASSETS.fetch(request);
   }
 
   return errorResponse(new AppError(404, "NotFound", "Route not found"));
 }
 
-async function handleApiFiles(request: Request, env: Env): Promise<Response> {
+async function handleApiFiles(request: Request, env: AppEnv): Promise<Response> {
   const db = requireDb(env);
   await requireUploadApiKey(request, db);
   const url = new URL(request.url);
@@ -790,7 +517,7 @@ async function handleApiFiles(request: Request, env: Env): Promise<Response> {
   return errorResponse(new AppError(404, "NotFound", "API file route not found"));
 }
 
-async function handleAdminLogin(request: Request, env: Env): Promise<Response> {
+async function handleAdminLogin(request: Request, env: AppEnv): Promise<Response> {
   const credentials = await readLoginCredentials(request);
   const isFormRequest = isFormContentType(request.headers.get("Content-Type"));
 
@@ -816,7 +543,7 @@ async function handleAdminLogin(request: Request, env: Env): Promise<Response> {
   return jsonResponse({ ok: true }, 200, { "Set-Cookie": cookie });
 }
 
-async function handleAdminLogout(request: Request, env: Env): Promise<Response> {
+async function handleAdminLogout(request: Request, env: AppEnv): Promise<Response> {
   await requireAdminSession(request, env);
 
   return jsonResponse(
@@ -828,7 +555,7 @@ async function handleAdminLogout(request: Request, env: Env): Promise<Response> 
 
 async function handleAuthenticatedAdminRequest(
   request: Request,
-  env: Env,
+  env: AppEnv,
   handler: (username: string) => Promise<Response>
 ): Promise<Response> {
   const session = await requireAdminSessionInfo(request, env);
@@ -854,9 +581,12 @@ async function handleAuthenticatedAdminRequest(
   });
 }
 
-async function handleAdminSession(request: Request, env: Env, username: string): Promise<Response> {
+async function handleAdminSession(request: Request, env: AppEnv, username: string): Promise<Response> {
   const maxFileBytes = parseMaxFileBytes(env.MAX_FILE_BYTES);
   const baseUrl = getPublicBaseUrl(request, env);
+  const uploadConcurrency = env.DATABASE
+    ? await getUploadConcurrencySetting(env.DATABASE)
+    : DEFAULT_UPLOAD_CONCURRENCY;
 
   return jsonResponse({
     ok: true,
@@ -866,12 +596,15 @@ async function handleAdminSession(request: Request, env: Env, username: string):
     max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
     direct_access_max_chunks: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
     direct_access_max_bytes: DIRECT_MULTIPART_ACCESS_MAX_BYTES,
+    upload_concurrency: uploadConcurrency,
+    upload_concurrency_min: MIN_UPLOAD_CONCURRENCY,
+    upload_concurrency_max: MAX_UPLOAD_CONCURRENCY,
     base_url: baseUrl,
     config: {
-      files_db: Boolean(env.FILES_DB),
+      database: Boolean(env.DATABASE),
       telegram_bot_token: hasEnvValue(env.TELEGRAM_BOT_TOKEN),
       telegram_storage_chat_id: hasEnvValue(env.TELEGRAM_STORAGE_CHAT_ID),
-      telegram_channels: Boolean(env.FILES_DB),
+      telegram_channels: Boolean(env.DATABASE),
       tg_channel_secret: hasEnvValue(env.TG_CHANNEL_SECRET || env.LINK_SIGNING_SECRET),
       link_signing_secret: hasEnvValue(env.LINK_SIGNING_SECRET),
       admin_username: hasEnvValue(env.ADMIN_USERNAME),
@@ -879,10 +612,10 @@ async function handleAdminSession(request: Request, env: Env, username: string):
       admin_session_secret: hasEnvValue(env.ADMIN_SESSION_SECRET)
     },
     config_values: {
-      files_db: env.FILES_DB ? "已绑定" : "未绑定",
+      database: env.DATABASE ? "已连接" : "未连接",
       telegram_bot_token: maskSecret(env.TELEGRAM_BOT_TOKEN),
       telegram_storage_chat_id: env.TELEGRAM_STORAGE_CHAT_ID?.trim() || "未配置",
-      telegram_channels: env.FILES_DB ? "设置页可配置" : "需要 D1 数据库",
+      telegram_channels: env.DATABASE ? "设置页可配置" : "需要 SQLite 数据库",
       tg_channel_secret: env.TG_CHANNEL_SECRET?.trim() ? maskSecret(env.TG_CHANNEL_SECRET) : "未单独配置，使用签名密钥",
       link_signing_secret: maskSecret(env.LINK_SIGNING_SECRET),
       admin_username: env.ADMIN_USERNAME?.trim() || "未配置",
@@ -898,7 +631,27 @@ async function handleAdminSession(request: Request, env: Env, username: string):
   });
 }
 
-async function handleAdminFiles(request: Request, env: Env, username: string): Promise<Response> {
+async function handleAdminSettings(request: Request, env: AppEnv): Promise<Response> {
+  const db = requireDb(env);
+
+  if (request.method === "PATCH") {
+    const body = await readJsonObject(request);
+    const uploadConcurrency = positiveIntegerField(body.upload_concurrency, "upload_concurrency");
+    const savedUploadConcurrency = await setUploadConcurrencySetting(db, uploadConcurrency, new Date().toISOString());
+    return jsonResponse({
+      ok: true,
+      settings: {
+        upload_concurrency: savedUploadConcurrency,
+        upload_concurrency_min: MIN_UPLOAD_CONCURRENCY,
+        upload_concurrency_max: MAX_UPLOAD_CONCURRENCY
+      }
+    });
+  }
+
+  return errorResponse(new AppError(405, "MethodNotAllowed", "Unsupported settings method"));
+}
+
+async function handleAdminFiles(request: Request, env: AppEnv, username: string): Promise<Response> {
   const db = requireDb(env);
   const url = new URL(request.url);
 
@@ -1075,7 +828,7 @@ async function handleAdminFiles(request: Request, env: Env, username: string): P
   return errorResponse(new AppError(404, "NotFound", "Admin file route not found"));
 }
 
-async function handleAdminDirectories(request: Request, env: Env): Promise<Response> {
+async function handleAdminDirectories(request: Request, env: AppEnv): Promise<Response> {
   const db = requireDb(env);
   const url = new URL(request.url);
 
@@ -1174,7 +927,7 @@ async function handleAdminDirectories(request: Request, env: Env): Promise<Respo
   return errorResponse(new AppError(404, "NotFound", "Admin directory route not found"));
 }
 
-async function handleAdminEntries(request: Request, env: Env): Promise<Response> {
+async function handleAdminEntries(request: Request, env: AppEnv): Promise<Response> {
   const db = requireDb(env);
   const url = new URL(request.url);
 
@@ -1271,7 +1024,7 @@ async function handleAdminEntries(request: Request, env: Env): Promise<Response>
   return errorResponse(new AppError(404, "NotFound", "Admin entry route not found"));
 }
 
-async function handleAdminMultipartUploads(request: Request, env: Env, username: string): Promise<Response> {
+async function handleAdminMultipartUploads(request: Request, env: AppEnv, username: string): Promise<Response> {
   const db = requireDb(env);
   const url = new URL(request.url);
 
@@ -1468,7 +1221,7 @@ async function handleAdminMultipartUploads(request: Request, env: Env, username:
   return errorResponse(new AppError(404, "NotFound", "Admin multipart upload route not found"));
 }
 
-async function handleAdminHlsUploads(request: Request, env: Env, username: string): Promise<Response> {
+async function handleAdminHlsUploads(request: Request, env: AppEnv, username: string): Promise<Response> {
   const db = requireDb(env);
   const url = new URL(request.url);
 
@@ -1642,7 +1395,7 @@ async function handleAdminHlsUploads(request: Request, env: Env, username: strin
   return errorResponse(new AppError(404, "NotFound", "Admin HLS upload route not found"));
 }
 
-async function handleApiMultipartUploads(request: Request, env: Env): Promise<Response> {
+async function handleApiMultipartUploads(request: Request, env: AppEnv): Promise<Response> {
   const url = new URL(request.url);
 
   if (request.method === "GET" && url.pathname === "/api/v1/uploads/url-thumbnail-source") {
@@ -1842,7 +1595,7 @@ async function probeHlsSource(
 }
 
 async function createHlsUpload(params: {
-  db: D1Database;
+  db: AppDatabase;
   sourceUrl: URL;
   sourceHeaders?: RemoteRequestHeaders;
   selectedVariantId: string | undefined;
@@ -1918,8 +1671,8 @@ async function createHlsUpload(params: {
 }
 
 async function importHlsSegment(params: {
-  env: Env;
-  db: D1Database;
+  env: AppEnv;
+  db: AppDatabase;
   asset: HlsAssetRecord;
   segmentIndex: number;
 }): Promise<HlsSegmentImportResult> {
@@ -2056,8 +1809,8 @@ async function importHlsSegment(params: {
 }
 
 async function ensureHlsInitSegmentImported(params: {
-  env: Env;
-  db: D1Database;
+  env: AppEnv;
+  db: AppDatabase;
   asset: HlsAssetRecord;
 }): Promise<HlsAssetRecord> {
   if (!params.asset.init_source_url) {
@@ -2141,8 +1894,8 @@ async function ensureHlsInitSegmentImported(params: {
 }
 
 async function importHlsSegmentChunk(params: {
-  env: Env;
-  db: D1Database;
+  env: AppEnv;
+  db: AppDatabase;
   asset: HlsAssetRecord;
   segmentIndex: number;
   chunkIndexValue: string;
@@ -2172,7 +1925,7 @@ async function importHlsSegmentChunk(params: {
 }
 
 async function completeHlsMultipartSegment(params: {
-  db: D1Database;
+  db: AppDatabase;
   asset: HlsAssetRecord;
   segmentIndex: number;
 }): Promise<HlsSegmentImportResult> {
@@ -2197,8 +1950,8 @@ async function completeHlsMultipartSegment(params: {
 
 async function completeHlsUpload(params: {
   request: Request;
-  env: Env;
-  db: D1Database;
+  env: AppEnv;
+  db: AppDatabase;
   asset: HlsAssetRecord;
   conflictAction?: FileNameConflictAction;
   thumbnail?: ThumbnailInput;
@@ -2667,7 +2420,7 @@ function hexToArrayBuffer(hex: string): ArrayBuffer {
 }
 
 async function ensureHlsSegmentMultipartUpload(params: {
-  db: D1Database;
+  db: AppDatabase;
   asset: HlsAssetRecord;
   segment: HlsSegmentRecord;
   mimeType: string;
@@ -2719,7 +2472,7 @@ async function ensureHlsSegmentMultipartUpload(params: {
   return upload;
 }
 
-async function hlsSegmentImportResult(db: D1Database, segment: HlsSegmentRecord): Promise<HlsSegmentImportResult> {
+async function hlsSegmentImportResult(db: AppDatabase, segment: HlsSegmentRecord): Promise<HlsSegmentImportResult> {
   if (!segment.multipart_upload_id) {
     return {
       segment,
@@ -2737,7 +2490,7 @@ async function hlsSegmentImportResult(db: D1Database, segment: HlsSegmentRecord)
   };
 }
 
-async function requireHlsAsset(db: D1Database, assetId: string): Promise<HlsAssetRecord> {
+async function requireHlsAsset(db: AppDatabase, assetId: string): Promise<HlsAssetRecord> {
   const asset = await getHlsAssetRecord(db, assetId);
   if (!asset) {
     throw new AppError(404, "HlsAssetNotFound", "HLS 上传任务不存在");
@@ -2745,7 +2498,7 @@ async function requireHlsAsset(db: D1Database, assetId: string): Promise<HlsAsse
   return asset;
 }
 
-async function requireMutableHlsAsset(db: D1Database, assetId: string): Promise<HlsAssetRecord> {
+async function requireMutableHlsAsset(db: AppDatabase, assetId: string): Promise<HlsAssetRecord> {
   const asset = await requireHlsAsset(db, assetId);
   if (asset.status === "done" || asset.status === "cancelled" || asset.final_file_id) {
     throw new AppError(409, "HlsAssetClosed", "HLS 上传任务已结束");
@@ -2753,7 +2506,7 @@ async function requireMutableHlsAsset(db: D1Database, assetId: string): Promise<
   return asset;
 }
 
-async function requireHlsSegment(db: D1Database, assetId: string, segmentIndex: number): Promise<HlsSegmentRecord> {
+async function requireHlsSegment(db: AppDatabase, assetId: string, segmentIndex: number): Promise<HlsSegmentRecord> {
   const segment = await getHlsSegmentRecordByIndex(db, assetId, segmentIndex);
   if (!segment) {
     throw new AppError(404, "HlsSegmentNotFound", "HLS segment 不存在");
@@ -2761,7 +2514,7 @@ async function requireHlsSegment(db: D1Database, assetId: string, segmentIndex: 
   return segment;
 }
 
-async function requireHlsSegmentMultipartUpload(db: D1Database, segment: HlsSegmentRecord): Promise<MultipartUploadRecord> {
+async function requireHlsSegmentMultipartUpload(db: AppDatabase, segment: HlsSegmentRecord): Promise<MultipartUploadRecord> {
   if (segment.storage_backend !== "telegram_multipart" || !segment.multipart_upload_id) {
     throw new AppError(400, "HlsSegmentNotMultipart", "该 HLS segment 不是大 segment 分片任务");
   }
@@ -2872,9 +2625,9 @@ function serializeHlsMediaPlan(plan: HlsMediaPlan): Record<string, unknown> {
 }
 
 async function serializeHlsUploadResult(
-  db: D1Database,
+  db: AppDatabase,
   request: Request,
-  env: Env,
+  env: AppEnv,
   result: HlsInitResult
 ): Promise<Record<string, unknown>> {
   return {
@@ -2883,7 +2636,7 @@ async function serializeHlsUploadResult(
   };
 }
 
-function serializeHlsAsset(asset: HlsAssetRecord, request: Request, env: Env): Record<string, unknown> {
+function serializeHlsAsset(asset: HlsAssetRecord, request: Request, env: AppEnv): Record<string, unknown> {
   const baseUrl = getPublicBaseUrl(request, env);
   return {
     id: asset.id,
@@ -2908,7 +2661,7 @@ function serializeHlsAsset(asset: HlsAssetRecord, request: Request, env: Env): R
   };
 }
 
-async function serializeHlsSegment(db: D1Database, segment: HlsSegmentRecord): Promise<Record<string, unknown>> {
+async function serializeHlsSegment(db: AppDatabase, segment: HlsSegmentRecord): Promise<Record<string, unknown>> {
   const chunks = segment.multipart_upload_id
     ? await listFileChunkRecords(db, segment.multipart_upload_id)
     : [];
@@ -2943,7 +2696,7 @@ function chunkRange(count: number): number[] {
   return Array.from({ length: count }, (_, index) => index);
 }
 
-async function handleAdminApiKeys(request: Request, env: Env): Promise<Response> {
+async function handleAdminApiKeys(request: Request, env: AppEnv): Promise<Response> {
   const db = requireDb(env);
   const url = new URL(request.url);
 
@@ -3019,7 +2772,7 @@ async function handleAdminApiKeys(request: Request, env: Env): Promise<Response>
   return errorResponse(new AppError(405, "MethodNotAllowed", "Unsupported API key method"));
 }
 
-async function handleAdminTelegramChannels(request: Request, env: Env): Promise<Response> {
+async function handleAdminTelegramChannels(request: Request, env: AppEnv): Promise<Response> {
   const db = requireDb(env);
   const url = new URL(request.url);
 
@@ -3205,7 +2958,7 @@ function normalizeTelegramChannelStatus(value: unknown): TelegramChannelStatus {
   throw new AppError(400, "InvalidBody", "Telegram channel status must be active or disabled");
 }
 
-async function requireTelegramChannelUnique(paramsDb: D1Database, params: {
+async function requireTelegramChannelUnique(paramsDb: AppDatabase, params: {
   name: string;
   botTokenHash: string;
   chatId: string;
@@ -3228,7 +2981,7 @@ async function requireTelegramChannelUnique(paramsDb: D1Database, params: {
   throw new AppError(409, "TelegramChannelTargetConflict", "Telegram bot token and chat_id channel already exists");
 }
 
-async function readUploadInput(request: Request, env: Env): Promise<{
+async function readUploadInput(request: Request, env: AppEnv): Promise<{
   file: File;
   remark?: string;
   directoryPath: string;
@@ -3291,7 +3044,7 @@ async function readUploadInput(request: Request, env: Env): Promise<{
   throw new AppError(400, "MissingFile", "Multipart field 'file' is required");
 }
 
-async function readUrlUploadJson(request: Request, env: Env): Promise<{
+async function readUrlUploadJson(request: Request, env: AppEnv): Promise<{
   file: File;
   remark?: string;
   directoryPath: string;
@@ -3684,7 +3437,7 @@ function remoteFetchHeaders(
 
 async function downloadFileFromUrl(params: {
   sourceUrl: URL;
-  env: Env;
+  env: AppEnv;
   maxFileBytes: number;
   fileName?: string;
   sourceHeaders?: RemoteRequestHeaders;
@@ -3742,7 +3495,7 @@ async function downloadFileFromUrl(params: {
 
 async function downloadSignedFileUrl(params: {
   sourceUrl: URL;
-  env: Env;
+  env: AppEnv;
   maxFileBytes: number;
 }): Promise<File | undefined> {
   const token = extractOptionalFileToken(params.sourceUrl.pathname);
@@ -3801,7 +3554,7 @@ async function downloadSignedFileUrl(params: {
 }
 
 async function uploadRateLimitedTelegramDocument(params: {
-  env: Env;
+  env: AppEnv;
   botToken: string;
   chatId: string;
   file: Blob;
@@ -3824,8 +3577,8 @@ async function uploadRateLimitedTelegramDocument(params: {
 }
 
 async function uploadTelegramDocumentWithChannel(params: {
-  env: Env;
-  db?: D1Database;
+  env: AppEnv;
+  db?: AppDatabase;
   file: Blob;
   fileName: string;
   preferredChannelId?: string;
@@ -3859,7 +3612,7 @@ async function uploadTelegramDocumentWithChannel(params: {
 }
 
 async function getRateLimitedTelegramFileUrl(params: {
-  env: Env;
+  env: AppEnv;
   botToken: string;
   fileId: string;
   channelId?: string;
@@ -3878,8 +3631,8 @@ async function getRateLimitedTelegramFileUrl(params: {
 }
 
 async function acquireTelegramUploadSlot(
-  env: Env,
-  db: D1Database | undefined,
+  env: AppEnv,
+  db: AppDatabase | undefined,
   options: { preferredChannelId?: string; preferredChannelIndex?: number } = {}
 ): Promise<TelegramUploadSlot> {
   const channels = await listUploadTelegramChannels(env, db);
@@ -3905,7 +3658,7 @@ async function acquireTelegramUploadSlot(
 }
 
 async function acquireTelegramApiSlot(
-  env: Env,
+  env: AppEnv,
   scope: TelegramRateLimitScope,
   channelId?: string,
   channelIds?: string[],
@@ -3921,8 +3674,7 @@ async function acquireTelegramApiSlot(
     };
   }
 
-  const id = limiter.idFromName(TELEGRAM_RATE_LIMITER_OBJECT_NAME);
-  const response = await limiter.get(id).fetch("https://telegram-rate-limiter/acquire", {
+  const response = await limiter.fetch("https://telegram-rate-limiter/acquire", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -3945,14 +3697,13 @@ async function acquireTelegramApiSlot(
   };
 }
 
-async function releaseTelegramApiSlot(env: Env, slot: TelegramApiSlot): Promise<void> {
+async function releaseTelegramApiSlot(env: AppEnv, slot: TelegramApiSlot): Promise<void> {
   if (slot.scope !== "sendDocument" || !slot.token || !env.TELEGRAM_RATE_LIMITER) {
     return;
   }
 
-  const id = env.TELEGRAM_RATE_LIMITER.idFromName(TELEGRAM_RATE_LIMITER_OBJECT_NAME);
   try {
-    await env.TELEGRAM_RATE_LIMITER.get(id).fetch("https://telegram-rate-limiter/release", {
+    await env.TELEGRAM_RATE_LIMITER.fetch("https://telegram-rate-limiter/release", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -3971,7 +3722,7 @@ async function releaseTelegramApiSlot(env: Env, slot: TelegramApiSlot): Promise<
 }
 
 async function penalizeTelegramApiSlotFromError(
-  env: Env,
+  env: AppEnv,
   scope: TelegramRateLimitScope,
   channelId: string | undefined,
   error: unknown
@@ -3981,9 +3732,8 @@ async function penalizeTelegramApiSlotFromError(
     return;
   }
 
-  const id = env.TELEGRAM_RATE_LIMITER.idFromName(TELEGRAM_RATE_LIMITER_OBJECT_NAME);
   try {
-    await env.TELEGRAM_RATE_LIMITER.get(id).fetch("https://telegram-rate-limiter/penalize", {
+    await env.TELEGRAM_RATE_LIMITER.fetch("https://telegram-rate-limiter/penalize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -4010,7 +3760,7 @@ function telegramRetryAfterSeconds(error: unknown): number | undefined {
   return Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : undefined;
 }
 
-function channelCryptoSecret(env: Env): string {
+function channelCryptoSecret(env: AppEnv): string {
   return requireEnv({ LINK_SIGNING_SECRET: env.TG_CHANNEL_SECRET || env.LINK_SIGNING_SECRET }, "LINK_SIGNING_SECRET");
 }
 
@@ -4018,7 +3768,7 @@ async function telegramChannelTokenHash(botToken: string): Promise<string> {
   return base64UrlEncodeLocal(new Uint8Array(await crypto.subtle.digest("SHA-256", toArrayBufferLocal(textEncodeLocal(botToken)))));
 }
 
-async function encryptTelegramBotToken(botToken: string, env: Env): Promise<string> {
+async function encryptTelegramBotToken(botToken: string, env: AppEnv): Promise<string> {
   if (!botToken) {
     return "";
   }
@@ -4034,7 +3784,7 @@ async function encryptTelegramBotToken(botToken: string, env: Env): Promise<stri
   return `v1.${base64UrlEncodeLocal(iv)}.${base64UrlEncodeLocal(cipher)}`;
 }
 
-async function decryptTelegramBotToken(encrypted: string, env: Env): Promise<string> {
+async function decryptTelegramBotToken(encrypted: string, env: AppEnv): Promise<string> {
   if (!encrypted) {
     return "";
   }
@@ -4057,7 +3807,7 @@ async function decryptTelegramBotToken(encrypted: string, env: Env): Promise<str
   }
 }
 
-async function importTelegramChannelAesKey(env: Env): Promise<CryptoKey> {
+async function importTelegramChannelAesKey(env: AppEnv): Promise<CryptoKey> {
   const digest = await crypto.subtle.digest("SHA-256", toArrayBufferLocal(textEncodeLocal(channelCryptoSecret(env))));
   return crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
 }
@@ -4103,7 +3853,7 @@ function isTelegramChannelConfigured(record: TelegramChannelRecord): boolean {
   return Boolean(record.bot_token_encrypted && record.chat_id.trim());
 }
 
-async function materializeTelegramChannel(record: TelegramChannelRecord, env: Env): Promise<TelegramStorageChannel | null> {
+async function materializeTelegramChannel(record: TelegramChannelRecord, env: AppEnv): Promise<TelegramStorageChannel | null> {
   if (!isTelegramChannelConfigured(record)) {
     return null;
   }
@@ -4118,7 +3868,7 @@ async function materializeTelegramChannel(record: TelegramChannelRecord, env: En
   };
 }
 
-function defaultEnvTelegramChannel(env: Env): TelegramStorageChannel | null {
+function defaultEnvTelegramChannel(env: AppEnv): TelegramStorageChannel | null {
   const botToken = env.TELEGRAM_BOT_TOKEN?.trim();
   const chatId = env.TELEGRAM_STORAGE_CHAT_ID?.trim();
 
@@ -4136,7 +3886,7 @@ function defaultEnvTelegramChannel(env: Env): TelegramStorageChannel | null {
   };
 }
 
-async function resolveTelegramChannel(env: Env, db: D1Database | undefined, channelId: string | null | undefined): Promise<TelegramStorageChannel> {
+async function resolveTelegramChannel(env: AppEnv, db: AppDatabase | undefined, channelId: string | null | undefined): Promise<TelegramStorageChannel> {
   const normalizedChannelId = normalizeTelegramChannelId(channelId);
 
   if (db) {
@@ -4159,7 +3909,7 @@ async function resolveTelegramChannel(env: Env, db: D1Database | undefined, chan
   throw new AppError(500, "TelegramChannelNotConfigured", `Telegram channel '${normalizedChannelId}' is not configured`);
 }
 
-async function listUploadTelegramChannels(env: Env, db: D1Database | undefined): Promise<TelegramStorageChannel[]> {
+async function listUploadTelegramChannels(env: AppEnv, db: AppDatabase | undefined): Promise<TelegramStorageChannel[]> {
   const channels: TelegramStorageChannel[] = [];
 
   if (db) {
@@ -4191,7 +3941,7 @@ async function listUploadTelegramChannels(env: Env, db: D1Database | undefined):
   return channels;
 }
 
-async function serializeTelegramChannelRecord(record: TelegramChannelRecord, env: Env): Promise<Record<string, unknown>> {
+async function serializeTelegramChannelRecord(record: TelegramChannelRecord, env: AppEnv): Promise<Record<string, unknown>> {
   const botToken = record.bot_token_encrypted ? await decryptTelegramBotToken(record.bot_token_encrypted, env) : "";
 
   return {
@@ -4293,7 +4043,7 @@ function ensureFileExtension(fileName: string, mimeType: string): string {
 }
 
 async function createMultipartUpload(params: {
-  db: D1Database;
+  db: AppDatabase;
   sourceKind: "local" | "url";
   sourceUrl?: string;
   sourceHeadersJson?: string;
@@ -4459,7 +4209,7 @@ async function fetchRemoteRange(
 
 async function createThumbnailSourceInfo(params: {
   request: Request;
-  env: Env;
+  env: AppEnv;
   uploadId?: string;
   sourceUrl: URL;
   mimeType: string;
@@ -4516,7 +4266,7 @@ function thumbnailSourceMaxBytes(kind: "image" | "video"): number {
   return kind === "video" ? VIDEO_THUMBNAIL_SOURCE_MAX_BYTES : IMAGE_THUMBNAIL_SOURCE_MAX_BYTES;
 }
 
-async function handleThumbnailSourceProxy(request: Request, env: Env): Promise<Response> {
+async function handleThumbnailSourceProxy(request: Request, env: AppEnv): Promise<Response> {
   const url = new URL(request.url);
   const token = url.searchParams.get("token");
 
@@ -4583,7 +4333,7 @@ async function handleThumbnailSourceProxy(request: Request, env: Env): Promise<R
 }
 
 async function thumbnailSourceRequestHeaders(
-  env: Env,
+  env: AppEnv,
   payload: ThumbnailSourceTokenPayload
 ): Promise<RemoteRequestHeaders | undefined> {
   if (!payload.upload_id) {
@@ -4650,7 +4400,7 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 }
 
 async function requireMultipartUpload(
-  db: D1Database,
+  db: AppDatabase,
   id: string,
   sourceKind?: "local" | "url"
 ): Promise<MultipartUploadRecord> {
@@ -4667,7 +4417,7 @@ async function requireMultipartUpload(
   return upload;
 }
 
-async function requireFileRecord(db: D1Database, id: string): Promise<FileRecord> {
+async function requireFileRecord(db: AppDatabase, id: string): Promise<FileRecord> {
   const file = await getFileRecord(db, id);
 
   if (!file) {
@@ -4678,7 +4428,7 @@ async function requireFileRecord(db: D1Database, id: string): Promise<FileRecord
 }
 
 async function requireFileNameAvailable(params: {
-  db: D1Database;
+  db: AppDatabase;
   directoryPath: string;
   fileName: string;
   excludeId?: string;
@@ -4691,7 +4441,7 @@ async function requireFileNameAvailable(params: {
 }
 
 async function requireFileNameWritable(params: {
-  db: D1Database;
+  db: AppDatabase;
   directoryPath: string;
   fileName: string;
   conflictAction: FileNameConflictAction;
@@ -4756,7 +4506,7 @@ function normalizeUploadPreflightEntries(value: unknown): UploadPreflightEntry[]
 }
 
 async function preflightUploadEntries(
-  db: D1Database,
+  db: AppDatabase,
   entries: UploadPreflightEntry[]
 ): Promise<UploadPreflightResultEntry[]> {
   const seenTargets = new Map<string, string>();
@@ -4805,7 +4555,7 @@ async function preflightUploadEntries(
 }
 
 async function requireFileMoveNamesAvailable(params: {
-  db: D1Database;
+  db: AppDatabase;
   files: FileRecord[];
   directoryPath: string;
 }): Promise<void> {
@@ -4938,8 +4688,8 @@ async function downloadRemoteChunk(upload: MultipartUploadRecord, chunkIndex: nu
 }
 
 async function downloadAndUploadRemoteChunk(params: {
-  env: Env;
-  db: D1Database;
+  env: AppEnv;
+  db: AppDatabase;
   upload: MultipartUploadRecord;
   chunkIndex: number;
 }) {
@@ -5012,8 +4762,8 @@ function validateRemoteChunkResponse(params: {
 }
 
 async function uploadChunkToTelegram(params: {
-  env: Env;
-  db: D1Database;
+  env: AppEnv;
+  db: AppDatabase;
   upload: MultipartUploadRecord;
   chunk: Blob;
   chunkIndex: number;
@@ -5057,8 +4807,8 @@ function chunkDigest(upload: MultipartUploadRecord, chunkIndex: number, telegram
 
 async function completeMultipartUpload(params: {
   request: Request;
-  env: Env;
-  db: D1Database;
+  env: AppEnv;
+  db: AppDatabase;
   upload: MultipartUploadRecord;
   conflictAction?: FileNameConflictAction;
   thumbnail?: ThumbnailInput;
@@ -5150,8 +4900,8 @@ async function completeMultipartUpload(params: {
 
 async function uploadOptionalThumbnail(params: {
   request: Request;
-  env: Env;
-  db: D1Database;
+  env: AppEnv;
+  db: AppDatabase;
   originalFileName: string;
   thumbnail: ThumbnailInput | undefined;
 }): Promise<UploadedThumbnailResult | undefined> {
@@ -5173,8 +4923,8 @@ async function uploadOptionalThumbnail(params: {
 
 async function uploadThumbnailToTelegram(params: {
   request: Request;
-  env: Env;
-  db: D1Database;
+  env: AppEnv;
+  db: AppDatabase;
   originalFileName: string;
   thumbnail: ThumbnailInput;
 }): Promise<UploadedThumbnailResult> {
@@ -5297,9 +5047,9 @@ function multipartDigest(chunks: FileChunkRecord[]): string {
 
 async function uploadAndRecordFile(params: {
   request: Request;
-  env: Env;
+  env: AppEnv;
   file: File;
-  db?: D1Database;
+  db?: AppDatabase;
   uploadedBy?: string;
   remark?: string;
   directoryId?: string | null;
@@ -5402,7 +5152,7 @@ async function uploadAndRecordFile(params: {
   };
 }
 
-async function createFilePathForRecord(record: FileRecord, fileName: string, env: Env): Promise<string> {
+async function createFilePathForRecord(record: FileRecord, fileName: string, env: AppEnv): Promise<string> {
   const signingSecret = requireEnv(env, "LINK_SIGNING_SECRET");
   const iat = Math.floor(Date.now() / 1000);
   const storageBackend = fileStorageBackend(record);
@@ -5465,7 +5215,7 @@ function requirePositiveRecordInteger(value: number | null | undefined, fieldNam
   return value as number;
 }
 
-async function handleFileAccess(request: Request, env: Env): Promise<Response> {
+async function handleFileAccess(request: Request, env: AppEnv): Promise<Response> {
   const url = new URL(request.url);
   const chunkAccess = extractMultipartChunkAccess(url.pathname);
   const token = chunkAccess?.token ?? extractFileToken(url.pathname);
@@ -5495,7 +5245,7 @@ async function handleFileAccess(request: Request, env: Env): Promise<Response> {
     throw new AppError(400, "NotHlsRoute", "HLS files must be accessed through /hls");
   }
 
-  const db = env.FILES_DB;
+  const db = env.DATABASE;
   const channel = await resolveTelegramChannel(env, db, payload.v === 3 ? payload.channel_id : "default");
   const telegramFileUrl = await getRateLimitedTelegramFileUrl({
     env,
@@ -5527,7 +5277,7 @@ async function handleFileAccess(request: Request, env: Env): Promise<Response> {
   });
 }
 
-async function handleHlsAccess(request: Request, env: Env): Promise<Response> {
+async function handleHlsAccess(request: Request, env: AppEnv): Promise<Response> {
   const url = new URL(request.url);
   const access = extractHlsAccess(url.pathname);
   const payload = await verifySignedToken(access.token, requireEnv(env, "LINK_SIGNING_SECRET"));
@@ -5625,7 +5375,7 @@ async function handleHlsAccess(request: Request, env: Env): Promise<Response> {
   return new Response(playlist, { headers });
 }
 
-async function handleAdminHlsPreviewPlaylist(request: Request, env: Env, assetId: string): Promise<Response> {
+async function handleAdminHlsPreviewPlaylist(request: Request, env: AppEnv, assetId: string): Promise<Response> {
   const db = requireDb(env);
   const asset = await requireHlsAsset(db, assetId);
   const doneSegments = leadingDoneHlsSegments(await listHlsSegmentRecords(db, asset.id), HLS_PREVIEW_SEGMENT_COUNT);
@@ -5658,8 +5408,8 @@ async function handleAdminHlsPreviewPlaylist(request: Request, env: Env, assetId
 }
 
 async function serveHlsPackageDownload(params: {
-  env: Env;
-  db: D1Database;
+  env: AppEnv;
+  db: AppDatabase;
   asset: HlsAssetRecord;
   segments: HlsSegmentRecord[];
   fileName: string;
@@ -5686,8 +5436,8 @@ async function serveHlsPackageDownload(params: {
 }
 
 async function serveStoredHlsInitSegment(params: {
-  env: Env;
-  db: D1Database;
+  env: AppEnv;
+  db: AppDatabase;
   asset: HlsAssetRecord;
   rangeHeader: string | null;
   forceDownload: boolean;
@@ -5741,8 +5491,8 @@ async function serveStoredHlsInitSegment(params: {
 }
 
 async function serveStoredHlsSegment(params: {
-  env: Env;
-  db: D1Database;
+  env: AppEnv;
+  db: AppDatabase;
   segment: HlsSegmentRecord;
   rangeHeader: string | null;
   forceDownload: boolean;
@@ -5763,8 +5513,8 @@ async function serveStoredHlsSegment(params: {
 }
 
 async function serveSingleHlsSegment(params: {
-  env: Env;
-  db: D1Database;
+  env: AppEnv;
+  db: AppDatabase;
   segment: HlsSegmentRecord;
   rangeHeader: string | null;
   forceDownload: boolean;
@@ -5810,8 +5560,8 @@ async function serveSingleHlsSegment(params: {
 }
 
 async function serveMultipartHlsSegment(params: {
-  env: Env;
-  db: D1Database;
+  env: AppEnv;
+  db: AppDatabase;
   segment: HlsSegmentRecord;
   rangeHeader: string | null;
   forceDownload: boolean;
@@ -5854,8 +5604,8 @@ async function serveMultipartHlsSegment(params: {
 }
 
 async function serveHlsSegmentChunk(params: {
-  env: Env;
-  db: D1Database;
+  env: AppEnv;
+  db: AppDatabase;
   segment: HlsSegmentRecord;
   chunkIndex: number;
   rangeHeader: string | null;
@@ -5984,8 +5734,8 @@ function hlsInitSegmentHeaders(
 }
 
 function streamHlsSegmentsForDownload(params: {
-  env: Env;
-  db: D1Database;
+  env: AppEnv;
+  db: AppDatabase;
   asset: HlsAssetRecord;
   segments: HlsSegmentRecord[];
   kind: HlsDownloadKind;
@@ -6162,7 +5912,7 @@ function hlsSegmentDownloadPartCount(segment: HlsSegmentRecord): number {
 }
 
 async function handleMultipartChunkAccess(params: {
-  env: Env;
+  env: AppEnv;
   payload: Awaited<ReturnType<typeof verifySignedToken>>;
   chunkIndex: number;
   rangeHeader: string | null;
@@ -6226,7 +5976,7 @@ async function handleMultipartChunkAccess(params: {
 }
 
 async function handleMultipartChunkRecordAccess(params: {
-  env: Env;
+  env: AppEnv;
   file: FileRecord;
   chunkIndex: number;
 }): Promise<Response> {
@@ -6281,7 +6031,7 @@ async function handleMultipartChunkRecordAccess(params: {
 }
 
 async function handleMultipartFileAccess(params: {
-  env: Env;
+  env: AppEnv;
   payload: Extract<Awaited<ReturnType<typeof verifySignedToken>>, { v: 2 }>;
   rangeHeader: string | null;
   forceDownload: boolean;
@@ -6389,7 +6139,7 @@ function recordChunkDownloadFileName(fileName: string, chunkCount: number, chunk
 }
 
 function streamMultipartFile(params: {
-  env: Env;
+  env: AppEnv;
   payload: Extract<Awaited<ReturnType<typeof verifySignedToken>>, { v: 2 }>;
   chunks: FileChunkRecord[];
   range: ParsedByteRange;
@@ -6452,7 +6202,7 @@ function streamMultipartFile(params: {
           }
 
           const { chunk, chunkStart, chunkEnd, overlapStart, overlapEnd } = segment;
-          const channel = await resolveTelegramChannel(params.env, params.env.FILES_DB, chunk.telegram_channel_id);
+          const channel = await resolveTelegramChannel(params.env, params.env.DATABASE, chunk.telegram_channel_id);
           const telegramFileUrl = await getRateLimitedTelegramFileUrl({
             env: params.env,
             botToken: channel.botToken,
@@ -6530,7 +6280,7 @@ function rangeNotSatisfiableResponse(size: number): Response {
   return new Response(null, { status: 416, headers });
 }
 
-async function requireUploadApiKey(request: Request, db: D1Database): Promise<ApiKeyRecord> {
+async function requireUploadApiKey(request: Request, db: AppDatabase): Promise<ApiKeyRecord> {
   const authorization = request.headers.get("Authorization") || "";
   const [scheme, token, extra] = authorization.split(/\s+/);
 
@@ -6583,7 +6333,7 @@ function isFormContentType(contentType: string | null): boolean {
   return normalized.includes("application/x-www-form-urlencoded") || normalized.includes("multipart/form-data");
 }
 
-async function hlsDownloadSummaryForFile(db: D1Database, file: FileRecord): Promise<{
+async function hlsDownloadSummaryForFile(db: AppDatabase, file: FileRecord): Promise<{
   segment_count: number;
   kind: HlsDownloadKind | null;
   part_count: number;
@@ -6607,8 +6357,8 @@ async function hlsDownloadSummaryForFile(db: D1Database, file: FileRecord): Prom
 
 async function serializeHlsDownloadPlanForFile(params: {
   request: Request;
-  env: Env;
-  db: D1Database;
+  env: AppEnv;
+  db: AppDatabase;
   file: FileRecord;
 }): Promise<Record<string, unknown>> {
   if (fileStorageBackend(params.file) !== "hls_package") {
@@ -6697,7 +6447,7 @@ async function serializeHlsDownloadPlanForFile(params: {
 }
 
 async function requireHlsDownloadRecordsForFile(
-  db: D1Database,
+  db: AppDatabase,
   file: FileRecord
 ): Promise<{ asset: HlsAssetRecord; segments: HlsSegmentRecord[] }> {
   const assetId = file.telegram_file_id.startsWith("hls:")
@@ -6713,7 +6463,7 @@ async function requireHlsDownloadRecordsForFile(
   return { asset, segments };
 }
 
-async function createHlsAccessTokenForFile(file: FileRecord, env: Env): Promise<string> {
+async function createHlsAccessTokenForFile(file: FileRecord, env: AppEnv): Promise<string> {
   const assetId = file.telegram_file_id.startsWith("hls:")
     ? file.telegram_file_id.slice("hls:".length)
     : file.id;
@@ -6732,7 +6482,7 @@ async function createHlsAccessTokenForFile(file: FileRecord, env: Env): Promise<
   );
 }
 
-async function serializeFileRecord(file: FileRecord, baseUrl: string, db: D1Database): Promise<Record<string, unknown>> {
+async function serializeFileRecord(file: FileRecord, baseUrl: string, db: AppDatabase): Promise<Record<string, unknown>> {
   const storageBackend = fileStorageBackend(file);
   const directAccess = canDirectlyAccessFileRecord(file);
   const filePath = publicFilePathForResponse(file.file_path, storageBackend);
@@ -7194,7 +6944,7 @@ function normalizeDirectoryPath(value: unknown): string {
   return segments.length === 0 ? "/" : `/${segments.join("/")}`;
 }
 
-async function requireReadableDirectory(db: D1Database, path: string): Promise<DirectoryRecord | null> {
+async function requireReadableDirectory(db: AppDatabase, path: string): Promise<DirectoryRecord | null> {
   if (path === "/") {
     return null;
   }
@@ -7207,11 +6957,11 @@ async function requireReadableDirectory(db: D1Database, path: string): Promise<D
   return directory;
 }
 
-async function requireWritableDirectory(db: D1Database, path: string): Promise<DirectoryRecord | null> {
+async function requireWritableDirectory(db: AppDatabase, path: string): Promise<DirectoryRecord | null> {
   return requireReadableDirectory(db, path);
 }
 
-async function ensureWritableDirectory(db: D1Database, path: string): Promise<DirectoryRecord | null> {
+async function ensureWritableDirectory(db: AppDatabase, path: string): Promise<DirectoryRecord | null> {
   if (path === "/") {
     return null;
   }
@@ -7292,7 +7042,7 @@ function requireEntrySelection(fileIds: string[], directoryIds: string[]): void 
   }
 }
 
-async function requireFileRecords(db: D1Database, ids: string[]): Promise<FileRecord[]> {
+async function requireFileRecords(db: AppDatabase, ids: string[]): Promise<FileRecord[]> {
   const records: FileRecord[] = [];
 
   for (const id of ids) {
@@ -7306,7 +7056,7 @@ async function requireFileRecords(db: D1Database, ids: string[]): Promise<FileRe
   return records;
 }
 
-async function requireDirectoryRecords(db: D1Database, ids: string[]): Promise<DirectoryRecord[]> {
+async function requireDirectoryRecords(db: AppDatabase, ids: string[]): Promise<DirectoryRecord[]> {
   const records: DirectoryRecord[] = [];
 
   for (const id of ids) {
@@ -7337,7 +7087,7 @@ function validateEntryMoveParent(directories: DirectoryRecord[], parentPath: str
 }
 
 async function validateEntryMoveTarget(
-  db: D1Database,
+  db: AppDatabase,
   directories: DirectoryRecord[],
   parentPath: string
 ): Promise<void> {
@@ -7356,7 +7106,7 @@ async function validateEntryMoveTarget(
   }
 }
 
-async function resolveMoveTargetDirectory(db: D1Database, body: Record<string, unknown>): Promise<string> {
+async function resolveMoveTargetDirectory(db: AppDatabase, body: Record<string, unknown>): Promise<string> {
   if (body.new_directory_name !== undefined) {
     const parentPath = normalizeDirectoryPath(
       body.new_directory_parent_path ?? body.parent_path ?? body.directory_path ?? "/"
@@ -7448,7 +7198,7 @@ function publicUploadFilePathForResponse(result: UploadResult): string {
   return publicFilePathForResponse(result.filePath, result.storageBackend);
 }
 
-function getPublicBaseUrl(request: Request, env: Env): string {
+function getPublicBaseUrl(request: Request, env: AppEnv): string {
   return normalizeBaseUrl(env.PUBLIC_BASE_URL || new URL(request.url).origin);
 }
 
