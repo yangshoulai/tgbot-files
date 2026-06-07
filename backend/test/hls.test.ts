@@ -94,4 +94,69 @@ seg-1.ts
     expect(rewritten).toContain("https://files.example.com/api/hls/token/segments/0/seg-0.ts");
     expect(rewritten).toContain("https://files.example.com/api/hls/token/segments/1/seg-1.ts");
   });
+
+  it("parses fMP4 init segment metadata", () => {
+    const playlist = `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:4
+#EXT-X-MAP:URI="init.mp4",BYTERANGE="120@0"
+#EXTINF:4.000,
+seg-0.m4s
+#EXT-X-ENDLIST
+`;
+
+    const plan = parseHlsPlaylist(playlist, new URL("https://media.example.com/path/index.m3u8"));
+
+    expect(plan.kind).toBe("media");
+    if (plan.kind !== "media") {
+      return;
+    }
+    expect(plan.initSegment).toMatchObject({
+      uri: "https://media.example.com/path/init.mp4",
+      rawUri: "init.mp4",
+      byteRange: { offset: 0, length: 120 },
+      encryption: null
+    });
+  });
+
+  it("parses byte-range fMP4 segments and rewrites them as independent resources", () => {
+    const playlist = `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:4
+#EXT-X-MAP:URI="video.mp4",BYTERANGE="16@0"
+#EXTINF:4.000,
+#EXT-X-BYTERANGE:20@16
+video.mp4
+#EXTINF:4.000,
+#EXT-X-BYTERANGE:24
+video.mp4
+#EXT-X-ENDLIST
+`;
+
+    const plan = parseHlsPlaylist(playlist, new URL("https://media.example.com/path/index.m3u8"));
+
+    expect(plan.kind).toBe("media");
+    if (plan.kind !== "media") {
+      return;
+    }
+    expect(plan.segments.map((segment) => segment.byteRange)).toEqual([
+      { offset: 16, length: 20 },
+      { offset: 36, length: 24 }
+    ]);
+
+    const rewritten = buildRewrittenMediaPlaylist({
+      playlistText: playlist,
+      targetDuration: 4,
+      initSegmentPath: "https://files.example.com/api/hls/token/init/video.mp4",
+      segments: [
+        { index: 0, duration: 4, path: "https://files.example.com/api/hls/token/segments/0/video-0.m4s" },
+        { index: 1, duration: 4, path: "https://files.example.com/api/hls/token/segments/1/video-1.m4s" }
+      ]
+    });
+
+    expect(rewritten).toContain('#EXT-X-MAP:URI="https://files.example.com/api/hls/token/init/video.mp4"');
+    expect(rewritten).not.toContain("#EXT-X-BYTERANGE");
+    expect(rewritten).toContain("https://files.example.com/api/hls/token/segments/0/video-0.m4s");
+    expect(rewritten).toContain("https://files.example.com/api/hls/token/segments/1/video-1.m4s");
+  });
 });

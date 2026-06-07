@@ -13,6 +13,7 @@ export interface HlsSegmentPlan {
   uri: string;
   rawUri: string;
   duration: number;
+  byteRange: HlsByteRange | null;
   encryption: HlsSegmentEncryption | null;
 }
 
@@ -21,6 +22,18 @@ export interface HlsSegmentEncryption {
   keyUri: string;
   rawKeyUri: string;
   ivHex: string;
+}
+
+export interface HlsInitSegmentPlan {
+  uri: string;
+  rawUri: string;
+  byteRange: HlsByteRange | null;
+  encryption: HlsSegmentEncryption | null;
+}
+
+export interface HlsByteRange {
+  offset: number;
+  length: number;
 }
 
 interface HlsEncryptionState {
@@ -36,6 +49,7 @@ export interface HlsMediaPlan {
   playlistText: string;
   targetDuration: number;
   duration: number;
+  initSegment?: HlsInitSegmentPlan;
   segments: HlsSegmentPlan[];
 }
 
@@ -80,6 +94,15 @@ export function hlsSegmentFileName(url: URL, index: number): string {
   return `segment-${String(index).padStart(5, "0")}.ts`;
 }
 
+export function hlsInitSegmentFileName(url: URL): string {
+  const segment = url.pathname.split("/").filter(Boolean).at(-1);
+  if (segment) {
+    return sanitizeFileName(segment);
+  }
+
+  return "init.mp4";
+}
+
 export function hlsMimeTypeForSegment(url: URL, contentType?: string | null): string {
   const normalized = contentType?.split(";")[0]?.trim().toLowerCase();
   if (normalized && normalized !== "application/octet-stream") {
@@ -100,22 +123,37 @@ export function hlsMimeTypeForSegment(url: URL, contentType?: string | null): st
   return "video/mp2t";
 }
 
+export function hlsMimeTypeForInitSegment(url: URL, contentType?: string | null): string {
+  const normalized = contentType?.split(";")[0]?.trim().toLowerCase();
+  if (normalized && normalized !== "application/octet-stream") {
+    return normalized;
+  }
+
+  const segmentMimeType = hlsMimeTypeForSegment(url, contentType);
+  return segmentMimeType === "video/mp2t" ? "video/mp4" : segmentMimeType;
+}
+
 export function buildRewrittenMediaPlaylist(params: {
   playlistText?: string | null;
   targetDuration: number;
+  initSegmentPath?: string | null;
   segments: Array<{ index: number; duration: number; path: string }>;
 }): string {
   if (params.playlistText) {
-    return rewriteMediaPlaylistUris(params.playlistText, params.segments);
+    return rewriteMediaPlaylistUris(params.playlistText, params.segments, params.initSegmentPath ?? null);
   }
 
   const lines = [
     "#EXTM3U",
-    "#EXT-X-VERSION:3",
+    params.initSegmentPath ? "#EXT-X-VERSION:7" : "#EXT-X-VERSION:3",
     `#EXT-X-TARGETDURATION:${Math.max(1, Math.ceil(params.targetDuration))}`,
     "#EXT-X-MEDIA-SEQUENCE:0",
     "#EXT-X-PLAYLIST-TYPE:VOD"
   ];
+
+  if (params.initSegmentPath) {
+    lines.push(`#EXT-X-MAP:URI="${escapeHlsAttributeValue(params.initSegmentPath)}"`);
+  }
 
   for (const segment of params.segments) {
     lines.push(`#EXTINF:${segment.duration.toFixed(3)},`);
@@ -127,12 +165,9 @@ export function buildRewrittenMediaPlaylist(params: {
 }
 
 function rejectUnsupportedHlsTags(lines: string[]): void {
-  if (lines.some((line) => line.startsWith("#EXT-X-BYTERANGE"))) {
-    throw new AppError(400, "UnsupportedHlsByteRange", "暂不支持 byte-range HLS");
-  }
-
-  if (lines.some((line) => line.startsWith("#EXT-X-MAP"))) {
-    throw new AppError(400, "UnsupportedHlsInitSegment", "暂不支持 fMP4/init segment HLS");
+  const mapCount = lines.filter((line) => line.startsWith("#EXT-X-MAP")).length;
+  if (mapCount > 1) {
+    throw new AppError(400, "UnsupportedHlsInitSegment", "暂不支持多个 EXT-X-MAP/init segment 的 fMP4 HLS");
   }
 }
 
@@ -185,6 +220,9 @@ function parseMediaPlaylist(lines: string[], playlistUrl: URL, playlistText: str
   let targetDuration = 0;
   let mediaSequence = 0;
   let currentEncryption: HlsEncryptionState | null = null;
+  let initSegment: HlsInitSegmentPlan | undefined;
+  let pendingByteRange: HlsByteRange | null = null;
+  let nextByteRangeOffset = 0;
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
@@ -209,11 +247,21 @@ function parseMediaPlaylist(lines: string[], playlistUrl: URL, playlistText: str
       continue;
     }
 
+    if (line.startsWith("#EXT-X-MAP")) {
+      initSegment = parseHlsMap(line, playlistUrl, currentEncryption);
+      continue;
+    }
+
     if (!line.startsWith("#EXTINF:")) {
       continue;
     }
 
     const duration = parseExtinfDuration(line);
+    const rangeLine = nextByteRangeLine(lines, index + 1);
+    if (rangeLine) {
+      pendingByteRange = parseHlsByteRange(rangeLine.slice("#EXT-X-BYTERANGE:".length), nextByteRangeOffset);
+      nextByteRangeOffset = pendingByteRange.offset + pendingByteRange.length;
+    }
     const uri = nextUriLine(lines, index + 1);
     if (!uri) {
       throw new AppError(400, "InvalidHlsPlaylist", "#EXTINF 后缺少 segment URI");
@@ -225,6 +273,7 @@ function parseMediaPlaylist(lines: string[], playlistUrl: URL, playlistText: str
       uri: new URL(uri, playlistUrl).toString(),
       rawUri: uri,
       duration,
+      byteRange: pendingByteRange,
       encryption: currentEncryption
         ? {
             ...currentEncryption,
@@ -232,6 +281,7 @@ function parseMediaPlaylist(lines: string[], playlistUrl: URL, playlistText: str
           }
         : null
     });
+    pendingByteRange = null;
   }
 
   if (segments.length === 0) {
@@ -244,13 +294,15 @@ function parseMediaPlaylist(lines: string[], playlistUrl: URL, playlistText: str
     playlistText,
     targetDuration: targetDuration || Math.max(...segments.map((segment) => segment.duration)),
     duration: segments.reduce((total, segment) => total + segment.duration, 0),
+    ...(initSegment ? { initSegment } : {}),
     segments
   };
 }
 
 function rewriteMediaPlaylistUris(
   playlistText: string,
-  segments: Array<{ index: number; duration: number; path: string }>
+  segments: Array<{ index: number; duration: number; path: string }>,
+  initSegmentPath: string | null
 ): string {
   const replacements = new Map(segments.map((segment) => [segment.index, segment.path]));
   const output: string[] = [];
@@ -271,6 +323,17 @@ function rewriteMediaPlaylistUris(
       continue;
     }
 
+    if (line.startsWith("#EXT-X-MAP")) {
+      if (initSegmentPath) {
+        output.push(`#EXT-X-MAP:URI="${escapeHlsAttributeValue(initSegmentPath)}"`);
+      }
+      continue;
+    }
+
+    if (line.startsWith("#EXT-X-BYTERANGE")) {
+      continue;
+    }
+
     if (pendingSegmentIndex !== null && line && !line.startsWith("#")) {
       output.push(replacements.get(pendingSegmentIndex) ?? rawLine);
       pendingSegmentIndex = null;
@@ -282,6 +345,62 @@ function rewriteMediaPlaylistUris(
 
   const text = output.join("\n").replace(/\n*$/g, "");
   return `${text}\n`;
+}
+
+function parseHlsMap(
+  line: string,
+  playlistUrl: URL,
+  currentEncryption: HlsEncryptionState | null
+): HlsInitSegmentPlan {
+  const attrs = parseHlsAttributes(line.slice(line.indexOf(":") + 1));
+  if (!attrs.URI) {
+    throw new AppError(400, "InvalidHlsPlaylist", "EXT-X-MAP 缺少 URI");
+  }
+
+  if (currentEncryption && !currentEncryption.ivHex) {
+    throw new AppError(400, "UnsupportedHlsEncryption", "加密 fMP4 init segment 必须提供显式 IV");
+  }
+
+  return {
+    uri: new URL(attrs.URI, playlistUrl).toString(),
+    rawUri: attrs.URI,
+    byteRange: attrs.BYTERANGE ? parseHlsByteRange(attrs.BYTERANGE, 0) : null,
+    encryption: currentEncryption ? initSegmentEncryption(currentEncryption) : null
+  };
+}
+
+function initSegmentEncryption(currentEncryption: HlsEncryptionState): HlsSegmentEncryption {
+  if (!currentEncryption.ivHex) {
+    throw new AppError(400, "UnsupportedHlsEncryption", "加密 fMP4 init segment 必须提供显式 IV");
+  }
+
+  return {
+    ...currentEncryption,
+    ivHex: currentEncryption.ivHex
+  };
+}
+
+function parseHlsByteRange(value: string, defaultOffset: number): HlsByteRange {
+  const [lengthText, offsetText] = value.trim().split("@");
+  const length = Number(lengthText);
+  const offset = offsetText === undefined || offsetText === ""
+    ? defaultOffset
+    : Number(offsetText);
+
+  if (
+    !Number.isSafeInteger(length) ||
+    length <= 0 ||
+    !Number.isSafeInteger(offset) ||
+    offset < 0
+  ) {
+    throw new AppError(400, "InvalidHlsPlaylist", "HLS byte-range 无效");
+  }
+
+  return { offset, length };
+}
+
+function escapeHlsAttributeValue(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
 }
 
 function nextUriLine(lines: string[], startIndex: number): string | undefined {
@@ -336,6 +455,23 @@ function parseHlsAttributes(value: string): Record<string, string> {
   }
 
   return attrs;
+}
+
+function nextByteRangeLine(lines: string[], startIndex: number): string | undefined {
+  for (let index = startIndex; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (!line) {
+      continue;
+    }
+    if (line.startsWith("#EXT-X-BYTERANGE:")) {
+      return line;
+    }
+    if (!line.startsWith("#")) {
+      return undefined;
+    }
+  }
+
+  return undefined;
 }
 
 function parseHlsKey(line: string, playlistUrl: URL): HlsEncryptionState | null {

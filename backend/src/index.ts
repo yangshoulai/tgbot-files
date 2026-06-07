@@ -8,6 +8,7 @@ import {
 import { createSignedPayload, createSignedToken, TokenError, verifySignedPayload, verifySignedToken } from "./crypto";
 import {
   attachHlsSegmentMultipartUpload,
+  completeHlsInitSegmentSingle,
   completeHlsAssetWithFileRecord,
   completeHlsSegmentMultipart,
   completeHlsSegmentSingle,
@@ -17,6 +18,7 @@ import {
   deleteStaleHlsUploadData,
   deleteStaleMultipartUploadData,
   failHlsSegment,
+  failHlsInitSegment,
   getDirectoryRecord,
   getDirectoryRecordByPath,
   getDirectoryUsageStats,
@@ -51,6 +53,7 @@ import {
   moveDirectoryTree,
   renameDirectoryTree,
   requireDb,
+  markHlsInitSegmentImporting,
   markHlsAssetStatus,
   markHlsSegmentImporting,
   softDeleteApiKeyRecord,
@@ -92,10 +95,14 @@ import {
 import { md5Hex } from "./md5";
 import {
   buildRewrittenMediaPlaylist,
+  hlsInitSegmentFileName,
   hlsFileNameFromUrl,
+  hlsMimeTypeForInitSegment,
   hlsMimeTypeForSegment,
   hlsSegmentFileName,
   parseHlsPlaylist,
+  type HlsByteRange,
+  type HlsInitSegmentPlan,
   type HlsMediaPlan,
   type HlsPlaylistPlan,
   type HlsSegmentEncryption,
@@ -1526,6 +1533,18 @@ async function handleAdminHlsUploads(request: Request, env: Env, username: strin
     return handleAdminHlsPreviewPlaylist(request, env, decodeURIComponent(previewPlaylistMatch[1]));
   }
 
+  const previewInitMatch = /^\/api\/admin\/uploads\/hls\/([^/]+)\/preview-init(?:\/[^/]+)?$/.exec(url.pathname);
+  if (request.method === "GET" && previewInitMatch?.[1]) {
+    const asset = await requireHlsAsset(db, decodeURIComponent(previewInitMatch[1]));
+    return serveStoredHlsInitSegment({
+      env,
+      db,
+      asset,
+      rangeHeader: request.headers.get("Range"),
+      forceDownload: false
+    });
+  }
+
   const previewSegmentMatch = /^\/api\/admin\/uploads\/hls\/([^/]+)\/preview-segments\/(\d+)$/.exec(url.pathname);
   if (request.method === "GET" && previewSegmentMatch?.[1] && previewSegmentMatch?.[2]) {
     const asset = await requireHlsAsset(db, decodeURIComponent(previewSegmentMatch[1]));
@@ -1864,6 +1883,12 @@ async function createHlsUpload(params: {
     durationSeconds: resolved.mediaPlan.duration,
     segmentCount: resolved.mediaPlan.segments.length,
     playlistText: resolved.mediaPlan.playlistText,
+    ...(resolved.mediaPlan.initSegment ? {
+      initSourceUrl: resolved.mediaPlan.initSegment.uri,
+      initByteRangeStart: resolved.mediaPlan.initSegment.byteRange?.offset ?? null,
+      initByteRangeLength: resolved.mediaPlan.initSegment.byteRange?.length ?? null,
+      initMimeType: hlsMimeTypeForInitSegment(new URL(resolved.mediaPlan.initSegment.uri))
+    } : {}),
     createdAt: now,
     updatedAt: now,
     ...(params.remark ? { remark: params.remark } : {}),
@@ -1878,6 +1903,8 @@ async function createHlsUpload(params: {
       variantId: resolved.selectedVariantId ?? "media",
       segmentIndex: segment.index,
       sourceUrl: segment.uri,
+      byteRangeStart: segment.byteRange?.offset ?? null,
+      byteRangeLength: segment.byteRange?.length ?? null,
       durationSeconds: segment.duration,
       mimeType: hlsMimeTypeForSegment(segmentUrl),
       status: "pending",
@@ -1901,6 +1928,11 @@ async function importHlsSegment(params: {
   const segment = await requireHlsSegment(params.db, params.asset.id, params.segmentIndex);
 
   if (segment.status === "done") {
+    await ensureHlsInitSegmentImported({
+      env: params.env,
+      db: params.db,
+      asset: params.asset
+    });
     return hlsSegmentImportResult(params.db, segment);
   }
 
@@ -1908,10 +1940,16 @@ async function importHlsSegment(params: {
   await markHlsSegmentImporting(params.db, segment.id, new Date().toISOString());
 
   try {
+    const asset = await ensureHlsInitSegmentImported({
+      env: params.env,
+      db: params.db,
+      asset: params.asset
+    });
     const sourceUrl = new URL(segment.source_url);
-    const sourceHeaders = storedRemoteRequestHeaders(params.asset.source_headers_json);
-    const encryption = hlsSegmentEncryptionForAsset(params.asset, params.segmentIndex);
-    const probe = await probeHlsSegmentSource(sourceUrl, sourceHeaders);
+    const sourceHeaders = storedRemoteRequestHeaders(asset.source_headers_json);
+    const byteRange = hlsSegmentByteRange(segment);
+    const encryption = hlsSegmentEncryptionForAsset(asset, params.segmentIndex);
+    const probe = await probeHlsSegmentSource(sourceUrl, sourceHeaders, byteRange);
     const mimeType = hlsMimeTypeForSegment(sourceUrl, probe.contentType);
 
     if (probe.size !== undefined && probe.size > MAX_TELEGRAM_MULTIPART_BYTES) {
@@ -1931,7 +1969,8 @@ async function importHlsSegment(params: {
         sourceUrl,
         TELEGRAM_CHUNK_SIZE_BYTES + HLS_AES_128_KEY_BYTES,
         probe.size,
-        sourceHeaders
+        sourceHeaders,
+        byteRange
       );
       const blob = await decryptHlsSegmentBlob(encryptedBlob, encryption, sourceHeaders);
       if (blob.size > TELEGRAM_CHUNK_SIZE_BYTES) {
@@ -1988,7 +2027,7 @@ async function importHlsSegment(params: {
       };
     }
 
-    const blob = await downloadHlsSegmentBlob(sourceUrl, TELEGRAM_CHUNK_SIZE_BYTES, probe.size, sourceHeaders);
+    const blob = await downloadHlsSegmentBlob(sourceUrl, TELEGRAM_CHUNK_SIZE_BYTES, probe.size, sourceHeaders, byteRange);
     const fileName = hlsSegmentFileName(sourceUrl, segment.segment_index);
     const { telegramDocument, channel } = await uploadTelegramDocumentWithChannel({
       env: params.env,
@@ -2013,6 +2052,91 @@ async function importHlsSegment(params: {
     return hlsSegmentImportResult(params.db, await requireHlsSegment(params.db, params.asset.id, params.segmentIndex));
   } catch (error) {
     await failHlsSegment(params.db, segment.id, errorMessageForServer(error), new Date().toISOString());
+    await markHlsAssetStatus(params.db, params.asset.id, "failed", new Date().toISOString());
+    throw error;
+  }
+}
+
+async function ensureHlsInitSegmentImported(params: {
+  env: Env;
+  db: D1Database;
+  asset: HlsAssetRecord;
+}): Promise<HlsAssetRecord> {
+  if (!params.asset.init_source_url) {
+    return params.asset;
+  }
+
+  if (
+    params.asset.init_status === "done" &&
+    params.asset.init_storage_backend === "telegram_single" &&
+    params.asset.init_telegram_file_id &&
+    Number.isSafeInteger(params.asset.init_size)
+  ) {
+    return params.asset;
+  }
+
+  const startedAt = new Date().toISOString();
+  await markHlsInitSegmentImporting(params.db, params.asset.id, startedAt);
+
+  try {
+    const sourceUrl = new URL(params.asset.init_source_url);
+    const sourceHeaders = storedRemoteRequestHeaders(params.asset.source_headers_json);
+    const initPlan = hlsInitSegmentPlanForAsset(params.asset);
+    const byteRange = initPlan?.byteRange ?? hlsInitByteRange(params.asset);
+    const encryption = initPlan?.encryption ?? null;
+    const probe = await probeHlsSegmentSource(sourceUrl, sourceHeaders, byteRange);
+    const mimeType = hlsMimeTypeForInitSegment(sourceUrl, probe.contentType ?? params.asset.init_mime_type);
+
+    if (probe.size !== undefined && probe.size > MAX_TELEGRAM_MULTIPART_BYTES) {
+      throw fileTooLargeError(MAX_TELEGRAM_MULTIPART_BYTES, probe.size);
+    }
+
+    const maxInitBytes = encryption
+      ? TELEGRAM_CHUNK_SIZE_BYTES + HLS_AES_128_KEY_BYTES
+      : TELEGRAM_CHUNK_SIZE_BYTES;
+    if (probe.size !== undefined && probe.size > maxInitBytes) {
+      throw new AppError(
+        400,
+        "HlsInitSegmentTooLarge",
+        `fMP4 init segment 目前最大支持 ${formatHumanFileSize(TELEGRAM_CHUNK_SIZE_BYTES)}`
+      );
+    }
+
+    const sourceBlob = await downloadHlsSegmentBlob(sourceUrl, maxInitBytes, probe.size, sourceHeaders, byteRange);
+    const blob = encryption
+      ? await decryptHlsSegmentBlob(sourceBlob, encryption, sourceHeaders)
+      : sourceBlob;
+    if (blob.size > TELEGRAM_CHUNK_SIZE_BYTES) {
+      throw new AppError(
+        400,
+        "HlsInitSegmentTooLarge",
+        `fMP4 init segment 目前最大支持 ${formatHumanFileSize(TELEGRAM_CHUNK_SIZE_BYTES)}`
+      );
+    }
+
+    const { telegramDocument, channel } = await uploadTelegramDocumentWithChannel({
+      env: params.env,
+      db: params.db,
+      file: blob,
+      fileName: hlsInitSegmentFileName(sourceUrl),
+      preferredChannelIndex: 0
+    });
+    const completedAt = new Date().toISOString();
+
+    await completeHlsInitSegmentSingle({
+      db: params.db,
+      assetId: params.asset.id,
+      mimeType,
+      size: telegramDocument.file_size ?? blob.size,
+      telegramFileId: telegramDocument.file_id,
+      telegramChannelId: channel.id,
+      completedAt,
+      ...(telegramDocument.file_unique_id ? { telegramFileUniqueId: telegramDocument.file_unique_id } : {})
+    });
+
+    return await requireHlsAsset(params.db, params.asset.id);
+  } catch (error) {
+    await failHlsInitSegment(params.db, params.asset.id, errorMessageForServer(error), new Date().toISOString());
     await markHlsAssetStatus(params.db, params.asset.id, "failed", new Date().toISOString());
     throw error;
   }
@@ -2083,7 +2207,8 @@ async function completeHlsUpload(params: {
 }): Promise<UploadResult> {
   const segments = await listHlsSegmentRecords(params.db, params.asset.id);
   validateCompleteHlsSegments(params.asset, segments);
-  const totalSize = segments.reduce((total, segment) => total + requireHlsSegmentSize(segment), 0);
+  const totalSize = hlsInitSegmentSize(params.asset) +
+    segments.reduce((total, segment) => total + requireHlsSegmentSize(segment), 0);
 
   await requireFileNameWritable({
     db: params.db,
@@ -2256,9 +2381,35 @@ async function probeHlsSegmentSource(sourceUrl: URL, sourceHeaders?: RemoteReque
   size?: number;
   contentType?: string | null;
   supportsRange: boolean;
+}>;
+async function probeHlsSegmentSource(
+  sourceUrl: URL,
+  sourceHeaders: RemoteRequestHeaders | undefined,
+  byteRange: HlsByteRange | null
+): Promise<{
+  size?: number;
+  contentType?: string | null;
+  supportsRange: boolean;
+}>;
+async function probeHlsSegmentSource(
+  sourceUrl: URL,
+  sourceHeaders?: RemoteRequestHeaders,
+  byteRange: HlsByteRange | null = null
+): Promise<{
+  size?: number;
+  contentType?: string | null;
+  supportsRange: boolean;
 }> {
   const head = await fetchRemoteHead(sourceUrl, sourceHeaders);
   const contentType = head?.headers.get("Content-Type") ?? null;
+  if (byteRange) {
+    return {
+      size: byteRange.length,
+      contentType,
+      supportsRange: true
+    };
+  }
+
   const size = parseContentLength(head?.headers.get("Content-Length") ?? null);
   const headSupportsRange = (head?.headers.get("Accept-Ranges") ?? "").toLowerCase().includes("bytes");
 
@@ -2290,8 +2441,30 @@ async function downloadHlsSegmentBlob(
   sourceUrl: URL,
   maxBytes: number,
   expectedSize: number | undefined,
-  sourceHeaders?: RemoteRequestHeaders
+  sourceHeaders?: RemoteRequestHeaders,
+  byteRange: HlsByteRange | null = null
 ): Promise<Blob> {
+  if (byteRange) {
+    if (byteRange.length > maxBytes) {
+      throw new AppError(400, "RangeNotSupported", "较大的 HLS segment 必须支持 Range 请求");
+    }
+
+    const response = await fetchRemoteRange(sourceUrl, byteRange.offset, byteRange.offset + byteRange.length - 1, sourceHeaders);
+    validateHlsRangeResponse(response, byteRange);
+
+    const blob = await response.blob().catch(() => {
+      throw new AppError(502, "HlsSegmentReadFailed", "HLS segment 读取失败");
+    });
+    if (blob.size !== byteRange.length) {
+      throw new AppError(400, "InvalidChunkSize", `HLS byte-range 大小必须为 ${formatHumanFileSize(byteRange.length)}（当前 ${formatHumanFileSize(blob.size)}）`, {
+        expected_chunk_bytes: byteRange.length,
+        actual_chunk_bytes: blob.size
+      });
+    }
+
+    return blob;
+  }
+
   let response: Response;
   try {
     response = await fetch(sourceUrl.toString(), {
@@ -2328,6 +2501,36 @@ async function downloadHlsSegmentBlob(
   return blob;
 }
 
+function validateHlsRangeResponse(response: Response, byteRange: HlsByteRange): void {
+  if (response.status !== 206) {
+    throw new AppError(400, "RangeNotSupported", "HLS byte-range source must return 206");
+  }
+
+  const contentRange = parseContentRange(response.headers.get("Content-Range"));
+  if (!contentRange) {
+    throw new AppError(400, "RangeNotSupported", "HLS byte-range source must include Content-Range");
+  }
+
+  const expectedEnd = byteRange.offset + byteRange.length - 1;
+  if (contentRange.start !== byteRange.offset || contentRange.end !== expectedEnd || contentRange.size < expectedEnd + 1) {
+    throw new AppError(400, "InvalidChunkRange", "HLS byte-range source returned an unexpected range", {
+      expected_start: byteRange.offset,
+      expected_end: expectedEnd,
+      actual_start: contentRange.start,
+      actual_end: contentRange.end,
+      actual_total_bytes: contentRange.size
+    });
+  }
+
+  const contentLength = parseContentLength(response.headers.get("Content-Length"));
+  if (contentLength !== undefined && contentLength !== byteRange.length) {
+    throw new AppError(400, "InvalidChunkSize", `HLS byte-range 大小必须为 ${formatHumanFileSize(byteRange.length)}（当前 ${formatHumanFileSize(contentLength)}）`, {
+      expected_chunk_bytes: byteRange.length,
+      actual_chunk_bytes: contentLength
+    });
+  }
+}
+
 function hlsSegmentEncryptionForAsset(asset: HlsAssetRecord, segmentIndex: number): HlsSegmentEncryption | null {
   const plan = parseHlsPlaylist(asset.playlist_text, new URL(asset.media_playlist_url));
   if (plan.kind !== "media") {
@@ -2335,6 +2538,56 @@ function hlsSegmentEncryptionForAsset(asset: HlsAssetRecord, segmentIndex: numbe
   }
 
   return plan.segments[segmentIndex]?.encryption ?? null;
+}
+
+function hlsInitSegmentPlanForAsset(asset: HlsAssetRecord): HlsInitSegmentPlan | null {
+  if (!asset.init_source_url) {
+    return null;
+  }
+
+  const plan = parseHlsPlaylist(asset.playlist_text, new URL(asset.media_playlist_url));
+  if (plan.kind !== "media") {
+    throw new AppError(400, "InvalidHlsPlaylist", "HLS media playlist 无效");
+  }
+
+  return plan.initSegment ?? {
+    uri: asset.init_source_url,
+    rawUri: asset.init_source_url,
+    byteRange: hlsInitByteRange(asset),
+    encryption: null
+  };
+}
+
+function hlsSegmentByteRange(segment: HlsSegmentRecord): HlsByteRange | null {
+  return hlsByteRangeFromRecord(segment.byte_range_start, segment.byte_range_length, "HLS segment byte-range");
+}
+
+function hlsInitByteRange(asset: HlsAssetRecord): HlsByteRange | null {
+  return hlsByteRangeFromRecord(asset.init_byte_range_start, asset.init_byte_range_length, "HLS init byte-range");
+}
+
+function hlsByteRangeFromRecord(
+  start: number | null | undefined,
+  length: number | null | undefined,
+  label: string
+): HlsByteRange | null {
+  if (start === null || start === undefined || length === null || length === undefined) {
+    return null;
+  }
+
+  if (
+    !Number.isSafeInteger(start) ||
+    Number(start) < 0 ||
+    !Number.isSafeInteger(length) ||
+    Number(length) <= 0
+  ) {
+    throw new AppError(409, "InvalidHlsByteRange", `${label} 无效`);
+  }
+
+  return {
+    offset: Number(start),
+    length: Number(length)
+  };
 }
 
 async function decryptHlsSegmentBlob(
@@ -2445,11 +2698,13 @@ async function ensureHlsSegmentMultipartUpload(params: {
   const chunkCount = Math.ceil(params.size / TELEGRAM_CHUNK_SIZE_BYTES);
   const now = new Date().toISOString();
   const sourceUrl = new URL(params.segment.source_url);
+  const byteRange = hlsSegmentByteRange(params.segment);
   const upload = await insertMultipartUploadRecord(params.db, {
     id: crypto.randomUUID(),
     sourceKind: "url",
     sourceUrl: params.segment.source_url,
     ...(params.asset.source_headers_json ? { sourceHeadersJson: params.asset.source_headers_json } : {}),
+    ...(byteRange ? { sourceRangeStart: byteRange.offset } : {}),
     fileName: hlsSegmentFileName(sourceUrl, params.segment.segment_index),
     mimeType: params.mimeType,
     size: params.size,
@@ -2538,6 +2793,15 @@ function normalizeHlsSegmentIndex(value: string, segmentCount: number): number {
 }
 
 function validateCompleteHlsSegments(asset: HlsAssetRecord, segments: HlsSegmentRecord[]): void {
+  if (asset.init_source_url) {
+    requireHlsInitSegmentSize(asset);
+    if (asset.init_status !== "done" || asset.init_storage_backend !== "telegram_single" || !asset.init_telegram_file_id) {
+      throw new AppError(409, "HlsUploadIncomplete", "HLS init segment 尚未导入完成", {
+        init_status: asset.init_status
+      });
+    }
+  }
+
   if (segments.length !== asset.segment_count) {
     throw new AppError(409, "HlsUploadIncomplete", "HLS segment 数量不完整", {
       expected_segments: asset.segment_count,
@@ -2555,6 +2819,18 @@ function validateCompleteHlsSegments(asset: HlsAssetRecord, segments: HlsSegment
     }
     requireHlsSegmentSize(segment);
   }
+}
+
+function hlsInitSegmentSize(asset: HlsAssetRecord): number {
+  return asset.init_source_url ? requireHlsInitSegmentSize(asset) : 0;
+}
+
+function requireHlsInitSegmentSize(asset: HlsAssetRecord): number {
+  if (!Number.isSafeInteger(asset.init_size) || Number(asset.init_size) < 0) {
+    throw new AppError(409, "HlsUploadIncomplete", "HLS init segment 缺少文件大小");
+  }
+
+  return Number(asset.init_size);
 }
 
 function requireHlsSegmentSize(segment: HlsSegmentRecord): number {
@@ -4645,11 +4921,21 @@ async function downloadRemoteChunk(upload: MultipartUploadRecord, chunkIndex: nu
   const sourceUrl = new URL(upload.source_url);
   const sourceHeaders = storedRemoteRequestHeaders(upload.source_headers_json);
   const expectedSize = expectedChunkSize(upload, chunkIndex);
-  const start = chunkIndex * upload.chunk_size;
+  const sourceRangeStart = Number.isSafeInteger(upload.source_range_start)
+    ? Number(upload.source_range_start)
+    : 0;
+  const start = sourceRangeStart + chunkIndex * upload.chunk_size;
   const end = start + expectedSize - 1;
   const response = await fetchRemoteRange(sourceUrl, start, end, sourceHeaders);
 
-  validateRemoteChunkResponse({ response, upload, start, end, expectedSize });
+  validateRemoteChunkResponse({
+    response,
+    upload,
+    start,
+    end,
+    expectedSize,
+    sourceRangeStart: upload.source_range_start ?? null
+  });
 
   let chunk: Blob;
   try {
@@ -4698,6 +4984,7 @@ function validateRemoteChunkResponse(params: {
   start: number;
   end: number;
   expectedSize: number;
+  sourceRangeStart: number | null;
 }): void {
   if (params.response.status !== 206) {
     throw new AppError(400, "RangeNotSupported", "Source URL must return 206 for chunk Range requests");
@@ -4708,11 +4995,16 @@ function validateRemoteChunkResponse(params: {
     throw new AppError(400, "RangeNotSupported", "Source URL must include Content-Range for chunk Range requests");
   }
 
-  if (contentRange.start !== params.start || contentRange.end !== params.end || contentRange.size !== params.upload.size) {
+  const rangeMode = params.sourceRangeStart !== null;
+  const invalidRange = contentRange.start !== params.start ||
+    contentRange.end !== params.end ||
+    (!rangeMode && contentRange.size !== params.upload.size) ||
+    (rangeMode && contentRange.size < params.end + 1);
+  if (invalidRange) {
     throw new AppError(400, "InvalidChunkRange", "Source URL returned an unexpected byte range", {
       expected_start: params.start,
       expected_end: params.end,
-      expected_total_bytes: params.upload.size,
+      expected_total_bytes: rangeMode ? undefined : params.upload.size,
       actual_start: contentRange.start,
       actual_end: contentRange.end,
       actual_total_bytes: contentRange.size
@@ -5283,14 +5575,24 @@ async function handleHlsAccess(request: Request, env: Env): Promise<Response> {
     });
   }
 
+  if (access.initSegment) {
+    return serveStoredHlsInitSegment({
+      env,
+      db,
+      asset,
+      rangeHeader: request.headers.get("Range"),
+      forceDownload: url.searchParams.get("download") === "1" || url.searchParams.get("download") === "true"
+    });
+  }
+
   const segments = await listHlsSegmentRecords(db, asset.id);
   validateCompleteHlsSegments(asset, segments);
   const forceDownload = url.searchParams.get("download") === "1" || url.searchParams.get("download") === "true";
 
   if (forceDownload) {
-    const downloadInfo = hlsDownloadAvailability(segments);
+    const downloadInfo = hlsDownloadAvailability(asset, segments);
     if (!downloadInfo.downloadable) {
-      throw new AppError(400, "UnsupportedHlsDownload", "当前仅支持未加密 TS HLS 顺序合并下载");
+      throw new AppError(400, "UnsupportedHlsDownload", "当前仅支持 TS 或 fMP4 HLS 顺序合并下载");
     }
     if (!downloadInfo.directAccess) {
       throw new AppError(
@@ -5317,6 +5619,9 @@ async function handleHlsAccess(request: Request, env: Env): Promise<Response> {
   const playlist = buildRewrittenMediaPlaylist({
     playlistText: asset.playlist_text,
     targetDuration: asset.target_duration_seconds,
+    initSegmentPath: hlsAssetHasDoneInitSegment(asset)
+      ? `${baseUrl}${hlsPublicInitSegmentPath(access.token, asset)}`
+      : null,
     segments: segments.map((segment) => ({
       index: segment.segment_index,
       duration: segment.duration_seconds,
@@ -5340,9 +5645,16 @@ async function handleAdminHlsPreviewPlaylist(request: Request, env: Env, assetId
     throw new AppError(409, "HlsPreviewNotReady", "至少需要完成 1 个 HLS segment 后才能生成预览 playlist");
   }
 
+  if (asset.init_source_url && !hlsAssetHasDoneInitSegment(asset)) {
+    throw new AppError(409, "HlsPreviewNotReady", "HLS init segment 尚未导入完成");
+  }
+
   const baseUrl = new URL(request.url).origin;
   const playlist = buildRewrittenMediaPlaylist({
     targetDuration: asset.target_duration_seconds,
+    initSegmentPath: asset.init_source_url
+      ? `${baseUrl}/api/admin/uploads/hls/${encodeURIComponent(asset.id)}/preview-init/${encodeURIComponent(hlsInitSegmentFileName(new URL(asset.init_source_url)))}`
+      : null,
     segments: doneSegments.map((segment) => ({
       index: segment.segment_index,
       duration: segment.duration_seconds,
@@ -5363,18 +5675,80 @@ async function serveHlsPackageDownload(params: {
   segments: HlsSegmentRecord[];
   fileName: string;
 }): Promise<Response> {
-  if (!params.segments.every(isDownloadableTsSegment)) {
-    throw new AppError(400, "UnsupportedHlsDownload", "当前仅支持未加密 TS HLS 顺序合并下载");
+  const availability = hlsDownloadAvailability(params.asset, params.segments);
+  if (!availability.downloadable || !availability.kind) {
+    throw new AppError(400, "UnsupportedHlsDownload", "当前仅支持 TS 或 fMP4 HLS 顺序合并下载");
   }
 
-  const totalSize = params.segments.reduce((total, segment) => total + requireHlsSegmentSize(segment), 0);
+  const totalSize = hlsDownloadTotalSize(params.asset, params.segments, availability.kind);
   const headers = withSecurityHeaders();
-  headers.set("Content-Type", "video/mp2t");
-  headers.set("Content-Disposition", contentDispositionAttachment(hlsDownloadFileName(params.fileName)));
+  headers.set("Content-Type", hlsDownloadContentType(availability.kind));
+  headers.set("Content-Disposition", contentDispositionAttachment(hlsDownloadFileName(params.fileName, availability.kind)));
   headers.set("Content-Length", String(totalSize));
   headers.set("Cache-Control", "public, max-age=31536000, immutable");
 
-  return new Response(streamHlsSegmentsForDownload(params), { headers });
+  return new Response(streamHlsSegmentsForDownload({
+    env: params.env,
+    db: params.db,
+    asset: params.asset,
+    segments: params.segments,
+    kind: availability.kind
+  }), { headers });
+}
+
+async function serveStoredHlsInitSegment(params: {
+  env: Env;
+  db: D1Database;
+  asset: HlsAssetRecord;
+  rangeHeader: string | null;
+  forceDownload: boolean;
+}): Promise<Response> {
+  if (!params.asset.init_source_url) {
+    throw new AppError(404, "HlsInitSegmentNotFound", "HLS init segment 不存在");
+  }
+
+  if (!hlsAssetHasDoneInitSegment(params.asset)) {
+    throw new AppError(404, "HlsInitSegmentNotReady", "HLS init segment 尚未导入完成");
+  }
+
+  const size = requireHlsInitSegmentSize(params.asset);
+  const range = parseByteRange(params.rangeHeader, size);
+  if (!range) {
+    return rangeNotSatisfiableResponse(size);
+  }
+
+  const channel = await resolveTelegramChannel(params.env, params.db, params.asset.init_telegram_channel_id);
+  const initTelegramFileId = params.asset.init_telegram_file_id;
+  if (!initTelegramFileId) {
+    throw new AppError(404, "HlsInitSegmentNotFound", "HLS init segment 文件不存在");
+  }
+  const telegramFileUrl = await getRateLimitedTelegramFileUrl({
+    env: params.env,
+    botToken: channel.botToken,
+    channelId: channel.id,
+    fileId: initTelegramFileId
+  });
+  const telegramResponse = await fetchTelegramFile({
+    fileUrl: telegramFileUrl,
+    rangeHeader: range.partial ? `bytes=${range.start}-${range.end}` : null
+  });
+
+  if (range.partial && telegramResponse.status !== 206 && (range.start !== 0 || range.end !== size - 1)) {
+    throw new AppError(502, "TelegramFileDownloadFailed", "Telegram file server ignored a partial Range request");
+  }
+
+  if (!telegramResponse.body) {
+    throw new AppError(502, "TelegramFileDownloadFailed", "Telegram file response did not include a body");
+  }
+
+  const headers = hlsInitSegmentHeaders(params.asset, range, params.forceDownload, telegramResponse.headers.get("Content-Type"));
+  copyHeader(telegramResponse.headers, headers, "Content-Range");
+
+  return new Response(telegramResponse.body, {
+    status: range.partial ? 206 : 200,
+    statusText: telegramResponse.statusText,
+    headers
+  });
 }
 
 async function serveStoredHlsSegment(params: {
@@ -5598,12 +5972,37 @@ function hlsSegmentHeaders(
   return headers;
 }
 
+function hlsInitSegmentHeaders(
+  asset: HlsAssetRecord,
+  range: ParsedByteRange,
+  forceDownload: boolean,
+  telegramContentType: string | null
+): Headers {
+  const fileName = asset.init_source_url ? hlsInitSegmentFileName(new URL(asset.init_source_url)) : "init.mp4";
+  const headers = withSecurityHeaders();
+  headers.set("Content-Type", asset.init_mime_type || telegramContentType || "video/mp4");
+  headers.set(
+    "Content-Disposition",
+    forceDownload ? contentDispositionAttachment(fileName) : contentDispositionInline(fileName)
+  );
+  headers.set("Content-Length", String(range.end - range.start + 1));
+  headers.set("Cache-Control", "public, max-age=31536000, immutable");
+  headers.set("Accept-Ranges", "bytes");
+  if (range.partial && Number.isSafeInteger(asset.init_size)) {
+    headers.set("Content-Range", `bytes ${range.start}-${range.end}/${Number(asset.init_size)}`);
+  }
+  return headers;
+}
+
 function streamHlsSegmentsForDownload(params: {
   env: Env;
   db: D1Database;
+  asset: HlsAssetRecord;
   segments: HlsSegmentRecord[];
+  kind: HlsDownloadKind;
 }): ReadableStream<Uint8Array> {
-  let segmentIndex = 0;
+  const items = hlsDownloadItems(params.asset, params.segments, params.kind);
+  let itemIndex = 0;
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 
   return new ReadableStream<Uint8Array>({
@@ -5615,7 +6014,7 @@ function streamHlsSegmentsForDownload(params: {
             if (done) {
               reader.releaseLock();
               reader = undefined;
-              segmentIndex += 1;
+              itemIndex += 1;
               continue;
             }
 
@@ -5626,19 +6025,27 @@ function streamHlsSegmentsForDownload(params: {
             continue;
           }
 
-          const segment = params.segments[segmentIndex];
-          if (!segment) {
+          const item = items[itemIndex];
+          if (!item) {
             controller.close();
             return;
           }
 
-          const response = await serveStoredHlsSegment({
-            env: params.env,
-            db: params.db,
-            segment,
-            rangeHeader: null,
-            forceDownload: false
-          });
+          const response = item.kind === "init"
+            ? await serveStoredHlsInitSegment({
+                env: params.env,
+                db: params.db,
+                asset: params.asset,
+                rangeHeader: null,
+                forceDownload: false
+              })
+            : await serveStoredHlsSegment({
+                env: params.env,
+                db: params.db,
+                segment: item.segment,
+                rangeHeader: null,
+                forceDownload: false
+              });
 
           if (!response.body) {
             throw new AppError(502, "HlsDownloadFailed", "HLS segment response did not include a body");
@@ -5677,25 +6084,79 @@ function isDownloadableTsSegment(segment: HlsSegmentRecord): boolean {
   return sourcePath.endsWith(".ts") || mimeType === "video/mp2t";
 }
 
-function hlsDownloadFileName(fileName: string): string {
-  const normalized = sanitizeFileName(fileName);
-  return normalized.replace(/\.m3u8$/i, "") + ".ts";
+function isDownloadableFmp4Segment(segment: HlsSegmentRecord): boolean {
+  const sourcePath = new URL(segment.source_url).pathname.toLowerCase();
+  const mimeType = segment.mime_type.toLowerCase();
+  return sourcePath.endsWith(".m4s") ||
+    sourcePath.endsWith(".mp4") ||
+    sourcePath.endsWith(".m4v") ||
+    sourcePath.endsWith(".m4a") ||
+    sourcePath.endsWith(".cmfv") ||
+    sourcePath.endsWith(".cmfa") ||
+    mimeType === "video/mp4" ||
+    mimeType === "audio/mp4" ||
+    mimeType === "application/mp4";
 }
 
-function hlsDownloadAvailability(segments: HlsSegmentRecord[]): {
+type HlsDownloadKind = "ts" | "fmp4";
+
+type HlsDownloadItem =
+  | { kind: "init" }
+  | { kind: "segment"; segment: HlsSegmentRecord };
+
+function hlsAssetHasDoneInitSegment(asset: HlsAssetRecord): boolean {
+  return Boolean(
+    asset.init_source_url &&
+    asset.init_status === "done" &&
+    asset.init_storage_backend === "telegram_single" &&
+    asset.init_telegram_file_id &&
+    Number.isSafeInteger(asset.init_size) &&
+    Number(asset.init_size) >= 0
+  );
+}
+
+function hlsDownloadItems(asset: HlsAssetRecord, segments: HlsSegmentRecord[], kind: HlsDownloadKind): HlsDownloadItem[] {
+  const segmentItems = segments.map((segment) => ({ kind: "segment" as const, segment }));
+  return kind === "fmp4" ? [{ kind: "init" }, ...segmentItems] : segmentItems;
+}
+
+function hlsDownloadTotalSize(asset: HlsAssetRecord, segments: HlsSegmentRecord[], kind: HlsDownloadKind): number {
+  return (kind === "fmp4" ? requireHlsInitSegmentSize(asset) : 0) +
+    segments.reduce((total, segment) => total + requireHlsSegmentSize(segment), 0);
+}
+
+function hlsDownloadContentType(kind: HlsDownloadKind): string {
+  return kind === "fmp4" ? "video/mp4" : "video/mp2t";
+}
+
+function hlsDownloadFileName(fileName: string, kind: HlsDownloadKind): string {
+  const normalized = sanitizeFileName(fileName);
+  return normalized.replace(/\.m3u8$/i, "") + (kind === "fmp4" ? ".mp4" : ".ts");
+}
+
+function hlsDownloadAvailability(asset: HlsAssetRecord, segments: HlsSegmentRecord[]): {
   downloadable: boolean;
+  kind: HlsDownloadKind | null;
   partCount: number;
   directAccess: boolean;
 } {
-  const downloadable = segments.every(isDownloadableTsSegment);
-  const partCount = downloadable
-    ? segments.reduce((total, segment) => total + hlsSegmentDownloadPartCount(segment), 0)
+  const kind: HlsDownloadKind | null = !asset.init_source_url && segments.every(isDownloadableTsSegment)
+    ? "ts"
+    : hlsAssetHasDoneInitSegment(asset) && segments.every(isDownloadableFmp4Segment)
+      ? "fmp4"
+      : null;
+  const partCount = kind
+    ? hlsDownloadItems(asset, segments, kind).reduce((total, item) =>
+        total + (item.kind === "init" ? 1 : hlsSegmentDownloadPartCount(item.segment)),
+        0
+      )
     : 0;
 
   return {
-    downloadable,
+    downloadable: kind !== null,
+    kind,
     partCount,
-    directAccess: downloadable && partCount > 0 && partCount <= DIRECT_MULTIPART_ACCESS_MAX_CHUNKS
+    directAccess: kind !== null && partCount > 0 && partCount <= DIRECT_MULTIPART_ACCESS_MAX_CHUNKS
   };
 }
 
@@ -6135,6 +6596,7 @@ function isFormContentType(contentType: string | null): boolean {
 
 async function hlsDownloadSummaryForFile(db: D1Database, file: FileRecord): Promise<{
   segment_count: number;
+  kind: HlsDownloadKind | null;
   part_count: number;
   direct_access: boolean;
   direct_access_max_parts: number;
@@ -6142,10 +6604,11 @@ async function hlsDownloadSummaryForFile(db: D1Database, file: FileRecord): Prom
 }> {
   const { asset, segments } = await requireHlsDownloadRecordsForFile(db, file);
   validateCompleteHlsSegments(asset, segments);
-  const availability = hlsDownloadAvailability(segments);
+  const availability = hlsDownloadAvailability(asset, segments);
 
   return {
     segment_count: asset.segment_count,
+    kind: availability.kind,
     part_count: availability.partCount,
     direct_access: availability.directAccess,
     direct_access_max_parts: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
@@ -6165,9 +6628,9 @@ async function serializeHlsDownloadPlanForFile(params: {
 
   const { asset, segments } = await requireHlsDownloadRecordsForFile(params.db, params.file);
   validateCompleteHlsSegments(asset, segments);
-  const availability = hlsDownloadAvailability(segments);
-  if (!availability.downloadable) {
-    throw new AppError(400, "UnsupportedHlsDownload", "当前仅支持未加密 TS HLS 顺序合并下载");
+  const availability = hlsDownloadAvailability(asset, segments);
+  if (!availability.downloadable || !availability.kind) {
+    throw new AppError(400, "UnsupportedHlsDownload", "当前仅支持 TS 或 fMP4 HLS 顺序合并下载");
   }
 
   const token = await createHlsAccessTokenForFile(params.file, params.env);
@@ -6175,6 +6638,21 @@ async function serializeHlsDownloadPlanForFile(params: {
   let offset = 0;
   let partIndex = 0;
   const parts: Array<Record<string, unknown>> = [];
+
+  if (availability.kind === "fmp4") {
+    const initSize = requireHlsInitSegmentSize(asset);
+    parts.push({
+      index: partIndex,
+      kind: "init",
+      segment_index: null,
+      chunk_index: null,
+      offset,
+      size: initSize,
+      url: `${baseUrl}${hlsPublicInitSegmentPath(token, asset)}`
+    });
+    offset += initSize;
+    partIndex += 1;
+  }
 
   for (const segment of segments) {
     const segmentSize = requireHlsSegmentSize(segment);
@@ -6186,6 +6664,7 @@ async function serializeHlsDownloadPlanForFile(params: {
         const size = expectedRecordChunkSize(segmentSize, chunkSize, chunkCount, chunkIndex);
         parts.push({
           index: partIndex,
+          kind: "segment",
           segment_index: segment.segment_index,
           chunk_index: chunkIndex,
           offset,
@@ -6204,6 +6683,7 @@ async function serializeHlsDownloadPlanForFile(params: {
 
     parts.push({
       index: partIndex,
+      kind: "segment",
       segment_index: segment.segment_index,
       chunk_index: null,
       offset,
@@ -6216,7 +6696,8 @@ async function serializeHlsDownloadPlanForFile(params: {
 
   return {
     file_id: params.file.id,
-    file_name: hlsDownloadFileName(params.file.file_name),
+    file_name: hlsDownloadFileName(params.file.file_name, availability.kind),
+    kind: availability.kind,
     total_size: offset,
     segment_count: asset.segment_count,
     part_count: parts.length,
@@ -6954,6 +7435,11 @@ function hlsPublicSegmentPath(token: string, segment: HlsSegmentRecord): string 
   return `${HLS_PUBLIC_ROUTE_PREFIX}/${encodeURIComponent(token)}/segments/${segment.segment_index}/${encodeURIComponent(hlsSegmentFileName(new URL(segment.source_url), segment.segment_index))}`;
 }
 
+function hlsPublicInitSegmentPath(token: string, asset: HlsAssetRecord): string {
+  const fileName = asset.init_source_url ? hlsInitSegmentFileName(new URL(asset.init_source_url)) : "init.mp4";
+  return `${HLS_PUBLIC_ROUTE_PREFIX}/${encodeURIComponent(token)}/init/${encodeURIComponent(fileName)}`;
+}
+
 function hlsPublicSegmentChunkPath(token: string, segmentIndex: number, chunkIndex: number): string {
   return `${HLS_PUBLIC_ROUTE_PREFIX}/${encodeURIComponent(token)}/segments/${segmentIndex}/chunks/${chunkIndex}`;
 }
@@ -7075,7 +7561,7 @@ function extractMultipartChunkAccess(pathname: string): { token: string; chunkIn
   };
 }
 
-function extractHlsAccess(pathname: string): { token: string; segmentIndex?: number; chunkIndex?: number } {
+function extractHlsAccess(pathname: string): { token: string; initSegment?: boolean; segmentIndex?: number; chunkIndex?: number } {
   const parts = pathname.split("/").filter(Boolean);
   const tokenPartIndex = parts[0] === "hls"
     ? 1
@@ -7089,6 +7575,10 @@ function extractHlsAccess(pathname: string): { token: string; segmentIndex?: num
   }
 
   const segmentsPartIndex = tokenPartIndex + 1;
+  if (parts[segmentsPartIndex] === "init") {
+    return { token, initSegment: true };
+  }
+
   if (parts[segmentsPartIndex] !== "segments") {
     return { token };
   }

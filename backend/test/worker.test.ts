@@ -108,6 +108,11 @@ class FakeD1Statement {
         directoryId,
         directoryPath
       ] = this.bindings;
+      const storageBackend = this.bindings[14] === "telegram_multipart"
+        ? "telegram_multipart"
+        : this.bindings[14] === "hls_package"
+          ? "hls_package"
+          : "telegram_single";
 
       this.db.files.push({
         id: String(id),
@@ -125,7 +130,7 @@ class FakeD1Statement {
         deleted_at: null,
         directory_id: directoryId === null ? null : String(directoryId),
         directory_path: String(directoryPath || "/"),
-        storage_backend: this.bindings[14] === "telegram_multipart" ? "telegram_multipart" : "telegram_single",
+        storage_backend: storageBackend,
         chunk_size: this.bindings[15] === null ? null : Number(this.bindings[15]),
         chunk_count: this.bindings[16] === null ? null : Number(this.bindings[16]),
         thumbnail_file_id: this.bindings[17] === null ? null : String(this.bindings[17]),
@@ -146,6 +151,7 @@ class FakeD1Statement {
         sourceKind,
         sourceUrl,
         sourceHeadersJson,
+        sourceRangeStart,
         fileName,
         mimeType,
         size,
@@ -161,6 +167,7 @@ class FakeD1Statement {
         source_kind: sourceKind as MultipartUploadRecord["source_kind"],
         source_url: sourceUrl === null ? null : String(sourceUrl),
         source_headers_json: sourceHeadersJson === null ? null : String(sourceHeadersJson),
+        source_range_start: sourceRangeStart === null ? null : Number(sourceRangeStart),
         file_name: String(fileName),
         mime_type: String(mimeType),
         size: Number(size),
@@ -169,9 +176,123 @@ class FakeD1Statement {
         remark: remark === null ? null : String(remark),
         uploaded_by: uploadedBy === null ? null : String(uploadedBy),
         created_at: String(createdAt),
-        directory_id: this.bindings[12] === null ? null : String(this.bindings[12]),
-        directory_path: String(this.bindings[13] || "/"),
-        telegram_channel_group: String(this.bindings[14] || "default"),
+        directory_id: this.bindings[13] === null ? null : String(this.bindings[13]),
+        directory_path: String(this.bindings[14] || "/"),
+        telegram_channel_group: String(this.bindings[15] || "default"),
+        completed_at: null
+      });
+      changes = 1;
+    }
+
+    if (normalizedSql.startsWith("INSERT INTO HLS_ASSETS")) {
+      const [
+        id,
+        sourceUrl,
+        sourceHeadersJson,
+        mediaPlaylistUrl,
+        fileName,
+        mimeType,
+        directoryId,
+        directoryPath,
+        status,
+        selectedVariantId,
+        targetDurationSeconds,
+        durationSeconds,
+        segmentCount,
+        estimatedSize,
+        playlistText,
+        initSourceUrl,
+        initByteRangeStart,
+        initByteRangeLength,
+        initMimeType,
+        initStatus,
+        remark,
+        uploadedBy,
+        createdAt,
+        updatedAt
+      ] = this.bindings;
+
+      this.db.hlsAssets.push({
+        id: String(id),
+        source_url: String(sourceUrl),
+        source_headers_json: sourceHeadersJson === null ? null : String(sourceHeadersJson),
+        media_playlist_url: String(mediaPlaylistUrl),
+        file_name: String(fileName),
+        mime_type: String(mimeType),
+        directory_id: directoryId === null ? null : String(directoryId),
+        directory_path: String(directoryPath || "/"),
+        status: status as HlsAssetRecord["status"],
+        selected_variant_id: selectedVariantId === null ? null : String(selectedVariantId),
+        target_duration_seconds: Number(targetDurationSeconds),
+        duration_seconds: Number(durationSeconds),
+        segment_count: Number(segmentCount),
+        estimated_size: estimatedSize === null ? null : Number(estimatedSize),
+        playlist_text: String(playlistText),
+        playlist_file_id: null,
+        final_file_id: null,
+        init_source_url: initSourceUrl === null ? null : String(initSourceUrl),
+        init_byte_range_start: initByteRangeStart === null ? null : Number(initByteRangeStart),
+        init_byte_range_length: initByteRangeLength === null ? null : Number(initByteRangeLength),
+        init_mime_type: initMimeType === null ? null : String(initMimeType),
+        init_size: null,
+        init_storage_backend: null,
+        init_telegram_file_id: null,
+        init_telegram_file_unique_id: null,
+        init_telegram_channel_id: "default",
+        init_status: initStatus as HlsAssetRecord["init_status"],
+        init_error_message: null,
+        init_completed_at: null,
+        thumbnail_status: "none",
+        remark: remark === null ? null : String(remark),
+        uploaded_by: uploadedBy === null ? null : String(uploadedBy),
+        created_at: String(createdAt),
+        updated_at: String(updatedAt),
+        completed_at: null,
+        deleted_at: null
+      });
+      changes = 1;
+    }
+
+    if (normalizedSql.startsWith("INSERT INTO HLS_SEGMENTS")) {
+      const [
+        id,
+        assetId,
+        variantId,
+        segmentIndex,
+        sourceUrl,
+        byteRangeStart,
+        byteRangeLength,
+        durationSeconds,
+        mimeType,
+        size,
+        status,
+        createdAt,
+        updatedAt
+      ] = this.bindings;
+
+      this.db.hlsSegments.push({
+        id: String(id),
+        asset_id: String(assetId),
+        variant_id: String(variantId),
+        segment_index: Number(segmentIndex),
+        source_url: String(sourceUrl),
+        byte_range_start: byteRangeStart === null ? null : Number(byteRangeStart),
+        byte_range_length: byteRangeLength === null ? null : Number(byteRangeLength),
+        duration_seconds: Number(durationSeconds),
+        mime_type: String(mimeType),
+        size: size === null ? null : Number(size),
+        storage_backend: null,
+        telegram_file_id: null,
+        telegram_file_unique_id: null,
+        telegram_channel_id: "default",
+        multipart_upload_id: null,
+        chunk_size: null,
+        chunk_count: null,
+        status: status as HlsSegmentRecord["status"],
+        attempts: 0,
+        error_message: null,
+        created_at: String(createdAt),
+        updated_at: String(updatedAt),
         completed_at: null
       });
       changes = 1;
@@ -332,6 +453,59 @@ class FakeD1Statement {
       if (asset) {
         asset.status = status as HlsAssetRecord["status"];
         asset.updated_at = updatedAt;
+        changes = 1;
+      }
+    }
+
+    if (normalizedSql.startsWith("UPDATE HLS_ASSETS") && normalizedSql.includes("SET STATUS = 'DONE'")) {
+      const [finalFileId, updatedAt, completedAt, id] = this.bindings;
+      const asset = this.db.hlsAssets.find((item) => item.id === id && item.deleted_at === null);
+      if (asset) {
+        asset.status = "done";
+        asset.final_file_id = String(finalFileId);
+        asset.source_headers_json = null;
+        asset.updated_at = String(updatedAt);
+        asset.completed_at = String(completedAt);
+        changes = 1;
+      }
+    }
+
+    if (normalizedSql.startsWith("UPDATE HLS_ASSETS") && normalizedSql.includes("SET INIT_STATUS = 'IMPORTING'")) {
+      const [updatedAt, id] = this.bindings;
+      const asset = this.db.hlsAssets.find((item) => item.id === id && item.deleted_at === null);
+      if (asset) {
+        asset.init_status = "importing";
+        asset.init_error_message = null;
+        asset.updated_at = String(updatedAt);
+        changes = 1;
+      }
+    }
+
+    if (normalizedSql.startsWith("UPDATE HLS_ASSETS") && normalizedSql.includes("SET INIT_STATUS = 'DONE'")) {
+      const [mimeType, size, telegramFileId, telegramFileUniqueId, telegramChannelId, updatedAt, completedAt, id] = this.bindings;
+      const asset = this.db.hlsAssets.find((item) => item.id === id && item.deleted_at === null);
+      if (asset) {
+        asset.init_status = "done";
+        asset.init_mime_type = String(mimeType);
+        asset.init_size = Number(size);
+        asset.init_storage_backend = "telegram_single";
+        asset.init_telegram_file_id = String(telegramFileId);
+        asset.init_telegram_file_unique_id = telegramFileUniqueId === null ? null : String(telegramFileUniqueId);
+        asset.init_telegram_channel_id = String(telegramChannelId || "default");
+        asset.init_error_message = null;
+        asset.updated_at = String(updatedAt);
+        asset.init_completed_at = String(completedAt);
+        changes = 1;
+      }
+    }
+
+    if (normalizedSql.startsWith("UPDATE HLS_ASSETS") && normalizedSql.includes("SET INIT_STATUS = 'FAILED'")) {
+      const [message, updatedAt, id] = this.bindings;
+      const asset = this.db.hlsAssets.find((item) => item.id === id && item.deleted_at === null);
+      if (asset) {
+        asset.init_status = "failed";
+        asset.init_error_message = String(message);
+        asset.updated_at = String(updatedAt);
         changes = 1;
       }
     }
@@ -1101,6 +1275,18 @@ function hlsAssetRecord(overrides: Partial<HlsAssetRecord> = {}): HlsAssetRecord
     playlist_text: "#EXTM3U\n#EXTINF:6,\nseg-0.ts\n#EXTINF:6,\nseg-1.ts\n#EXT-X-ENDLIST\n",
     playlist_file_id: "tg-playlist",
     final_file_id: "file-hls",
+    init_source_url: null,
+    init_byte_range_start: null,
+    init_byte_range_length: null,
+    init_mime_type: null,
+    init_size: null,
+    init_storage_backend: null,
+    init_telegram_file_id: null,
+    init_telegram_file_unique_id: null,
+    init_telegram_channel_id: "default",
+    init_status: "none",
+    init_error_message: null,
+    init_completed_at: null,
     thumbnail_status: "none",
     remark: null,
     uploaded_by: "admin",
@@ -1119,6 +1305,8 @@ function hlsSegmentRecord(segmentIndex: number, overrides: Partial<HlsSegmentRec
     variant_id: "variant-0",
     segment_index: segmentIndex,
     source_url: `https://media.example.com/seg-${segmentIndex}.ts`,
+    byte_range_start: null,
+    byte_range_length: null,
     duration_seconds: 6,
     mime_type: "video/mp2t",
     size: 3,
@@ -3963,6 +4151,247 @@ seg-0.ts
         hlsToken: null
       }
     ]);
+  });
+
+  it("imports fMP4 init and byte-range segments, then exposes playable and downloadable URLs", async () => {
+    const db = new FakeD1();
+    const adminEnv: Env = {
+      ...env,
+      FILES_DB: db as unknown as D1Database,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const mediaUrl = "https://media.example.com/path/video.mp4";
+    const playlistText = `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:4
+#EXT-X-MAP:URI="video.mp4",BYTERANGE="4@0"
+#EXTINF:4.000,
+#EXT-X-BYTERANGE:5@4
+video.mp4
+#EXT-X-ENDLIST
+`;
+    db.hlsAssets.push(hlsAssetRecord({
+      id: "hls-fmp4",
+      final_file_id: null,
+      status: "pending",
+      source_url: "https://media.example.com/path/index.m3u8",
+      media_playlist_url: "https://media.example.com/path/index.m3u8",
+      file_name: "movie.m3u8",
+      playlist_text: playlistText,
+      segment_count: 1,
+      target_duration_seconds: 4,
+      duration_seconds: 4,
+      estimated_size: null,
+      init_source_url: mediaUrl,
+      init_byte_range_start: 0,
+      init_byte_range_length: 4,
+      init_mime_type: "video/mp4",
+      init_status: "pending"
+    }));
+    db.hlsSegments.push(hlsSegmentRecord(0, {
+      id: "hls-fmp4-segment-0",
+      asset_id: "hls-fmp4",
+      variant_id: "media",
+      source_url: mediaUrl,
+      byte_range_start: 4,
+      byte_range_length: 5,
+      duration_seconds: 4,
+      mime_type: "video/mp4",
+      status: "pending",
+      size: null,
+      storage_backend: null,
+      telegram_file_id: null,
+      completed_at: null
+    }));
+    const sourceFetchCalls: Array<{ method: string | undefined; range: string | null }> = [];
+    const uploadedDocuments: string[] = [];
+    let sendDocumentCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const inputUrl = String(input);
+        const headers = new Headers(init?.headers);
+
+        if (inputUrl === mediaUrl) {
+          sourceFetchCalls.push({ method: init?.method, range: headers.get("Range") });
+          if (init?.method === "HEAD") {
+            return new Response(null, {
+              headers: {
+                "Content-Length": "9",
+                "Content-Type": "video/mp4",
+                "Accept-Ranges": "bytes"
+              }
+            });
+          }
+          if (headers.get("Range") === "bytes=0-3") {
+            return new Response("init", {
+              status: 206,
+              headers: {
+                "Content-Length": "4",
+                "Content-Range": "bytes 0-3/9",
+                "Content-Type": "video/mp4"
+              }
+            });
+          }
+          if (headers.get("Range") === "bytes=4-8") {
+            return new Response("media", {
+              status: 206,
+              headers: {
+                "Content-Length": "5",
+                "Content-Range": "bytes 4-8/9",
+                "Content-Type": "video/mp4"
+              }
+            });
+          }
+        }
+
+        if (inputUrl === "https://api.telegram.org/bot123456:test-token/sendDocument") {
+          sendDocumentCalls += 1;
+          const formData = init?.body as FormData;
+          const document = formData.get("document");
+          if (!(document instanceof Blob)) {
+            throw new Error("Expected Telegram document Blob");
+          }
+          uploadedDocuments.push(await document.text());
+          return jsonResponse({
+            ok: true,
+            result: {
+              document: {
+                file_id: sendDocumentCalls === 1 ? "tg-fmp4-init" : "tg-fmp4-segment-0",
+                file_unique_id: sendDocumentCalls === 1 ? "tg-fmp4-init-unique" : "tg-fmp4-segment-0-unique",
+                file_name: sendDocumentCalls === 1 ? "video.mp4" : "video.mp4",
+                mime_type: "video/mp4",
+                file_size: document.size
+              }
+            }
+          });
+        }
+
+        if (inputUrl.includes("file_id=tg-fmp4-init")) {
+          return jsonResponse({ ok: true, result: { file_id: "tg-fmp4-init", file_path: "documents/fmp4-init" } });
+        }
+        if (inputUrl.includes("file_id=tg-fmp4-segment-0")) {
+          return jsonResponse({ ok: true, result: { file_id: "tg-fmp4-segment-0", file_path: "documents/fmp4-segment-0" } });
+        }
+        if (inputUrl.endsWith("/documents/fmp4-init")) {
+          return new Response("init", {
+            headers: { "Content-Type": "video/mp4", "Content-Length": "4" }
+          });
+        }
+        if (inputUrl.endsWith("/documents/fmp4-segment-0")) {
+          return new Response("media", {
+            headers: { "Content-Type": "video/mp4", "Content-Length": "5" }
+          });
+        }
+
+        throw new Error(`Unexpected fetch ${inputUrl}`);
+      })
+    );
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const importResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/uploads/hls/hls-fmp4/segments/0/import", {
+        method: "POST",
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const importBody = await importResponse.json() as { segment: { status: string; storage_backend: string; size: number } };
+
+    expect(importResponse.status).toBe(200);
+    expect(importBody.segment).toMatchObject({ status: "done", storage_backend: "telegram_single", size: 5 });
+    expect(uploadedDocuments).toEqual(["init", "media"]);
+    expect(sourceFetchCalls.map((call) => call.range).filter(Boolean)).toEqual(["bytes=0-3", "bytes=4-8"]);
+    expect(db.hlsAssets[0]).toMatchObject({
+      init_status: "done",
+      init_size: 4,
+      init_storage_backend: "telegram_single",
+      init_telegram_file_id: "tg-fmp4-init"
+    });
+    expect(db.hlsSegments[0]).toMatchObject({
+      status: "done",
+      size: 5,
+      storage_backend: "telegram_single",
+      telegram_file_id: "tg-fmp4-segment-0"
+    });
+
+    const previewResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/uploads/hls/hls-fmp4/preview.m3u8", {
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const previewPlaylist = await previewResponse.text();
+    expect(previewResponse.status).toBe(200);
+    expect(previewPlaylist).toContain('#EXT-X-MAP:URI="https://files.example.com/api/admin/uploads/hls/hls-fmp4/preview-init/video.mp4"');
+    expect(previewPlaylist).not.toContain("#EXT-X-BYTERANGE");
+    expect(previewPlaylist).toContain("/preview-segments/0");
+
+    const completeResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/uploads/hls/hls-fmp4/complete", {
+        method: "POST",
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const completeBody = await completeResponse.json() as {
+      file: { id: string; url: string; size: number; storage_backend: string };
+    };
+
+    expect(completeResponse.status).toBe(200);
+    expect(completeBody.file).toMatchObject({
+      id: "hls-fmp4",
+      size: 9,
+      storage_backend: "hls_package"
+    });
+
+    const publicPlaylistResponse = await worker.fetch(new Request(completeBody.file.url), adminEnv);
+    const publicPlaylist = await publicPlaylistResponse.text();
+    expect(publicPlaylistResponse.status).toBe(200);
+    expect(publicPlaylist).toMatch(/#EXT-X-MAP:URI="https:\/\/files\.example\.com\/api\/hls\/[^/]+\/init\/video\.mp4"/);
+    expect(publicPlaylist).not.toContain("#EXT-X-BYTERANGE");
+    expect(publicPlaylist).toMatch(/https:\/\/files\.example\.com\/api\/hls\/[^/]+\/segments\/0\/video\.mp4/);
+
+    const downloadPlanResponse = await worker.fetch(
+      new Request("https://files.example.com/api/admin/files/hls-fmp4/hls-download", {
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const downloadPlanBody = await downloadPlanResponse.json() as {
+      hls_download: {
+        file_name: string;
+        kind: string;
+        total_size: number;
+        part_count: number;
+        parts: Array<{ kind: string; segment_index: number | null; chunk_index: number | null; offset: number; size: number; url: string }>;
+      };
+    };
+    expect(downloadPlanResponse.status).toBe(200);
+    expect(downloadPlanBody.hls_download).toMatchObject({
+      file_name: "movie.mp4",
+      kind: "fmp4",
+      total_size: 9,
+      part_count: 2
+    });
+    expect(downloadPlanBody.hls_download.parts.map(({ kind, segment_index, chunk_index, offset, size }) => ({
+      kind,
+      segment_index,
+      chunk_index,
+      offset,
+      size
+    }))).toEqual([
+      { kind: "init", segment_index: null, chunk_index: null, offset: 0, size: 4 },
+      { kind: "segment", segment_index: 0, chunk_index: null, offset: 4, size: 5 }
+    ]);
+    expect(new URL(downloadPlanBody.hls_download.parts[0]?.url || "").pathname).toMatch(/^\/api\/hls\/[^/]+\/init\/video\.mp4$/);
+
+    const directDownloadResponse = await worker.fetch(new Request(`${completeBody.file.url}?download=1`), adminEnv);
+    expect(directDownloadResponse.status).toBe(200);
+    expect(directDownloadResponse.headers.get("Content-Type")).toBe("video/mp4");
+    expect(directDownloadResponse.headers.get("Content-Disposition")).toContain("movie.mp4");
+    expect(await directDownloadResponse.text()).toBe("initmedia");
   });
 
   it("uses stored source headers for HLS multipart segment chunk imports", async () => {

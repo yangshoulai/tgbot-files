@@ -1067,9 +1067,9 @@ curl -X POST '${baseUrl}/api/admin/files' \\
               title: "获取 HLS 加速下载计划",
               auth: "Admin Cookie",
               summary: "为 HLS package 生成可并发下载的 part 列表。",
-              functionality: "把 HLS segment 和 segment chunk 展开成有序 parts，并生成签名 URL。",
-              useCases: ["控制台加速下载 HLS 文件。", "客户端并发下载后按 offset 合并为 TS 文件。"],
-              limits: ["仅支持 storage_backend=hls_package。", "只支持未加密 TS HLS 顺序合并。"],
+              functionality: "把 HLS init segment、media segment 和 segment chunk 展开成有序 parts，并生成签名 URL。",
+              useCases: ["控制台加速下载 HLS 文件。", "客户端并发下载后按 offset 合并为 TS 或 fMP4 文件。"],
+              limits: ["仅支持 storage_backend=hls_package。", "支持 TS HLS 与单 init segment fMP4 HLS 顺序合并。"],
               specialHandling: ["如果 HLS 不可合并会返回 UnsupportedHlsDownload。", "direct_access=false 时仍可使用 parts 加速下载。"],
               requestParams: [
                 adminCookie,
@@ -1078,7 +1078,8 @@ curl -X POST '${baseUrl}/api/admin/files' \\
               responseParams: [
                 okResponse,
                 p("hls_download.file_id", "Response", "是", "string", "文件 id", "源文件 id。"),
-                p("hls_download.file_name", "Response", "是", "string", "*.ts", "合并下载文件名。"),
+                p("hls_download.file_name", "Response", "是", "string", "*.ts / *.mp4", "合并下载文件名。"),
+                p("hls_download.kind", "Response", "是", "string", "ts / fmp4", "顺序合并的容器类型。"),
                 p("hls_download.total_size", "Response", "是", "number", "字节", "所有 part 总大小。"),
                 p("hls_download.part_count", "Response", "是", "number", ">=1", "可下载 part 数量。"),
                 p("hls_download.parts", "Response", "是", "array", "按 index 排序", "每个 part 的 offset、size、url。")
@@ -1886,7 +1887,7 @@ Content-Length: 5242880`
               functionality: "校验全部 segment 完成，写入 files 表，生成 /api/hls 签名访问路径。",
               useCases: ["HLS 导入全部完成后出现在文件列表。", "可选上传视频封面缩略图。"],
               limits: ["全部 segment 必须 done。", "缩略图最大 512KB，类型限 JPEG/PNG/WebP。"],
-              specialHandling: ["最终文件 storage_backend=hls_package。", "整包 download=1 只支持未加密 TS 且 part 数不超过直链预算。"],
+              specialHandling: ["最终文件 storage_backend=hls_package。", "整包 download=1 支持 TS 或 fMP4 顺序合并，且 part 数不能超过直链预算。"],
               requestParams: [
                 adminCookie,
                 p("assetId", "Path", "是", "string", "HLS asset id", "导入任务 id。"),
@@ -2278,10 +2279,10 @@ X-Chunk-Offset: 0`
               path: "/api/hls/:token/:filename?",
               title: "读取 HLS Playlist 或整包下载",
               auth: "Signed HLS token",
-              summary: "返回重写后的 HLS media playlist；download=1 时尝试合并下载 TS。",
+              summary: "返回重写后的 HLS media playlist；download=1 时尝试合并下载 TS 或 fMP4。",
               functionality: "验证 v4 HLS token，读取 HLS asset 和 segments，重写 segment URL 为同源 /api/hls 路径。",
               useCases: ["视频在线播放。", "HLS 文件整包下载。"],
-              limits: ["asset 必须 status=done。", "整包下载仅支持未加密 TS 且 part 数不超过直链预算。"],
+              limits: ["asset 必须 status=done。", "整包下载支持 TS 或 fMP4 顺序合并，且 part 数不超过直链预算。"],
               specialHandling: ["download=1 且 part 太多会返回 DirectAccessDisabled，前端应使用 hls-download plan。", "旧 /hls/:token 路径仍可解析，但响应路径统一推荐 /api/hls。"],
               requestParams: [
                 signedToken,

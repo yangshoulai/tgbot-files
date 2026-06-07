@@ -80,6 +80,7 @@ export interface FileItem {
 
 export interface HlsDownloadSummary {
   segment_count: number;
+  kind: "ts" | "fmp4" | null;
   part_count: number;
   direct_access: boolean;
   direct_access_max_parts: number;
@@ -88,7 +89,8 @@ export interface HlsDownloadSummary {
 
 export interface HlsDownloadPart {
   index: number;
-  segment_index: number;
+  kind?: "init" | "segment";
+  segment_index: number | null;
   chunk_index: number | null;
   offset: number;
   size: number;
@@ -98,6 +100,7 @@ export interface HlsDownloadPart {
 export interface HlsDownloadPlan {
   file_id: string;
   file_name: string;
+  kind: "ts" | "fmp4";
   total_size: number;
   segment_count: number;
   part_count: number;

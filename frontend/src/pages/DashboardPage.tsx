@@ -1045,9 +1045,11 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         downloadAcceleratedPart({
           url: part.url,
           expectedSize: part.size,
-          label: part.chunk_index === null
-            ? `HLS 片段 ${part.segment_index + 1}`
-            : `HLS 片段 ${part.segment_index + 1} / 分片 ${part.chunk_index + 1}`,
+          label: part.kind === "init" || part.segment_index === null
+            ? "HLS 初始化片段"
+            : part.chunk_index === null
+              ? `HLS 片段 ${part.segment_index + 1}`
+              : `HLS 片段 ${part.segment_index + 1} / 分片 ${part.chunk_index + 1}`,
           signal,
           onProgress: (progress) => onProgress(progress.downloadedBytes)
         })

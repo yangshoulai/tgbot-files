@@ -118,6 +118,7 @@ export interface MultipartUploadRecord {
   source_kind: MultipartSourceKind;
   source_url: string | null;
   source_headers_json?: string | null;
+  source_range_start?: number | null;
   file_name: string;
   mime_type: string;
   size: number;
@@ -137,6 +138,7 @@ export interface NewMultipartUploadRecord {
   sourceKind: MultipartSourceKind;
   sourceUrl?: string;
   sourceHeadersJson?: string;
+  sourceRangeStart?: number | null;
   fileName: string;
   mimeType: string;
   size: number;
@@ -236,6 +238,18 @@ export interface HlsAssetRecord {
   playlist_text: string;
   playlist_file_id: string | null;
   final_file_id: string | null;
+  init_source_url: string | null;
+  init_byte_range_start: number | null;
+  init_byte_range_length: number | null;
+  init_mime_type: string | null;
+  init_size: number | null;
+  init_storage_backend: HlsSegmentStorageBackend | null;
+  init_telegram_file_id: string | null;
+  init_telegram_file_unique_id: string | null;
+  init_telegram_channel_id: string;
+  init_status: "none" | HlsSegmentStatus;
+  init_error_message: string | null;
+  init_completed_at: string | null;
   thumbnail_status: ThumbnailStatus;
   remark: string | null;
   uploaded_by: string | null;
@@ -261,6 +275,10 @@ export interface NewHlsAssetRecord {
   segmentCount: number;
   estimatedSize?: number | null;
   playlistText: string;
+  initSourceUrl?: string | null;
+  initByteRangeStart?: number | null;
+  initByteRangeLength?: number | null;
+  initMimeType?: string | null;
   remark?: string;
   uploadedBy?: string;
   createdAt: string;
@@ -273,6 +291,8 @@ export interface HlsSegmentRecord {
   variant_id: string;
   segment_index: number;
   source_url: string;
+  byte_range_start: number | null;
+  byte_range_length: number | null;
   duration_seconds: number;
   mime_type: string;
   size: number | null;
@@ -297,6 +317,8 @@ export interface NewHlsSegmentRecord {
   variantId: string;
   segmentIndex: number;
   sourceUrl: string;
+  byteRangeStart?: number | null;
+  byteRangeLength?: number | null;
   durationSeconds: number;
   mimeType: string;
   size?: number | null;
@@ -1132,6 +1154,7 @@ export async function insertMultipartUploadRecord(
         source_kind,
         source_url,
         source_headers_json,
+        source_range_start,
         file_name,
         mime_type,
         size,
@@ -1144,13 +1167,14 @@ export async function insertMultipartUploadRecord(
         directory_path,
         telegram_channel_group,
         completed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
     )
     .bind(
       record.id,
       record.sourceKind,
       record.sourceUrl ?? null,
       record.sourceHeadersJson ?? null,
+      record.sourceRangeStart ?? null,
       record.fileName,
       record.mimeType,
       record.size,
@@ -1170,6 +1194,7 @@ export async function insertMultipartUploadRecord(
     source_kind: record.sourceKind,
     source_url: record.sourceUrl ?? null,
     source_headers_json: record.sourceHeadersJson ?? null,
+    source_range_start: record.sourceRangeStart ?? null,
     file_name: record.fileName,
     mime_type: record.mimeType,
     size: record.size,
@@ -1193,6 +1218,7 @@ export async function getMultipartUploadRecord(db: D1Database, id: string): Prom
         source_kind,
         source_url,
         source_headers_json,
+        source_range_start,
         file_name,
         mime_type,
         size,
@@ -1587,13 +1613,18 @@ export async function insertHlsAssetRecord(db: D1Database, record: NewHlsAssetRe
         segment_count,
         estimated_size,
         playlist_text,
+        init_source_url,
+        init_byte_range_start,
+        init_byte_range_length,
+        init_mime_type,
+        init_status,
         remark,
         uploaded_by,
         created_at,
         updated_at,
         completed_at,
         deleted_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`
     )
     .bind(
       record.id,
@@ -1611,6 +1642,11 @@ export async function insertHlsAssetRecord(db: D1Database, record: NewHlsAssetRe
       record.segmentCount,
       record.estimatedSize ?? null,
       record.playlistText,
+      record.initSourceUrl ?? null,
+      record.initByteRangeStart ?? null,
+      record.initByteRangeLength ?? null,
+      record.initMimeType ?? null,
+      record.initSourceUrl ? "pending" : "none",
       record.remark ?? null,
       record.uploadedBy ?? null,
       record.createdAt,
@@ -1639,13 +1675,15 @@ export async function insertHlsSegmentRecords(db: D1Database, records: NewHlsSeg
           variant_id,
           segment_index,
           source_url,
+          byte_range_start,
+          byte_range_length,
           duration_seconds,
           mime_type,
           size,
           status,
           created_at,
           updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .bind(
         record.id,
@@ -1653,6 +1691,8 @@ export async function insertHlsSegmentRecords(db: D1Database, records: NewHlsSeg
         record.variantId,
         record.segmentIndex,
         record.sourceUrl,
+        record.byteRangeStart ?? null,
+        record.byteRangeLength ?? null,
         record.durationSeconds,
         record.mimeType,
         record.size ?? null,
@@ -1684,6 +1724,18 @@ export async function getHlsAssetRecord(db: D1Database, id: string): Promise<Hls
         playlist_text,
         playlist_file_id,
         final_file_id,
+        init_source_url,
+        init_byte_range_start,
+        init_byte_range_length,
+        init_mime_type,
+        init_size,
+        init_storage_backend,
+        init_telegram_file_id,
+        init_telegram_file_unique_id,
+        COALESCE(init_telegram_channel_id, 'default') AS init_telegram_channel_id,
+        COALESCE(init_status, 'none') AS init_status,
+        init_error_message,
+        init_completed_at,
         COALESCE(thumbnail_status, 'none') AS thumbnail_status,
         remark,
         uploaded_by,
@@ -1719,6 +1771,18 @@ export async function getHlsAssetRecordByFinalFileId(db: D1Database, finalFileId
         playlist_text,
         playlist_file_id,
         final_file_id,
+        init_source_url,
+        init_byte_range_start,
+        init_byte_range_length,
+        init_mime_type,
+        init_size,
+        init_storage_backend,
+        init_telegram_file_id,
+        init_telegram_file_unique_id,
+        COALESCE(init_telegram_channel_id, 'default') AS init_telegram_channel_id,
+        COALESCE(init_status, 'none') AS init_status,
+        init_error_message,
+        init_completed_at,
         COALESCE(thumbnail_status, 'none') AS thumbnail_status,
         remark,
         uploaded_by,
@@ -1743,6 +1807,8 @@ export async function listHlsSegmentRecords(db: D1Database, assetId: string): Pr
         variant_id,
         segment_index,
         source_url,
+        byte_range_start,
+        byte_range_length,
         duration_seconds,
         mime_type,
         size,
@@ -1782,6 +1848,8 @@ export async function getHlsSegmentRecordByIndex(
         variant_id,
         segment_index,
         source_url,
+        byte_range_start,
+        byte_range_length,
         duration_seconds,
         mime_type,
         size,
@@ -1837,6 +1905,61 @@ export async function markHlsSegmentImporting(
       WHERE id = ?`
     )
     .bind(updatedAt, id)
+    .run();
+}
+
+export async function markHlsInitSegmentImporting(
+  db: D1Database,
+  assetId: string,
+  updatedAt: string
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE hls_assets
+      SET init_status = 'importing',
+        init_error_message = NULL,
+        updated_at = ?
+      WHERE id = ? AND deleted_at IS NULL`
+    )
+    .bind(updatedAt, assetId)
+    .run();
+}
+
+export async function completeHlsInitSegmentSingle(params: {
+  db: D1Database;
+  assetId: string;
+  mimeType: string;
+  size: number;
+  telegramFileId: string;
+  telegramFileUniqueId?: string;
+  telegramChannelId?: string;
+  completedAt: string;
+}): Promise<void> {
+  await params.db
+    .prepare(
+      `UPDATE hls_assets
+      SET init_status = 'done',
+        init_mime_type = ?,
+        init_size = ?,
+        init_storage_backend = 'telegram_single',
+        init_telegram_file_id = ?,
+        init_telegram_file_unique_id = ?,
+        init_telegram_channel_id = ?,
+        init_error_message = NULL,
+        updated_at = ?,
+        init_completed_at = ?
+      WHERE id = ? AND deleted_at IS NULL`
+    )
+    .bind(
+      params.mimeType,
+      params.size,
+      params.telegramFileId,
+      params.telegramFileUniqueId ?? null,
+      params.telegramChannelId ?? "default",
+      params.completedAt,
+      params.completedAt,
+      params.assetId
+    )
     .run();
 }
 
@@ -1962,6 +2085,24 @@ export async function failHlsSegment(
       WHERE id = ?`
     )
     .bind(message.slice(0, 1000), updatedAt, id)
+    .run();
+}
+
+export async function failHlsInitSegment(
+  db: D1Database,
+  assetId: string,
+  message: string,
+  updatedAt: string
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE hls_assets
+      SET init_status = 'failed',
+        init_error_message = ?,
+        updated_at = ?
+      WHERE id = ? AND deleted_at IS NULL`
+    )
+    .bind(message.slice(0, 1000), updatedAt, assetId)
     .run();
 }
 
