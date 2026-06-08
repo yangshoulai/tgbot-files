@@ -212,7 +212,7 @@ export function MediaControls({
         />
       </div>
 
-      <div className={cn("flex min-w-0 flex-nowrap items-center", floating ? "gap-1.5 sm:gap-2" : "gap-2", tiny && "gap-1")}>
+      <div className={cn("flex min-w-0 items-center", inline ? "flex-wrap gap-y-2" : "flex-nowrap", floating ? "gap-1.5 sm:gap-2" : "gap-2", tiny && "gap-1")}>
         <div className="flex shrink-0 items-center gap-1 sm:gap-1.5">
           <MediaButton
             label={state.playing ? "暂停" : "播放"}
@@ -274,7 +274,11 @@ export function MediaControls({
               : `${formatMediaTime(currentTime)} / ${duration ? formatMediaTime(duration) : "--:--"}`}
         </div>
 
-        <div className={cn("ml-auto flex min-w-0 shrink-0 items-center", floating ? "gap-1 sm:gap-1.5" : "gap-1.5")}>
+        <div className={cn(
+          "ml-auto flex min-w-0 shrink-0 items-center",
+          inline && "max-[560px]:ml-0 max-[560px]:w-full max-[560px]:justify-between",
+          floating ? "gap-1 sm:gap-1.5" : "gap-1.5"
+        )}>
           <MediaButton label={state.muted ? "取消静音" : "静音"} onClick={toggleMute} dense={dense} floating={floating} inline={inline} tabIndex={controlTabIndex}>
             {state.muted || state.volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
           </MediaButton>

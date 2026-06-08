@@ -161,82 +161,88 @@ export function AudioPreview({ file, fullscreen, onToggleFullscreen }: AudioPrev
       </div>
 
       <div className={cn("relative flex w-full flex-col gap-4", showLyricsPanel ? "max-w-5xl" : "max-w-3xl")}>
-        <div className={cn("grid gap-4", showLyricsPanel && "lg:grid-cols-[minmax(0,0.95fr)_minmax(19rem,1.05fr)] lg:items-stretch")}>
-          <div className="flex min-w-0 flex-col gap-4">
-            <div className="flex min-w-0 items-center gap-4">
-              <div className="size-20 shrink-0 overflow-hidden rounded-2xl border border-white/80 bg-background shadow-[0_18px_42px_rgba(15,23,42,0.16)] ring-1 ring-border/70 sm:size-24">
-                {coverUrl ? (
-                  <img
-                    src={coverUrl}
-                    alt={`${file.file_name} 封面`}
-                    onError={() => setCoverFailed(true)}
-                    className="h-full w-full object-cover"
-                  />
-                ) : (
-                  <span className="grid h-full w-full place-items-center bg-primary-soft text-primary-strong">
-                    <Music2 size={34} />
-                  </span>
-                )}
-              </div>
-
-              <div className="min-w-0 flex-1">
-                <p className="truncate text-base font-semibold text-foreground sm:text-lg" title={file.file_name}>{file.file_name}</p>
-                <p className="mt-1 text-sm text-muted">{formatBytes(file.size)} · {file.mime_type}</p>
-              </div>
-            </div>
-
-            {loading ? (
-              <div className="inline-flex w-fit items-center gap-2 rounded-full border border-border bg-background px-3 py-1.5 text-xs font-medium text-muted">
-                <Spinner size={15} />
-                音频加载中…
-              </div>
-            ) : null}
-
-            {failed ? (
-              <p className="rounded-xl border border-danger/30 bg-danger-soft px-3 py-2 text-sm text-danger">
-                音频加载失败，请尝试下载后播放。
-              </p>
-            ) : null}
-
-            <audio
-              ref={audioRef}
-              src={file.file_path}
-              preload="metadata"
-              onLoadStart={() => setLoading(true)}
-              onLoadedMetadata={() => {
-                setLoading(false);
-                setFailed(false);
-              }}
-              onCanPlay={() => {
-                setLoading(false);
-                setFailed(false);
-              }}
-              onPlaying={() => {
-                setLoading(false);
-                setFailed(false);
-              }}
-              onError={() => {
-                setLoading(false);
-                setFailed(true);
-              }}
-            >
-              当前浏览器不支持该音频预览。
-            </audio>
-            <MediaControls mediaRef={audioRef} fullscreen={fullscreen} onToggleFullscreen={onToggleFullscreen} compact variant="inline" />
+        <div className="flex min-w-0 items-center gap-4 rounded-[1.35rem] border border-white/80 bg-white/[0.68] p-3 shadow-[0_18px_44px_rgba(15,23,42,0.1)] ring-1 ring-border/70 backdrop-blur-md sm:p-4">
+          <div className="size-20 shrink-0 overflow-hidden rounded-2xl border border-white/80 bg-background shadow-[0_18px_42px_rgba(15,23,42,0.16)] ring-1 ring-border/70 sm:size-24">
+            {coverUrl ? (
+              <img
+                src={coverUrl}
+                alt={`${file.file_name} 封面`}
+                onError={() => setCoverFailed(true)}
+                className="h-full w-full object-cover"
+              />
+            ) : (
+              <span className="grid h-full w-full place-items-center bg-primary-soft text-primary-strong">
+                <Music2 size={34} />
+              </span>
+            )}
           </div>
 
-          {showLyricsPanel ? (
-            <LyricsPanel
-              tracks={lyricsTracks}
-              selectedTrack={selectedLyrics}
-              selectedTrackId={selectedLyricsId}
-              activeLineIndex={activeLyricsIndex}
-              loading={lyricsLoading}
-              failed={lyricsFailed}
-              fullscreen={fullscreen}
-              onSelectedTrackChange={setSelectedLyricsId}
-            />
-          ) : null}
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-base font-semibold text-foreground sm:text-lg" title={file.file_name}>{file.file_name}</p>
+            <p className="mt-1 text-sm text-muted">{formatBytes(file.size)} · {file.mime_type}</p>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              {loading ? (
+                <span className="inline-flex w-fit items-center gap-2 rounded-full border border-border bg-background px-3 py-1.5 text-xs font-medium text-muted">
+                  <Spinner size={15} />
+                  音频加载中…
+                </span>
+              ) : null}
+              {showLyricsPanel ? (
+                <span className="inline-flex w-fit items-center gap-1.5 rounded-full border border-primary/15 bg-primary-soft px-3 py-1.5 text-xs font-medium text-primary-strong">
+                  <FileText size={14} />
+                  已加载歌词
+                </span>
+              ) : null}
+            </div>
+          </div>
+        </div>
+
+        {failed ? (
+          <p className="rounded-xl border border-danger/30 bg-danger-soft px-3 py-2 text-sm text-danger">
+            音频加载失败，请尝试下载后播放。
+          </p>
+        ) : null}
+
+        <audio
+          ref={audioRef}
+          src={file.file_path}
+          preload="metadata"
+          onLoadStart={() => setLoading(true)}
+          onLoadedMetadata={() => {
+            setLoading(false);
+            setFailed(false);
+          }}
+          onCanPlay={() => {
+            setLoading(false);
+            setFailed(false);
+          }}
+          onPlaying={() => {
+            setLoading(false);
+            setFailed(false);
+          }}
+          onError={() => {
+            setLoading(false);
+            setFailed(true);
+          }}
+        >
+          当前浏览器不支持该音频预览。
+        </audio>
+
+        {showLyricsPanel ? (
+          <LyricsPanel
+            tracks={lyricsTracks}
+            selectedTrack={selectedLyrics}
+            selectedTrackId={selectedLyricsId}
+            activeLineIndex={activeLyricsIndex}
+            loading={lyricsLoading}
+            failed={lyricsFailed}
+            fullscreen={fullscreen}
+            onSelectedTrackChange={setSelectedLyricsId}
+          />
+        ) : null}
+
+        <div className="w-full">
+          <MediaControls mediaRef={audioRef} fullscreen={fullscreen} onToggleFullscreen={onToggleFullscreen} compact variant="inline" className="w-full" />
         </div>
       </div>
     </div>
