@@ -160,10 +160,11 @@ export function MediaControls({
       className={cn(
         inline ? "text-foreground" : "text-white",
         floating
-          ? "w-full drop-shadow-[0_2px_12px_rgba(0,0,0,0.65)]"
+          ? "w-full rounded-[1.25rem] border border-white/10 bg-[#07110f]/78 p-2.5 shadow-[0_18px_58px_rgba(0,0,0,0.5)] ring-1 ring-white/10 backdrop-blur-2xl"
           : inline
             ? "rounded-2xl border border-white/80 bg-white/[0.85] p-3 shadow-[0_18px_44px_rgba(15,23,42,0.12)] ring-1 ring-border/70 backdrop-blur-md"
             : "rounded-2xl border border-white/10 bg-black/70 p-3 shadow-dialog backdrop-blur-md",
+        floating && tiny ? "rounded-2xl p-2" : null,
         !floating && !inline && dense ? "p-2.5" : null,
         !floating && !inline && tiny ? "p-2" : null,
         inline && dense ? "p-3" : null,
@@ -174,13 +175,16 @@ export function MediaControls({
       <div
         className={cn(
           "relative rounded-full",
-          floating ? "mb-2 h-1.5 bg-white/30 sm:h-2" : inline ? "mb-3 h-2 bg-border" : dense ? "mb-2 h-2.5 bg-white/15" : "mb-3 h-3 bg-white/15",
+          floating ? "mb-2.5 h-1.5 bg-white/18 sm:h-2" : inline ? "mb-3 h-2 bg-border" : dense ? "mb-2 h-2.5 bg-white/15" : "mb-3 h-3 bg-white/15",
           tiny && "mb-1.5 h-1.5"
         )}
       >
-        <div className={cn("absolute inset-y-0 left-0 rounded-full", inline ? "bg-border-strong/60" : "bg-white/35")} style={{ width: `${bufferedPercent}%` }} />
+        <div className={cn("absolute inset-y-0 left-0 rounded-full", inline ? "bg-border-strong/60" : floating ? "bg-white/28" : "bg-white/35")} style={{ width: `${bufferedPercent}%` }} />
         <div
-          className={cn("absolute inset-y-0 left-0 rounded-full", floating ? "bg-[#ff0033]" : "bg-primary")}
+          className={cn(
+            "absolute inset-y-0 left-0 rounded-full",
+            floating ? "bg-primary shadow-[0_0_18px_rgba(16,185,129,0.48)]" : "bg-primary"
+          )}
           style={{ width: `${progressPercent}%` }}
         />
         <input
@@ -244,10 +248,10 @@ export function MediaControls({
 
         <div
           className={cn(
-            "shrink-0 text-center font-mono text-xs",
+            "shrink-0 text-center font-mono text-xs tabular-nums",
             inline ? "text-foreground/70" : "text-white/75",
             dense ? "min-w-[5.75rem]" : "min-w-[6.75rem]",
-            floating && "min-w-[5.1rem] text-white/90 sm:min-w-[6.5rem]",
+            floating && "min-w-[5.1rem] rounded-full bg-white/[0.06] px-2 py-1 text-white/88 ring-1 ring-white/[0.08] sm:min-w-[6.5rem]",
             tiny && "min-w-[3.5rem] text-[11px]"
           )}
         >
@@ -273,7 +277,7 @@ export function MediaControls({
             tabIndex={controlTabIndex}
             className={cn(
               "h-1.5 cursor-pointer",
-              floating ? "hidden w-16 accent-[#ff0033] min-[560px]:block" : inline ? "hidden w-16 accent-primary sm:block" : dense ? "hidden w-14 accent-primary lg:block" : "hidden w-20 accent-primary md:block"
+              floating ? "hidden w-16 accent-primary min-[560px]:block" : inline ? "hidden w-16 accent-primary sm:block" : dense ? "hidden w-14 accent-primary lg:block" : "hidden w-20 accent-primary md:block"
             )}
           />
           {!tiny ? (
@@ -285,8 +289,8 @@ export function MediaControls({
                 tabIndex={controlTabIndex}
                 className={cn(
                   "border text-xs outline-none transition-colors focus-visible:focus-ring",
-                  floating ? "h-8 w-[3.1rem] rounded-md px-1 sm:w-[3.35rem] sm:rounded-full sm:px-1.5" : "rounded-md",
-                  inline ? "h-8 w-[3.35rem] border-border bg-surface px-1.5 text-foreground hover:bg-primary-soft/50" : "border-white/10 bg-white/10 text-white hover:bg-white/15",
+                  floating ? "h-8 w-[3.1rem] rounded-full px-1 sm:w-[3.35rem] sm:px-1.5" : "rounded-md",
+                  inline ? "h-8 w-[3.35rem] border-border bg-surface px-1.5 text-foreground hover:bg-primary-soft/50" : "border-white/10 bg-white/[0.08] text-white hover:bg-white/15",
                   dense && !floating ? "h-8 w-14 px-1.5" : null,
                   !dense ? "h-9 w-16 px-2" : null
                 )}
@@ -331,7 +335,9 @@ function MediaButton({ label, onClick, children, emphasis = false, dense = false
         "inline-flex shrink-0 items-center justify-center gap-1.5 border text-xs font-medium transition-colors focus-visible:outline-none focus-visible:focus-ring",
         dense ? "size-8 rounded-lg px-0" : "h-9 rounded-lg px-2.5",
         floating
-          ? "size-8 rounded-full border-transparent bg-transparent text-white/92 hover:bg-white/15 hover:text-white active:bg-white/20 sm:size-9"
+          ? emphasis
+            ? "size-9 rounded-full border-primary/70 bg-primary text-white shadow-[0_10px_28px_rgba(16,185,129,0.4)] hover:bg-primary-strong hover:text-white active:bg-primary-strong sm:size-10"
+            : "size-8 rounded-full border-white/10 bg-white/[0.07] text-white/88 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] hover:bg-white/[0.14] hover:text-white active:bg-white/20 sm:size-9"
           : inline
             ? emphasis
               ? "border-primary bg-primary text-white shadow-[0_10px_24px_rgba(16,185,129,0.32)] hover:bg-primary-strong hover:text-white active:bg-primary-strong"

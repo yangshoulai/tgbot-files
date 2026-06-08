@@ -279,8 +279,8 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
 
   if (!videoSrc) {
     return (
-      <div className="grid w-full place-items-center bg-[#07110f] px-6 py-12 text-center text-white">
-        <div className="max-w-md rounded-2xl border border-white/10 bg-white/5 px-6 py-5 shadow-dialog">
+      <div className="grid w-full place-items-center bg-[radial-gradient(circle_at_18%_0%,rgba(16,185,129,0.16),transparent_34%),linear-gradient(135deg,#07110f,#101827_58%,#030712)] px-6 py-12 text-center text-white">
+        <div className="max-w-md rounded-3xl border border-white/10 bg-white/[0.07] px-6 py-5 shadow-[0_24px_70px_rgba(0,0,0,0.36)] ring-1 ring-white/[0.08] backdrop-blur-xl">
           <p className="text-sm font-semibold">该视频暂时无法直接预览</p>
           <p className="mt-2 text-xs leading-6 text-white/65">
             {videoPreviewUnavailableMessage({ canUseMultipartPreview, hasSignedFileToken: Boolean(signedFileToken), serviceWorkerState })}
@@ -301,10 +301,15 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
   }
 
   return (
-    <div className={cn("flex w-full items-center justify-center bg-[#07110f] p-0 sm:p-4", fullscreen ? "h-full min-h-0" : "h-[min(68dvh,760px)] min-h-56") }>
+    <div
+      className={cn(
+        "relative flex w-full items-center justify-center overflow-hidden bg-[radial-gradient(circle_at_16%_0%,rgba(16,185,129,0.2),transparent_32%),linear-gradient(135deg,#07110f_0%,#101827_58%,#030712_100%)] px-2 py-3 sm:px-5 sm:py-5",
+        fullscreen ? "h-full min-h-0" : "min-h-56"
+      )}
+    >
       <div
         ref={frameRef}
-        className="relative max-h-full max-w-full overflow-hidden bg-black shadow-dialog ring-1 ring-white/10 sm:rounded-[1.25rem]"
+        className="relative isolate max-h-full max-w-full overflow-hidden bg-[#020403] shadow-[0_28px_90px_rgba(0,0,0,0.42)] ring-1 ring-white/12 sm:rounded-[1rem]"
         style={{
           aspectRatio: ratio.label.replace(":", " / "),
           width: `min(100%, calc(${heightLimit} * ${ratio.value}))`
@@ -330,7 +335,7 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
           poster={poster}
           playsInline
           preload="auto"
-          className="h-full w-full bg-black object-contain"
+          className="h-full w-full bg-[#020403] object-contain"
           onLoadStart={() => showLoading(true)}
           onWaiting={() => showLoading()}
           onSeeking={() => showLoading()}
@@ -368,8 +373,8 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
         </video>
 
         {loading ? (
-          <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center bg-black/30 text-white">
-            <div className="inline-flex items-center gap-2 rounded-full bg-black/70 px-4 py-2 text-sm font-medium shadow-card backdrop-blur">
+          <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center bg-[#020403]/35 text-white backdrop-blur-[2px]">
+            <div className="inline-flex items-center gap-2 rounded-full border border-white/12 bg-white/10 px-4 py-2 text-sm font-medium shadow-[0_16px_44px_rgba(0,0,0,0.38)] backdrop-blur-xl">
               <Spinner size={18} className="text-white" />
               视频加载中…
             </div>
@@ -377,14 +382,14 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
         ) : null}
 
         {failed ? (
-          <div className="absolute inset-x-4 top-4 z-20 rounded-xl border border-danger/30 bg-danger/20 px-3 py-2 text-sm text-white backdrop-blur">
+          <div className="absolute inset-x-4 top-4 z-20 rounded-xl border border-danger/30 bg-danger/20 px-3 py-2 text-sm text-white shadow-[0_18px_44px_rgba(0,0,0,0.35)] backdrop-blur-xl">
             视频加载失败，请尝试下载后播放。
           </div>
         ) : null}
 
         <div
           className={cn(
-            "absolute inset-x-0 bottom-0 z-20 bg-gradient-to-t from-black/90 via-black/45 to-transparent px-2 pb-2 pt-14 transition-all duration-200 ease-out sm:px-4 sm:pb-4 sm:pt-20",
+            "absolute inset-x-0 bottom-0 z-20 bg-gradient-to-t from-black/82 via-black/30 to-transparent px-2 pb-2 pt-16 transition-all duration-200 ease-out sm:px-4 sm:pb-4 sm:pt-24",
             controlsVisible ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-3 opacity-0"
           )}
         >
