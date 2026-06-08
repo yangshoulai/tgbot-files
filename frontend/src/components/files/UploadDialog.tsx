@@ -3,19 +3,25 @@ import { AlertTriangle, Check, CheckCircle2, ClipboardPaste, FilePlus2, FolderOp
 import {
   ApiError,
   cancelHlsUpload,
+  cancelMagnetUpload,
   completeHlsSegment,
   completeHlsUpload,
+  completeMagnetMultipartUpload,
   completeMultipartUpload,
   getHlsUploadStatus,
+  getMagnetUploadStatus,
   getMultipartUploadStatus,
   importHlsSegment,
   importHlsSegmentChunk,
+  initMagnetUpload,
   initMultipartUpload,
   initHlsUpload,
   initUrlMultipartUpload,
   listDirectories,
   preflightUploads,
+  probeMagnetUpload,
   probeHlsUpload,
+  uploadMagnetMultipartChunk,
   uploadMultipartChunk,
   uploadUrlMultipartChunk,
   type DirectoryItem,
@@ -23,6 +29,8 @@ import {
   type HlsAsset,
   type HlsProbeInfo,
   type HlsSegment,
+  type MagnetImport,
+  type MagnetImportFile,
   type MultipartUpload,
   type SourceRequestHeaders,
   type ThumbnailUploadPayload,
@@ -122,6 +130,18 @@ interface HlsUrlState {
   retry?: HlsRetryState;
 }
 
+interface MagnetUploadEntry {
+  fileIndex: number;
+  upload: MultipartUpload;
+  targetDirectoryPath: string;
+}
+
+interface MagnetUrlState {
+  import?: MagnetImport;
+  selectedIndexes: number[];
+  uploads?: MagnetUploadEntry[];
+}
+
 interface FileNameConflictState {
   fileName: string;
   suggestedName: string;
@@ -160,6 +180,7 @@ interface UrlUploadState {
   conflictAction?: FileNameConflictAction;
   thumbnail?: UploadThumbnailState;
   hls?: HlsUrlState;
+  magnet?: MagnetUrlState;
 }
 
 type UploadThumbnailStatus = "idle" | "generating" | "ready" | "failed" | "removed";
@@ -191,6 +212,8 @@ const MULTIPART_UPLOAD_RETRY_DELAY_MS = 800;
 const LOCAL_CHUNK_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 const URL_CHUNK_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
 const HLS_SEGMENT_REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
+const MAGNET_STATUS_POLL_MS = 2_000;
+const MAGNET_DOWNLOAD_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const FILE_NAME_CONFLICT_TOAST_MESSAGE = "上传目录已存在同名文件，请选择覆盖或改名上传";
 
 class MultipartChunkUploadError extends Error {
@@ -321,6 +344,7 @@ export function UploadDialog({
       });
       setUrlUpload((current) => {
         cleanupTemporaryHlsUpload(current);
+        cleanupTemporaryMagnetUpload(current);
         revokeThumbnail(current.thumbnail?.generated);
         return { status: "pending" };
       });
@@ -350,6 +374,7 @@ export function UploadDialog({
     setCurlImportError(undefined);
     setUrlUpload((current) => {
       cleanupTemporaryHlsUpload(current);
+      cleanupTemporaryMagnetUpload(current);
       revokeThumbnail(current.thumbnail?.generated);
       return { status: "pending" };
     });
@@ -506,6 +531,7 @@ export function UploadDialog({
         item.fileNameOverride.trim().length === 0
       );
   const hasDone = urlUpload.status === "done" || items.some((item) => item.status === "done");
+  const isMagnetSource = isLikelyMagnetUrl(normalizedSourceUrl);
 
   useEffect(() => {
     if (!open) return;
@@ -557,6 +583,7 @@ export function UploadDialog({
     setSourceUrl(value);
     setUrlUpload((current) => {
       cleanupTemporaryHlsUpload(current);
+      cleanupTemporaryMagnetUpload(current);
       revokeThumbnail(current.thumbnail?.generated);
       hlsThumbnailGeneratingRef.current = false;
       hlsThumbnailPromiseRef.current = null;
@@ -570,12 +597,13 @@ export function UploadDialog({
         return current;
       }
 
-      const shouldResetRemoteState = current.retry || current.hls || current.thumbnail;
+      const shouldResetRemoteState = current.retry || current.hls || current.magnet || current.thumbnail;
       if (!shouldResetRemoteState) {
         return current;
       }
 
       cleanupTemporaryHlsUpload(current);
+      cleanupTemporaryMagnetUpload(current);
       revokeThumbnail(current.thumbnail?.generated);
       hlsThumbnailGeneratingRef.current = false;
       hlsThumbnailPromiseRef.current = null;
@@ -588,7 +616,8 @@ export function UploadDialog({
         retry: undefined,
         conflict: undefined,
         thumbnail: undefined,
-        hls: undefined
+        hls: undefined,
+        magnet: undefined
       };
     });
   }
@@ -662,6 +691,21 @@ export function UploadDialog({
 
   function handleUploadDirectoryPathChange(path: string) {
     setUploadDirectoryPath(path);
+    setUrlUpload((current) => {
+      if (!current.conflict || current.status === "uploading" || current.status === "done") {
+        return current;
+      }
+
+      return {
+        ...current,
+        status: "pending",
+        message: undefined,
+        progress: undefined,
+        conflict: undefined,
+        conflictAction: "error",
+        editingFileName: false
+      };
+    });
     setItems((current) =>
       current.map((item) => {
         if (!item.conflict) return item;
@@ -828,8 +872,51 @@ export function UploadDialog({
     }));
   }
 
+  function toggleMagnetFileSelection(fileIndex: number, selected: boolean) {
+    setUrlUpload((current) => {
+      const magnet = current.magnet;
+      if (!magnet) return current;
+      const selectedSet = new Set(magnet.selectedIndexes);
+      if (selected) {
+        selectedSet.add(fileIndex);
+      } else {
+        selectedSet.delete(fileIndex);
+      }
+      return {
+        ...current,
+        magnet: {
+          ...magnet,
+          selectedIndexes: Array.from(selectedSet).sort((left, right) => left - right)
+        }
+      };
+    });
+  }
+
+  function selectAllMagnetFiles(uploadableOnly = true) {
+    setUrlUpload((current) => {
+      const magnet = current.magnet;
+      if (!magnet?.import) return current;
+      return {
+        ...current,
+        magnet: {
+          ...magnet,
+          selectedIndexes: magnet.import.files
+            .filter((file) => !uploadableOnly || file.size <= maxMultipartBytes)
+            .map((file) => file.file_index)
+        }
+      };
+    });
+  }
+
+  function clearMagnetFileSelection() {
+    setUrlUpload((current) => current.magnet
+      ? { ...current, magnet: { ...current.magnet, selectedIndexes: [] } }
+      : current
+    );
+  }
+
   function extractFirstUrl(value: string): string | undefined {
-    const match = value.match(/https?:\/\/[^\s<>"']+/i);
+    const match = value.match(/(?:https?:\/\/|magnet:\?)[^\s<>"']+/i);
     return match?.[0];
   }
 
@@ -840,15 +927,26 @@ export function UploadDialog({
       return "请粘贴要上传的 URL";
     }
 
+    if (isLikelyMagnetUrl(normalized)) {
+      try {
+        const url = new URL(normalized);
+        if (url.protocol !== "magnet:" || !url.searchParams.get("xt")) {
+          return "请输入完整的磁力链接，例如 magnet:?xt=urn:btih:...";
+        }
+      } catch {
+        return "请输入完整的磁力链接，例如 magnet:?xt=urn:btih:...";
+      }
+      return undefined;
+    }
+
     try {
       const url = new URL(normalized);
       if (url.protocol !== "http:" && url.protocol !== "https:") {
-        return "仅支持 http/https URL";
+        return "仅支持 http/https URL 或 magnet 磁力链接";
       }
     } catch {
       return "请输入完整的 URL，例如 https://example.com/file.pdf";
     }
-
     return undefined;
   }
 
@@ -1576,6 +1674,11 @@ export function UploadDialog({
       return;
     }
 
+    if (isLikelyMagnetUrl(normalizedSourceUrl)) {
+      await submitMagnetUpload();
+      return;
+    }
+
     const sourceHeadersResult = readSourceHeadersForUpload();
     if (!sourceHeadersResult.ok) {
       return;
@@ -1722,6 +1825,229 @@ export function UploadDialog({
     } finally {
       finishUploadTask(task);
       setSubmitting(false);
+    }
+  }
+
+  async function submitMagnetUpload() {
+    const task = startUploadTask("url");
+    setSubmitting(true);
+    setUrlUpload((current) => ({
+      ...current,
+      status: "uploading",
+      message: undefined,
+      retry: undefined,
+      conflict: undefined,
+      progress: { completed: 0, total: 1, label: current.magnet?.import ? "准备磁力导入" : "解析磁力链接" }
+    }));
+
+    try {
+      let magnet = urlUpload.magnet?.import;
+      let selectedIndexes = urlUpload.magnet?.selectedIndexes ?? [];
+
+      if (!magnet || magnet.status === "failed" || magnet.status === "cancelled") {
+        magnet = (await probeMagnetUpload(normalizedSourceUrl, task.abortController.signal)).magnet;
+        magnet = await waitForMagnetStatus(
+          magnet.id,
+          task,
+          (current) => current.status === "ready" || current.status === "failed" || current.status === "cancelled",
+          "解析磁力文件列表"
+        );
+        const parsedMagnet = magnet;
+        selectedIndexes = defaultMagnetSelectedIndexes(parsedMagnet.files, maxMultipartBytes);
+        setUrlUpload((current) => ({
+          ...current,
+          status: parsedMagnet.status === "ready" ? "pending" : "error",
+          message: parsedMagnet.status === "ready"
+            ? `已解析 ${parsedMagnet.files.length} 个文件，请选择要导入的文件后再次点击上传`
+            : parsedMagnet.error_message || "磁力链接解析失败",
+          progress: undefined,
+          magnet: {
+            import: parsedMagnet,
+            selectedIndexes
+          }
+        }));
+        if (parsedMagnet.status !== "ready") {
+          throw new Error(parsedMagnet.error_message || "磁力链接解析失败");
+        }
+        return;
+      }
+
+      if (selectedIndexes.length === 0) {
+        throw new Error("请选择至少一个磁力文件");
+      }
+
+      const init = await initMagnetUpload({
+        import_id: magnet.id,
+        file_indexes: selectedIndexes,
+        directory_path: uploadDirectoryPath,
+        ...(urlUpload.conflictAction && urlUpload.conflictAction !== "error" ? { on_conflict: urlUpload.conflictAction } : {}),
+        ...(remark.trim() ? { remark: remark.trim() } : {})
+      }, task.abortController.signal);
+      magnet = init.magnet;
+      const uploads = init.uploads.map((entry) => ({
+        fileIndex: entry.file_index,
+        upload: entry.upload,
+        targetDirectoryPath: entry.target_directory_path
+      }));
+
+      setUrlUpload((current) => ({
+        ...current,
+        status: "uploading",
+        message: `aria2 正在下载 ${uploads.length} 个文件`,
+        progress: { completed: 0, total: uploads.length, label: "等待磁力文件下载完成" },
+        magnet: {
+          import: magnet,
+          selectedIndexes,
+          uploads
+        }
+      }));
+
+      magnet = await waitForMagnetStatus(
+        magnet.id,
+        task,
+        (current) => current.status === "downloaded" || current.status === "importing" || current.status === "done" || current.status === "failed" || current.status === "cancelled",
+        "下载磁力文件"
+      );
+      if (magnet.status === "failed" || magnet.status === "cancelled") {
+        throw new Error(magnet.error_message || "磁力文件下载失败");
+      }
+
+      let completedFiles = 0;
+      for (const entry of uploads) {
+        const { upload, fileIndex } = entry;
+        if (task.cancelled) {
+          throw new Error("已停止");
+        }
+
+        setUrlUpload((current) => ({
+          ...current,
+          status: "uploading",
+          message: `正在导入 ${upload.file_name}`,
+          chunks: createUploadChunkStates(upload.size, upload.chunk_size, upload.chunk_count),
+          progress: {
+            completed: completedFiles,
+            total: uploads.length,
+            label: `导入文件 ${completedFiles + 1}/${uploads.length}`
+          },
+          magnet: current.magnet ? { ...current.magnet, import: magnet, uploads } : { import: magnet, selectedIndexes, uploads }
+        }));
+
+        const result = await runConcurrentChunks({
+          total: upload.chunk_count,
+          taskLabel: `导入 ${upload.file_name}`,
+          doneLabel: `已导入 ${upload.file_name}`,
+          concurrency: effectiveUploadConcurrency,
+          task,
+          requestTimeoutMs: URL_CHUNK_REQUEST_TIMEOUT_MS,
+          onProgress: (progress) => {
+            setUrlUpload((current) => ({
+              ...current,
+              status: "uploading",
+              progress: {
+                completed: progress.completed,
+                total: progress.total,
+                failed: progress.failed,
+                label: `${completedFiles + 1}/${uploads.length} · ${progress.label}`
+              }
+            }));
+          },
+          onChunkState: updateUrlChunk,
+          onChunk: async (index, signal) => {
+            await uploadMagnetMultipartChunk(magnet!.id, fileIndex, index, signal);
+          }
+        });
+
+        if (result.failedChunks.length > 0 || result.cancelled) {
+          throw new Error(result.cancelled ? "已停止，可重新发起磁力导入" : `${upload.file_name} 有 ${result.failedChunks.length} 个分片导入失败`);
+        }
+
+        await runAbortableUploadRequest(task, URL_CHUNK_REQUEST_TIMEOUT_MS, (signal) =>
+          completeMagnetMultipartUpload(magnet!.id, fileIndex, undefined, signal)
+        );
+        completedFiles += 1;
+      }
+
+      const latest = await getMagnetUploadStatus(magnet.id, task.abortController.signal);
+      setUrlUpload((current) => ({
+        ...current,
+        status: "done",
+        message: `已导入 ${completedFiles} 个磁力文件`,
+        progress: undefined,
+        chunks: undefined,
+        magnet: {
+          ...(current.magnet ?? { selectedIndexes }),
+          import: latest.magnet,
+          selectedIndexes,
+          uploads
+        }
+      }));
+      onUploaded(completedFiles);
+    } catch (uploadError) {
+      const stopped = task.cancelled || isAbortError(uploadError);
+      const conflict = fileNameConflictFromError(uploadError);
+      const message = stopped
+        ? "已停止"
+        : conflict
+          ? "磁力文件与目标目录已有文件重名，请换目录或先处理同名文件"
+          : uploadError instanceof ApiError
+            ? uploadError.message
+            : uploadError instanceof Error
+              ? uploadError.message
+              : "磁力导入失败";
+      setUrlUpload((current) => ({
+        ...current,
+        status: "error",
+        message: conflict ? undefined : message,
+        conflict,
+        conflictAction: "error",
+        progress: undefined
+      }));
+      if (!stopped) {
+        onError(message);
+      }
+    } finally {
+      finishUploadTask(task);
+      setSubmitting(false);
+    }
+  }
+
+  async function waitForMagnetStatus(
+    importId: string,
+    task: UploadAbortContext,
+    isDone: (current: MagnetImport) => boolean,
+    label: string
+  ): Promise<MagnetImport> {
+    const deadline = Date.now() + MAGNET_DOWNLOAD_TIMEOUT_MS;
+
+    while (true) {
+      if (task.cancelled) {
+        throw new Error("已停止");
+      }
+
+      const response = await runAbortableUploadRequest(task, URL_CHUNK_REQUEST_TIMEOUT_MS, (signal) =>
+        getMagnetUploadStatus(importId, signal)
+      );
+      const magnet = response.magnet;
+
+      setUrlUpload((current) => ({
+        ...current,
+        magnet: current.magnet
+          ? { ...current.magnet, import: magnet }
+          : { import: magnet, selectedIndexes: defaultMagnetSelectedIndexes(magnet.files, maxMultipartBytes) },
+        progress: current.progress
+          ? { ...current.progress, label: magnetStatusProgressLabel(label, magnet) }
+          : { completed: 0, total: 1, label: magnetStatusProgressLabel(label, magnet) }
+      }));
+
+      if (isDone(magnet)) {
+        return magnet;
+      }
+
+      if (Date.now() >= deadline) {
+        throw new Error(`${label}超时`);
+      }
+
+      await delay(MAGNET_STATUS_POLL_MS, task.abortController.signal);
     }
   }
 
@@ -2473,13 +2799,13 @@ export function UploadDialog({
                   : hasUnresolvedConflict
                     ? "请选择处理方式"
                   : pendingCount > 0
-                    ? mode === "url" ? "上传 URL" : `开始上传 ${pendingCount} 个`
+                    ? mode === "url" ? (isMagnetSource && urlUpload.magnet?.import ? "导入选中文件" : isMagnetSource ? "解析磁力链接" : "上传 URL") : `开始上传 ${pendingCount} 个`
                     : "无待传文件"}
             </Button>
           </>
         }
       >
-      <form id="upload-form" className="flex flex-col gap-4" onSubmit={onSubmit}>
+      <form id="upload-form" className="flex flex-col gap-4" onSubmit={onSubmit} noValidate>
         <div className="flex items-center justify-between gap-3">
           <Segmented<UploadMode>
             value={mode}
@@ -2487,13 +2813,13 @@ export function UploadDialog({
             ariaLabel="上传方式"
             options={[
               { value: "file", label: "本地文件", icon: <UploadCloud size={15} /> },
-              { value: "url", label: "URL 链接", icon: <Link2 size={15} /> }
+              { value: "url", label: "URL / 磁力", icon: <Link2 size={15} /> }
             ]}
           />
           <span className="hidden text-xs text-muted sm:inline">统一分片上传</span>
         </div>
         <div className="rounded-xl border border-border bg-background px-3 py-2.5 text-xs leading-5 text-muted">
-          本地文件和 URL 导入都会先创建上传会话，再上传或导入分片，最后统一生成文件索引。图片/视频会尝试生成缩略图；失败时不影响文件上传。
+          本地文件、URL 和磁力导入都会先创建上传会话，再上传或导入分片，最后统一生成文件索引。图片/视频会尝试生成缩略图；失败时不影响文件上传。
         </div>
 
         <div className="flex flex-col gap-1.5">
@@ -2625,21 +2951,23 @@ export function UploadDialog({
             <div className="flex flex-col gap-1.5">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <label htmlFor="upload-source-url" className="text-xs font-medium text-muted">
-                  粘贴文件 URL
+                  粘贴文件 URL 或磁力链接
                 </label>
-                <button
-                  type="button"
-                  disabled={uploadBusy}
-                  className="rounded-md px-1.5 py-1 text-xs font-medium text-primary-strong transition-colors hover:bg-primary-soft hover:text-primary disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:focus-ring"
-                  onClick={openCurlImport}
-                >
-                  从 cURL 解析
-                </button>
+                {!isMagnetSource ? (
+                  <button
+                    type="button"
+                    disabled={uploadBusy}
+                    className="rounded-md px-1.5 py-1 text-xs font-medium text-primary-strong transition-colors hover:bg-primary-soft hover:text-primary disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:focus-ring"
+                    onClick={openCurlImport}
+                  >
+                    从 cURL 解析
+                  </button>
+                ) : null}
               </div>
               <Input
                 id="upload-source-url"
-                type="url"
-                placeholder="https://example.com/report.pdf"
+                type="text"
+                placeholder="https://example.com/report.pdf 或 magnet:?xt=urn:btih:..."
                 value={sourceUrl}
                 disabled={uploadBusy}
                 invalid={urlUpload.status === "error"}
@@ -2656,10 +2984,11 @@ export function UploadDialog({
                 }}
               />
               <p className="text-xs leading-5 text-muted">
-                URL 导入统一要求远端支持 Range，并按 {formatBytes(multipartChunkBytes)} 分片导入；图片/视频 URL 会尝试通过同源代理生成缩略图。
+                URL 导入要求远端支持 Range；磁力导入会先由 aria2 下载选中文件，再按 {formatBytes(multipartChunkBytes)} 分片转存到 Telegram。
               </p>
             </div>
 
+            {!isMagnetSource ? (
             <div className="flex flex-col gap-2">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <label className="text-xs font-medium text-muted">
@@ -2732,6 +3061,7 @@ export function UploadDialog({
                 key 会自动保存为小写。服务端会自动设置 Range；不要填写 Range、Host、Content-Length 等连接控制头。
               </p>
             </div>
+            ) : null}
 
             {normalizedSourceUrl ? (
               <UrlUploadRow
@@ -2744,6 +3074,8 @@ export function UploadDialog({
                 editingFileName={urlUpload.editingFileName}
                 conflict={urlUpload.conflict}
                 hls={urlUpload.hls}
+                magnet={urlUpload.magnet}
+                maxMultipartBytes={maxMultipartBytes}
                 onClear={() => handleSourceUrlChange("")}
                 onRetry={
                   urlUpload.hls?.retry
@@ -2757,7 +3089,10 @@ export function UploadDialog({
                 onFileNameChange={updateUrlFileName}
                 onFileNameEditingChange={setUrlFileNameEditing}
                 onHlsVariantChange={selectHlsVariant}
-                onRenameConflict={urlUpload.conflict ? () => resolveUrlConflict("error") : undefined}
+                onMagnetFileToggle={toggleMagnetFileSelection}
+                onMagnetSelectAll={() => selectAllMagnetFiles(true)}
+                onMagnetClearSelection={clearMagnetFileSelection}
+                onRenameConflict={urlUpload.conflict && !isMagnetSource ? () => resolveUrlConflict("error") : undefined}
                 onOverwriteConflict={urlUpload.conflict ? () => resolveUrlConflict("overwrite") : undefined}
                 thumbnail={urlUpload.thumbnail}
                 onThumbnailChange={(file) => void handleManualUrlThumbnail(file)}
@@ -3257,9 +3592,70 @@ function cleanupTemporaryHlsUpload(state: UrlUploadState): void {
     .catch(() => undefined);
 }
 
+function cleanupTemporaryMagnetUpload(state: UrlUploadState): void {
+  if (state.status === "done") {
+    return;
+  }
+
+  const importId = state.magnet?.import?.id;
+  if (!importId) {
+    return;
+  }
+
+  void getMagnetUploadStatus(importId)
+    .then((response) => {
+      if (response.magnet.status === "done" || response.magnet.completed_at) {
+        return undefined;
+      }
+      return cancelMagnetUpload(importId);
+    })
+    .catch(() => undefined);
+}
+
 function withoutHlsRetry(state: HlsUrlState): HlsUrlState {
   const { retry: _retry, ...rest } = state;
   return rest;
+}
+
+function isLikelyMagnetUrl(value: string): boolean {
+  return value.trim().toLowerCase().startsWith("magnet:?");
+}
+
+function defaultMagnetSelectedIndexes(files: MagnetImportFile[], maxMultipartBytes: number): number[] {
+  return files
+    .filter((file) => file.size > 0 && file.size <= maxMultipartBytes)
+    .map((file) => file.file_index)
+    .sort((left, right) => left - right);
+}
+
+function magnetStatusLabel(status: MagnetImport["status"]): string {
+  switch (status) {
+    case "probing":
+      return "解析中";
+    case "ready":
+      return "已解析";
+    case "downloading":
+      return "下载中";
+    case "downloaded":
+      return "已下载";
+    case "importing":
+      return "导入中";
+    case "done":
+      return "已完成";
+    case "failed":
+      return "失败";
+    case "cancelled":
+      return "已取消";
+    default:
+      return status;
+  }
+}
+
+function magnetStatusProgressLabel(label: string, magnet: MagnetImport): string {
+  const status = magnetStatusLabel(magnet.status);
+  const fileCount = magnet.file_count || magnet.files.length;
+  const size = magnet.total_size ? ` · ${formatBytes(magnet.total_size)}` : "";
+  return `${label} · ${status}${fileCount > 0 ? ` · ${fileCount} 个文件${size}` : ""}`;
 }
 
 function isLikelyHlsUrl(value: string): boolean {
@@ -3826,6 +4222,8 @@ interface UrlUploadRowProps {
   editingFileName?: boolean;
   conflict?: FileNameConflictState;
   hls?: HlsUrlState;
+  magnet?: MagnetUrlState;
+  maxMultipartBytes: number;
   thumbnail?: UploadThumbnailState;
   onRetry?: () => void;
   onStop?: () => void;
@@ -3833,6 +4231,9 @@ interface UrlUploadRowProps {
   onFileNameChange: (value: string) => void;
   onFileNameEditingChange: (editing: boolean) => void;
   onHlsVariantChange: (variantId: string) => void;
+  onMagnetFileToggle: (fileIndex: number, selected: boolean) => void;
+  onMagnetSelectAll: () => void;
+  onMagnetClearSelection: () => void;
   onRenameConflict?: () => void;
   onOverwriteConflict?: () => void;
   onThumbnailChange: (file: File) => void;
@@ -3850,6 +4251,8 @@ function UrlUploadRow({
   editingFileName,
   conflict,
   hls,
+  magnet,
+  maxMultipartBytes,
   thumbnail,
   onClear,
   onRetry,
@@ -3858,13 +4261,17 @@ function UrlUploadRow({
   onFileNameChange,
   onFileNameEditingChange,
   onHlsVariantChange,
+  onMagnetFileToggle,
+  onMagnetSelectAll,
+  onMagnetClearSelection,
   onRenameConflict,
   onOverwriteConflict,
   onThumbnailChange,
   onThumbnailRemove,
   disabled
 }: UrlUploadRowProps) {
-  const fileName = fileNameOverride ?? remoteFileLabel(url);
+  const isMagnet = isLikelyMagnetUrl(url);
+  const fileName = isMagnet ? (magnet?.import?.name ?? "磁力链接") : fileNameOverride ?? remoteFileLabel(url);
   return (
     <div className="flex flex-col gap-2 rounded-xl border border-border bg-surface px-3 py-2.5">
       <div className="flex items-start gap-3">
@@ -3879,15 +4286,19 @@ function UrlUploadRow({
           />
         </span>
         <div className="min-w-0 flex-1">
-          <EditableFileName
-            value={fileName}
-            originalValue={remoteFileLabel(url)}
-            editing={Boolean(editingFileName)}
-            conflict={conflict}
-            disabled={disabled || status === "uploading" || status === "done"}
-            onChange={onFileNameChange}
-            onEditingChange={onFileNameEditingChange}
-          />
+          {isMagnet ? (
+            <p className="truncate text-sm font-semibold text-foreground" title={fileName}>{fileName}</p>
+          ) : (
+            <EditableFileName
+              value={fileName}
+              originalValue={remoteFileLabel(url)}
+              editing={Boolean(editingFileName)}
+              conflict={conflict}
+              disabled={disabled || status === "uploading" || status === "done"}
+              onChange={onFileNameChange}
+              onEditingChange={onFileNameEditingChange}
+            />
+          )}
           <p className="truncate text-xs text-muted">
             {url}
             {thumbnailHint(thumbnail) ? <span> · {thumbnailHint(thumbnail)}</span> : null}
@@ -3900,6 +4311,16 @@ function UrlUploadRow({
               onVariantChange={onHlsVariantChange}
             />
           ) : null}
+          {magnet?.import ? (
+            <MagnetUploadDetails
+              magnet={magnet}
+              maxMultipartBytes={maxMultipartBytes}
+              disabled={disabled || status === "uploading" || status === "done"}
+              onToggle={onMagnetFileToggle}
+              onSelectAll={onMagnetSelectAll}
+              onClearSelection={onMagnetClearSelection}
+            />
+          ) : null}
           {progress ? <ProgressBar progress={progress} /> : null}
           <ConflictResolutionActions
             conflict={conflict}
@@ -3909,12 +4330,14 @@ function UrlUploadRow({
           />
         </div>
         <div className="flex shrink-0 flex-wrap items-center justify-end gap-0.5 self-center">
-          <ThumbnailPicker
-            disabled={disabled || status === "uploading"}
-            onChange={onThumbnailChange}
-            onRemove={onThumbnailRemove}
-            hasThumbnail={thumbnail?.status === "ready"}
-          />
+          {!isMagnet ? (
+            <ThumbnailPicker
+              disabled={disabled || status === "uploading"}
+              onChange={onThumbnailChange}
+              onRemove={onThumbnailRemove}
+              hasThumbnail={thumbnail?.status === "ready"}
+            />
+          ) : null}
           {onRetry ? (
             <button
               type="button"
@@ -4005,6 +4428,99 @@ function HlsUploadDetails({
           ))}
         </select>
       ) : null}
+    </div>
+  );
+}
+
+function MagnetUploadDetails({
+  magnet,
+  maxMultipartBytes,
+  disabled,
+  onToggle,
+  onSelectAll,
+  onClearSelection
+}: {
+  magnet: MagnetUrlState;
+  maxMultipartBytes: number;
+  disabled: boolean;
+  onToggle: (fileIndex: number, selected: boolean) => void;
+  onSelectAll: () => void;
+  onClearSelection: () => void;
+}) {
+  const info = magnet.import;
+  if (!info) {
+    return null;
+  }
+
+  const selected = new Set(magnet.selectedIndexes);
+  const selectedFiles = info.files.filter((file) => selected.has(file.file_index));
+  const selectedBytes = selectedFiles.reduce((total, file) => total + file.size, 0);
+  const uploadableCount = info.files.filter((file) => file.size <= maxMultipartBytes).length;
+
+  return (
+    <div className="mt-2 flex flex-col gap-2 rounded-lg border border-border bg-background/70 p-2">
+      <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted">
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+          <HlsMetaPill tone="strong">Magnet</HlsMetaPill>
+          <HlsMetaPill>{magnetStatusLabel(info.status)}</HlsMetaPill>
+          <HlsMetaPill>{info.files.length} 个文件</HlsMetaPill>
+          <HlsMetaPill>已选 {selectedFiles.length} 个 · {formatBytes(selectedBytes)}</HlsMetaPill>
+        </div>
+        <div className="flex shrink-0 items-center gap-1">
+          <button
+            type="button"
+            disabled={disabled || uploadableCount === 0}
+            className="rounded-md px-1.5 py-1 font-medium text-primary-strong transition-colors hover:bg-primary-soft disabled:pointer-events-none disabled:opacity-50"
+            onClick={onSelectAll}
+          >
+            全选可上传
+          </button>
+          <button
+            type="button"
+            disabled={disabled || selectedFiles.length === 0}
+            className="rounded-md px-1.5 py-1 font-medium text-muted transition-colors hover:bg-surface disabled:pointer-events-none disabled:opacity-50"
+            onClick={onClearSelection}
+          >
+            清空
+          </button>
+        </div>
+      </div>
+      {info.error_message ? (
+        <p className="rounded-md bg-danger-soft px-2 py-1.5 text-xs text-danger">{info.error_message}</p>
+      ) : null}
+      <div className="max-h-60 overflow-auto rounded-lg border border-border bg-surface">
+        {info.files.length > 0 ? (
+          <div className="divide-y divide-border">
+            {info.files.map((file) => {
+              const tooLarge = file.size > maxMultipartBytes;
+              return (
+                <label
+                  key={file.file_index}
+                  className={cn(
+                    "grid cursor-pointer grid-cols-[1.25rem_minmax(0,1fr)_auto] items-center gap-2 px-2.5 py-2 text-xs",
+                    disabled || tooLarge ? "cursor-not-allowed opacity-60" : "hover:bg-background"
+                  )}
+                >
+                  <input
+                    type="checkbox"
+                    checked={selected.has(file.file_index)}
+                    disabled={disabled || tooLarge}
+                    onChange={(event) => onToggle(file.file_index, event.currentTarget.checked)}
+                    className="size-4 accent-[var(--color-primary)]"
+                  />
+                  <span className="min-w-0">
+                    <span className="block truncate font-medium text-foreground" title={file.path}>{file.path}</span>
+                    {tooLarge ? <span className="text-danger">超过 {formatBytes(maxMultipartBytes)} 上限</span> : <span className="text-muted">{file.mime_type}</span>}
+                  </span>
+                  <span className="font-mono text-[11px] text-muted">{formatBytes(file.size)}</span>
+                </label>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="px-3 py-4 text-center text-xs text-muted">文件列表解析中</div>
+        )}
+      </div>
     </div>
   );
 }
@@ -4150,16 +4666,18 @@ function ConflictResolutionActions({
         {conflict.message ? <p className="text-warning/80">{conflict.message}</p> : null}
       </div>
       <span className="flex min-w-0 flex-wrap gap-1.5">
-        <button
-          type="button"
-          onClick={onRename}
-          onPointerDown={(event) => event.preventDefault()}
-          title={`重命名为 ${conflict.suggestedName}`}
-          disabled={disabled || !onRename}
-          className="min-w-0 max-w-full rounded-md border border-warning/35 bg-surface px-2.5 py-1 font-medium text-warning transition-colors hover:bg-warning-soft disabled:pointer-events-none disabled:opacity-50"
-        >
-          <span className="block max-w-full truncate">重命名为 {conflict.suggestedName}</span>
-        </button>
+        {onRename ? (
+          <button
+            type="button"
+            onClick={onRename}
+            onPointerDown={(event) => event.preventDefault()}
+            title={`重命名为 ${conflict.suggestedName}`}
+            disabled={disabled}
+            className="min-w-0 max-w-full rounded-md border border-warning/35 bg-surface px-2.5 py-1 font-medium text-warning transition-colors hover:bg-warning-soft disabled:pointer-events-none disabled:opacity-50"
+          >
+            <span className="block max-w-full truncate">重命名为 {conflict.suggestedName}</span>
+          </button>
+        ) : null}
         <button
           type="button"
           onClick={onOverwrite}

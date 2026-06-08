@@ -1,0 +1,14 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends aria2 ca-certificates \
+  && rm -rf /var/lib/apt/lists/* \
+  && mkdir -p /data/aria2/downloads
+
+COPY docker/aria2-entrypoint.sh /usr/local/bin/aria2-entrypoint.sh
+RUN chmod +x /usr/local/bin/aria2-entrypoint.sh
+
+EXPOSE 6800 6881 6881/udp
+VOLUME ["/data"]
+
+ENTRYPOINT ["/usr/local/bin/aria2-entrypoint.sh"]

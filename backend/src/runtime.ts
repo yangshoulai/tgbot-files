@@ -12,6 +12,10 @@ export interface AppEnv {
   MAX_FILE_BYTES?: string;
   STALE_MULTIPART_UPLOAD_TTL_HOURS?: string;
   TG_CHANNEL_SECRET?: string;
+  ARIA2_RPC_URL?: string;
+  ARIA2_RPC_SECRET?: string;
+  ARIA2_DOWNLOAD_DIR?: string;
+  ARIA2_METADATA_TIMEOUT_SECONDS?: string;
 }
 
 export interface StaticAssetHandler {

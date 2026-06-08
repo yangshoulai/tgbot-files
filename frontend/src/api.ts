@@ -231,7 +231,7 @@ export interface EntryDeleteResponse {
 
 export interface MultipartUpload {
   id: string;
-  source_kind?: "local" | "url";
+  source_kind?: "local" | "url" | "magnet";
   file_name: string;
   mime_type: string;
   size: number;
@@ -282,10 +282,59 @@ export interface MultipartChunkResponse {
 export interface MultipartUploadStatusResponse {
   ok: boolean;
   upload: MultipartUpload & {
-    source_kind: "local" | "url";
+    source_kind: "local" | "url" | "magnet";
   };
   uploaded_chunks: number[];
   missing_chunks: number[];
+}
+
+export interface MagnetImportFile {
+  id: string;
+  file_index: number;
+  path: string;
+  file_name: string;
+  relative_directory_path: string | null;
+  size: number;
+  mime_type: string;
+  chunk_size: number;
+  chunk_count: number;
+  upload_id: string | null;
+  selected: boolean;
+  status: "pending" | "selected" | "uploading" | "done" | "failed";
+  error_message: string | null;
+}
+
+export interface MagnetImport {
+  id: string;
+  magnet_uri: string;
+  info_hash: string | null;
+  name: string | null;
+  status: "probing" | "ready" | "downloading" | "downloaded" | "importing" | "done" | "failed" | "cancelled";
+  file_count: number;
+  total_size: number | null;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+  metadata_completed_at: string | null;
+  download_started_at: string | null;
+  download_completed_at: string | null;
+  completed_at: string | null;
+  files: MagnetImportFile[];
+}
+
+export interface MagnetProbeResponse {
+  ok: boolean;
+  magnet: MagnetImport;
+}
+
+export interface MagnetInitResponse {
+  ok: boolean;
+  magnet: MagnetImport;
+  uploads: Array<{
+    file_index: number;
+    upload: MultipartUpload;
+    target_directory_path: string;
+  }>;
 }
 
 export interface HlsVariant {
@@ -692,6 +741,102 @@ export function getMultipartUploadStatus(uploadId: string, signal?: AbortSignal)
   return requestJson<MultipartUploadStatusResponse>(
     `/api/admin/uploads/${encodeURIComponent(uploadId)}/status`,
     { signal }
+  );
+}
+
+export function probeMagnetUpload(magnet: string, signal?: AbortSignal) {
+  return requestJson<MagnetProbeResponse>("/api/admin/uploads/magnet/probe", {
+    method: "POST",
+    signal,
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ magnet })
+  });
+}
+
+export function getMagnetUploadStatus(importId: string, signal?: AbortSignal) {
+  return requestJson<MagnetProbeResponse>(
+    `/api/admin/uploads/magnet/${encodeURIComponent(importId)}/status`,
+    { signal }
+  );
+}
+
+export function initMagnetUpload(params: {
+  import_id: string;
+  file_indexes: number[];
+  directory_path?: string;
+  remark?: string;
+  on_conflict?: FileNameConflictAction;
+}, signal?: AbortSignal) {
+  return requestJson<MagnetInitResponse>(
+    `/api/admin/uploads/magnet/${encodeURIComponent(params.import_id)}/init`,
+    {
+      method: "POST",
+      signal,
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        file_indexes: params.file_indexes,
+        ...(params.directory_path ? { directory_path: params.directory_path } : {}),
+        ...(params.remark ? { remark: params.remark } : {}),
+        ...(params.on_conflict && params.on_conflict !== "error" ? { on_conflict: params.on_conflict } : {})
+      })
+    }
+  );
+}
+
+export function uploadMagnetMultipartChunk(importId: string, fileIndex: number, chunkIndex: number, signal?: AbortSignal) {
+  return requestJson<MultipartChunkResponse>(
+    `/api/admin/uploads/magnet/${encodeURIComponent(importId)}/files/${fileIndex}/chunks/${chunkIndex}`,
+    { method: "POST", signal }
+  );
+}
+
+export function completeMagnetMultipartUpload(
+  importId: string,
+  fileIndex: number,
+  thumbnail?: ThumbnailUploadPayload,
+  signal?: AbortSignal,
+  conflictAction?: FileNameConflictAction
+) {
+  const path = `/api/admin/uploads/magnet/${encodeURIComponent(importId)}/files/${fileIndex}/complete`;
+
+  if (!thumbnail) {
+    return requestJson<AdminUploadResponse>(path, {
+      method: "POST",
+      signal,
+      ...(conflictAction && conflictAction !== "error"
+        ? {
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ on_conflict: conflictAction })
+          }
+        : {})
+    });
+  }
+
+  const form = new FormData();
+  if (conflictAction && conflictAction !== "error") {
+    form.set("on_conflict", conflictAction);
+  }
+  form.set("thumbnail", thumbnail.blob, thumbnail.fileName);
+  if (thumbnail.width) form.set("thumbnail_width", String(thumbnail.width));
+  if (thumbnail.height) form.set("thumbnail_height", String(thumbnail.height));
+
+  return requestJson<AdminUploadResponse>(path, {
+    method: "POST",
+    signal,
+    body: form
+  });
+}
+
+export function cancelMagnetUpload(importId: string, signal?: AbortSignal) {
+  return requestJson<{ ok: boolean }>(
+    `/api/admin/uploads/magnet/${encodeURIComponent(importId)}`,
+    { method: "DELETE", signal }
   );
 }
 

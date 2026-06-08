@@ -24,6 +24,7 @@ import {
   getDirectoryUsageStats,
   findActiveApiKeyRecord,
   findActiveFileNameConflict,
+  cancelMagnetImportRecord,
   getApiKeyRecord,
   getFileChunkRecord,
   getFileRecord,
@@ -31,6 +32,8 @@ import {
   getHlsAssetRecord,
   getHlsAssetRecordByFinalFileId,
   getHlsSegmentRecordByIndex,
+  getMagnetImportFileRecord,
+  getMagnetImportRecord,
   getMultipartUploadRecord,
   getTelegramChannelRecord,
   getTelegramChannelUsage,
@@ -39,6 +42,7 @@ import {
   insertFileRecordWithConflictAction,
   insertHlsAssetRecord,
   insertHlsSegmentRecords,
+  insertMagnetImportRecord,
   insertMultipartUploadRecord,
   insertTelegramChannelRecord,
   listActiveTelegramChannelRecords,
@@ -48,10 +52,17 @@ import {
   listHlsSegmentRecords,
   listApiKeyRecords,
   listFileRecords,
+  listMagnetImportFileRecords,
   listTelegramChannelRecords,
+  markMagnetImportDoneIfComplete,
+  markMagnetImportDownloaded,
+  markMagnetImportDownloading,
+  markMagnetImportFailed,
+  markMagnetImportImporting,
   moveFileRecords,
   moveDirectoryTree,
   renameDirectoryTree,
+  replaceMagnetImportFiles,
   requireDb,
   markHlsInitSegmentImporting,
   markHlsAssetStatus,
@@ -63,11 +74,13 @@ import {
   touchApiKeyRecord,
   updateApiKeyRecord,
   updateFileRecordMetadata,
+  updateMagnetImportFileStatus,
   updateTelegramChannelRecord,
   upsertFileChunkRecord,
   deleteTelegramChannelRecord,
   getUploadConcurrencySetting,
   setUploadConcurrencySetting,
+  selectMagnetImportFiles,
   MIN_UPLOAD_CONCURRENCY,
   MAX_UPLOAD_CONCURRENCY,
   type ApiKeyRecord,
@@ -79,11 +92,14 @@ import {
   type FileTypeFilter,
   type HlsAssetRecord,
   type HlsSegmentRecord,
+  type MagnetImportFileRecord,
+  type MagnetImportRecord,
   type MultipartUploadRecord,
   type TelegramChannelRecord,
   type TelegramChannelStatus,
   type ThumbnailStatus
 } from "./database";
+import { aria2AddUri, aria2ForceRemove, aria2TellStatus, requireAria2Config, type Aria2File, type Aria2Status } from "./aria2";
 import {
   AppError,
   contentDispositionAttachment,
@@ -116,6 +132,8 @@ import {
 import { extensionForMimeType, mimeTypeForFileName, resolveStoredMimeType } from "./mime";
 import { fetchTelegramFile, getTelegramFileUrl, uploadDocumentToTelegram } from "./telegram";
 import type { AppDatabase, AppEnv } from "./runtime";
+import { mkdir, open, readdir, readFile, rm } from "node:fs/promises";
+import path from "node:path";
 
 
 
@@ -1032,6 +1050,10 @@ async function handleAdminMultipartUploads(request: Request, env: AppEnv, userna
     return handleAdminHlsUploads(request, env, username);
   }
 
+  if (url.pathname === "/api/admin/uploads/magnet" || url.pathname.startsWith("/api/admin/uploads/magnet/")) {
+    return handleAdminMagnetUploads(request, env, username);
+  }
+
   if (request.method === "POST" && url.pathname === "/api/admin/uploads/preflight") {
     const body = await readJsonObject(request);
     const entries = normalizeUploadPreflightEntries(body.entries);
@@ -1054,7 +1076,7 @@ async function handleAdminMultipartUploads(request: Request, env: AppEnv, userna
     const fileName = sanitizeFileName(stringField(body.file_name, "file_name"));
     const mimeType = normalizeMimeTypeField(body.mime_type);
     const size = positiveIntegerField(body.size, "size");
-    const remark = normalizeRemark(body.remark);
+    const remark = normalizeRemark(body.remark) ?? null;
     const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
     const conflictAction = normalizeFileNameConflictAction(body.on_conflict);
     const directory = await ensureWritableDirectory(db, directoryPath);
@@ -1081,7 +1103,7 @@ async function handleAdminMultipartUploads(request: Request, env: AppEnv, userna
     const body = await readJsonObject(request);
     const sourceUrl = normalizeSourceUrl(body.url);
     const sourceHeaders = normalizeRemoteRequestHeaders(body.headers ?? body.source_headers ?? body.request_headers);
-    const remark = normalizeRemark(body.remark);
+    const remark = normalizeRemark(body.remark) ?? null;
     const fileNameOverride = normalizeOptionalFileName(body.file_name);
     const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
     const conflictAction = normalizeFileNameConflictAction(body.on_conflict);
@@ -1393,6 +1415,893 @@ async function handleAdminHlsUploads(request: Request, env: AppEnv, username: st
   }
 
   return errorResponse(new AppError(404, "NotFound", "Admin HLS upload route not found"));
+}
+
+async function handleAdminMagnetUploads(request: Request, env: AppEnv, username: string): Promise<Response> {
+  const db = requireDb(env);
+  const url = new URL(request.url);
+
+  if (request.method === "POST" && url.pathname === "/api/admin/uploads/magnet/probe") {
+    const body = await readJsonObject(request);
+    const magnetUri = normalizeMagnetUri(body.magnet ?? body.url);
+    const result = await createMagnetImport({
+      env,
+      db,
+      magnetUri,
+      uploadedBy: username
+    });
+
+    return jsonResponse({
+      ok: true,
+      magnet: serializeMagnetImport(result.importRecord, result.files)
+    }, 201);
+  }
+
+  const statusMatch = /^\/api\/admin\/uploads\/magnet\/([^/]+)\/status$/.exec(url.pathname);
+  if (request.method === "GET" && statusMatch?.[1]) {
+    const result = await refreshMagnetImportStatus(env, db, decodeURIComponent(statusMatch[1]));
+    return jsonResponse({
+      ok: true,
+      magnet: serializeMagnetImport(result.importRecord, result.files)
+    });
+  }
+
+  const initMatch = /^\/api\/admin\/uploads\/magnet\/([^/]+)\/init$/.exec(url.pathname);
+  if (request.method === "POST" && initMatch?.[1]) {
+    const body = await readJsonObject(request);
+    const importId = decodeURIComponent(initMatch[1]);
+    const fileIndexes = normalizeMagnetFileIndexes(body.file_indexes ?? body.files);
+    const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
+    const conflictAction = normalizeFileNameConflictAction(body.on_conflict);
+    const remark = normalizeRemark(body.remark) ?? null;
+    const result = await initMagnetImportSelection({
+      env,
+      db,
+      importId,
+      fileIndexes,
+      directoryPath,
+      conflictAction,
+      remark,
+      uploadedBy: username
+    });
+
+    return jsonResponse({
+      ok: true,
+      magnet: serializeMagnetImport(result.importRecord, result.files),
+      uploads: result.uploads
+    });
+  }
+
+  const chunkMatch = /^\/api\/admin\/uploads\/magnet\/([^/]+)\/files\/(\d+)\/chunks\/(\d+)$/.exec(url.pathname);
+  if (request.method === "POST" && chunkMatch?.[1] && chunkMatch?.[2] && chunkMatch?.[3]) {
+    const importId = decodeURIComponent(chunkMatch[1]);
+    const fileIndex = parseMagnetFileIndex(chunkMatch[2]);
+    const chunkIndex = Number(chunkMatch[3]);
+    const result = await importMagnetFileChunk({
+      env,
+      db,
+      importId,
+      fileIndex,
+      chunkIndex
+    });
+
+    return jsonResponse({
+      ok: true,
+      chunk: serializeChunk(result.record),
+      uploaded_chunks: (await listFileChunkRecords(db, result.upload.id)).length
+    });
+  }
+
+  const completeMatch = /^\/api\/admin\/uploads\/magnet\/([^/]+)\/files\/(\d+)\/complete$/.exec(url.pathname);
+  if (request.method === "POST" && completeMatch?.[1] && completeMatch?.[2]) {
+    const importId = decodeURIComponent(completeMatch[1]);
+    const fileIndex = parseMagnetFileIndex(completeMatch[2]);
+    const input = await readCompleteUploadInput(request, url.searchParams);
+    const result = await completeMagnetFileUpload({
+      request,
+      env,
+      db,
+      importId,
+      fileIndex,
+      conflictAction: input.conflictAction,
+      ...(input.thumbnail ? { thumbnail: input.thumbnail } : {})
+    });
+
+    return jsonResponse({
+      ok: true,
+      file: serializeUploadedFileResult(result, username)
+    });
+  }
+
+  const deleteMatch = /^\/api\/admin\/uploads\/magnet\/([^/]+)$/.exec(url.pathname);
+  if (request.method === "DELETE" && deleteMatch?.[1]) {
+    const importId = decodeURIComponent(deleteMatch[1]);
+    const record = await requireMagnetImport(db, importId);
+    const config = requireAria2Config(env);
+    if (record.aria2_metadata_gid) {
+      await aria2ForceRemove(config, record.aria2_metadata_gid);
+    }
+    if (record.aria2_download_gid) {
+      await aria2ForceRemove(config, record.aria2_download_gid);
+    }
+    await cancelMagnetImportRecord(db, importId, new Date().toISOString());
+    const cleanup = await deleteMagnetImportDownloadDir(config, record);
+    return jsonResponse({ ok: true, cleanup });
+  }
+
+  return errorResponse(new AppError(404, "NotFound", "Admin magnet upload route not found"));
+}
+
+async function createMagnetImport(params: {
+  env: AppEnv;
+  db: AppDatabase;
+  magnetUri: string;
+  uploadedBy: string;
+}): Promise<{ importRecord: MagnetImportRecord; files: MagnetImportFileRecord[] }> {
+  const config = requireAria2Config(params.env);
+  const id = crypto.randomUUID();
+  const downloadDir = magnetDownloadDir(config.downloadDir, id);
+  await mkdir(downloadDir, { recursive: true });
+  const gid = await aria2AddUri(config, [params.magnetUri], {
+    dir: downloadDir,
+    "bt-metadata-only": "true",
+    "bt-save-metadata": "true",
+    "follow-torrent": "false",
+    "seed-time": "0"
+  });
+  const now = new Date().toISOString();
+  const importRecord = await insertMagnetImportRecord(params.db, {
+    id,
+    magnetUri: params.magnetUri,
+    aria2MetadataGid: gid,
+    downloadDir,
+    uploadedBy: params.uploadedBy,
+    createdAt: now,
+    updatedAt: now
+  });
+
+  return waitForMagnetMetadata(params.env, params.db, importRecord.id);
+}
+
+async function waitForMagnetMetadata(
+  env: AppEnv,
+  db: AppDatabase,
+  importId: string
+): Promise<{ importRecord: MagnetImportRecord; files: MagnetImportFileRecord[] }> {
+  const config = requireAria2Config(env);
+  const deadline = Date.now() + config.metadataTimeoutMs;
+  let result = await refreshMagnetImportStatus(env, db, importId);
+
+  while (result.importRecord.status === "probing" && Date.now() < deadline) {
+    await delay(900);
+    result = await refreshMagnetImportStatus(env, db, importId);
+  }
+
+  return result;
+}
+
+async function refreshMagnetImportStatus(
+  env: AppEnv,
+  db: AppDatabase,
+  importId: string
+): Promise<{ importRecord: MagnetImportRecord; files: MagnetImportFileRecord[] }> {
+  const config = requireAria2Config(env);
+  let importRecord = await requireMagnetImport(db, importId);
+
+  if (importRecord.status === "probing" && importRecord.aria2_metadata_gid) {
+    const status = await tellAria2StatusFollowing(config, importRecord.aria2_metadata_gid);
+    await refreshMagnetMetadataFromStatus(db, importRecord, status);
+    importRecord = await requireMagnetImport(db, importId);
+  }
+
+  if (
+    (importRecord.status === "downloading" || importRecord.status === "importing") &&
+    importRecord.aria2_download_gid
+  ) {
+    const status = await tellAria2StatusFollowing(config, importRecord.aria2_download_gid);
+    if (status.status === "complete") {
+      await markMagnetImportDownloaded(db, importRecord.id, new Date().toISOString());
+      importRecord = await requireMagnetImport(db, importId);
+    } else if (status.status === "error" || status.status === "removed") {
+      await markMagnetImportFailed(db, importRecord.id, status.errorMessage || "aria2 下载磁力文件失败", new Date().toISOString());
+      importRecord = await requireMagnetImport(db, importId);
+    }
+  }
+
+  return {
+    importRecord,
+    files: await listMagnetImportFileRecords(db, importRecord.id)
+  };
+}
+
+async function refreshMagnetMetadataFromStatus(
+  db: AppDatabase,
+  importRecord: MagnetImportRecord,
+  status: Aria2Status
+): Promise<void> {
+  if (status.status === "error" || status.status === "removed") {
+    await markMagnetImportFailed(db, importRecord.id, status.errorMessage || "aria2 获取磁力元数据失败", new Date().toISOString());
+    return;
+  }
+
+  const files = magnetFilesFromAria2Status(status, importRecord.download_dir);
+  if (files.length === 0 && status.status === "complete") {
+    const torrentFiles = await loadMagnetFilesFromSavedTorrent(importRecord.download_dir);
+    if (torrentFiles && torrentFiles.length > 0) {
+      const now = new Date().toISOString();
+      await replaceMagnetImportFiles(
+        db,
+        importRecord.id,
+        torrentFiles.map((file) => ({
+          id: crypto.randomUUID(),
+          importId: importRecord.id,
+          fileIndex: file.fileIndex,
+          path: file.relativePath,
+          fileName: file.fileName,
+          relativeDirectoryPath: file.relativeDirectoryPath,
+          size: file.size,
+          mimeType: file.mimeType,
+          chunkSize: TELEGRAM_CHUNK_SIZE_BYTES,
+          chunkCount: Math.ceil(file.size / TELEGRAM_CHUNK_SIZE_BYTES),
+          createdAt: now,
+          updatedAt: now
+        })),
+        {
+          infoHash: magnetInfoHash(importRecord.magnet_uri),
+          name: status.bittorrent?.info?.name ?? null,
+          totalSize: torrentFiles.reduce((total, file) => total + file.size, 0),
+          updatedAt: now
+        }
+      );
+    }
+    return;
+  }
+  if (files.length === 0) {
+    return;
+  }
+
+  const now = new Date().toISOString();
+  await replaceMagnetImportFiles(
+    db,
+    importRecord.id,
+    files.map((file) => ({
+      id: crypto.randomUUID(),
+      importId: importRecord.id,
+      fileIndex: file.fileIndex,
+      path: file.relativePath,
+      fileName: file.fileName,
+      relativeDirectoryPath: file.relativeDirectoryPath,
+      size: file.size,
+      mimeType: file.mimeType,
+      chunkSize: TELEGRAM_CHUNK_SIZE_BYTES,
+      chunkCount: Math.ceil(file.size / TELEGRAM_CHUNK_SIZE_BYTES),
+      createdAt: now,
+      updatedAt: now
+    })),
+    {
+      infoHash: magnetInfoHash(importRecord.magnet_uri),
+      name: status.bittorrent?.info?.name ?? null,
+      totalSize: files.reduce((total, file) => total + file.size, 0),
+      updatedAt: now
+    }
+  );
+}
+
+async function initMagnetImportSelection(params: {
+  env: AppEnv;
+  db: AppDatabase;
+  importId: string;
+  fileIndexes: number[];
+  directoryPath: string;
+  conflictAction: FileNameConflictAction;
+  remark: string | null;
+  uploadedBy: string;
+}): Promise<{
+  importRecord: MagnetImportRecord;
+  files: MagnetImportFileRecord[];
+  uploads: Array<{ file_index: number; upload: Record<string, unknown>; target_directory_path: string }>;
+}> {
+  const refreshed = await refreshMagnetImportStatus(params.env, params.db, params.importId);
+  const importRecord = refreshed.importRecord;
+  if (importRecord.status !== "ready" && importRecord.status !== "downloaded") {
+    throw new AppError(409, "MagnetMetadataNotReady", "磁力链接文件列表尚未解析完成");
+  }
+
+  const selectedSet = new Set(params.fileIndexes);
+  const files = refreshed.files.filter((file) => selectedSet.has(file.file_index));
+  if (files.length !== selectedSet.size) {
+    throw new AppError(400, "InvalidMagnetFileSelection", "选择的磁力文件不存在");
+  }
+
+  const uploadByFileIndex = new Map<number, string>();
+  const uploads: Array<{ file_index: number; upload: Record<string, unknown>; target_directory_path: string }> = [];
+  for (const file of files) {
+    validateMultipartFileSize(file.size);
+    const targetDirectoryPath = targetDirectoryForMagnetFile(params.directoryPath, file);
+    const directory = await ensureWritableDirectory(params.db, targetDirectoryPath);
+    const upload = await createMultipartUpload({
+      db: params.db,
+      sourceKind: "magnet",
+      sourceUrl: importRecord.magnet_uri,
+      fileName: file.file_name,
+      mimeType: file.mime_type,
+      size: file.size,
+      uploadedBy: params.uploadedBy,
+      directoryId: directory?.id ?? null,
+      directoryPath: targetDirectoryPath,
+      conflictAction: params.conflictAction,
+      ...(params.remark ? { remark: params.remark } : {})
+    });
+    uploadByFileIndex.set(file.file_index, upload.id);
+    uploads.push({
+      file_index: file.file_index,
+      upload: serializeMultipartInit(upload),
+      target_directory_path: targetDirectoryPath
+    });
+  }
+
+  const config = requireAria2Config(params.env);
+  const gid = await aria2AddUri(config, [importRecord.magnet_uri], {
+    dir: importRecord.download_dir,
+    "select-file": params.fileIndexes.join(","),
+    "bt-save-metadata": "true",
+    "seed-time": "0",
+    "max-upload-limit": "64K"
+  });
+  const now = new Date().toISOString();
+  await selectMagnetImportFiles({
+    db: params.db,
+    importId: importRecord.id,
+    fileIndexes: params.fileIndexes,
+    uploadByFileIndex,
+    updatedAt: now
+  });
+  await markMagnetImportDownloading({
+    db: params.db,
+    id: importRecord.id,
+    aria2DownloadGid: gid,
+    selectedIndexesJson: JSON.stringify(params.fileIndexes),
+    updatedAt: now
+  });
+
+  return {
+    importRecord: await requireMagnetImport(params.db, importRecord.id),
+    files: await listMagnetImportFileRecords(params.db, importRecord.id),
+    uploads
+  };
+}
+
+async function importMagnetFileChunk(params: {
+  env: AppEnv;
+  db: AppDatabase;
+  importId: string;
+  fileIndex: number;
+  chunkIndex: number;
+}): Promise<{ record: Awaited<ReturnType<typeof uploadChunkToTelegram>>; upload: MultipartUploadRecord }> {
+  const refreshed = await refreshMagnetImportStatus(params.env, params.db, params.importId);
+  if (refreshed.importRecord.status !== "downloaded" && refreshed.importRecord.status !== "importing") {
+    throw new AppError(409, "MagnetDownloadNotReady", "磁力文件尚未下载完成，暂不能导入分片");
+  }
+
+  const file = await requireMagnetImportFile(params.db, params.importId, params.fileIndex);
+  if (!file.upload_id || file.selected !== 1) {
+    throw new AppError(400, "MagnetFileNotSelected", "磁力文件尚未初始化上传会话");
+  }
+
+  const upload = await requireMultipartUpload(params.db, file.upload_id, "magnet");
+  const chunkIndex = normalizeChunkIndex(String(params.chunkIndex), upload);
+  await markMagnetImportImporting(params.db, params.importId, new Date().toISOString());
+  await updateMagnetImportFileStatus({
+    db: params.db,
+    importId: params.importId,
+    fileIndex: params.fileIndex,
+    status: "uploading",
+    updatedAt: new Date().toISOString()
+  });
+
+  try {
+    const chunk = await readMagnetFileChunk(refreshed.importRecord, file, upload, chunkIndex);
+    const record = await uploadChunkToTelegram({
+      env: params.env,
+      db: params.db,
+      upload,
+      chunk,
+      chunkIndex
+    });
+    await upsertFileChunkRecord(params.db, record);
+    return { record, upload };
+  } catch (error) {
+    await updateMagnetImportFileStatus({
+      db: params.db,
+      importId: params.importId,
+      fileIndex: params.fileIndex,
+      status: "failed",
+      errorMessage: error instanceof Error ? error.message : "磁力文件分片导入失败",
+      updatedAt: new Date().toISOString()
+    });
+    throw error;
+  }
+}
+
+async function completeMagnetFileUpload(params: {
+  request: Request;
+  env: AppEnv;
+  db: AppDatabase;
+  importId: string;
+  fileIndex: number;
+  conflictAction?: FileNameConflictAction;
+  thumbnail?: ThumbnailInput;
+}): Promise<UploadResult> {
+  const file = await requireMagnetImportFile(params.db, params.importId, params.fileIndex);
+  if (!file.upload_id || file.selected !== 1) {
+    throw new AppError(400, "MagnetFileNotSelected", "磁力文件尚未初始化上传会话");
+  }
+
+  const upload = await requireMultipartUpload(params.db, file.upload_id, "magnet");
+  const result = await completeMultipartUpload({
+    request: params.request,
+    env: params.env,
+    db: params.db,
+    upload,
+    ...(params.conflictAction ? { conflictAction: params.conflictAction } : {}),
+    ...(params.thumbnail ? { thumbnail: params.thumbnail } : {})
+  });
+  const now = new Date().toISOString();
+  await updateMagnetImportFileStatus({
+    db: params.db,
+    importId: params.importId,
+    fileIndex: params.fileIndex,
+    status: "done",
+    updatedAt: now
+  });
+  await markMagnetImportDoneIfComplete(params.db, params.importId, now);
+  const latest = await requireMagnetImport(params.db, params.importId);
+  if (latest.status === "done") {
+    await deleteMagnetImportDownloadDir(requireAria2Config(params.env), latest);
+  }
+  return result;
+}
+
+async function tellAria2StatusFollowing(config: ReturnType<typeof requireAria2Config>, gid: string): Promise<Aria2Status> {
+  const status = await aria2TellStatus(config, gid);
+  const followedBy = status.followedBy?.[0];
+  if (followedBy) {
+    return aria2TellStatus(config, followedBy);
+  }
+  return status;
+}
+
+function magnetFilesFromAria2Status(status: Aria2Status, downloadDir: string): Array<{
+  fileIndex: number;
+  relativePath: string;
+  fileName: string;
+  relativeDirectoryPath: string | null;
+  size: number;
+  mimeType: string;
+}> {
+  const files = status.files ?? [];
+  return files
+    .map((file) => magnetFileFromAria2File(file, downloadDir))
+    .filter((file): file is NonNullable<ReturnType<typeof magnetFileFromAria2File>> => Boolean(file));
+}
+
+function magnetFileFromAria2File(file: Aria2File, downloadDir: string): {
+  fileIndex: number;
+  relativePath: string;
+  fileName: string;
+  relativeDirectoryPath: string | null;
+  size: number;
+  mimeType: string;
+} | null {
+  const fileIndex = Number(file.index);
+  const size = Number(file.length);
+  if (!Number.isSafeInteger(fileIndex) || fileIndex <= 0 || !Number.isSafeInteger(size) || size <= 0) {
+    return null;
+  }
+
+  const sourcePath = file.path || "";
+  const rawRelativePath = path.isAbsolute(sourcePath) ? path.relative(downloadDir, sourcePath) : sourcePath;
+  const relativePath = normalizeTorrentRelativePath(rawRelativePath);
+  if (!relativePath || relativePath.endsWith(".torrent")) {
+    return null;
+  }
+
+  const segments = relativePath.split("/").filter(Boolean);
+  const fileName = sanitizeFileName(segments.at(-1) ?? "file");
+  const relativeDirectoryPath = segments.length > 1
+    ? segments.slice(0, -1).map((segment) => sanitizeDirectorySegment(segment)).filter(Boolean).join("/") || null
+    : null;
+
+  return {
+    fileIndex,
+    relativePath: relativeDirectoryPath ? `${relativeDirectoryPath}/${fileName}` : fileName,
+    fileName,
+    relativeDirectoryPath,
+    size,
+    mimeType: mimeTypeForMagnetFileName(fileName)
+  };
+}
+
+async function loadMagnetFilesFromSavedTorrent(
+  downloadDir: string
+): Promise<Array<{
+  fileIndex: number;
+  relativePath: string;
+  fileName: string;
+  relativeDirectoryPath: string | null;
+  size: number;
+  mimeType: string;
+}> | null> {
+  const entries = await readdir(downloadDir).catch(() => []);
+  const torrentFile = entries.find((entry) => entry.toLowerCase().endsWith(".torrent"));
+  if (!torrentFile) {
+    return null;
+  }
+
+  const bytes = await readFile(path.join(downloadDir, torrentFile));
+  return torrentFilesFromBencodedTorrent(bytes);
+}
+
+function torrentFilesFromBencodedTorrent(bytes: Uint8Array): Array<{
+  fileIndex: number;
+  relativePath: string;
+  fileName: string;
+  relativeDirectoryPath: string | null;
+  size: number;
+  mimeType: string;
+}> {
+  const root = parseBencode(bytes);
+  const info = bencodeDictValue(root, "info");
+  const name = sanitizeDirectorySegment(bencodeStringValue(info.get("name")) || "torrent");
+  const files = bencodeListValue(info.get("files"));
+
+  if (files) {
+    const parsed: Array<{
+      fileIndex: number;
+      relativePath: string;
+      fileName: string;
+      relativeDirectoryPath: string | null;
+      size: number;
+      mimeType: string;
+    }> = [];
+    files.forEach((item, index) => {
+      if (!(item instanceof Map)) return;
+      const size = bencodeNumberValue(item.get("length"));
+      const pathParts = bencodeListValue(item.get("path"))
+        ?.map((part) => sanitizeDirectorySegment(bencodeStringValue(part) || ""))
+        .filter(Boolean) ?? [];
+      if (!Number.isSafeInteger(size) || size <= 0 || pathParts.length === 0) return;
+      const fileName = sanitizeFileName(pathParts.at(-1) ?? "file");
+      const relativeDirectoryPath = [name, ...pathParts.slice(0, -1)].filter(Boolean).join("/") || null;
+      parsed.push({
+        fileIndex: index + 1,
+        relativePath: relativeDirectoryPath ? `${relativeDirectoryPath}/${fileName}` : fileName,
+        fileName,
+        relativeDirectoryPath,
+        size,
+        mimeType: mimeTypeForMagnetFileName(fileName)
+      });
+    });
+    return parsed;
+  }
+
+  const size = bencodeNumberValue(info.get("length"));
+  if (!Number.isSafeInteger(size) || size <= 0) {
+    return [];
+  }
+
+  const fileName = sanitizeFileName(name || "torrent");
+  return [{
+    fileIndex: 1,
+    relativePath: fileName,
+    fileName,
+    relativeDirectoryPath: null,
+    size,
+    mimeType: mimeTypeForMagnetFileName(fileName)
+  }];
+}
+
+function mimeTypeForMagnetFileName(fileName: string): string {
+  return mimeTypeForFileName(fileName) ?? "application/octet-stream";
+}
+
+async function readMagnetFileChunk(
+  importRecord: MagnetImportRecord,
+  file: MagnetImportFileRecord,
+  upload: MultipartUploadRecord,
+  chunkIndex: number
+): Promise<Blob> {
+  const expectedSize = expectedChunkSize(upload, chunkIndex);
+  const start = chunkIndex * upload.chunk_size;
+  const absolutePath = safeMagnetFilePath(importRecord.download_dir, file.path);
+  const handle = await open(absolutePath, "r").catch(() => {
+    throw new AppError(409, "MagnetFileNotReady", "磁力文件尚未落盘完成");
+  });
+
+  try {
+    const buffer = new Uint8Array(expectedSize);
+    const { bytesRead } = await handle.read(buffer, 0, expectedSize, start);
+    if (bytesRead !== expectedSize) {
+      throw new AppError(409, "MagnetFileNotReady", "磁力文件分片尚未下载完成");
+    }
+    return new Blob([buffer], { type: upload.mime_type });
+  } finally {
+    await handle.close();
+  }
+}
+
+function safeMagnetFilePath(downloadDir: string, relativePath: string): string {
+  const resolvedBase = path.resolve(downloadDir);
+  const resolved = path.resolve(downloadDir, relativePath);
+  if (resolved !== resolvedBase && resolved.startsWith(`${resolvedBase}${path.sep}`)) {
+    return resolved;
+  }
+  throw new AppError(400, "InvalidMagnetFilePath", "磁力文件路径无效");
+}
+
+async function deleteMagnetImportDownloadDir(
+  config: ReturnType<typeof requireAria2Config>,
+  importRecord: MagnetImportRecord
+): Promise<{ deleted: boolean; path?: string; skipped?: string }> {
+  const resolvedBase = path.resolve(config.downloadDir);
+  const resolvedDir = path.resolve(importRecord.download_dir);
+
+  if (resolvedDir === resolvedBase || !resolvedDir.startsWith(`${resolvedBase}${path.sep}`)) {
+    return { deleted: false, skipped: "download_dir_outside_base" };
+  }
+
+  await rm(resolvedDir, { recursive: true, force: true });
+  return { deleted: true, path: importRecord.download_dir };
+}
+
+function targetDirectoryForMagnetFile(baseDirectoryPath: string, file: MagnetImportFileRecord): string {
+  const relativeDirectoryPath = file.relative_directory_path?.trim();
+  if (!relativeDirectoryPath) {
+    return baseDirectoryPath;
+  }
+
+  return normalizeDirectoryPath(`${baseDirectoryPath.replace(/\/+$/g, "")}/${relativeDirectoryPath}`);
+}
+
+async function requireMagnetImport(db: AppDatabase, id: string): Promise<MagnetImportRecord> {
+  const record = await getMagnetImportRecord(db, id);
+  if (!record) {
+    throw new AppError(404, "MagnetImportNotFound", "Magnet import task not found");
+  }
+  return record;
+}
+
+async function requireMagnetImportFile(db: AppDatabase, importId: string, fileIndex: number): Promise<MagnetImportFileRecord> {
+  const file = await getMagnetImportFileRecord(db, importId, fileIndex);
+  if (!file) {
+    throw new AppError(404, "MagnetImportFileNotFound", "Magnet import file not found");
+  }
+  return file;
+}
+
+function serializeMagnetImport(record: MagnetImportRecord, files: MagnetImportFileRecord[]): Record<string, unknown> {
+  return {
+    id: record.id,
+    magnet_uri: record.magnet_uri,
+    info_hash: record.info_hash,
+    name: record.name,
+    status: record.status,
+    file_count: record.file_count,
+    total_size: record.total_size,
+    error_message: record.error_message,
+    created_at: record.created_at,
+    updated_at: record.updated_at,
+    metadata_completed_at: record.metadata_completed_at,
+    download_started_at: record.download_started_at,
+    download_completed_at: record.download_completed_at,
+    completed_at: record.completed_at,
+    files: files.map((file) => ({
+      id: file.id,
+      file_index: file.file_index,
+      path: file.path,
+      file_name: file.file_name,
+      relative_directory_path: file.relative_directory_path,
+      size: file.size,
+      mime_type: file.mime_type,
+      chunk_size: file.chunk_size,
+      chunk_count: file.chunk_count,
+      upload_id: file.upload_id,
+      selected: file.selected === 1,
+      status: file.status,
+      error_message: file.error_message
+    }))
+  };
+}
+
+function normalizeMagnetUri(value: unknown): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new AppError(400, "MissingMagnet", "JSON field 'magnet' is required");
+  }
+
+  const normalized = value.trim();
+  if (!normalized.toLowerCase().startsWith("magnet:?")) {
+    throw new AppError(400, "InvalidMagnet", "仅支持 magnet:? 磁力链接");
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    throw new AppError(400, "InvalidMagnet", "磁力链接格式无效");
+  }
+
+  if (parsed.protocol !== "magnet:" || !parsed.searchParams.get("xt")) {
+    throw new AppError(400, "InvalidMagnet", "磁力链接缺少 xt 参数");
+  }
+
+  return normalized;
+}
+
+function normalizeMagnetFileIndexes(value: unknown): number[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new AppError(400, "InvalidMagnetFileSelection", "file_indexes must be a non-empty array");
+  }
+
+  const indexes = Array.from(new Set(value.map((item) => Number(item))));
+  for (const index of indexes) {
+    if (!Number.isSafeInteger(index) || index <= 0) {
+      throw new AppError(400, "InvalidMagnetFileSelection", "file_indexes contains an invalid file index");
+    }
+  }
+
+  return indexes.sort((left, right) => left - right);
+}
+
+function parseMagnetFileIndex(value: string): number {
+  const index = Number(value);
+  if (!Number.isSafeInteger(index) || index <= 0) {
+    throw new AppError(400, "InvalidMagnetFileIndex", "Magnet file index is invalid");
+  }
+  return index;
+}
+
+function magnetDownloadDir(baseDir: string, importId: string): string {
+  return path.join(baseDir, importId);
+}
+
+function magnetInfoHash(magnetUri: string): string | null {
+  try {
+    const xt = new URL(magnetUri).searchParams.get("xt");
+    const match = /^urn:btih:([a-z0-9]+)$/i.exec(xt || "");
+    return match?.[1]?.toLowerCase() ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeTorrentRelativePath(value: string): string | null {
+  const segments = value
+    .replace(/\\/g, "/")
+    .split("/")
+    .map((segment) => segment.trim())
+    .filter((segment) => segment && segment !== "." && segment !== "..")
+    .map((segment, index, all) => index === all.length - 1 ? sanitizeFileName(segment) : sanitizeDirectorySegment(segment))
+    .filter(Boolean);
+
+  return segments.length > 0 ? segments.join("/") : null;
+}
+
+function sanitizeDirectorySegment(value: string | undefined): string {
+  const cleaned = sanitizeFileName(value)
+    .replace(/[\\/]/g, "")
+    .trim();
+
+  if (!cleaned || cleaned === "." || cleaned === "..") {
+    return "folder";
+  }
+
+  return cleaned.slice(0, 80);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+type BValue = number | Uint8Array | BValue[] | Map<string, BValue>;
+
+function parseBencode(bytes: Uint8Array): Map<string, BValue> {
+  let offset = 0;
+
+  const parseValue = (): BValue => {
+    const byte = bytes[offset];
+    if (byte === undefined) {
+      throw new AppError(400, "InvalidTorrentMetadata", "Torrent metadata is truncated");
+    }
+
+    if (byte === 0x69) {
+      offset += 1;
+      const end = bytes.indexOf(0x65, offset);
+      if (end < 0) {
+        throw new AppError(400, "InvalidTorrentMetadata", "Torrent integer is invalid");
+      }
+      const text = new TextDecoder().decode(bytes.slice(offset, end));
+      offset = end + 1;
+      const value = Number(text);
+      if (!Number.isSafeInteger(value)) {
+        throw new AppError(400, "InvalidTorrentMetadata", "Torrent integer is out of range");
+      }
+      return value;
+    }
+
+    if (byte === 0x6c) {
+      offset += 1;
+      const values: BValue[] = [];
+      while (bytes[offset] !== 0x65) {
+        values.push(parseValue());
+      }
+      offset += 1;
+      return values;
+    }
+
+    if (byte === 0x64) {
+      offset += 1;
+      const values = new Map<string, BValue>();
+      while (bytes[offset] !== 0x65) {
+        const key = parseValue();
+        if (!(key instanceof Uint8Array)) {
+          throw new AppError(400, "InvalidTorrentMetadata", "Torrent dictionary key is invalid");
+        }
+        values.set(new TextDecoder().decode(key), parseValue());
+      }
+      offset += 1;
+      return values;
+    }
+
+    if (byte >= 0x30 && byte <= 0x39) {
+      let colon = offset;
+      while (bytes[colon] !== 0x3a) {
+        colon += 1;
+        if (colon >= bytes.length) {
+          throw new AppError(400, "InvalidTorrentMetadata", "Torrent byte string is invalid");
+        }
+      }
+      const length = Number(new TextDecoder().decode(bytes.slice(offset, colon)));
+      if (!Number.isSafeInteger(length) || length < 0) {
+        throw new AppError(400, "InvalidTorrentMetadata", "Torrent byte string length is invalid");
+      }
+      offset = colon + 1;
+      const end = offset + length;
+      if (end > bytes.length) {
+        throw new AppError(400, "InvalidTorrentMetadata", "Torrent byte string is truncated");
+      }
+      const value = bytes.slice(offset, end);
+      offset = end;
+      return value;
+    }
+
+    throw new AppError(400, "InvalidTorrentMetadata", "Torrent metadata is invalid");
+  };
+
+  const root = parseValue();
+  if (!(root instanceof Map)) {
+    throw new AppError(400, "InvalidTorrentMetadata", "Torrent root must be a dictionary");
+  }
+  return root;
+}
+
+function bencodeDictValue(root: Map<string, BValue>, key: string): Map<string, BValue> {
+  const value = root.get(key);
+  if (!(value instanceof Map)) {
+    throw new AppError(400, "InvalidTorrentMetadata", `Torrent metadata missing ${key}`);
+  }
+  return value;
+}
+
+function bencodeListValue(value: BValue | undefined): BValue[] | undefined {
+  return Array.isArray(value) ? value : undefined;
+}
+
+function bencodeStringValue(value: BValue | undefined): string | undefined {
+  return value instanceof Uint8Array ? new TextDecoder().decode(value) : undefined;
+}
+
+function bencodeNumberValue(value: BValue | undefined): number {
+  return typeof value === "number" ? value : Number.NaN;
 }
 
 async function handleApiMultipartUploads(request: Request, env: AppEnv): Promise<Response> {
@@ -4044,7 +4953,7 @@ function ensureFileExtension(fileName: string, mimeType: string): string {
 
 async function createMultipartUpload(params: {
   db: AppDatabase;
-  sourceKind: "local" | "url";
+  sourceKind: "local" | "url" | "magnet";
   sourceUrl?: string;
   sourceHeadersJson?: string;
   fileName: string;
@@ -4402,7 +5311,7 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 async function requireMultipartUpload(
   db: AppDatabase,
   id: string,
-  sourceKind?: "local" | "url"
+  sourceKind?: "local" | "url" | "magnet"
 ): Promise<MultipartUploadRecord> {
   const upload = await getMultipartUploadRecord(db, id);
 

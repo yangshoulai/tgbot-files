@@ -56,7 +56,11 @@ const env: AppEnv = {
   ...optionalEnv("PUBLIC_BASE_URL"),
   ...optionalEnv("MAX_FILE_BYTES"),
   ...optionalEnv("STALE_MULTIPART_UPLOAD_TTL_HOURS"),
-  ...optionalEnv("TG_CHANNEL_SECRET")
+  ...optionalEnv("TG_CHANNEL_SECRET"),
+  ...optionalEnv("ARIA2_RPC_URL"),
+  ...optionalEnv("ARIA2_RPC_SECRET"),
+  ...optionalEnv("ARIA2_DOWNLOAD_DIR"),
+  ...optionalEnv("ARIA2_METADATA_TIMEOUT_SECONDS")
 };
 
 const server = createServer((request, response) => {

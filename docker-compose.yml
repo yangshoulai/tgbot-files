@@ -4,6 +4,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    depends_on:
+      - aria2
     ports:
       - "8787:8787"
     volumes:
@@ -23,3 +25,31 @@ services:
       ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
       ADMIN_SESSION_SECRET: "${ADMIN_SESSION_SECRET}"
       TG_CHANNEL_SECRET: "${TG_CHANNEL_SECRET:-}"
+      ARIA2_RPC_URL: "${ARIA2_RPC_URL:-http://aria2:6800/jsonrpc}"
+      ARIA2_RPC_SECRET: "${ARIA2_RPC_SECRET:?ARIA2_RPC_SECRET is required}"
+      ARIA2_DOWNLOAD_DIR: "${ARIA2_DOWNLOAD_DIR:-/data/aria2/downloads}"
+      ARIA2_METADATA_TIMEOUT_SECONDS: "${ARIA2_METADATA_TIMEOUT_SECONDS:-30}"
+
+  aria2:
+    build:
+      context: .
+      dockerfile: Dockerfile.aria2
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    ports:
+      - "6881:6881"
+      - "6881:6881/udp"
+    command:
+      - "--enable-rpc=true"
+      - "--rpc-listen-all=true"
+      - "--rpc-listen-port=6800"
+      - "--rpc-secret=${ARIA2_RPC_SECRET:?ARIA2_RPC_SECRET is required}"
+      - "--dir=/data/aria2/downloads"
+      - "--save-session=/data/aria2/session.txt"
+      - "--input-file=/data/aria2/session.txt"
+      - "--save-session-interval=60"
+      - "--force-save=true"
+      - "--bt-save-metadata=true"
+      - "--seed-time=0"
+      - "--max-overall-upload-limit=64K"
