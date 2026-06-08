@@ -1214,19 +1214,19 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
           </div>
         </div>
 
-        <div className="grid grid-cols-1 gap-2 lg:grid-cols-[minmax(240px,1fr)_220px_145px_auto] lg:items-center">
-          <Input
-            placeholder="搜索文件名、备注"
-            leadingIcon={<Search size={15} />}
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-          />
+        <div className="grid grid-cols-1 gap-2 lg:grid-cols-[220px_minmax(240px,1fr)_145px_auto] lg:items-center">
           <DirectoryTreeSelect
             ariaLabel="目录过滤"
             value={currentDirPath}
             directories={directoryOptions}
             disabled={isListBusy}
             onChange={goToDirectory}
+          />
+          <Input
+            placeholder="搜索文件名、备注"
+            leadingIcon={<Search size={15} />}
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
           />
           <select
             aria-label="文件类型过滤"

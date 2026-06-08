@@ -343,8 +343,8 @@ export function FileTable({
           );
         })}
       </div>
-      <div className="hidden overflow-x-auto scroll-thin sm:block">
-        <table className="w-full border-collapse text-sm">
+      <div className="hidden overflow-x-hidden sm:block">
+        <table className="w-full table-fixed border-collapse text-sm">
           <thead>
             <tr className="border-b border-border bg-background/60">
               <th className="w-10 px-4 py-3 align-middle font-medium text-muted">
@@ -373,7 +373,7 @@ export function FileTable({
                 activeSort={sortKey}
                 direction={sortDirection}
                 onSort={onSort}
-                className="hidden px-4 py-3 text-left font-medium text-muted lg:table-cell"
+                className="hidden w-28 px-4 py-3 text-left font-medium text-muted lg:table-cell"
               />
               <SortHeader
                 label="类型"
@@ -381,7 +381,7 @@ export function FileTable({
                 activeSort={sortKey}
                 direction={sortDirection}
                 onSort={onSort}
-                className="hidden px-4 py-3 text-left font-medium text-muted md:table-cell"
+                className="hidden w-28 px-4 py-3 text-left font-medium text-muted md:table-cell"
               />
               <SortHeader
                 label="上传时间"
@@ -389,9 +389,9 @@ export function FileTable({
                 activeSort={sortKey}
                 direction={sortDirection}
                 onSort={onSort}
-                className="hidden px-4 py-3 text-left font-medium text-muted md:table-cell"
+                className="hidden w-40 px-4 py-3 text-left font-medium text-muted md:table-cell"
               />
-              <th className="px-4 py-3 text-right font-medium text-muted">操作</th>
+              <th className="w-44 px-4 py-3 text-right font-medium text-muted md:w-56 lg:w-72">操作</th>
             </tr>
           </thead>
           <tbody>
@@ -413,16 +413,16 @@ export function FileTable({
                     className={checkboxClass}
                   />
                 </td>
-                <td className="px-4 py-3 align-middle">
+                <td className="max-w-0 px-4 py-3 align-middle">
                   <button
                     type="button"
                     onClick={() => onOpenDirectory(directory)}
-                    className="flex min-w-0 items-center gap-3 text-left focus-visible:outline-none focus-visible:focus-ring"
+                    className="flex w-full min-w-0 items-center gap-3 text-left focus-visible:outline-none focus-visible:focus-ring"
                   >
                     <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-primary-soft text-primary-strong">
                       <Folder size={20} />
                     </span>
-                    <div className="flex min-w-0 flex-col gap-0.5">
+                    <div className="flex min-w-0 flex-1 flex-col gap-0.5">
                       <span className="truncate text-sm font-semibold text-foreground" title={directory.name}>
                         {directory.name}
                       </span>
@@ -446,7 +446,7 @@ export function FileTable({
                   {formatDateTime(directory.created_at)}
                 </td>
                 <td className="px-4 py-3 align-middle">
-                  <div className="flex items-center justify-end gap-1.5">
+                  <div className="flex flex-wrap items-center justify-end gap-1.5">
                     <IconButton
                       variant="ghost"
                       size="sm"
@@ -506,8 +506,8 @@ export function FileTable({
                       className={checkboxClass}
                     />
                   </td>
-                  <td className="px-4 py-3 align-middle">
-                    <div className="flex min-w-0 items-center gap-3">
+                  <td className="max-w-0 px-4 py-3 align-middle">
+                    <div className="flex w-full min-w-0 items-center gap-3">
                       <FileVisual
                         mimeType={file.mime_type}
                         fileName={file.file_name}
@@ -517,7 +517,7 @@ export function FileTable({
                         onClick={previewFromThumbnail}
                         actionLabel={`预览缩略图 ${file.file_name}`}
                       />
-                      <div className="flex min-w-0 flex-col gap-0.5">
+                      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
                         <span className="truncate text-sm font-medium text-foreground" title={file.file_name}>
                           {file.file_name}
                         </span>
@@ -540,7 +540,7 @@ export function FileTable({
                     {formatDateTime(file.created_at)}
                   </td>
                   <td className="px-4 py-3 align-middle">
-                    <div className="flex items-center justify-end gap-1.5">
+                    <div className="flex flex-wrap items-center justify-end gap-1.5">
                       <IconButton
                         variant="ghost"
                         size="sm"
