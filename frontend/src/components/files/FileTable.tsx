@@ -446,7 +446,7 @@ export function FileTable({
                   {formatDateTime(directory.created_at)}
                 </td>
                 <td className="px-4 py-3 align-middle">
-                  <div className="flex flex-wrap items-center justify-end gap-1.5">
+                  <div className="flex flex-nowrap items-center justify-end gap-1">
                     <IconButton
                       variant="ghost"
                       size="sm"
@@ -540,7 +540,7 @@ export function FileTable({
                     {formatDateTime(file.created_at)}
                   </td>
                   <td className="px-4 py-3 align-middle">
-                    <div className="flex flex-wrap items-center justify-end gap-1.5">
+                    <div className="flex flex-nowrap items-center justify-end gap-1">
                       <IconButton
                         variant="ghost"
                         size="sm"
