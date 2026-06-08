@@ -346,6 +346,8 @@ function buildDocs(session: SessionResponse): Record<DocAudience, DocGroup> {
   const maxMultipart = formatBytes(session.max_multipart_file_bytes);
   const chunkSize = formatBytes(session.multipart_chunk_bytes);
   const directMax = formatBytes(session.direct_access_max_bytes);
+  const exampleMultipartSize = session.max_multipart_file_bytes;
+  const exampleMultipartChunkCount = Math.ceil(session.max_multipart_file_bytes / session.multipart_chunk_bytes);
 
   const bearer = p("Authorization", "Header", "是", "string", "Bearer <API_KEY>", "外部上传 API Key，禁用或删除后立即不可用。");
   const adminCookie = p("admin_session", "Cookie", "是", "string", "HttpOnly", "管理员登录后由服务端设置，成功请求会自动续期。");
@@ -481,10 +483,10 @@ function buildDocs(session: SessionResponse): Record<DocAudience, DocGroup> {
   "file": {
     "id": "file-id",
     "file_name": "backup.zip",
-    "size": 5368709120,
+    "size": ${exampleMultipartSize},
     "storage_backend": "telegram_multipart",
     "chunk_size": ${session.multipart_chunk_bytes},
-    "chunk_count": 512,
+    "chunk_count": ${exampleMultipartChunkCount},
     "direct_access": false,
     "download_strategy": "accelerated",
     "url": null,
@@ -524,7 +526,7 @@ function buildDocs(session: SessionResponse): Record<DocAudience, DocGroup> {
 Content-Type: application/octet-stream
 Content-Length: ${session.multipart_chunk_bytes}
 X-Chunk-Index: 0
-X-Chunk-Count: 512
+X-Chunk-Count: ${exampleMultipartChunkCount}
 X-Chunk-Offset: 0`
             }
           ]
@@ -561,7 +563,7 @@ X-Chunk-Offset: 0`
   -d '{
     "file_name": "backup.zip",
     "mime_type": "application/zip",
-    "size": 5368709120,
+    "size": ${exampleMultipartSize},
     "directory_path": "/backup",
     "remark": "每日备份"
   }'`,
@@ -571,9 +573,9 @@ X-Chunk-Offset: 0`
     "id": "upload-id",
     "file_name": "backup.zip",
     "mime_type": "application/zip",
-    "size": 5368709120,
+    "size": ${exampleMultipartSize},
     "chunk_size": ${session.multipart_chunk_bytes},
-    "chunk_count": 512,
+    "chunk_count": ${exampleMultipartChunkCount},
     "direct_access": false,
     "direct_access_max_chunks": ${session.direct_access_max_chunks}
   }
@@ -646,7 +648,7 @@ curl -X POST '${baseUrl}/api/v1/uploads/<UPLOAD_ID>/complete' \\
     "id": "upload-id",
     "file_name": "backup.zip",
     "storage_backend": "telegram_multipart",
-    "chunk_count": 512,
+    "chunk_count": ${exampleMultipartChunkCount},
     "direct_access": false,
     "download_strategy": "accelerated",
     "thumbnail_status": "ready",
@@ -752,7 +754,7 @@ curl -X POST '${baseUrl}/api/v1/uploads/<UPLOAD_ID>/complete' \\
               summary: "为浏览器生成缩略图提供短期同源媒体代理。",
               functionality: "校验 thumbnail_source token 后代理远程图片或视频内容，保留 Content-Length、Content-Range、Accept-Ranges。",
               useCases: ["URL 导入视频时在浏览器用 video + canvas 抽帧。", "URL 导入图片时直接绘制缩略图。"],
-              limits: ["token 默认 10 分钟过期。", "图片源最大 100MB，视频源最大 5GB。"],
+              limits: ["token 默认 10 分钟过期。", `图片源最大 100MB，视频源最大 ${maxMultipart}。`],
               specialHandling: ["视频未带 Range 时默认只代理前 2MB。", "会复用 URL 初始化时保存的远端请求头。"],
               requestParams: [
                 p("token", "Query", "是", "string", "签名 token", "url/init 返回的 thumbnail_source.url 查询参数。"),
@@ -1408,14 +1410,14 @@ curl -X POST '${baseUrl}/api/admin/files' \\
               requestExample: `curl -X POST '${baseUrl}/api/admin/uploads/init' \\
   -H 'Cookie: admin_session=...' \\
   -H 'Content-Type: application/json' \\
-  -d '{ "file_name": "backup.zip", "mime_type": "application/zip", "size": 5368709120, "directory_path": "/backup" }'`,
+  -d '{ "file_name": "backup.zip", "mime_type": "application/zip", "size": ${exampleMultipartSize}, "directory_path": "/backup" }'`,
               responseExample: `{
   "ok": true,
   "upload": {
     "id": "upload-id",
     "file_name": "backup.zip",
     "chunk_size": ${session.multipart_chunk_bytes},
-    "chunk_count": 512,
+    "chunk_count": ${exampleMultipartChunkCount},
     "direct_access": false
   }
 }`
@@ -1485,7 +1487,7 @@ curl -X POST '${baseUrl}/api/admin/files' \\
   -H 'Cookie: admin_session=...'`,
               responseExample: `{
   "ok": true,
-  "upload": { "id": "upload-id", "source_kind": "local", "file_name": "backup.zip", "chunk_count": 512 },
+  "upload": { "id": "upload-id", "source_kind": "local", "file_name": "backup.zip", "chunk_count": ${exampleMultipartChunkCount} },
   "uploaded_chunks": [0, 1],
   "missing_chunks": [2, 3, 4]
 }`
@@ -1573,7 +1575,7 @@ curl -X POST '${baseUrl}/api/admin/uploads/<UPLOAD_ID>/complete' \\
   "file": {
     "id": "upload-id",
     "storage_backend": "telegram_multipart",
-    "chunk_count": 512,
+    "chunk_count": ${exampleMultipartChunkCount},
     "direct_access": false,
     "download_strategy": "accelerated",
     "thumbnail_status": "ready"
@@ -2263,7 +2265,7 @@ Accept-Ranges: bytes`
 Content-Type: application/octet-stream
 Content-Length: ${session.multipart_chunk_bytes}
 X-Chunk-Index: 0
-X-Chunk-Count: 512
+X-Chunk-Count: ${exampleMultipartChunkCount}
 X-Chunk-Offset: 0`
             }
           ]

@@ -23,7 +23,7 @@ const AppEnv: AppEnv = {
 };
 const directAccessMaxChunks = 20;
 const telegramChunkSizeBytes = 10 * 1024 * 1024;
-const maxMultipartFileBytes = 5 * 1024 * 1024 * 1024;
+const maxMultipartFileBytes = 20 * 1024 * 1024 * 1024;
 
 class FakeDatabase {
   readonly directories: DirectoryRecord[] = [];
@@ -3564,7 +3564,7 @@ describe("admin file manager", () => {
     expect(db.multipartUploads[0]?.remark).toBe("大文件 URL");
   });
 
-  it("returns a thumbnail source for URL video uploads up to 5 GiB", async () => {
+  it("returns a thumbnail source for URL video uploads up to 20 GiB", async () => {
     const db = new FakeDatabase();
     const adminEnv: AppEnv = {
       ...AppEnv,
@@ -5023,12 +5023,12 @@ video.mp4
 
     expect(response.status).toBe(413);
     expect(body.error).toBe("FileTooLarge");
-    expect(body.message).toContain("5G");
-    expect(body.message).toContain("5G1B");
+    expect(body.message).toContain("20G");
+    expect(body.message).toContain("20G1B");
     expect(body.details.max_file_bytes).toBe(maxMultipartFileBytes);
     expect(body.details.actual_file_bytes).toBe(actualFileBytes);
-    expect(body.details.max_file_size).toBe("5G");
-    expect(body.details.actual_file_size).toBe("5G1B");
+    expect(body.details.max_file_size).toBe("20G");
+    expect(body.details.actual_file_size).toBe("20G1B");
     expect(body.details.chunk_size).toBe("10MB");
   });
 
@@ -5081,11 +5081,11 @@ video.mp4
 
     expect(response.status).toBe(413);
     expect(body.error).toBe("FileTooLarge");
-    expect(body.message).toContain("5G");
+    expect(body.message).toContain("20G");
     expect(body.message).toContain("1T20G");
     expect(body.details.max_file_bytes).toBe(maxMultipartFileBytes);
     expect(body.details.actual_file_bytes).toBe(actualFileBytes);
-    expect(body.details.max_file_size).toBe("5G");
+    expect(body.details.max_file_size).toBe("20G");
     expect(body.details.actual_file_size).toBe("1T20G");
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
