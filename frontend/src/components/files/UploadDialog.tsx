@@ -18,6 +18,7 @@ import {
   initHlsUpload,
   initUrlMultipartUpload,
   listDirectories,
+  magnetThumbnailSourceUrl,
   preflightUploads,
   probeMagnetUpload,
   probeHlsUpload,
@@ -1327,6 +1328,37 @@ export function UploadDialog({
     }
   }
 
+  async function resolveMagnetThumbnailForUpload(
+    importId: string,
+    fileIndex: number,
+    upload: MultipartUpload
+  ): Promise<ThumbnailUploadPayload | undefined> {
+    if (!isVideoUploadCandidate(upload)) {
+      return undefined;
+    }
+
+    let generated: GeneratedThumbnail | undefined;
+
+    try {
+      setUrlUpload((current) => ({
+        ...current,
+        progress: current.progress
+          ? { ...current.progress, label: `正在生成 ${upload.file_name} 缩略图` }
+          : current.progress
+      }));
+      generated = await generateThumbnailFromRemoteSource({
+        kind: "video",
+        url: magnetThumbnailSourceUrl(importId, fileIndex),
+        mime_type: upload.mime_type
+      }, upload.file_name);
+      return thumbnailPayload(generated);
+    } catch {
+      return undefined;
+    } finally {
+      revokeThumbnail(generated);
+    }
+  }
+
   async function retryLocalMultipart(
     target: QueueItem,
     retry: MultipartRetryState,
@@ -1961,8 +1993,19 @@ export function UploadDialog({
           throw new Error(result.cancelled ? "已停止，可重新发起磁力导入" : `${upload.file_name} 有 ${result.failedChunks.length} 个分片导入失败`);
         }
 
+        const thumbnail = await resolveMagnetThumbnailForUpload(magnet!.id, fileIndex, upload);
+        if (task.cancelled) {
+          throw new Error("已停止");
+        }
+
+        setUrlUpload((current) => ({
+          ...current,
+          progress: current.progress
+            ? { ...current.progress, label: `正在生成 ${upload.file_name} 文件索引` }
+            : current.progress
+        }));
         await runAbortableUploadRequest(task, URL_CHUNK_REQUEST_TIMEOUT_MS, (signal) =>
-          completeMagnetMultipartUpload(magnet!.id, fileIndex, undefined, signal)
+          completeMagnetMultipartUpload(magnet!.id, fileIndex, thumbnail, signal)
         );
         completedFiles += 1;
       }
@@ -3520,6 +3563,10 @@ function thumbnailPayload(thumbnail: GeneratedThumbnail): ThumbnailUploadPayload
     ...(thumbnail.width ? { width: thumbnail.width } : {}),
     ...(thumbnail.height ? { height: thumbnail.height } : {})
   };
+}
+
+function isVideoUploadCandidate(upload: Pick<MultipartUpload, "mime_type" | "file_name">): boolean {
+  return upload.mime_type.toLowerCase().startsWith("video/") || /\.(mp4|m4v|mov|webm|ogv)$/i.test(upload.file_name);
 }
 
 function fileNameConflictFromError(error: unknown): FileNameConflictState | undefined {

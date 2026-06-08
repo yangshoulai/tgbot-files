@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Hls from "hls.js";
 import { RotateCcw } from "lucide-react";
-import type { FileItem } from "../../../api";
+import { listFiles, type FileItem } from "../../../api";
 import { canUseAcceleratedDownload, extractSignedFileToken } from "../../../lib/accelerated-download";
 import { hasFileLinkAccess } from "../../../lib/file-access";
 import {
@@ -29,6 +29,7 @@ interface VideoPreviewProps {
 const VIDEO_PREVIEW_TIMEOUT_MS = 30_000;
 const VIDEO_CONTROLS_HIDE_DELAY_MS = 1_800;
 const VIDEO_LOADING_INDICATOR_DELAY_MS = 360;
+const SUBTITLE_PREVIEW_TIMEOUT_MS = 20_000;
 
 export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPreviewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -42,6 +43,7 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
   const [serviceWorkerState, setServiceWorkerState] = useState<VideoPreviewServiceWorkerState>(initialVideoPreviewServiceWorkerState);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
+  const [subtitleTrack, setSubtitleTrack] = useState<SubtitleTrack | null>(null);
   const heightLimit = fullscreen ? "calc(100dvh - 9rem)" : "min(68dvh, 760px)";
   const linkFile = hasFileLinkAccess(file) ? file : null;
   const isHlsPackage = file.storage_backend === "hls_package";
@@ -233,6 +235,84 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
   }, [chunkedPreviewMetadata, chunkedPreviewUrl]);
 
   useEffect(() => {
+    let disposed = false;
+    let subtitleObjectUrl: string | undefined;
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), SUBTITLE_PREVIEW_TIMEOUT_MS);
+
+    setSubtitleTrack(null);
+
+    async function loadSubtitleTrack() {
+      const stem = fileStem(file.file_name);
+      if (!stem) return;
+
+      const result = await listFiles({
+        q: stem,
+        dir: file.directory_path || "/",
+        limit: "all",
+        type: "all"
+      });
+      if (disposed) return;
+
+      const subtitle = preferredSubtitleFile(result.files, file);
+      if (!subtitle || !hasFileLinkAccess(subtitle)) return;
+
+      const extension = subtitleExtension(subtitle.file_name);
+      if (!extension) return;
+
+      const response = await fetch(subtitle.file_path, {
+        credentials: "include",
+        signal: controller.signal
+      });
+      if (!response.ok) {
+        throw new Error(response.statusText || "字幕读取失败");
+      }
+
+      const text = await response.text();
+      if (disposed) return;
+
+      const webVtt = subtitleTextToWebVtt(text, extension);
+      subtitleObjectUrl = URL.createObjectURL(new Blob([webVtt], { type: "text/vtt" }));
+      setSubtitleTrack({
+        src: subtitleObjectUrl,
+        label: subtitleLabel(subtitle.file_name)
+      });
+    }
+
+    void loadSubtitleTrack()
+      .catch(() => {
+        if (!disposed) {
+          setSubtitleTrack(null);
+        }
+      })
+      .finally(() => window.clearTimeout(timeoutId));
+
+    return () => {
+      disposed = true;
+      window.clearTimeout(timeoutId);
+      controller.abort();
+      if (subtitleObjectUrl) {
+        URL.revokeObjectURL(subtitleObjectUrl);
+      }
+    };
+  }, [file.directory_path, file.file_name, file.id]);
+
+  useEffect(() => {
+    if (!subtitleTrack || !videoRef.current) return undefined;
+
+    const video = videoRef.current;
+    const timerId = window.setTimeout(() => {
+      Array.from(video.textTracks).forEach((track) => {
+        if (track.kind === "subtitles" && track.label === subtitleTrack.label) {
+          track.mode = "showing";
+        }
+      });
+    });
+
+    return () => window.clearTimeout(timerId);
+  }, [subtitleTrack]);
+
+  useEffect(() => {
     if (!isHlsPackage || !videoSrc || !videoRef.current) return undefined;
 
     const video = videoRef.current;
@@ -369,6 +449,16 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
             }
           }}
         >
+          {subtitleTrack ? (
+            <track
+              key={subtitleTrack.src}
+              kind="subtitles"
+              src={subtitleTrack.src}
+              srcLang="und"
+              label={subtitleTrack.label}
+              default
+            />
+          ) : null}
           当前浏览器不支持该视频预览。
         </video>
 
@@ -409,6 +499,11 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
 
 type MediaControlsDensity = "regular" | "narrow" | "tiny";
 
+interface SubtitleTrack {
+  src: string;
+  label: string;
+}
+
 type VideoPreviewServiceWorkerState = {
   status: "checking" | "controlled" | "need-reload" | "unsupported" | "failed";
   message?: string;
@@ -436,6 +531,53 @@ function videoPreviewUnavailableMessage({
   if (serviceWorkerState.status === "unsupported") return serviceWorkerState.message || "当前浏览器不支持 Service Worker，无法预览超过直链上限的视频。";
   if (serviceWorkerState.status === "failed") return serviceWorkerState.message ? `Service Worker 注册或激活失败：${serviceWorkerState.message}` : "Service Worker 注册或激活失败，无法接管分片预览请求。";
   return "Service Worker 已接管页面，但分片预览地址未生成，请重新打开预览窗口。";
+}
+
+function preferredSubtitleFile(files: FileItem[], videoFile: FileItem): FileItem | undefined {
+  const videoStem = fileStem(videoFile.file_name);
+  const directoryPath = videoFile.directory_path || "/";
+
+  return files
+    .filter((candidate) =>
+      candidate.id !== videoFile.id &&
+      (candidate.directory_path || "/") === directoryPath &&
+      fileStem(candidate.file_name) === videoStem &&
+      subtitleExtension(candidate.file_name) !== null
+    )
+    .sort((left, right) => subtitlePriority(left.file_name) - subtitlePriority(right.file_name))[0];
+}
+
+function fileStem(fileName: string): string {
+  return fileName.replace(/\.[^.]+$/, "").trim().toLocaleLowerCase();
+}
+
+function subtitleExtension(fileName: string): "vtt" | "srt" | null {
+  const normalized = fileName.toLocaleLowerCase();
+  if (normalized.endsWith(".vtt") || normalized.endsWith(".webvtt")) return "vtt";
+  if (normalized.endsWith(".srt")) return "srt";
+  return null;
+}
+
+function subtitlePriority(fileName: string): number {
+  return subtitleExtension(fileName) === "vtt" ? 0 : 1;
+}
+
+function subtitleLabel(fileName: string): string {
+  const extension = subtitleExtension(fileName);
+  return extension === "vtt" ? "同名字幕（VTT）" : "同名字幕（SRT）";
+}
+
+function subtitleTextToWebVtt(text: string, extension: "vtt" | "srt"): string {
+  const normalized = text.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trimStart();
+  if (/^WEBVTT(?:\s|$)/i.test(normalized)) {
+    return normalized;
+  }
+
+  if (extension === "srt") {
+    return `WEBVTT\n\n${normalized.replace(/(\d{1,2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2")}`;
+  }
+
+  return `WEBVTT\n\n${normalized}`;
 }
 
 function toAspectRatio(width: number, height: number): { label: string; value: number } {

@@ -794,6 +794,10 @@ export function uploadMagnetMultipartChunk(importId: string, fileIndex: number, 
   );
 }
 
+export function magnetThumbnailSourceUrl(importId: string, fileIndex: number): string {
+  return `/api/admin/uploads/magnet/${encodeURIComponent(importId)}/files/${fileIndex}/thumbnail-source`;
+}
+
 export function completeMagnetMultipartUpload(
   importId: string,
   fileIndex: number,

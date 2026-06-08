@@ -142,8 +142,10 @@ import {
 import { extensionForMimeType, mimeTypeForFileName, resolveStoredMimeType } from "./mime";
 import { fetchTelegramFile, getTelegramFileUrl, uploadDocumentToTelegram } from "./telegram";
 import type { AppDatabase, AppEnv } from "./runtime";
+import { createReadStream } from "node:fs";
 import { lstat, mkdir, open, readdir, readFile, rm, statfs } from "node:fs/promises";
 import path from "node:path";
+import { Readable } from "node:stream";
 
 
 
@@ -1578,6 +1580,17 @@ async function handleAdminMagnetUploads(request: Request, env: AppEnv, username:
     });
   }
 
+  const thumbnailSourceMatch = /^\/api\/admin\/uploads\/magnet\/([^/]+)\/files\/(\d+)\/thumbnail-source$/.exec(url.pathname);
+  if (request.method === "GET" && thumbnailSourceMatch?.[1] && thumbnailSourceMatch?.[2]) {
+    return serveMagnetThumbnailSource({
+      request,
+      env,
+      db,
+      importId: decodeURIComponent(thumbnailSourceMatch[1]),
+      fileIndex: parseMagnetFileIndex(thumbnailSourceMatch[2])
+    });
+  }
+
   const chunkMatch = /^\/api\/admin\/uploads\/magnet\/([^/]+)\/files\/(\d+)\/chunks\/(\d+)$/.exec(url.pathname);
   if (request.method === "POST" && chunkMatch?.[1] && chunkMatch?.[2] && chunkMatch?.[3]) {
     const importId = decodeURIComponent(chunkMatch[1]);
@@ -2130,6 +2143,62 @@ function torrentFilesFromBencodedTorrent(bytes: Uint8Array): Array<{
 
 function mimeTypeForMagnetFileName(fileName: string): string {
   return mimeTypeForFileName(fileName) ?? "application/octet-stream";
+}
+
+async function serveMagnetThumbnailSource(params: {
+  request: Request;
+  env: AppEnv;
+  db: AppDatabase;
+  importId: string;
+  fileIndex: number;
+}): Promise<Response> {
+  const refreshed = await refreshMagnetImportStatus(params.env, params.db, params.importId);
+  if (
+    refreshed.importRecord.status !== "downloaded" &&
+    refreshed.importRecord.status !== "importing" &&
+    refreshed.importRecord.status !== "done"
+  ) {
+    throw new AppError(409, "MagnetDownloadNotReady", "磁力文件尚未下载完成，暂不能生成缩略图源");
+  }
+
+  const file = await requireMagnetImportFile(params.db, params.importId, params.fileIndex);
+  if (thumbnailSourceKind(file.mime_type) !== "video") {
+    throw new AppError(400, "UnsupportedMagnetThumbnailSource", "仅支持为视频磁力文件生成缩略图源");
+  }
+
+  const absolutePath = safeMagnetFilePath(refreshed.importRecord.download_dir, file.path);
+  const stats = await lstat(absolutePath).catch(() => {
+    throw new AppError(409, "MagnetFileNotReady", "磁力文件尚未落盘完成");
+  });
+
+  if (!stats.isFile() || stats.size < file.size) {
+    throw new AppError(409, "MagnetFileNotReady", "磁力文件尚未下载完成，暂不能读取视频帧");
+  }
+
+  const range = parseByteRange(params.request.headers.get("Range"), file.size);
+  if (!range) {
+    return rangeNotSatisfiableResponse(file.size);
+  }
+
+  const headers = withSecurityHeaders();
+  headers.set("Content-Type", file.mime_type);
+  headers.set("Content-Length", String(range.end - range.start + 1));
+  headers.set("Accept-Ranges", "bytes");
+  headers.set("Cache-Control", "private, max-age=600");
+  headers.set("Content-Disposition", contentDispositionInline(file.file_name));
+  if (range.partial) {
+    headers.set("Content-Range", `bytes ${range.start}-${range.end}/${file.size}`);
+  }
+
+  const stream = Readable.toWeb(createReadStream(absolutePath, {
+    start: range.start,
+    end: range.end
+  })) as ReadableStream;
+
+  return new Response(stream, {
+    status: range.partial ? 206 : 200,
+    headers
+  });
 }
 
 async function readMagnetFileChunk(
