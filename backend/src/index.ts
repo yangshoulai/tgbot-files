@@ -1559,6 +1559,7 @@ async function handleAdminMagnetUploads(request: Request, env: AppEnv, username:
     const body = await readJsonObject(request);
     const importId = decodeURIComponent(initMatch[1]);
     const fileIndexes = normalizeMagnetFileIndexes(body.file_indexes ?? body.files);
+    const fileOptions = normalizeMagnetFileUploadOptions(body.file_options, fileIndexes);
     const directoryPath = normalizeDirectoryPath(body.directory_path ?? "/");
     const conflictAction = normalizeFileNameConflictAction(body.on_conflict);
     const remark = normalizeRemark(body.remark) ?? null;
@@ -1567,6 +1568,7 @@ async function handleAdminMagnetUploads(request: Request, env: AppEnv, username:
       db,
       importId,
       fileIndexes,
+      fileOptions,
       directoryPath,
       conflictAction,
       remark,
@@ -1812,11 +1814,17 @@ async function refreshMagnetMetadataFromStatus(
   );
 }
 
+interface MagnetFileUploadOption {
+  fileName?: string;
+  conflictAction?: FileNameConflictAction;
+}
+
 async function initMagnetImportSelection(params: {
   env: AppEnv;
   db: AppDatabase;
   importId: string;
   fileIndexes: number[];
+  fileOptions: Map<number, MagnetFileUploadOption>;
   directoryPath: string;
   conflictAction: FileNameConflictAction;
   remark: string | null;
@@ -1848,19 +1856,22 @@ async function initMagnetImportSelection(params: {
   const uploads: Array<{ file_index: number; upload: Record<string, unknown>; target_directory_path: string }> = [];
   for (const file of files) {
     validateMultipartFileSize(file.size);
+    const fileOption = params.fileOptions.get(file.file_index);
+    const targetFileName = fileOption?.fileName ?? file.file_name;
+    const targetConflictAction = fileOption?.conflictAction ?? params.conflictAction;
     const targetDirectoryPath = targetDirectoryForMagnetFile(params.directoryPath, file);
     const directory = await ensureWritableDirectory(params.db, targetDirectoryPath);
     const upload = await createMultipartUpload({
       db: params.db,
       sourceKind: "magnet",
       sourceUrl: importRecord.magnet_uri,
-      fileName: file.file_name,
+      fileName: targetFileName,
       mimeType: file.mime_type,
       size: file.size,
       uploadedBy: params.uploadedBy,
       directoryId: directory?.id ?? null,
       directoryPath: targetDirectoryPath,
-      conflictAction: params.conflictAction,
+      conflictAction: targetConflictAction,
       ...(params.remark ? { remark: params.remark } : {})
     });
     uploadByFileIndex.set(file.file_index, upload.id);
@@ -2499,6 +2510,49 @@ function normalizeMagnetFileIndexes(value: unknown): number[] {
   }
 
   return indexes.sort((left, right) => left - right);
+}
+
+function normalizeMagnetFileUploadOptions(
+  value: unknown,
+  selectedIndexes: number[]
+): Map<number, MagnetFileUploadOption> {
+  const options = new Map<number, MagnetFileUploadOption>();
+
+  if (value === undefined || value === null) {
+    return options;
+  }
+
+  if (!Array.isArray(value)) {
+    throw new AppError(400, "InvalidMagnetFileOptions", "file_options must be an array");
+  }
+
+  const selectedSet = new Set(selectedIndexes);
+  for (const [position, item] of value.entries()) {
+    if (!isPlainRecord(item)) {
+      throw new AppError(400, "InvalidMagnetFileOptions", `file_options[${position}] must be an object`);
+    }
+
+    const fileIndex = positiveIntegerField(item.file_index, `file_options[${position}].file_index`);
+    if (!selectedSet.has(fileIndex)) {
+      throw new AppError(400, "InvalidMagnetFileOptions", `file_options[${position}].file_index is not selected`);
+    }
+
+    const option: MagnetFileUploadOption = {};
+    const fileName = normalizeOptionalFileName(item.file_name);
+    if (fileName) {
+      option.fileName = fileName;
+    }
+
+    if (item.on_conflict !== undefined) {
+      option.conflictAction = normalizeFileNameConflictAction(item.on_conflict);
+    }
+
+    if (option.fileName || option.conflictAction) {
+      options.set(fileIndex, option);
+    }
+  }
+
+  return options;
 }
 
 function parseMagnetFileIndex(value: string): number {

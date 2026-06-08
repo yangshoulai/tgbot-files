@@ -337,6 +337,12 @@ export interface MagnetInitResponse {
   }>;
 }
 
+export interface MagnetFileUploadOption {
+  file_index: number;
+  file_name?: string;
+  on_conflict?: FileNameConflictAction;
+}
+
 export interface HlsVariant {
   id: string;
   uri: string;
@@ -765,6 +771,7 @@ export function getMagnetUploadStatus(importId: string, signal?: AbortSignal) {
 export function initMagnetUpload(params: {
   import_id: string;
   file_indexes: number[];
+  file_options?: MagnetFileUploadOption[];
   directory_path?: string;
   remark?: string;
   on_conflict?: FileNameConflictAction;
@@ -779,6 +786,7 @@ export function initMagnetUpload(params: {
       },
       body: JSON.stringify({
         file_indexes: params.file_indexes,
+        ...(params.file_options && params.file_options.length > 0 ? { file_options: params.file_options } : {}),
         ...(params.directory_path ? { directory_path: params.directory_path } : {}),
         ...(params.remark ? { remark: params.remark } : {}),
         ...(params.on_conflict && params.on_conflict !== "error" ? { on_conflict: params.on_conflict } : {})

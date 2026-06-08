@@ -30,6 +30,7 @@ import {
   type HlsAsset,
   type HlsProbeInfo,
   type HlsSegment,
+  type MagnetFileUploadOption,
   type MagnetImport,
   type MagnetImportFile,
   type MultipartUpload,
@@ -135,11 +136,20 @@ interface MagnetUploadEntry {
   fileIndex: number;
   upload: MultipartUpload;
   targetDirectoryPath: string;
+  conflictAction: FileNameConflictAction;
+}
+
+interface MagnetFileDecision {
+  fileNameOverride?: string;
+  editingFileName?: boolean;
+  conflict?: FileNameConflictState;
+  conflictAction?: FileNameConflictAction;
 }
 
 interface MagnetUrlState {
   import?: MagnetImport;
   selectedIndexes: number[];
+  fileDecisions?: Record<number, MagnetFileDecision>;
   uploads?: MagnetUploadEntry[];
 }
 
@@ -515,16 +525,29 @@ export function UploadDialog({
   const normalizedSourceUrl = sourceUrl.trim();
   const urlPendingCount = normalizedSourceUrl && urlUpload.status !== "uploading" && urlUpload.status !== "done" ? 1 : 0;
   const pendingCount = mode === "url" ? urlPendingCount : filePendingCount;
+  const isMagnetSource = isLikelyMagnetUrl(normalizedSourceUrl);
+  const hasUnresolvedMagnetConflict = isMagnetSource && Boolean(urlUpload.magnet?.selectedIndexes.some((fileIndex) =>
+    Boolean(urlUpload.magnet?.fileDecisions?.[fileIndex]?.conflict)
+  ));
   const hasUnresolvedConflict = mode === "url"
-    ? Boolean(urlUpload.conflict)
+    ? Boolean(urlUpload.conflict) || hasUnresolvedMagnetConflict
     : items.some((item) => isLocalItemAwaitingDecision(item) && Boolean(item.conflict));
+  const hasInvalidMagnetFileName = isMagnetSource && Boolean(urlUpload.magnet?.selectedIndexes.some((fileIndex) => {
+    const decision = urlUpload.magnet?.fileDecisions?.[fileIndex];
+    return Boolean(
+      decision &&
+      (decision.editingFileName || decision.conflict) &&
+      decision.fileNameOverride !== undefined &&
+      decision.fileNameOverride.trim().length === 0
+    );
+  }));
   const hasInvalidFileName = mode === "url"
     ? Boolean(
         normalizedSourceUrl &&
         (urlUpload.editingFileName || urlUpload.conflict) &&
         urlUpload.fileNameOverride !== undefined &&
         urlUpload.fileNameOverride.trim().length === 0
-      )
+      ) || hasInvalidMagnetFileName
     : items.some((item) =>
         isLocalItemAwaitingDecision(item) &&
         (item.editingFileName || item.conflict) &&
@@ -532,7 +555,6 @@ export function UploadDialog({
         item.fileNameOverride.trim().length === 0
       );
   const hasDone = urlUpload.status === "done" || items.some((item) => item.status === "done");
-  const isMagnetSource = isLikelyMagnetUrl(normalizedSourceUrl);
 
   useEffect(() => {
     if (!open) return;
@@ -693,7 +715,7 @@ export function UploadDialog({
   function handleUploadDirectoryPathChange(path: string) {
     setUploadDirectoryPath(path);
     setUrlUpload((current) => {
-      if (!current.conflict || current.status === "uploading" || current.status === "done") {
+      if (current.status === "uploading" || current.status === "done") {
         return current;
       }
 
@@ -704,7 +726,14 @@ export function UploadDialog({
         progress: undefined,
         conflict: undefined,
         conflictAction: "error",
-        editingFileName: false
+        editingFileName: false,
+        magnet: current.magnet
+          ? {
+              ...current.magnet,
+              uploads: undefined,
+              fileDecisions: resetMagnetDecisionsForDirectoryChange(current.magnet.fileDecisions)
+            }
+          : current.magnet
       };
     });
     setItems((current) =>
@@ -916,6 +945,125 @@ export function UploadDialog({
     );
   }
 
+  function updateMagnetFileName(fileIndex: number, value: string) {
+    setUrlUpload((current) => {
+      const magnet = current.magnet;
+      const file = magnet?.import?.files.find((candidate) => candidate.file_index === fileIndex);
+      if (!magnet || !file) return current;
+
+      const fileNameOverride = magnetFileNameOverrideValue(file, value);
+      const nextDecisions = {
+        ...(magnet.fileDecisions ?? {}),
+        [fileIndex]: {
+          ...(magnet.fileDecisions?.[fileIndex] ?? {}),
+          fileNameOverride,
+          conflictAction: "error" as FileNameConflictAction,
+          conflict: undefined
+        }
+      };
+
+      return {
+        ...current,
+        status: "pending",
+        message: undefined,
+        progress: undefined,
+        magnet: {
+          ...magnet,
+          fileDecisions: nextDecisions
+        }
+      };
+    });
+  }
+
+  function setMagnetFileNameEditing(fileIndex: number, editing: boolean) {
+    setUrlUpload((current) => {
+      const magnet = current.magnet;
+      const file = magnet?.import?.files.find((candidate) => candidate.file_index === fileIndex);
+      if (!magnet || !file) return current;
+
+      return {
+        ...current,
+        magnet: {
+          ...magnet,
+          fileDecisions: {
+            ...(magnet.fileDecisions ?? {}),
+            [fileIndex]: {
+              ...(magnet.fileDecisions?.[fileIndex] ?? {}),
+              editingFileName: editing,
+              fileNameOverride: editing && magnet.fileDecisions?.[fileIndex]?.fileNameOverride === undefined
+                ? file.file_name
+                : magnet.fileDecisions?.[fileIndex]?.fileNameOverride
+            }
+          }
+        }
+      };
+    });
+  }
+
+  function resolveMagnetFileConflict(fileIndex: number, action: FileNameConflictAction) {
+    setUrlUpload((current) => {
+      const magnet = current.magnet;
+      const file = magnet?.import?.files.find((candidate) => candidate.file_index === fileIndex);
+      const conflict = magnet?.fileDecisions?.[fileIndex]?.conflict;
+      if (!magnet || !file || !conflict) return current;
+
+      const fileName = action === "overwrite" ? conflict.fileName : conflict.suggestedName;
+      return {
+        ...current,
+        status: "pending",
+        message: action === "overwrite" ? "已选择覆盖同名磁力文件" : undefined,
+        progress: undefined,
+        magnet: {
+          ...magnet,
+          fileDecisions: {
+            ...(magnet.fileDecisions ?? {}),
+            [fileIndex]: {
+              ...(magnet.fileDecisions?.[fileIndex] ?? {}),
+              fileNameOverride: magnetFileNameOverrideValue(file, fileName),
+              editingFileName: false,
+              conflict: undefined,
+              conflictAction: action
+            }
+          }
+        }
+      };
+    });
+  }
+
+  function resolveAllMagnetConflictsAsOverwrite() {
+    setUrlUpload((current) => {
+      const magnet = current.magnet;
+      if (!magnet?.import) return current;
+
+      const selected = new Set(magnet.selectedIndexes);
+      const nextDecisions: Record<number, MagnetFileDecision> = { ...(magnet.fileDecisions ?? {}) };
+      for (const file of magnet.import.files) {
+        if (!selected.has(file.file_index)) continue;
+        const decision = nextDecisions[file.file_index];
+        if (!decision?.conflict) continue;
+
+        nextDecisions[file.file_index] = {
+          ...decision,
+          fileNameOverride: magnetFileNameOverrideValue(file, decision.conflict.fileName),
+          editingFileName: false,
+          conflict: undefined,
+          conflictAction: "overwrite"
+        };
+      }
+
+      return {
+        ...current,
+        status: "pending",
+        message: "已选择覆盖所有冲突磁力文件",
+        progress: undefined,
+        magnet: {
+          ...magnet,
+          fileDecisions: nextDecisions
+        }
+      };
+    });
+  }
+
   function extractFirstUrl(value: string): string | undefined {
     const match = value.match(/(?:https?:\/\/|magnet:\?)[^\s<>"']+/i);
     return match?.[0];
@@ -1078,6 +1226,96 @@ export function UploadDialog({
       return false;
     } catch (error) {
       onError(`重复检测失败：${errorMessage(error)}`);
+      return false;
+    } finally {
+      setCheckingConflicts(false);
+    }
+  }
+
+  async function preflightMagnetSelection(
+    magnet: MagnetImport,
+    selectedIndexes: number[],
+    decisions: Record<number, MagnetFileDecision> = urlUploadRef.current.magnet?.fileDecisions ?? {}
+  ): Promise<boolean> {
+    const selectedSet = new Set(selectedIndexes);
+    const selectedFiles = magnet.files.filter((file) => selectedSet.has(file.file_index) && file.size <= maxMultipartBytes);
+    const entries = selectedFiles.map((file) => {
+      const decision = decisions[file.file_index];
+      return {
+        client_id: String(file.file_index),
+        directory_path: magnetTargetDirectoryPath(uploadDirectoryPath, file),
+        file_name: effectiveMagnetFileName(file, decision),
+        size: file.size
+      };
+    });
+
+    if (entries.length === 0) {
+      return true;
+    }
+
+    setCheckingConflicts(true);
+    try {
+      const response = await preflightUploads(entries);
+      const conflictByIndex = new Map<number, UploadPreflightResultEntry>();
+
+      for (const entry of response.entries) {
+        if (entry.status !== "conflict") continue;
+        const fileIndex = Number(entry.client_id);
+        const decision = decisions[fileIndex];
+        if (entry.source === "file" && decision?.conflictAction === "overwrite") {
+          continue;
+        }
+        conflictByIndex.set(fileIndex, entry);
+      }
+
+      setUrlUpload((current) => {
+        if (!current.magnet?.import || current.magnet.import.id !== magnet.id) {
+          return current;
+        }
+
+        const nextDecisions: Record<number, MagnetFileDecision> = { ...(current.magnet.fileDecisions ?? {}) };
+        for (const file of selectedFiles) {
+          const conflict = conflictByIndex.get(file.file_index);
+          const existing = nextDecisions[file.file_index] ?? {};
+
+          if (conflict) {
+            nextDecisions[file.file_index] = {
+              ...existing,
+              conflict: fileNameConflictFromPreflight(conflict),
+              conflictAction: "error",
+              editingFileName: false
+            };
+            continue;
+          }
+
+          if (existing.conflict) {
+            const { conflict: _conflict, ...rest } = existing;
+            nextDecisions[file.file_index] = rest;
+          }
+        }
+
+        return {
+          ...current,
+          status: "pending",
+          message: conflictByIndex.size > 0
+            ? `发现 ${conflictByIndex.size} 个同名磁力文件，请选择全部覆盖或单个改名`
+            : current.message,
+          progress: undefined,
+          magnet: {
+            ...current.magnet,
+            fileDecisions: nextDecisions
+          }
+        };
+      });
+
+      if (conflictByIndex.size > 0) {
+        onError(`发现 ${conflictByIndex.size} 个同名磁力文件，请选择全部覆盖或单个改名`);
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      onError(`磁力文件重复检测失败：${errorMessage(error)}`);
       return false;
     } finally {
       setCheckingConflicts(false);
@@ -1895,12 +2133,14 @@ export function UploadDialog({
           progress: undefined,
           magnet: {
             import: parsedMagnet,
-            selectedIndexes
+            selectedIndexes,
+            fileDecisions: {}
           }
         }));
         if (parsedMagnet.status !== "ready") {
           throw new Error(parsedMagnet.error_message || "磁力链接解析失败");
         }
+        await preflightMagnetSelection(parsedMagnet, selectedIndexes, {});
         return;
       }
 
@@ -1908,9 +2148,20 @@ export function UploadDialog({
         throw new Error("请选择至少一个磁力文件");
       }
 
+      const currentMagnetState = urlUploadRef.current.magnet;
+      const currentDecisions = currentMagnetState?.fileDecisions ?? {};
+      if (!(await preflightMagnetSelection(magnet, selectedIndexes, currentDecisions))) {
+        return;
+      }
+      const fileOptions = magnetFileUploadOptions(magnet, selectedIndexes, currentDecisions);
+      const conflictActionByFileIndex = new Map<number, FileNameConflictAction>(
+        fileOptions.map((option) => [option.file_index, option.on_conflict ?? "error"])
+      );
+
       const init = await initMagnetUpload({
         import_id: magnet.id,
         file_indexes: selectedIndexes,
+        file_options: fileOptions,
         directory_path: uploadDirectoryPath,
         ...(urlUpload.conflictAction && urlUpload.conflictAction !== "error" ? { on_conflict: urlUpload.conflictAction } : {}),
         ...(remark.trim() ? { remark: remark.trim() } : {})
@@ -1919,7 +2170,8 @@ export function UploadDialog({
       const uploads = init.uploads.map((entry) => ({
         fileIndex: entry.file_index,
         upload: entry.upload,
-        targetDirectoryPath: entry.target_directory_path
+        targetDirectoryPath: entry.target_directory_path,
+        conflictAction: conflictActionByFileIndex.get(entry.file_index) ?? "error"
       }));
 
       setUrlUpload((current) => ({
@@ -1946,7 +2198,7 @@ export function UploadDialog({
 
       let completedFiles = 0;
       for (const entry of uploads) {
-        const { upload, fileIndex } = entry;
+        const { upload, fileIndex, conflictAction } = entry;
         if (task.cancelled) {
           throw new Error("已停止");
         }
@@ -2005,7 +2257,7 @@ export function UploadDialog({
             : current.progress
         }));
         await runAbortableUploadRequest(task, URL_CHUNK_REQUEST_TIMEOUT_MS, (signal) =>
-          completeMagnetMultipartUpload(magnet!.id, fileIndex, thumbnail, signal)
+          completeMagnetMultipartUpload(magnet!.id, fileIndex, thumbnail, signal, conflictAction)
         );
         completedFiles += 1;
       }
@@ -3119,6 +3371,7 @@ export function UploadDialog({
                 hls={urlUpload.hls}
                 magnet={urlUpload.magnet}
                 maxMultipartBytes={maxMultipartBytes}
+                directoryPath={uploadDirectoryPath}
                 onClear={() => handleSourceUrlChange("")}
                 onRetry={
                   urlUpload.hls?.retry
@@ -3135,6 +3388,11 @@ export function UploadDialog({
                 onMagnetFileToggle={toggleMagnetFileSelection}
                 onMagnetSelectAll={() => selectAllMagnetFiles(true)}
                 onMagnetClearSelection={clearMagnetFileSelection}
+                onMagnetFileNameChange={updateMagnetFileName}
+                onMagnetFileNameEditingChange={setMagnetFileNameEditing}
+                onMagnetRenameConflict={(fileIndex) => resolveMagnetFileConflict(fileIndex, "error")}
+                onMagnetOverwriteConflict={(fileIndex) => resolveMagnetFileConflict(fileIndex, "overwrite")}
+                onMagnetOverwriteAllConflicts={resolveAllMagnetConflictsAsOverwrite}
                 onRenameConflict={urlUpload.conflict && !isMagnetSource ? () => resolveUrlConflict("error") : undefined}
                 onOverwriteConflict={urlUpload.conflict ? () => resolveUrlConflict("overwrite") : undefined}
                 thumbnail={urlUpload.thumbnail}
@@ -3430,6 +3688,59 @@ function effectiveFileName(item: QueueItem): string {
 
 function effectiveDirectoryPath(item: QueueItem, baseDirectoryPath: string): string {
   return joinDirectoryPath(baseDirectoryPath, item.relativeDirectoryPath);
+}
+
+function effectiveMagnetFileName(file: MagnetImportFile, decision: MagnetFileDecision | undefined): string {
+  return normalizedFileNameOverride(decision?.fileNameOverride) ?? file.file_name;
+}
+
+function magnetTargetDirectoryPath(baseDirectoryPath: string, file: MagnetImportFile): string {
+  return joinDirectoryPath(baseDirectoryPath, file.relative_directory_path ?? undefined);
+}
+
+function magnetFileNameOverrideValue(file: MagnetImportFile, value: string): string | undefined {
+  if (value.trim().length === 0) {
+    return value;
+  }
+
+  return value.trim() === file.file_name ? undefined : value;
+}
+
+function resetMagnetDecisionsForDirectoryChange(
+  decisions: Record<number, MagnetFileDecision> | undefined
+): Record<number, MagnetFileDecision> | undefined {
+  if (!decisions) {
+    return undefined;
+  }
+
+  const next: Record<number, MagnetFileDecision> = {};
+  for (const [key, decision] of Object.entries(decisions)) {
+    const { conflict: _conflict, conflictAction: _conflictAction, editingFileName: _editingFileName, ...rest } = decision;
+    if (Object.keys(rest).length > 0) {
+      next[Number(key)] = rest;
+    }
+  }
+
+  return Object.keys(next).length > 0 ? next : undefined;
+}
+
+function magnetFileUploadOptions(
+  magnet: MagnetImport,
+  selectedIndexes: number[],
+  decisions: Record<number, MagnetFileDecision>
+): MagnetFileUploadOption[] {
+  const selected = new Set(selectedIndexes);
+  return magnet.files
+    .filter((file) => selected.has(file.file_index))
+    .map((file) => {
+      const decision = decisions[file.file_index];
+      const fileName = effectiveMagnetFileName(file, decision);
+      return {
+        file_index: file.file_index,
+        ...(fileName !== file.file_name ? { file_name: fileName } : {}),
+        ...(decision?.conflictAction === "overwrite" ? { on_conflict: "overwrite" as const } : {})
+      };
+    });
 }
 
 interface WebkitFileSystemEntryLike {
@@ -4271,6 +4582,7 @@ interface UrlUploadRowProps {
   hls?: HlsUrlState;
   magnet?: MagnetUrlState;
   maxMultipartBytes: number;
+  directoryPath: string;
   thumbnail?: UploadThumbnailState;
   onRetry?: () => void;
   onStop?: () => void;
@@ -4281,6 +4593,11 @@ interface UrlUploadRowProps {
   onMagnetFileToggle: (fileIndex: number, selected: boolean) => void;
   onMagnetSelectAll: () => void;
   onMagnetClearSelection: () => void;
+  onMagnetFileNameChange: (fileIndex: number, value: string) => void;
+  onMagnetFileNameEditingChange: (fileIndex: number, editing: boolean) => void;
+  onMagnetRenameConflict: (fileIndex: number) => void;
+  onMagnetOverwriteConflict: (fileIndex: number) => void;
+  onMagnetOverwriteAllConflicts: () => void;
   onRenameConflict?: () => void;
   onOverwriteConflict?: () => void;
   onThumbnailChange: (file: File) => void;
@@ -4300,6 +4617,7 @@ function UrlUploadRow({
   hls,
   magnet,
   maxMultipartBytes,
+  directoryPath,
   thumbnail,
   onClear,
   onRetry,
@@ -4311,6 +4629,11 @@ function UrlUploadRow({
   onMagnetFileToggle,
   onMagnetSelectAll,
   onMagnetClearSelection,
+  onMagnetFileNameChange,
+  onMagnetFileNameEditingChange,
+  onMagnetRenameConflict,
+  onMagnetOverwriteConflict,
+  onMagnetOverwriteAllConflicts,
   onRenameConflict,
   onOverwriteConflict,
   onThumbnailChange,
@@ -4362,10 +4685,16 @@ function UrlUploadRow({
             <MagnetUploadDetails
               magnet={magnet}
               maxMultipartBytes={maxMultipartBytes}
+              directoryPath={directoryPath}
               disabled={disabled || status === "uploading" || status === "done"}
               onToggle={onMagnetFileToggle}
               onSelectAll={onMagnetSelectAll}
               onClearSelection={onMagnetClearSelection}
+              onFileNameChange={onMagnetFileNameChange}
+              onFileNameEditingChange={onMagnetFileNameEditingChange}
+              onRenameConflict={onMagnetRenameConflict}
+              onOverwriteConflict={onMagnetOverwriteConflict}
+              onOverwriteAllConflicts={onMagnetOverwriteAllConflicts}
             />
           ) : null}
           {progress ? <ProgressBar progress={progress} /> : null}
@@ -4482,17 +4811,29 @@ function HlsUploadDetails({
 function MagnetUploadDetails({
   magnet,
   maxMultipartBytes,
+  directoryPath,
   disabled,
   onToggle,
   onSelectAll,
-  onClearSelection
+  onClearSelection,
+  onFileNameChange,
+  onFileNameEditingChange,
+  onRenameConflict,
+  onOverwriteConflict,
+  onOverwriteAllConflicts
 }: {
   magnet: MagnetUrlState;
   maxMultipartBytes: number;
+  directoryPath: string;
   disabled: boolean;
   onToggle: (fileIndex: number, selected: boolean) => void;
   onSelectAll: () => void;
   onClearSelection: () => void;
+  onFileNameChange: (fileIndex: number, value: string) => void;
+  onFileNameEditingChange: (fileIndex: number, editing: boolean) => void;
+  onRenameConflict: (fileIndex: number) => void;
+  onOverwriteConflict: (fileIndex: number) => void;
+  onOverwriteAllConflicts: () => void;
 }) {
   const info = magnet.import;
   if (!info) {
@@ -4500,9 +4841,11 @@ function MagnetUploadDetails({
   }
 
   const selected = new Set(magnet.selectedIndexes);
+  const decisions = magnet.fileDecisions ?? {};
   const selectedFiles = info.files.filter((file) => selected.has(file.file_index));
   const selectedBytes = selectedFiles.reduce((total, file) => total + file.size, 0);
   const uploadableCount = info.files.filter((file) => file.size <= maxMultipartBytes).length;
+  const selectedConflictCount = selectedFiles.filter((file) => Boolean(decisions[file.file_index]?.conflict)).length;
 
   return (
     <div className="mt-2 flex flex-col gap-2 rounded-lg border border-border bg-background/70 p-2">
@@ -4514,6 +4857,16 @@ function MagnetUploadDetails({
           <HlsMetaPill>已选 {selectedFiles.length} 个 · {formatBytes(selectedBytes)}</HlsMetaPill>
         </div>
         <div className="flex shrink-0 items-center gap-1">
+          {selectedConflictCount > 0 ? (
+            <button
+              type="button"
+              disabled={disabled}
+              className="rounded-md px-1.5 py-1 font-medium text-warning transition-colors hover:bg-warning-soft disabled:pointer-events-none disabled:opacity-50"
+              onClick={onOverwriteAllConflicts}
+            >
+              全部覆盖冲突
+            </button>
+          ) : null}
           <button
             type="button"
             disabled={disabled || uploadableCount === 0}
@@ -4540,27 +4893,70 @@ function MagnetUploadDetails({
           <div className="divide-y divide-border">
             {info.files.map((file) => {
               const tooLarge = file.size > maxMultipartBytes;
+              const isSelected = selected.has(file.file_index);
+              const decision = decisions[file.file_index];
+              const targetDirectoryPath = magnetTargetDirectoryPath(directoryPath, file);
+              const targetFileName = effectiveMagnetFileName(file, decision);
+              const editorFileName = decision?.editingFileName
+                ? decision.fileNameOverride ?? file.file_name
+                : targetFileName;
+              const disabledRow = disabled || tooLarge;
               return (
-                <label
+                <div
                   key={file.file_index}
                   className={cn(
-                    "grid cursor-pointer grid-cols-[1.25rem_minmax(0,1fr)_auto] items-center gap-2 px-2.5 py-2 text-xs",
-                    disabled || tooLarge ? "cursor-not-allowed opacity-60" : "hover:bg-background"
+                    "grid grid-cols-[1.25rem_minmax(0,1fr)_auto] items-center gap-2 px-2.5 py-2 text-xs",
+                    disabledRow ? "opacity-60" : "hover:bg-background"
                   )}
                 >
                   <input
                     type="checkbox"
-                    checked={selected.has(file.file_index)}
-                    disabled={disabled || tooLarge}
+                    checked={isSelected}
+                    disabled={disabledRow}
                     onChange={(event) => onToggle(file.file_index, event.currentTarget.checked)}
                     className="size-4 accent-[var(--color-primary)]"
                   />
-                  <span className="min-w-0">
-                    <span className="block truncate font-medium text-foreground" title={file.path}>{file.path}</span>
-                    {tooLarge ? <span className="text-danger">超过 {formatBytes(maxMultipartBytes)} 上限</span> : <span className="text-muted">{file.mime_type}</span>}
+                  <div className="min-w-0">
+                    {isSelected && !tooLarge ? (
+                      <EditableFileName
+                        value={editorFileName}
+                        originalValue={file.file_name}
+                        editing={Boolean(decision?.editingFileName)}
+                        conflict={decision?.conflict}
+                        disabled={disabled}
+                        onChange={(value) => onFileNameChange(file.file_index, value)}
+                        onEditingChange={(editing) => onFileNameEditingChange(file.file_index, editing)}
+                      />
+                    ) : (
+                      <span className="block truncate font-medium text-foreground" title={file.path}>{file.path}</span>
+                    )}
+                    <p className="truncate text-[11px] text-muted">
+                      {tooLarge ? (
+                        <span className="text-danger">超过 {formatBytes(maxMultipartBytes)} 上限</span>
+                      ) : (
+                        <>
+                          <span>{file.mime_type}</span>
+                          <span> · 目标 {targetDirectoryPath === "/" ? "/" : `${targetDirectoryPath}/`}{targetFileName}</span>
+                          {decision?.conflict ? <span className="text-warning"> · 目标已有同名文件</span> : null}
+                          {!decision?.conflict && decision?.conflictAction === "overwrite" ? <span className="text-warning"> · 将覆盖</span> : null}
+                          {!decision?.conflict && decision?.fileNameOverride ? <span className="text-primary-strong"> · 已改名</span> : null}
+                        </>
+                      )}
+                    </p>
+                    {file.relative_directory_path ? (
+                      <p className="truncate text-[11px] text-subtle" title={file.path}>磁力路径：{file.path}</p>
+                    ) : null}
+                  </div>
+                  <span className="flex shrink-0 items-center gap-1">
+                    <CompactConflictActions
+                      conflict={isSelected ? decision?.conflict : undefined}
+                      disabled={disabled}
+                      onRename={() => onRenameConflict(file.file_index)}
+                      onOverwrite={() => onOverwriteConflict(file.file_index)}
+                    />
+                    <span className="font-mono text-[11px] text-muted">{formatBytes(file.size)}</span>
                   </span>
-                  <span className="font-mono text-[11px] text-muted">{formatBytes(file.size)}</span>
-                </label>
+                </div>
               );
             })}
           </div>
@@ -4665,14 +5061,16 @@ function CompactConflictActions({
       >
         改名
       </button>
-      <button
-        type="button"
-        onClick={onSkip}
-        disabled={disabled || !onSkip}
-        className="h-6 rounded px-1.5 text-[11px] font-medium text-muted transition-colors hover:bg-background hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
-      >
-        忽略
-      </button>
+      {onSkip ? (
+        <button
+          type="button"
+          onClick={onSkip}
+          disabled={disabled}
+          className="h-6 rounded px-1.5 text-[11px] font-medium text-muted transition-colors hover:bg-background hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+        >
+          忽略
+        </button>
+      ) : null}
     </span>
   );
 }

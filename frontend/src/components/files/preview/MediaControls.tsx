@@ -1,11 +1,19 @@
 import { useCallback, useEffect, useState, type ReactNode, type RefObject } from "react";
-import { FastForward, Maximize2, Minimize2, Pause, Play, Rewind, Square, Volume2, VolumeX } from "lucide-react";
+import { Captions, FastForward, Maximize2, Minimize2, Pause, Play, Rewind, Square, Volume2, VolumeX } from "lucide-react";
 import { cn } from "../../../lib/cn";
+
+export interface MediaSubtitleOption {
+  id: string;
+  label: string;
+}
 
 interface MediaControlsProps {
   mediaRef: RefObject<HTMLMediaElement>;
   fullscreen: boolean;
   onToggleFullscreen: () => void;
+  subtitles?: MediaSubtitleOption[];
+  selectedSubtitleId?: string | null;
+  onSubtitleChange?: (subtitleId: string | null) => void;
   compact?: boolean;
   variant?: "panel" | "floating" | "inline";
   density?: "regular" | "narrow" | "tiny";
@@ -29,6 +37,9 @@ export function MediaControls({
   mediaRef,
   fullscreen,
   onToggleFullscreen,
+  subtitles = [],
+  selectedSubtitleId = null,
+  onSubtitleChange,
   compact = false,
   variant = "panel",
   density = "regular",
@@ -154,6 +165,7 @@ export function MediaControls({
   const currentTime = Math.min(state.currentTime, duration || state.currentTime);
   const bufferedPercent = duration > 0 ? Math.min(100, (state.bufferedEnd / duration) * 100) : 0;
   const progressPercent = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
+  const canChooseSubtitle = subtitles.length > 0 && Boolean(onSubtitleChange);
 
   return (
     <div
@@ -299,6 +311,38 @@ export function MediaControls({
                 {playbackRates.map((rate) => (
                   <option key={rate} value={rate} className={inline ? "bg-surface text-foreground" : "bg-foreground text-white"}>
                     {rate}x
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+          {canChooseSubtitle ? (
+            <label
+              className={cn(
+                "inline-flex shrink-0 items-center gap-1 text-xs",
+                inline ? "text-muted" : "text-white/70",
+                narrow && "max-[430px]:hidden"
+              )}
+              title={subtitles.length > 1 ? "切换字幕" : "字幕"}
+            >
+              <Captions size={15} className={cn(inline ? "text-foreground/60" : "text-white/76", tiny && "hidden")} />
+              <select
+                value={selectedSubtitleId ?? ""}
+                onChange={(event) => onSubtitleChange?.(event.target.value || null)}
+                tabIndex={controlTabIndex}
+                className={cn(
+                  "border text-xs outline-none transition-colors focus-visible:focus-ring",
+                  floating ? "h-8 w-[4.35rem] rounded-full px-1 sm:w-[5.25rem] sm:px-1.5" : "rounded-md",
+                  inline ? "h-8 w-[5.25rem] border-border bg-surface px-1.5 text-foreground hover:bg-primary-soft/50" : "border-white/10 bg-white/[0.08] text-white hover:bg-white/15",
+                  dense && !floating ? "h-8 w-[4.8rem] px-1.5" : null,
+                  !dense ? "h-9 w-[5.6rem] px-2" : null
+                )}
+                aria-label="切换字幕"
+              >
+                <option value="" className={inline ? "bg-surface text-foreground" : "bg-foreground text-white"}>字幕关</option>
+                {subtitles.map((subtitle) => (
+                  <option key={subtitle.id} value={subtitle.id} className={inline ? "bg-surface text-foreground" : "bg-foreground text-white"}>
+                    {subtitle.label}
                   </option>
                 ))}
               </select>
