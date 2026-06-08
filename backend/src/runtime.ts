@@ -16,6 +16,9 @@ export interface AppEnv {
   ARIA2_RPC_SECRET?: string;
   ARIA2_DOWNLOAD_DIR?: string;
   ARIA2_METADATA_TIMEOUT_SECONDS?: string;
+  ARIA2_DOWNLOAD_MAX_BYTES?: string;
+  ARIA2_DOWNLOAD_MIN_FREE_BYTES?: string;
+  ARIA2_DOWNLOAD_RETENTION_HOURS?: string;
 }
 
 export interface StaticAssetHandler {

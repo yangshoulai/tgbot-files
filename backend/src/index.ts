@@ -53,6 +53,8 @@ import {
   listApiKeyRecords,
   listFileRecords,
   listMagnetImportFileRecords,
+  listMagnetImportRecordsForAria2Cleanup,
+  listProtectedMagnetImportRecordsForAria2Cleanup,
   listTelegramChannelRecords,
   markMagnetImportDoneIfComplete,
   markMagnetImportDownloaded,
@@ -99,7 +101,15 @@ import {
   type TelegramChannelStatus,
   type ThumbnailStatus
 } from "./database";
-import { aria2AddUri, aria2ForceRemove, aria2TellStatus, requireAria2Config, type Aria2File, type Aria2Status } from "./aria2";
+import {
+  aria2AddUri,
+  aria2ForceRemove,
+  aria2TellStatus,
+  requireAria2Config,
+  resolveAria2DownloadConfig,
+  type Aria2File,
+  type Aria2Status
+} from "./aria2";
 import {
   AppError,
   contentDispositionAttachment,
@@ -132,7 +142,7 @@ import {
 import { extensionForMimeType, mimeTypeForFileName, resolveStoredMimeType } from "./mime";
 import { fetchTelegramFile, getTelegramFileUrl, uploadDocumentToTelegram } from "./telegram";
 import type { AppDatabase, AppEnv } from "./runtime";
-import { mkdir, open, readdir, readFile, rm } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, readFile, rm, statfs } from "node:fs/promises";
 import path from "node:path";
 
 
@@ -256,6 +266,7 @@ const HLS_MAX_PLAYLIST_BYTES = 2 * 1024 * 1024;
 const HLS_AES_128_KEY_BYTES = 16;
 const HLS_SEGMENT_IMPORT_TIMEOUT_MS = 10 * 60 * 1000;
 const HLS_PREVIEW_SEGMENT_COUNT = 4;
+const ARIA2_CACHE_DIRECTORY_NAME_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 type TelegramRateLimitScope = "sendDocument" | "getFile";
 
@@ -315,7 +326,8 @@ export async function runScheduledCleanup(env: AppEnv, nowMs = Date.now(), cron 
     result.deletedHlsAssets > 0 ||
     result.deletedHlsSegments > 0 ||
     result.deletedHlsUploads > 0 ||
-    result.deletedHlsChunks > 0
+    result.deletedHlsChunks > 0 ||
+    result.deletedAria2Dirs > 0
   ) {
     console.log("Stale upload cleanup completed", {
       cron,
@@ -325,10 +337,15 @@ export async function runScheduledCleanup(env: AppEnv, nowMs = Date.now(), cron 
       deleted_hls_assets: result.deletedHlsAssets,
       deleted_hls_segments: result.deletedHlsSegments,
       deleted_hls_uploads: result.deletedHlsUploads,
-      deleted_hls_chunks: result.deletedHlsChunks
+      deleted_hls_chunks: result.deletedHlsChunks,
+      deleted_aria2_dirs: result.deletedAria2Dirs,
+      deleted_aria2_bytes: result.deletedAria2Bytes,
+      aria2_download_bytes: result.aria2DownloadBytes,
+      skipped_aria2_dirs: result.skippedAria2Dirs
     });
   }
 }
+
 async function cleanupStaleUploads(
   env: AppEnv,
   nowMs: number
@@ -340,6 +357,10 @@ async function cleanupStaleUploads(
   deletedHlsSegments: number;
   deletedHlsUploads: number;
   deletedHlsChunks: number;
+  deletedAria2Dirs: number;
+  deletedAria2Bytes: number;
+  aria2DownloadBytes: number;
+  skippedAria2Dirs: number;
 }> {
   const db = requireDb(env);
   const ttlMs = parseStaleMultipartUploadTtlMs(env.STALE_MULTIPART_UPLOAD_TTL_HOURS);
@@ -348,6 +369,7 @@ async function cleanupStaleUploads(
     deleteStaleMultipartUploadData(db, expiredBefore),
     deleteStaleHlsUploadData(db, expiredBefore)
   ]);
+  const aria2 = await cleanupAria2DownloadCache(env, db, nowMs);
 
   return {
     expiredBefore,
@@ -356,9 +378,93 @@ async function cleanupStaleUploads(
     deletedHlsAssets: hls.deletedAssets,
     deletedHlsSegments: hls.deletedSegments,
     deletedHlsUploads: hls.deletedUploads,
-    deletedHlsChunks: hls.deletedChunks
+    deletedHlsChunks: hls.deletedChunks,
+    deletedAria2Dirs: aria2.deletedDirs,
+    deletedAria2Bytes: aria2.deletedBytes,
+    aria2DownloadBytes: aria2.currentBytes,
+    skippedAria2Dirs: aria2.skippedDirs
   };
 }
+
+async function cleanupAria2DownloadCache(
+  env: AppEnv,
+  db: AppDatabase,
+  nowMs: number
+): Promise<{ deletedDirs: number; deletedBytes: number; currentBytes: number; skippedDirs: number }> {
+  if (!env.ARIA2_DOWNLOAD_DIR?.trim() && !env.ARIA2_RPC_URL?.trim() && !env.ARIA2_RPC_SECRET?.trim()) {
+    return { deletedDirs: 0, deletedBytes: 0, currentBytes: 0, skippedDirs: 0 };
+  }
+
+  const config = resolveAria2DownloadConfig(env);
+  await mkdir(config.downloadDir, { recursive: true });
+
+  const expiredBefore = new Date(nowMs - config.downloadRetentionMs).toISOString();
+  const protectedRecords = await listProtectedMagnetImportRecordsForAria2Cleanup(db, expiredBefore);
+  const protectedDirs = new Set(
+    protectedRecords
+      .map((record) => safeAria2DownloadDir(config.downloadDir, record.download_dir))
+      .filter((dir): dir is string => Boolean(dir))
+  );
+  const staleRecords = await listMagnetImportRecordsForAria2Cleanup(db, expiredBefore);
+  let deletedDirs = 0;
+  let deletedBytes = 0;
+  let skippedDirs = 0;
+  const deletedPaths = new Set<string>();
+
+  for (const record of staleRecords) {
+    const resolvedDir = safeAria2DownloadDir(config.downloadDir, record.download_dir);
+    if (!resolvedDir || protectedDirs.has(resolvedDir) || deletedPaths.has(resolvedDir)) {
+      skippedDirs += 1;
+      continue;
+    }
+
+    await forceRemoveAria2MagnetTaskIfConfigured(env, record);
+    const result = await deleteAria2DownloadDir(config.downloadDir, resolvedDir);
+    if (result.deleted) {
+      deletedDirs += 1;
+      deletedBytes += result.bytes;
+      deletedPaths.add(resolvedDir);
+      if (record.status === "downloaded") {
+        await cancelMagnetImportRecord(db, record.id, new Date(nowMs).toISOString());
+      }
+    } else {
+      skippedDirs += 1;
+    }
+  }
+
+  let currentBytes = await directorySizeBytes(config.downloadDir);
+  if (config.downloadMaxBytes > 0 && currentBytes > config.downloadMaxBytes) {
+    const candidates = await listAria2DownloadCacheCandidates(
+      config.downloadDir,
+      protectedDirs,
+      deletedPaths,
+      nowMs - config.downloadRetentionMs
+    );
+    for (const candidate of candidates) {
+      if (currentBytes <= config.downloadMaxBytes) {
+        break;
+      }
+
+      const result = await deleteAria2DownloadDir(config.downloadDir, candidate.path);
+      if (result.deleted) {
+        deletedDirs += 1;
+        deletedBytes += result.bytes;
+        currentBytes = Math.max(0, currentBytes - result.bytes);
+        deletedPaths.add(candidate.path);
+      } else {
+        skippedDirs += 1;
+      }
+    }
+  }
+
+  return {
+    deletedDirs,
+    deletedBytes,
+    currentBytes,
+    skippedDirs
+  };
+}
+
 
 async function cleanupStaleMultipartUploads(
   env: AppEnv,
@@ -1539,6 +1645,12 @@ async function createMagnetImport(params: {
   uploadedBy: string;
 }): Promise<{ importRecord: MagnetImportRecord; files: MagnetImportFileRecord[] }> {
   const config = requireAria2Config(params.env);
+  await ensureAria2DownloadCapacity({
+    env: params.env,
+    db: params.db,
+    additionalBytes: 0
+  });
+
   const id = crypto.randomUUID();
   const downloadDir = magnetDownloadDir(config.downloadDir, id);
   await mkdir(downloadDir, { recursive: true });
@@ -1712,6 +1824,12 @@ async function initMagnetImportSelection(params: {
   if (files.length !== selectedSet.size) {
     throw new AppError(400, "InvalidMagnetFileSelection", "选择的磁力文件不存在");
   }
+
+  await ensureAria2DownloadCapacity({
+    env: params.env,
+    db: params.db,
+    additionalBytes: files.reduce((total, file) => total + file.size, 0)
+  });
 
   const uploadByFileIndex = new Map<number, string>();
   const uploads: Array<{ file_index: number; upload: Record<string, unknown>; target_directory_path: string }> = [];
@@ -1907,6 +2025,11 @@ function magnetFileFromAria2File(file: Aria2File, downloadDir: string): {
   }
 
   const segments = relativePath.split("/").filter(Boolean);
+  const rawFileName = segments.at(-1) ?? "";
+  if (isAria2MetadataPlaceholderFile(rawFileName)) {
+    return null;
+  }
+
   const fileName = sanitizeFileName(segments.at(-1) ?? "file");
   const relativeDirectoryPath = segments.length > 1
     ? segments.slice(0, -1).map((segment) => sanitizeDirectorySegment(segment)).filter(Boolean).join("/") || null
@@ -1920,6 +2043,10 @@ function magnetFileFromAria2File(file: Aria2File, downloadDir: string): {
     size,
     mimeType: mimeTypeForMagnetFileName(fileName)
   };
+}
+
+function isAria2MetadataPlaceholderFile(fileName: string): boolean {
+  return fileName.startsWith("[METADATA]");
 }
 
 async function loadMagnetFilesFromSavedTorrent(
@@ -2043,15 +2170,168 @@ async function deleteMagnetImportDownloadDir(
   config: ReturnType<typeof requireAria2Config>,
   importRecord: MagnetImportRecord
 ): Promise<{ deleted: boolean; path?: string; skipped?: string }> {
-  const resolvedBase = path.resolve(config.downloadDir);
-  const resolvedDir = path.resolve(importRecord.download_dir);
-
-  if (resolvedDir === resolvedBase || !resolvedDir.startsWith(`${resolvedBase}${path.sep}`)) {
+  const resolvedDir = safeAria2DownloadDir(config.downloadDir, importRecord.download_dir);
+  if (!resolvedDir) {
     return { deleted: false, skipped: "download_dir_outside_base" };
   }
 
-  await rm(resolvedDir, { recursive: true, force: true });
+  const result = await deleteAria2DownloadDir(config.downloadDir, resolvedDir);
+  if (!result.deleted) {
+    return { deleted: false, skipped: "download_dir_missing" };
+  }
   return { deleted: true, path: importRecord.download_dir };
+}
+
+async function ensureAria2DownloadCapacity(params: {
+  env: AppEnv;
+  db: AppDatabase;
+  additionalBytes: number;
+}): Promise<void> {
+  const config = resolveAria2DownloadConfig(params.env);
+  const additionalBytes = Math.max(0, params.additionalBytes);
+  const cleanup = await cleanupAria2DownloadCache(params.env, params.db, Date.now());
+  const projectedBytes = cleanup.currentBytes + additionalBytes;
+
+  if (config.downloadMaxBytes > 0 && projectedBytes > config.downloadMaxBytes) {
+    throw new AppError(507, "Aria2DownloadStorageLimitExceeded", "aria2 下载目录容量不足，无法开始新的磁力下载", {
+      download_dir: config.downloadDir,
+      current_bytes: cleanup.currentBytes,
+      required_bytes: additionalBytes,
+      projected_bytes: projectedBytes,
+      max_bytes: config.downloadMaxBytes,
+      deleted_bytes: cleanup.deletedBytes
+    });
+  }
+
+  if (config.downloadMinFreeBytes > 0) {
+    const freeBytes = await availableDiskBytes(config.downloadDir);
+    if (freeBytes - additionalBytes < config.downloadMinFreeBytes) {
+      throw new AppError(507, "Aria2DownloadDiskFreeSpaceTooLow", "磁盘剩余空间不足，无法开始新的磁力下载", {
+        download_dir: config.downloadDir,
+        free_bytes: freeBytes,
+        required_bytes: additionalBytes,
+        min_free_bytes: config.downloadMinFreeBytes
+      });
+    }
+  }
+}
+
+async function forceRemoveAria2MagnetTaskIfConfigured(env: AppEnv, record: MagnetImportRecord): Promise<void> {
+  if (!env.ARIA2_RPC_URL?.trim() || !env.ARIA2_RPC_SECRET?.trim()) {
+    return;
+  }
+
+  const config = requireAria2Config(env);
+  for (const gid of [record.aria2_metadata_gid, record.aria2_download_gid]) {
+    if (!gid) continue;
+    await aria2ForceRemove(config, gid).catch((error) => {
+      console.warn("Failed to remove stale aria2 task", {
+        import_id: record.id,
+        gid,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
+  }
+}
+
+function safeAria2DownloadDir(baseDir: string, targetDir: string): string | null {
+  const resolvedBase = path.resolve(baseDir);
+  const resolvedDir = path.resolve(path.isAbsolute(targetDir) ? targetDir : path.join(baseDir, targetDir));
+
+  if (resolvedDir !== resolvedBase && resolvedDir.startsWith(`${resolvedBase}${path.sep}`)) {
+    return resolvedDir;
+  }
+
+  return null;
+}
+
+async function deleteAria2DownloadDir(
+  baseDir: string,
+  targetDir: string
+): Promise<{ deleted: boolean; bytes: number }> {
+  const resolvedDir = safeAria2DownloadDir(baseDir, targetDir);
+  if (!resolvedDir) {
+    return { deleted: false, bytes: 0 };
+  }
+
+  const targetStat = await lstat(resolvedDir).catch(() => null);
+  if (!targetStat?.isDirectory()) {
+    return { deleted: false, bytes: 0 };
+  }
+
+  const bytes = await directorySizeBytes(resolvedDir);
+  await rm(resolvedDir, { recursive: true, force: true });
+  return { deleted: true, bytes };
+}
+
+async function directorySizeBytes(rootDir: string): Promise<number> {
+  const rootStat = await lstat(rootDir).catch(() => null);
+  if (!rootStat) {
+    return 0;
+  }
+  if (!rootStat.isDirectory()) {
+    return rootStat.isFile() ? rootStat.size : 0;
+  }
+
+  const entries = await readdir(rootDir, { withFileTypes: true }).catch(() => []);
+  let total = 0;
+  for (const entry of entries) {
+    const entryPath = path.join(rootDir, entry.name);
+    if (entry.isDirectory()) {
+      total += await directorySizeBytes(entryPath);
+    } else if (entry.isFile()) {
+      total += (await lstat(entryPath).catch(() => null))?.size ?? 0;
+    }
+  }
+  return total;
+}
+
+async function availableDiskBytes(targetDir: string): Promise<number> {
+  await mkdir(targetDir, { recursive: true });
+  const stats = await statfs(targetDir);
+  return stats.bavail * stats.bsize;
+}
+
+async function listAria2DownloadCacheCandidates(
+  downloadDir: string,
+  protectedDirs: Set<string>,
+  ignoredDirs: Set<string>,
+  olderThanMs: number
+): Promise<Array<{ path: string; mtimeMs: number; bytes: number }>> {
+  const entries = await readdir(downloadDir, { withFileTypes: true }).catch(() => []);
+  const candidates: Array<{ path: string; mtimeMs: number; bytes: number }> = [];
+
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !ARIA2_CACHE_DIRECTORY_NAME_PATTERN.test(entry.name)) {
+      continue;
+    }
+
+    const entryPath = path.resolve(downloadDir, entry.name);
+    if (protectedDirs.has(entryPath) || ignoredDirs.has(entryPath)) {
+      continue;
+    }
+
+    const entryStat = await lstat(entryPath).catch(() => null);
+    if (!entryStat?.isDirectory()) {
+      continue;
+    }
+    if (entryStat.mtimeMs > olderThanMs) {
+      continue;
+    }
+
+    candidates.push({
+      path: entryPath,
+      mtimeMs: entryStat.mtimeMs,
+      bytes: await directorySizeBytes(entryPath)
+    });
+  }
+
+  return candidates.sort((left, right) => {
+    if (left.mtimeMs !== right.mtimeMs) {
+      return left.mtimeMs - right.mtimeMs;
+    }
+    return right.bytes - left.bytes;
+  });
 }
 
 function targetDirectoryForMagnetFile(baseDirectoryPath: string, file: MagnetImportFileRecord): string {

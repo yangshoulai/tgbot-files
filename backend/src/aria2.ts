@@ -31,14 +31,33 @@ export interface Aria2Config {
   rpcSecret: string;
   downloadDir: string;
   metadataTimeoutMs: number;
+  downloadMaxBytes: number;
+  downloadMinFreeBytes: number;
+  downloadRetentionMs: number;
+}
+
+export interface Aria2DownloadConfig {
+  downloadDir: string;
+  downloadMaxBytes: number;
+  downloadMinFreeBytes: number;
+  downloadRetentionMs: number;
 }
 
 let rpcCounter = 0;
 
+export function resolveAria2DownloadConfig(env: AppEnv): Aria2DownloadConfig {
+  return {
+    downloadDir: env.ARIA2_DOWNLOAD_DIR?.trim() || "/data/aria2/downloads",
+    downloadMaxBytes: parseNonNegativeBytes(env.ARIA2_DOWNLOAD_MAX_BYTES, 20 * 1024 * 1024 * 1024, "ARIA2_DOWNLOAD_MAX_BYTES"),
+    downloadMinFreeBytes: parseNonNegativeBytes(env.ARIA2_DOWNLOAD_MIN_FREE_BYTES, 5 * 1024 * 1024 * 1024, "ARIA2_DOWNLOAD_MIN_FREE_BYTES"),
+    downloadRetentionMs: parseRetentionMs(env.ARIA2_DOWNLOAD_RETENTION_HOURS)
+  };
+}
+
 export function requireAria2Config(env: AppEnv): Aria2Config {
   const rpcUrl = env.ARIA2_RPC_URL?.trim();
   const rpcSecret = env.ARIA2_RPC_SECRET?.trim();
-  const downloadDir = env.ARIA2_DOWNLOAD_DIR?.trim() || "/data/aria2/downloads";
+  const downloadConfig = resolveAria2DownloadConfig(env);
 
   if (!rpcUrl) {
     throw new AppError(500, "Aria2NotConfigured", "ARIA2_RPC_URL is required for magnet uploads");
@@ -51,7 +70,7 @@ export function requireAria2Config(env: AppEnv): Aria2Config {
   return {
     rpcUrl,
     rpcSecret,
-    downloadDir,
+    ...downloadConfig,
     metadataTimeoutMs: parseMetadataTimeoutMs(env.ARIA2_METADATA_TIMEOUT_SECONDS)
   };
 }
@@ -137,6 +156,27 @@ function parseMetadataTimeoutMs(value: string | undefined): number {
   const seconds = Number(value || "30");
   const normalized = Number.isSafeInteger(seconds) && seconds > 0 ? seconds : 30;
   return Math.min(Math.max(normalized, 5), 300) * 1000;
+}
+
+function parseNonNegativeBytes(value: string | undefined, fallback: number, name: string): number {
+  const raw = value?.trim();
+  if (!raw) {
+    return fallback;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new AppError(500, "ServerMisconfigured", `${name} must be a non-negative integer`);
+  }
+
+  return parsed;
+}
+
+function parseRetentionMs(value: string | undefined): number {
+  const parsed = Number(value?.trim());
+  const hours = Number.isFinite(parsed) ? Math.floor(parsed) : 24;
+  const boundedHours = Math.min(24 * 30, Math.max(0, hours));
+  return boundedHours * 60 * 60 * 1000;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

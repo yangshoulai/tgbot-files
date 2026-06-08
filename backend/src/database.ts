@@ -1418,6 +1418,81 @@ export async function getMagnetImportRecord(db: AppDatabase, id: string): Promis
     .first<MagnetImportRecord>();
 }
 
+export async function listMagnetImportRecordsForAria2Cleanup(
+  db: AppDatabase,
+  expiredBefore: string
+): Promise<MagnetImportRecord[]> {
+  const result = await db
+    .prepare(
+      `SELECT
+        id,
+        magnet_uri,
+        info_hash,
+        name,
+        status,
+        aria2_metadata_gid,
+        aria2_download_gid,
+        download_dir,
+        selected_indexes_json,
+        file_count,
+        total_size,
+        error_message,
+        uploaded_by,
+        created_at,
+        updated_at,
+        metadata_completed_at,
+        download_started_at,
+        download_completed_at,
+        completed_at,
+        cancelled_at
+      FROM magnet_imports
+      WHERE status IN ('done', 'failed', 'cancelled', 'downloaded')
+        AND updated_at <= ?
+      ORDER BY updated_at ASC`
+    )
+    .bind(expiredBefore)
+    .all<MagnetImportRecord>();
+
+  return result.results ?? [];
+}
+
+export async function listProtectedMagnetImportRecordsForAria2Cleanup(
+  db: AppDatabase,
+  expiredBefore: string
+): Promise<MagnetImportRecord[]> {
+  const result = await db
+    .prepare(
+      `SELECT
+        id,
+        magnet_uri,
+        info_hash,
+        name,
+        status,
+        aria2_metadata_gid,
+        aria2_download_gid,
+        download_dir,
+        selected_indexes_json,
+        file_count,
+        total_size,
+        error_message,
+        uploaded_by,
+        created_at,
+        updated_at,
+        metadata_completed_at,
+        download_started_at,
+        download_completed_at,
+        completed_at,
+        cancelled_at
+      FROM magnet_imports
+      WHERE status IN ('probing', 'ready', 'downloading', 'importing')
+        OR (status = 'downloaded' AND updated_at > ?)`
+    )
+    .bind(expiredBefore)
+    .all<MagnetImportRecord>();
+
+  return result.results ?? [];
+}
+
 export async function listMagnetImportFileRecords(db: AppDatabase, importId: string): Promise<MagnetImportFileRecord[]> {
   const result = await db
     .prepare(

@@ -60,7 +60,10 @@ const env: AppEnv = {
   ...optionalEnv("ARIA2_RPC_URL"),
   ...optionalEnv("ARIA2_RPC_SECRET"),
   ...optionalEnv("ARIA2_DOWNLOAD_DIR"),
-  ...optionalEnv("ARIA2_METADATA_TIMEOUT_SECONDS")
+  ...optionalEnv("ARIA2_METADATA_TIMEOUT_SECONDS"),
+  ...optionalEnv("ARIA2_DOWNLOAD_MAX_BYTES"),
+  ...optionalEnv("ARIA2_DOWNLOAD_MIN_FREE_BYTES"),
+  ...optionalEnv("ARIA2_DOWNLOAD_RETENTION_HOURS")
 };
 
 const server = createServer((request, response) => {
