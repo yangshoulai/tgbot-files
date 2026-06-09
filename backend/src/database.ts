@@ -203,6 +203,7 @@ export interface MagnetImportRecord {
 export interface NewMagnetImportRecord {
   id: string;
   magnetUri: string;
+  infoHash?: string | null;
   aria2MetadataGid: string;
   downloadDir: string;
   uploadedBy?: string;
@@ -1361,17 +1362,19 @@ export async function insertMagnetImportRecord(
       `INSERT INTO magnet_imports (
         id,
         magnet_uri,
+        info_hash,
         status,
         aria2_metadata_gid,
         download_dir,
         uploaded_by,
         created_at,
         updated_at
-      ) VALUES (?, ?, 'probing', ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, 'probing', ?, ?, ?, ?, ?)`
     )
     .bind(
       record.id,
       record.magnetUri,
+      record.infoHash ?? null,
       record.aria2MetadataGid,
       record.downloadDir,
       record.uploadedBy ?? null,
@@ -1416,6 +1419,83 @@ export async function getMagnetImportRecord(db: AppDatabase, id: string): Promis
     )
     .bind(id)
     .first<MagnetImportRecord>();
+}
+
+export async function findReusableMagnetImportRecord(
+  db: AppDatabase,
+  magnetUri: string,
+  infoHash: string | null
+): Promise<MagnetImportRecord | null> {
+  return await db
+    .prepare(
+      `SELECT
+        id,
+        magnet_uri,
+        info_hash,
+        name,
+        status,
+        aria2_metadata_gid,
+        aria2_download_gid,
+        download_dir,
+        selected_indexes_json,
+        file_count,
+        total_size,
+        error_message,
+        uploaded_by,
+        created_at,
+        updated_at,
+        metadata_completed_at,
+        download_started_at,
+        download_completed_at,
+        completed_at,
+        cancelled_at
+      FROM magnet_imports
+      WHERE status IN ('probing', 'ready', 'downloading', 'downloaded', 'importing')
+        AND (magnet_uri = ? OR (? IS NOT NULL AND info_hash = ?))
+      ORDER BY updated_at DESC
+      LIMIT 1`
+    )
+    .bind(magnetUri, infoHash, infoHash)
+    .first<MagnetImportRecord>();
+}
+
+export async function listRestartableMagnetImportRecordsBySource(
+  db: AppDatabase,
+  magnetUri: string,
+  infoHash: string | null
+): Promise<MagnetImportRecord[]> {
+  const result = await db
+    .prepare(
+      `SELECT
+        id,
+        magnet_uri,
+        info_hash,
+        name,
+        status,
+        aria2_metadata_gid,
+        aria2_download_gid,
+        download_dir,
+        selected_indexes_json,
+        file_count,
+        total_size,
+        error_message,
+        uploaded_by,
+        created_at,
+        updated_at,
+        metadata_completed_at,
+        download_started_at,
+        download_completed_at,
+        completed_at,
+        cancelled_at
+      FROM magnet_imports
+      WHERE status IN ('failed', 'cancelled')
+        AND (magnet_uri = ? OR (? IS NOT NULL AND info_hash = ?))
+      ORDER BY updated_at DESC`
+    )
+    .bind(magnetUri, infoHash, infoHash)
+    .all<MagnetImportRecord>();
+
+  return result.results ?? [];
 }
 
 export async function listMagnetImportRecordsForAria2Cleanup(

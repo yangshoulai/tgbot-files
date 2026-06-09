@@ -319,6 +319,11 @@ export interface MagnetImport {
   download_started_at: string | null;
   download_completed_at: string | null;
   completed_at: string | null;
+  aria2_status: "active" | "waiting" | "paused" | "error" | "complete" | "removed" | null;
+  download_completed_bytes: number | null;
+  download_total_bytes: number | null;
+  download_progress: number | null;
+  download_speed_bytes_per_second: number | null;
   files: MagnetImportFile[];
 }
 

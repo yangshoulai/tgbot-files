@@ -14,6 +14,7 @@ export interface Aria2Status {
   status: "active" | "waiting" | "paused" | "error" | "complete" | "removed";
   totalLength?: string;
   completedLength?: string;
+  downloadSpeed?: string;
   errorCode?: string;
   errorMessage?: string;
   followedBy?: string[];
@@ -30,6 +31,7 @@ export interface Aria2Config {
   rpcUrl: string;
   rpcSecret: string;
   downloadDir: string;
+  btTrackers: string | undefined;
   metadataTimeoutMs: number;
   downloadMaxBytes: number;
   downloadMinFreeBytes: number;
@@ -70,6 +72,7 @@ export function requireAria2Config(env: AppEnv): Aria2Config {
   return {
     rpcUrl,
     rpcSecret,
+    btTrackers: parseBtTrackers(env.ARIA2_BT_TRACKERS),
     ...downloadConfig,
     metadataTimeoutMs: parseMetadataTimeoutMs(env.ARIA2_METADATA_TIMEOUT_SECONDS)
   };
@@ -87,6 +90,7 @@ export async function aria2TellStatus(config: Aria2Config, gid: string): Promise
       "status",
       "totalLength",
       "completedLength",
+      "downloadSpeed",
       "errorCode",
       "errorMessage",
       "followedBy",
@@ -104,6 +108,20 @@ export async function aria2ForceRemove(config: Aria2Config, gid: string): Promis
     }
     throw error;
   });
+}
+
+export async function aria2RemoveDownloadResult(config: Aria2Config, gid: string): Promise<void> {
+  await aria2Rpc<string>(config, "aria2.removeDownloadResult", [gid]).catch(async (error) => {
+    if (error instanceof AppError && error.error === "Aria2RpcFailed") {
+      return;
+    }
+    throw error;
+  });
+}
+
+export async function aria2Forget(config: Aria2Config, gid: string): Promise<void> {
+  await aria2ForceRemove(config, gid);
+  await aria2RemoveDownloadResult(config, gid);
 }
 
 async function aria2Rpc<T>(config: Aria2Config, method: string, params: unknown[]): Promise<T> {
@@ -156,6 +174,15 @@ function parseMetadataTimeoutMs(value: string | undefined): number {
   const seconds = Number(value || "30");
   const normalized = Number.isSafeInteger(seconds) && seconds > 0 ? seconds : 30;
   return Math.min(Math.max(normalized, 5), 300) * 1000;
+}
+
+function parseBtTrackers(value: string | undefined): string | undefined {
+  const trackers = value
+    ?.split(/[,\n]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  return trackers && trackers.length > 0 ? trackers.join(",") : undefined;
 }
 
 function parseNonNegativeBytes(value: string | undefined, fallback: number, name: string): number {

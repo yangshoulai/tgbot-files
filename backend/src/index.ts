@@ -19,6 +19,7 @@ import {
   deleteStaleMultipartUploadData,
   failHlsSegment,
   failHlsInitSegment,
+  findReusableMagnetImportRecord,
   getDirectoryRecord,
   getDirectoryRecordByPath,
   getDirectoryUsageStats,
@@ -55,6 +56,7 @@ import {
   listMagnetImportFileRecords,
   listMagnetImportRecordsForAria2Cleanup,
   listProtectedMagnetImportRecordsForAria2Cleanup,
+  listRestartableMagnetImportRecordsBySource,
   listTelegramChannelRecords,
   markMagnetImportDoneIfComplete,
   markMagnetImportDownloaded,
@@ -103,7 +105,7 @@ import {
 } from "./database";
 import {
   aria2AddUri,
-  aria2ForceRemove,
+  aria2Forget,
   aria2TellStatus,
   requireAria2Config,
   resolveAria2DownloadConfig,
@@ -212,6 +214,12 @@ interface ThumbnailInput {
   file: File;
   width?: number;
   height?: number;
+}
+
+interface MagnetImportRefreshResult {
+  importRecord: MagnetImportRecord;
+  files: MagnetImportFileRecord[];
+  aria2Status?: Aria2Status;
 }
 
 interface UploadedThumbnailResult {
@@ -1541,7 +1549,7 @@ async function handleAdminMagnetUploads(request: Request, env: AppEnv, username:
 
     return jsonResponse({
       ok: true,
-      magnet: serializeMagnetImport(result.importRecord, result.files)
+      magnet: serializeMagnetImport(result.importRecord, result.files, result.aria2Status)
     }, 201);
   }
 
@@ -1550,7 +1558,7 @@ async function handleAdminMagnetUploads(request: Request, env: AppEnv, username:
     const result = await refreshMagnetImportStatus(env, db, decodeURIComponent(statusMatch[1]));
     return jsonResponse({
       ok: true,
-      magnet: serializeMagnetImport(result.importRecord, result.files)
+      magnet: serializeMagnetImport(result.importRecord, result.files, result.aria2Status)
     });
   }
 
@@ -1577,7 +1585,7 @@ async function handleAdminMagnetUploads(request: Request, env: AppEnv, username:
 
     return jsonResponse({
       ok: true,
-      magnet: serializeMagnetImport(result.importRecord, result.files),
+      magnet: serializeMagnetImport(result.importRecord, result.files, result.aria2Status),
       uploads: result.uploads
     });
   }
@@ -1639,12 +1647,7 @@ async function handleAdminMagnetUploads(request: Request, env: AppEnv, username:
     const importId = decodeURIComponent(deleteMatch[1]);
     const record = await requireMagnetImport(db, importId);
     const config = requireAria2Config(env);
-    if (record.aria2_metadata_gid) {
-      await aria2ForceRemove(config, record.aria2_metadata_gid);
-    }
-    if (record.aria2_download_gid) {
-      await aria2ForceRemove(config, record.aria2_download_gid);
-    }
+    await forgetAria2MagnetTask(config, record);
     await cancelMagnetImportRecord(db, importId, new Date().toISOString());
     const cleanup = await deleteMagnetImportDownloadDir(config, record);
     return jsonResponse({ ok: true, cleanup });
@@ -1658,8 +1661,17 @@ async function createMagnetImport(params: {
   db: AppDatabase;
   magnetUri: string;
   uploadedBy: string;
-}): Promise<{ importRecord: MagnetImportRecord; files: MagnetImportFileRecord[] }> {
+}): Promise<MagnetImportRefreshResult> {
   const config = requireAria2Config(params.env);
+  const infoHash = magnetInfoHash(params.magnetUri);
+  const reusable = await findReusableMagnetImportRecord(params.db, params.magnetUri, infoHash);
+  if (reusable) {
+    return reusable.status === "probing"
+      ? waitForMagnetMetadata(params.env, params.db, reusable.id)
+      : refreshMagnetImportStatus(params.env, params.db, reusable.id);
+  }
+
+  await cleanupRestartableMagnetImportsBySource(params.env, params.db, params.magnetUri, infoHash);
   await ensureAria2DownloadCapacity({
     env: params.env,
     db: params.db,
@@ -1669,17 +1681,18 @@ async function createMagnetImport(params: {
   const id = crypto.randomUUID();
   const downloadDir = magnetDownloadDir(config.downloadDir, id);
   await mkdir(downloadDir, { recursive: true });
-  const gid = await aria2AddUri(config, [params.magnetUri], {
+  const gid = await aria2AddUri(config, [params.magnetUri], aria2MagnetOptions(config, {
     dir: downloadDir,
     "bt-metadata-only": "true",
     "bt-save-metadata": "true",
     "follow-torrent": "false",
     "seed-time": "0"
-  });
+  }));
   const now = new Date().toISOString();
   const importRecord = await insertMagnetImportRecord(params.db, {
     id,
     magnetUri: params.magnetUri,
+    infoHash,
     aria2MetadataGid: gid,
     downloadDir,
     uploadedBy: params.uploadedBy,
@@ -1694,7 +1707,7 @@ async function waitForMagnetMetadata(
   env: AppEnv,
   db: AppDatabase,
   importId: string
-): Promise<{ importRecord: MagnetImportRecord; files: MagnetImportFileRecord[] }> {
+): Promise<MagnetImportRefreshResult> {
   const config = requireAria2Config(env);
   const deadline = Date.now() + config.metadataTimeoutMs;
   let result = await refreshMagnetImportStatus(env, db, importId);
@@ -1711,12 +1724,14 @@ async function refreshMagnetImportStatus(
   env: AppEnv,
   db: AppDatabase,
   importId: string
-): Promise<{ importRecord: MagnetImportRecord; files: MagnetImportFileRecord[] }> {
+): Promise<MagnetImportRefreshResult> {
   const config = requireAria2Config(env);
   let importRecord = await requireMagnetImport(db, importId);
+  let aria2Status: Aria2Status | undefined;
 
   if (importRecord.status === "probing" && importRecord.aria2_metadata_gid) {
     const status = await tellAria2StatusFollowing(config, importRecord.aria2_metadata_gid);
+    aria2Status = status;
     await refreshMagnetMetadataFromStatus(db, importRecord, status);
     importRecord = await requireMagnetImport(db, importId);
   }
@@ -1726,6 +1741,7 @@ async function refreshMagnetImportStatus(
     importRecord.aria2_download_gid
   ) {
     const status = await tellAria2StatusFollowing(config, importRecord.aria2_download_gid);
+    aria2Status = status;
     if (status.status === "complete") {
       await markMagnetImportDownloaded(db, importRecord.id, new Date().toISOString());
       importRecord = await requireMagnetImport(db, importId);
@@ -1737,8 +1753,46 @@ async function refreshMagnetImportStatus(
 
   return {
     importRecord,
-    files: await listMagnetImportFileRecords(db, importRecord.id)
+    files: await listMagnetImportFileRecords(db, importRecord.id),
+    ...(aria2Status ? { aria2Status } : {})
   };
+}
+
+function aria2MagnetOptions(config: ReturnType<typeof requireAria2Config>, options: Record<string, string>): Record<string, string> {
+  return config.btTrackers
+    ? { ...options, "bt-tracker": config.btTrackers }
+    : options;
+}
+
+async function cleanupRestartableMagnetImportsBySource(
+  env: AppEnv,
+  db: AppDatabase,
+  magnetUri: string,
+  infoHash: string | null
+): Promise<void> {
+  const records = await listRestartableMagnetImportRecordsBySource(db, magnetUri, infoHash);
+  if (records.length === 0) {
+    return;
+  }
+
+  const config = requireAria2Config(env);
+  for (const record of records) {
+    await forgetAria2MagnetTask(config, record);
+    await deleteMagnetImportDownloadDir(config, record);
+  }
+}
+
+async function forgetAria2MagnetTask(config: ReturnType<typeof requireAria2Config>, record: MagnetImportRecord): Promise<void> {
+  for (const gid of [record.aria2_metadata_gid, record.aria2_download_gid]) {
+    if (!gid) continue;
+    await aria2Forget(config, gid).catch((error) => {
+      console.warn("Failed to forget aria2 magnet task", {
+        import_id: record.id,
+        gid,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
+  }
 }
 
 async function refreshMagnetMetadataFromStatus(
@@ -1819,7 +1873,7 @@ interface MagnetFileUploadOption {
   conflictAction?: FileNameConflictAction;
 }
 
-async function initMagnetImportSelection(params: {
+interface MagnetImportSelectionParams {
   env: AppEnv;
   db: AppDatabase;
   importId: string;
@@ -1829,14 +1883,18 @@ async function initMagnetImportSelection(params: {
   conflictAction: FileNameConflictAction;
   remark: string | null;
   uploadedBy: string;
-}): Promise<{
-  importRecord: MagnetImportRecord;
-  files: MagnetImportFileRecord[];
+}
+
+async function initMagnetImportSelection(params: MagnetImportSelectionParams): Promise<MagnetImportRefreshResult & {
   uploads: Array<{ file_index: number; upload: Record<string, unknown>; target_directory_path: string }>;
 }> {
   const refreshed = await refreshMagnetImportStatus(params.env, params.db, params.importId);
   const importRecord = refreshed.importRecord;
-  if (importRecord.status !== "ready" && importRecord.status !== "downloaded") {
+  if (isInitializedMagnetImportStatus(importRecord.status)) {
+    return resumeInitializedMagnetImportSelection(params, refreshed);
+  }
+
+  if (importRecord.status !== "ready") {
     throw new AppError(409, "MagnetMetadataNotReady", "磁力链接文件列表尚未解析完成");
   }
 
@@ -1883,13 +1941,17 @@ async function initMagnetImportSelection(params: {
   }
 
   const config = requireAria2Config(params.env);
-  const gid = await aria2AddUri(config, [importRecord.magnet_uri], {
+  if (importRecord.aria2_metadata_gid) {
+    await aria2Forget(config, importRecord.aria2_metadata_gid);
+  }
+
+  const gid = await aria2AddUri(config, [importRecord.magnet_uri], aria2MagnetOptions(config, {
     dir: importRecord.download_dir,
     "select-file": params.fileIndexes.join(","),
     "bt-save-metadata": "true",
     "seed-time": "0",
     "max-upload-limit": "64K"
-  });
+  }));
   const now = new Date().toISOString();
   await selectMagnetImportFiles({
     db: params.db,
@@ -1911,6 +1973,90 @@ async function initMagnetImportSelection(params: {
     files: await listMagnetImportFileRecords(params.db, importRecord.id),
     uploads
   };
+}
+
+async function resumeInitializedMagnetImportSelection(
+  params: MagnetImportSelectionParams,
+  refreshed: MagnetImportRefreshResult
+): Promise<MagnetImportRefreshResult & {
+  uploads: Array<{ file_index: number; upload: Record<string, unknown>; target_directory_path: string }>;
+}> {
+  const existingIndexes = selectedMagnetFileIndexes(refreshed.importRecord, refreshed.files);
+  if (!sameNumberSet(existingIndexes, params.fileIndexes)) {
+    throw new AppError(409, "MagnetImportAlreadyStarted", "磁力任务已经开始下载，不能更改文件选择", {
+      selected_indexes: existingIndexes
+    });
+  }
+
+  const selectedSet = new Set(params.fileIndexes);
+  const files = refreshed.files.filter((file) => selectedSet.has(file.file_index));
+  if (files.length !== selectedSet.size) {
+    throw new AppError(400, "InvalidMagnetFileSelection", "选择的磁力文件不存在");
+  }
+
+  const uploads: Array<{ file_index: number; upload: Record<string, unknown>; target_directory_path: string }> = [];
+  for (const file of files) {
+    if (!file.upload_id || file.selected !== 1) {
+      throw new AppError(409, "MagnetUploadSessionMissing", "磁力任务缺少可恢复的上传会话，请取消后重新开始");
+    }
+
+    const upload = await requireMultipartUpload(params.db, file.upload_id, "magnet");
+    uploads.push({
+      file_index: file.file_index,
+      upload: serializeMultipartInit(multipartInitResultFromUploadRecord(upload)),
+      target_directory_path: upload.directory_path ?? targetDirectoryForMagnetFile(params.directoryPath, file)
+    });
+  }
+
+  return {
+    ...refreshed,
+    uploads
+  };
+}
+
+function isInitializedMagnetImportStatus(status: MagnetImportRecord["status"]): boolean {
+  return status === "downloading" || status === "downloaded" || status === "importing" || status === "done";
+}
+
+function selectedMagnetFileIndexes(record: MagnetImportRecord, files: MagnetImportFileRecord[]): number[] {
+  const fromRecord = parseSelectedMagnetIndexes(record.selected_indexes_json);
+  if (fromRecord.length > 0) {
+    return fromRecord;
+  }
+
+  return files
+    .filter((file) => file.selected === 1)
+    .map((file) => file.file_index)
+    .sort((left, right) => left - right);
+}
+
+function parseSelectedMagnetIndexes(value: string | null): number[] {
+  if (!value) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return Array.from(new Set(parsed.map((item) => Number(item))))
+      .filter((item) => Number.isSafeInteger(item) && item > 0)
+      .sort((left, right) => left - right);
+  } catch {
+    return [];
+  }
+}
+
+function sameNumberSet(left: number[], right: number[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  const normalizedLeft = [...left].sort((a, b) => a - b);
+  const normalizedRight = [...right].sort((a, b) => a - b);
+  return normalizedLeft.every((value, index) => value === normalizedRight[index]);
 }
 
 async function importMagnetFileChunk(params: {
@@ -1999,7 +2145,9 @@ async function completeMagnetFileUpload(params: {
   await markMagnetImportDoneIfComplete(params.db, params.importId, now);
   const latest = await requireMagnetImport(params.db, params.importId);
   if (latest.status === "done") {
-    await deleteMagnetImportDownloadDir(requireAria2Config(params.env), latest);
+    const config = requireAria2Config(params.env);
+    await forgetAria2MagnetTask(config, latest);
+    await deleteMagnetImportDownloadDir(config, latest);
   }
   return result;
 }
@@ -2302,16 +2450,7 @@ async function forceRemoveAria2MagnetTaskIfConfigured(env: AppEnv, record: Magne
   }
 
   const config = requireAria2Config(env);
-  for (const gid of [record.aria2_metadata_gid, record.aria2_download_gid]) {
-    if (!gid) continue;
-    await aria2ForceRemove(config, gid).catch((error) => {
-      console.warn("Failed to remove stale aria2 task", {
-        import_id: record.id,
-        gid,
-        error: error instanceof Error ? error.message : String(error)
-      });
-    });
-  }
+  await forgetAria2MagnetTask(config, record);
 }
 
 function safeAria2DownloadDir(baseDir: string, targetDir: string): string | null {
@@ -2439,7 +2578,12 @@ async function requireMagnetImportFile(db: AppDatabase, importId: string, fileIn
   return file;
 }
 
-function serializeMagnetImport(record: MagnetImportRecord, files: MagnetImportFileRecord[]): Record<string, unknown> {
+function serializeMagnetImport(
+  record: MagnetImportRecord,
+  files: MagnetImportFileRecord[],
+  aria2Status?: Aria2Status
+): Record<string, unknown> {
+  const download = magnetDownloadRuntimeStatus(record, aria2Status);
   return {
     id: record.id,
     magnet_uri: record.magnet_uri,
@@ -2455,6 +2599,11 @@ function serializeMagnetImport(record: MagnetImportRecord, files: MagnetImportFi
     download_started_at: record.download_started_at,
     download_completed_at: record.download_completed_at,
     completed_at: record.completed_at,
+    aria2_status: download.aria2Status,
+    download_completed_bytes: download.completedBytes,
+    download_total_bytes: download.totalBytes,
+    download_progress: download.progress,
+    download_speed_bytes_per_second: download.speedBytesPerSecond,
     files: files.map((file) => ({
       id: file.id,
       file_index: file.file_index,
@@ -2471,6 +2620,48 @@ function serializeMagnetImport(record: MagnetImportRecord, files: MagnetImportFi
       error_message: file.error_message
     }))
   };
+}
+
+function magnetDownloadRuntimeStatus(
+  record: MagnetImportRecord,
+  status: Aria2Status | undefined
+): {
+  aria2Status: Aria2Status["status"] | null;
+  completedBytes: number | null;
+  totalBytes: number | null;
+  progress: number | null;
+  speedBytesPerSecond: number | null;
+} {
+  const totalBytes = aria2NumericValue(status?.totalLength) ?? record.total_size ?? null;
+  let completedBytes = aria2NumericValue(status?.completedLength);
+  if (
+    completedBytes === null &&
+    totalBytes !== null &&
+    (record.status === "downloaded" || record.status === "importing" || record.status === "done")
+  ) {
+    completedBytes = totalBytes;
+  }
+
+  if (status?.status === "complete" && totalBytes !== null) {
+    completedBytes = totalBytes;
+  }
+
+  const progress = totalBytes !== null && totalBytes > 0 && completedBytes !== null
+    ? Math.min(1, Math.max(0, completedBytes / totalBytes))
+    : null;
+
+  return {
+    aria2Status: status?.status ?? null,
+    completedBytes,
+    totalBytes,
+    progress,
+    speedBytesPerSecond: aria2NumericValue(status?.downloadSpeed)
+  };
+}
+
+function aria2NumericValue(value: string | undefined): number | null {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
 function normalizeMagnetUri(value: unknown): string {
@@ -7856,6 +8047,18 @@ function serializeMultipartInit(result: MultipartInitResult): Record<string, unk
           expires_at: result.thumbnailSource.expiresAt
         }
       : null
+  };
+}
+
+function multipartInitResultFromUploadRecord(record: MultipartUploadRecord): MultipartInitResult {
+  return {
+    id: record.id,
+    fileName: record.file_name,
+    mimeType: record.mime_type,
+    size: record.size,
+    chunkSize: record.chunk_size,
+    chunkCount: record.chunk_count,
+    directoryPath: record.directory_path ?? "/"
   };
 }
 

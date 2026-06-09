@@ -63,7 +63,8 @@ const env: AppEnv = {
   ...optionalEnv("ARIA2_METADATA_TIMEOUT_SECONDS"),
   ...optionalEnv("ARIA2_DOWNLOAD_MAX_BYTES"),
   ...optionalEnv("ARIA2_DOWNLOAD_MIN_FREE_BYTES"),
-  ...optionalEnv("ARIA2_DOWNLOAD_RETENTION_HOURS")
+  ...optionalEnv("ARIA2_DOWNLOAD_RETENTION_HOURS"),
+  ...optionalEnv("ARIA2_BT_TRACKERS")
 };
 
 const server = createServer((request, response) => {

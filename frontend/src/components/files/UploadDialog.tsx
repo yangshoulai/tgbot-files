@@ -225,6 +225,8 @@ const URL_CHUNK_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
 const HLS_SEGMENT_REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const MAGNET_STATUS_POLL_MS = 2_000;
 const MAGNET_DOWNLOAD_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+const MAGNET_STATUS_MAX_TRANSIENT_FAILURES = 5;
+const MAGNET_STATUS_RETRY_DELAY_MS = 2_000;
 const FILE_NAME_CONFLICT_TOAST_MESSAGE = "上传目录已存在同名文件，请选择覆盖或改名上传";
 
 class MultipartChunkUploadError extends Error {
@@ -1238,7 +1240,11 @@ export function UploadDialog({
     decisions: Record<number, MagnetFileDecision> = urlUploadRef.current.magnet?.fileDecisions ?? {}
   ): Promise<boolean> {
     const selectedSet = new Set(selectedIndexes);
-    const selectedFiles = magnet.files.filter((file) => selectedSet.has(file.file_index) && file.size <= maxMultipartBytes);
+    const selectedFiles = magnet.files.filter((file) =>
+      selectedSet.has(file.file_index) &&
+      file.status !== "done" &&
+      file.size <= maxMultipartBytes
+    );
     const entries = selectedFiles.map((file) => {
       const decision = decisions[file.file_index];
       return {
@@ -2114,23 +2120,31 @@ export function UploadDialog({
       let magnet = urlUpload.magnet?.import;
       let selectedIndexes = urlUpload.magnet?.selectedIndexes ?? [];
 
-      if (!magnet || magnet.status === "failed" || magnet.status === "cancelled") {
-        magnet = (await probeMagnetUpload(normalizedSourceUrl, task.abortController.signal)).magnet;
-        magnet = await waitForMagnetStatus(
-          magnet.id,
-          task,
-          (current) => current.status === "ready" || current.status === "failed" || current.status === "cancelled",
-          "解析磁力文件列表"
-        );
+      if (!magnet || magnet.status === "failed" || magnet.status === "cancelled" || magnet.status === "probing") {
+        magnet = magnet && magnet.status === "probing"
+          ? magnet
+          : (await probeMagnetUpload(normalizedSourceUrl, task.abortController.signal)).magnet;
+        if (magnet.status === "probing") {
+          magnet = await waitForMagnetStatus(
+            magnet.id,
+            task,
+            (current) => current.status !== "probing",
+            "解析磁力文件列表"
+          );
+        }
         const parsedMagnet = magnet;
-        selectedIndexes = defaultMagnetSelectedIndexes(parsedMagnet.files, maxMultipartBytes);
+        selectedIndexes = selectedMagnetIndexesForResume(parsedMagnet, maxMultipartBytes);
         setUrlUpload((current) => ({
           ...current,
-          status: parsedMagnet.status === "ready" ? "pending" : "error",
+          status: parsedMagnet.status === "ready" ? "pending" : parsedMagnet.status === "failed" || parsedMagnet.status === "cancelled" ? "error" : "uploading",
           message: parsedMagnet.status === "ready"
             ? `已解析 ${parsedMagnet.files.length} 个文件，请选择要导入的文件后再次点击上传`
-            : parsedMagnet.error_message || "磁力链接解析失败",
-          progress: undefined,
+            : parsedMagnet.status === "failed" || parsedMagnet.status === "cancelled"
+              ? parsedMagnet.error_message || "磁力链接解析失败"
+              : "检测到已有磁力任务，准备继续",
+          progress: parsedMagnet.status === "ready" || parsedMagnet.status === "failed" || parsedMagnet.status === "cancelled"
+            ? undefined
+            : { completed: 0, total: 1, label: magnetStatusProgressLabel("继续磁力任务", parsedMagnet) },
           magnet: {
             import: parsedMagnet,
             selectedIndexes,
@@ -2138,12 +2152,18 @@ export function UploadDialog({
           }
         }));
         if (parsedMagnet.status !== "ready") {
-          throw new Error(parsedMagnet.error_message || "磁力链接解析失败");
+          if (parsedMagnet.status === "failed" || parsedMagnet.status === "cancelled") {
+            throw new Error(parsedMagnet.error_message || "磁力链接解析失败");
+          }
+        } else {
+          await preflightMagnetSelection(parsedMagnet, selectedIndexes, {});
+          return;
         }
-        await preflightMagnetSelection(parsedMagnet, selectedIndexes, {});
-        return;
       }
 
+      if (selectedIndexes.length === 0 && magnet) {
+        selectedIndexes = selectedMagnetIndexesForResume(magnet, maxMultipartBytes);
+      }
       if (selectedIndexes.length === 0) {
         throw new Error("请选择至少一个磁力文件");
       }
@@ -2195,12 +2215,29 @@ export function UploadDialog({
       if (magnet.status === "failed" || magnet.status === "cancelled") {
         throw new Error(magnet.error_message || "磁力文件下载失败");
       }
+      if (magnet.status === "done") {
+        setUrlUpload((current) => ({
+          ...current,
+          status: "done",
+          message: "磁力任务已完成",
+          progress: undefined,
+          chunks: undefined,
+          magnet: current.magnet ? { ...current.magnet, import: magnet, uploads } : { import: magnet, selectedIndexes, uploads }
+        }));
+        onUploaded(uploads.length);
+        return;
+      }
 
       let completedFiles = 0;
       for (const entry of uploads) {
         const { upload, fileIndex, conflictAction } = entry;
         if (task.cancelled) {
           throw new Error("已停止");
+        }
+        const magnetFile = magnet.files.find((file) => file.file_index === fileIndex);
+        if (magnetFile?.status === "done") {
+          completedFiles += 1;
+          continue;
         }
 
         setUrlUpload((current) => ({
@@ -2313,22 +2350,57 @@ export function UploadDialog({
     label: string
   ): Promise<MagnetImport> {
     const deadline = Date.now() + MAGNET_DOWNLOAD_TIMEOUT_MS;
+    let transientFailures = 0;
 
     while (true) {
       if (task.cancelled) {
         throw new Error("已停止");
       }
 
-      const response = await runAbortableUploadRequest(task, URL_CHUNK_REQUEST_TIMEOUT_MS, (signal) =>
-        getMagnetUploadStatus(importId, signal)
-      );
-      const magnet = response.magnet;
+      let magnet: MagnetImport;
+      try {
+        const response = await runAbortableUploadRequest(task, URL_CHUNK_REQUEST_TIMEOUT_MS, (signal) =>
+          getMagnetUploadStatus(importId, signal)
+        );
+        magnet = response.magnet;
+        transientFailures = 0;
+      } catch (error) {
+        if (task.cancelled || !isRetryableMagnetStatusError(error)) {
+          throw error;
+        }
+
+        transientFailures += 1;
+        if (transientFailures > MAGNET_STATUS_MAX_TRANSIENT_FAILURES) {
+          throw new Error(`${label}状态确认失败：${errorMessage(error)}`);
+        }
+
+        setUrlUpload((current) => ({
+          ...current,
+          progress: current.progress
+            ? {
+                ...current.progress,
+                label: `${label}状态确认失败，自动重试 ${transientFailures}/${MAGNET_STATUS_MAX_TRANSIENT_FAILURES}：${errorMessage(error)}`
+              }
+            : {
+                completed: 0,
+                total: 1,
+                label: `${label}状态确认失败，自动重试 ${transientFailures}/${MAGNET_STATUS_MAX_TRANSIENT_FAILURES}：${errorMessage(error)}`
+              }
+        }));
+
+        if (Date.now() >= deadline) {
+          throw new Error(`${label}超时`);
+        }
+
+        await delay(MAGNET_STATUS_RETRY_DELAY_MS * transientFailures, task.abortController.signal);
+        continue;
+      }
 
       setUrlUpload((current) => ({
         ...current,
         magnet: current.magnet
           ? { ...current.magnet, import: magnet }
-          : { import: magnet, selectedIndexes: defaultMagnetSelectedIndexes(magnet.files, maxMultipartBytes) },
+          : { import: magnet, selectedIndexes: selectedMagnetIndexesForResume(magnet, maxMultipartBytes) },
         progress: current.progress
           ? { ...current.progress, label: magnetStatusProgressLabel(label, magnet) }
           : { completed: 0, total: 1, label: magnetStatusProgressLabel(label, magnet) }
@@ -3510,6 +3582,23 @@ function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
 }
 
+function isRetryableMagnetStatusError(error: unknown): boolean {
+  if (isAbortError(error)) {
+    return true;
+  }
+
+  if (error instanceof ApiError) {
+    return error.status === 408 ||
+      error.status === 429 ||
+      error.status === 500 ||
+      error.status === 502 ||
+      error.status === 503 ||
+      error.status === 504;
+  }
+
+  return error instanceof Error;
+}
+
 function errorMessage(error: unknown): string {
   if (isAbortError(error)) {
     return "请求已中止或超时";
@@ -3986,6 +4075,15 @@ function defaultMagnetSelectedIndexes(files: MagnetImportFile[], maxMultipartByt
     .sort((left, right) => left - right);
 }
 
+function selectedMagnetIndexesForResume(magnet: MagnetImport, maxMultipartBytes: number): number[] {
+  const selected = magnet.files
+    .filter((file) => file.selected && file.size > 0 && file.size <= maxMultipartBytes)
+    .map((file) => file.file_index)
+    .sort((left, right) => left - right);
+
+  return selected.length > 0 ? selected : defaultMagnetSelectedIndexes(magnet.files, maxMultipartBytes);
+}
+
 function magnetStatusLabel(status: MagnetImport["status"]): string {
   switch (status) {
     case "probing":
@@ -4013,7 +4111,31 @@ function magnetStatusProgressLabel(label: string, magnet: MagnetImport): string 
   const status = magnetStatusLabel(magnet.status);
   const fileCount = magnet.file_count || magnet.files.length;
   const size = magnet.total_size ? ` · ${formatBytes(magnet.total_size)}` : "";
-  return `${label} · ${status}${fileCount > 0 ? ` · ${fileCount} 个文件${size}` : ""}`;
+  const download = magnetDownloadProgressLabel(magnet);
+  return `${label} · ${status}${download ? ` · ${download}` : ""}${fileCount > 0 ? ` · ${fileCount} 个文件${size}` : ""}`;
+}
+
+function magnetDownloadProgressLabel(magnet: MagnetImport): string | null {
+  const total = magnet.download_total_bytes;
+  const completed = magnet.download_completed_bytes;
+  if (
+    typeof total !== "number" ||
+    typeof completed !== "number" ||
+    !Number.isFinite(total) ||
+    !Number.isFinite(completed) ||
+    total <= 0
+  ) {
+    return null;
+  }
+
+  const progress = typeof magnet.download_progress === "number"
+    ? Math.min(100, Math.max(0, magnet.download_progress * 100))
+    : Math.min(100, Math.max(0, (completed / total) * 100));
+  const speed = magnet.download_speed_bytes_per_second && magnet.download_speed_bytes_per_second > 0
+    ? ` · ${formatBytes(magnet.download_speed_bytes_per_second)}/s`
+    : "";
+
+  return `${formatBytes(completed)}/${formatBytes(total)} · ${progress >= 10 ? progress.toFixed(0) : progress.toFixed(1)}%${speed}`;
 }
 
 function isLikelyHlsUrl(value: string): boolean {
