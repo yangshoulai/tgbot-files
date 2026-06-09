@@ -6,7 +6,8 @@ import { canUseAcceleratedDownload } from "../../lib/accelerated-download";
 import {
   canUseHlsAcceleratedDownload,
   hasDirectDownloadAccess,
-  hasFileLinkAccess
+  hasFileLinkAccess,
+  TEXT_PREVIEW_MAX_BYTES
 } from "../../lib/file-access";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
@@ -39,6 +40,15 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload }: 
   useEffect(() => {
     if (!file || (preview !== "text" && preview !== "markdown")) {
       setTextState({ status: "idle", content: "" });
+      return;
+    }
+
+    if (file.size > TEXT_PREVIEW_MAX_BYTES) {
+      setTextState({
+        status: "error",
+        content: "",
+        message: `文本文件超过 ${formatBytes(TEXT_PREVIEW_MAX_BYTES)}，请下载后查看`
+      });
       return;
     }
 

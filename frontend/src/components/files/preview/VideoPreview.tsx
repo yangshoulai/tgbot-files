@@ -530,7 +530,7 @@ function videoPreviewUnavailableMessage({
   if (serviceWorkerState.status === "need-reload") {
     return serviceWorkerState.message ? `${serviceWorkerState.message}，请点击“刷新页面”后再预览。` : "Service Worker 已注册，但当前页面还没有被它接管，请点击“刷新页面”后再预览。";
   }
-  if (serviceWorkerState.status === "unsupported") return serviceWorkerState.message || "当前浏览器不支持 Service Worker，无法预览超过直链上限的视频。";
+  if (serviceWorkerState.status === "unsupported") return serviceWorkerState.message || "当前浏览器不支持 Service Worker，无法通过分片代理预览该视频。";
   if (serviceWorkerState.status === "failed") return serviceWorkerState.message ? `Service Worker 注册或激活失败：${serviceWorkerState.message}` : "Service Worker 注册或激活失败，无法接管分片预览请求。";
   return "Service Worker 已接管页面，但分片预览地址未生成，请重新打开预览窗口。";
 }

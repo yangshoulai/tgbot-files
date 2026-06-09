@@ -2,6 +2,8 @@ import type { FileItem } from "../api";
 import { previewKind } from "../utils";
 import { canUseAcceleratedDownload } from "./accelerated-download";
 
+export const TEXT_PREVIEW_MAX_BYTES = 10 * 1024 * 1024;
+
 export interface LinkAccessibleFile extends FileItem {
   url: string;
 }
@@ -29,6 +31,10 @@ export function canPreviewThroughAvailableAccess(file: FileItem): boolean {
   const kind = previewKind(file);
 
   if (!kind) {
+    return false;
+  }
+
+  if ((kind === "text" || kind === "markdown") && file.size > TEXT_PREVIEW_MAX_BYTES) {
     return false;
   }
 

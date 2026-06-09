@@ -107,7 +107,7 @@ export function ApiDocsPage({ session }: ApiDocsPageProps) {
               <div className="mt-4 flex flex-wrap gap-2">
                 <Badge tone="primary">单文件上限 {formatBytes(session.max_file_bytes)}</Badge>
                 <Badge tone="success">分片上限 {formatBytes(session.max_multipart_file_bytes)}</Badge>
-                <Badge tone="info">直链预算 {session.direct_access_max_chunks} 片</Badge>
+                <Badge tone="info">整文件直链 {formatBytes(session.direct_access_max_bytes)}</Badge>
               </div>
             </div>
 
@@ -364,7 +364,7 @@ function buildDocs(session: SessionResponse): Record<DocAudience, DocGroup> {
     p("file.file_path", "Response", "是", "string", "/f 或 /api/hls 路径", "同源签名访问路径。"),
     p("file.url", "Response", "否", "string | null", "direct_access=true 时返回", "可直接预览的完整 URL。"),
     p("file.download_url", "Response", "否", "string | null", "direct_download=true 时返回", "带 download=1 的下载 URL。"),
-    p("file.direct_access", "Response", "是", "boolean", "按分片数判断", "是否允许整文件直链读取。"),
+    p("file.direct_access", "Response", "是", "boolean", "按文件大小判断", "是否允许整文件直链读取；系统大小上限内的分片文件会提供。"),
     p("file.download_strategy", "Response", "是", "string", "direct / direct_or_accelerated / accelerated", "前端选择下载方式的依据。"),
     p("file.thumbnail_url", "Response", "否", "string | null", "缩略图存在时返回", "预览列表可使用的缩略图 URL。")
   ];
@@ -378,7 +378,7 @@ function buildDocs(session: SessionResponse): Record<DocAudience, DocGroup> {
     p("upload.chunk_size", "Response", "是", "number", `${session.multipart_chunk_bytes}`, `固定分片大小，当前 ${chunkSize}。`),
     p("upload.chunk_count", "Response", "是", "number", ">=1", "需要上传或导入的分片数量。"),
     p("upload.directory_path", "Response", "是", "string", "最长 512 字符", "最终存放目录。"),
-    p("upload.direct_access", "Response", "是", "boolean", `<=${session.direct_access_max_chunks} 片`, "完成后是否提供整文件直链。"),
+    p("upload.direct_access", "Response", "是", "boolean", `<=${directMax}`, "完成后是否提供整文件直链。"),
     p("upload.thumbnail_source", "Response", "否", "object | null", "URL 图片或视频可能返回", "供浏览器生成缩略图的短期同源媒体入口。")
   ];
 
@@ -469,7 +469,7 @@ function buildDocs(session: SessionResponse): Record<DocAudience, DocGroup> {
               summary: "返回文件元数据、访问链接、下载策略和分片信息。",
               functionality: "按文件 id 读取数据库文件索引，并根据存储后端生成公开访问字段。",
               useCases: ["下载前判断 direct_access。", "外部客户端获取 chunk_count 后并发下载。", "同步本地文件清单。"],
-              limits: ["fileId 必须指向未删除文件。", "超大分片文件的 url/download_url 可能为 null。"],
+              limits: ["fileId 必须指向未删除文件。", "系统大小上限内的分片文件会返回 url/download_url。"],
               specialHandling: ["HLS 文件会额外返回 hls_download 摘要。", "telegram_channel_id 缺失时序列化为 default。"],
               requestParams: [
                 bearer,
@@ -487,10 +487,10 @@ function buildDocs(session: SessionResponse): Record<DocAudience, DocGroup> {
     "storage_backend": "telegram_multipart",
     "chunk_size": ${session.multipart_chunk_bytes},
     "chunk_count": ${exampleMultipartChunkCount},
-    "direct_access": false,
-    "download_strategy": "accelerated",
-    "url": null,
-    "download_url": null
+    "direct_access": true,
+    "download_strategy": "direct_or_accelerated",
+    "url": "${baseUrl}/f/<token>/backup.zip",
+    "download_url": "${baseUrl}/f/<token>/backup.zip?download=1"
   }
 }`
             },
@@ -576,7 +576,7 @@ X-Chunk-Offset: 0`
     "size": ${exampleMultipartSize},
     "chunk_size": ${session.multipart_chunk_bytes},
     "chunk_count": ${exampleMultipartChunkCount},
-    "direct_access": false,
+    "direct_access": true,
     "direct_access_max_chunks": ${session.direct_access_max_chunks}
   }
 }`
@@ -649,11 +649,11 @@ curl -X POST '${baseUrl}/api/v1/uploads/<UPLOAD_ID>/complete' \\
     "file_name": "backup.zip",
     "storage_backend": "telegram_multipart",
     "chunk_count": ${exampleMultipartChunkCount},
-    "direct_access": false,
-    "download_strategy": "accelerated",
+    "direct_access": true,
+    "download_strategy": "direct_or_accelerated",
     "thumbnail_status": "ready",
-    "url": null,
-    "download_url": null
+    "url": "${baseUrl}/f/<token>/backup.zip",
+    "download_url": "${baseUrl}/f/<token>/backup.zip?download=1"
   }
 }`
             }
@@ -833,7 +833,7 @@ Set-Cookie: admin_session=...; HttpOnly; SameSite=Lax
                 p("max_file_bytes", "Response", "是", "number", "字节", "单文件直传上限。"),
                 p("multipart_chunk_bytes", "Response", "是", "number", "字节", "分片大小。"),
                 p("max_multipart_file_bytes", "Response", "是", "number", "字节", "分片文件总上限。"),
-                p("direct_access_max_chunks", "Response", "是", "number", "分片数", "允许整文件直链的最大分片数。"),
+                p("direct_access_max_chunks", "Response", "是", "number", "兼容字段", "系统文件大小上限对应的最大分片数。"),
                 p("base_url", "Response", "是", "string", "URL", "公开服务地址。"),
                 p("config", "Response", "是", "object", "boolean map", "关键绑定和环境变量是否配置。"),
                 p("config_values", "Response", "是", "object", "masked map", "设置页展示用配置摘要。")
@@ -1095,7 +1095,7 @@ curl -X POST '${baseUrl}/api/admin/files' \\
     "file_name": "movie.ts",
     "total_size": 73400320,
     "part_count": 12,
-    "direct_access": false,
+    "direct_access": true,
     "parts": [
       { "index": 0, "segment_index": 0, "chunk_index": null, "offset": 0, "size": 5242880, "url": "${baseUrl}/api/hls/<token>/segments/0/seg-0.ts" }
     ]
@@ -1418,7 +1418,7 @@ curl -X POST '${baseUrl}/api/admin/files' \\
     "file_name": "backup.zip",
     "chunk_size": ${session.multipart_chunk_bytes},
     "chunk_count": ${exampleMultipartChunkCount},
-    "direct_access": false
+    "direct_access": true
   }
 }`
             },
@@ -1576,8 +1576,8 @@ curl -X POST '${baseUrl}/api/admin/uploads/<UPLOAD_ID>/complete' \\
     "id": "upload-id",
     "storage_backend": "telegram_multipart",
     "chunk_count": ${exampleMultipartChunkCount},
-    "direct_access": false,
-    "download_strategy": "accelerated",
+    "direct_access": true,
+    "download_strategy": "direct_or_accelerated",
     "thumbnail_status": "ready"
   }
 }`
@@ -1889,7 +1889,7 @@ Content-Length: 5242880`
               functionality: "校验全部 segment 完成，写入 files 表，生成 /api/hls 签名访问路径。",
               useCases: ["HLS 导入全部完成后出现在文件列表。", "可选上传视频封面缩略图。"],
               limits: ["全部 segment 必须 done。", "缩略图最大 512KB，类型限 JPEG/PNG/WebP。"],
-              specialHandling: ["最终文件 storage_backend=hls_package。", "整包 download=1 支持 TS 或 fMP4 顺序合并，且 part 数不能超过直链预算。"],
+              specialHandling: ["最终文件 storage_backend=hls_package。", "整包 download=1 支持 TS 或 fMP4 顺序合并，直链能力按总大小上限判断。"],
               requestParams: [
                 adminCookie,
                 p("assetId", "Path", "是", "string", "HLS asset id", "导入任务 id。"),
@@ -2214,7 +2214,7 @@ Content-Length: 5242880`
               summary: "读取普通单文件或允许直链的分片文件。",
               functionality: "验证签名 token 后，从 Telegram 获取文件或合并可直链的 multipart 文件响应。",
               useCases: ["浏览器预览图片、视频、文本。", "下载 file.url 或 file.download_url。"],
-              limits: [`multipart 文件只有不超过 ${session.direct_access_max_chunks} 片或 ${directMax} 时才提供整文件直链。`, "token 由文件记录生成，不支持客户端自行构造。"],
+              limits: [`multipart 文件在系统大小上限 ${directMax} 内提供整文件直链。`, "token 由文件记录生成，不支持客户端自行构造。"],
               specialHandling: ["download=1 或 download=true 会设置 attachment。", "GET 和 HEAD 都会进入该读取路由。", "HLS 文件必须走 /api/hls。"],
               requestParams: [
                 signedToken,
@@ -2284,8 +2284,8 @@ X-Chunk-Offset: 0`
               summary: "返回重写后的 HLS media playlist；download=1 时尝试合并下载 TS 或 fMP4。",
               functionality: "验证 v4 HLS token，读取 HLS asset 和 segments，重写 segment URL 为同源 /api/hls 路径。",
               useCases: ["视频在线播放。", "HLS 文件整包下载。"],
-              limits: ["asset 必须 status=done。", "整包下载支持 TS 或 fMP4 顺序合并，且 part 数不超过直链预算。"],
-              specialHandling: ["download=1 且 part 太多会返回 DirectAccessDisabled，前端应使用 hls-download plan。", "旧 /hls/:token 路径仍可解析，但响应路径统一推荐 /api/hls。"],
+              limits: ["asset 必须 status=done。", "整包下载支持 TS 或 fMP4 顺序合并，且总大小不超过系统直链上限。"],
+              specialHandling: ["download=1 且文件超过系统直链大小上限时会返回 DirectAccessDisabled，前端可使用 hls-download plan。", "旧 /hls/:token 路径仍可解析，但响应路径统一推荐 /api/hls。"],
               requestParams: [
                 signedToken,
                 p("filename", "Path", "否", "string", "展示用", "可选文件名。"),

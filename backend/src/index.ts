@@ -253,10 +253,10 @@ interface ParsedByteRange {
 }
 
 const TELEGRAM_CHUNK_SIZE_BYTES = 10 * 1024 * 1024;
-const DIRECT_MULTIPART_ACCESS_MAX_CHUNKS = 20;
-const DIRECT_MULTIPART_ACCESS_MAX_BYTES = TELEGRAM_CHUNK_SIZE_BYTES * DIRECT_MULTIPART_ACCESS_MAX_CHUNKS;
 const MAX_TELEGRAM_MULTIPART_BYTES = 20 * 1024 * 1024 * 1024;
 const MAX_TELEGRAM_MULTIPART_CHUNKS = Math.ceil(MAX_TELEGRAM_MULTIPART_BYTES / TELEGRAM_CHUNK_SIZE_BYTES);
+const DIRECT_MULTIPART_ACCESS_MAX_CHUNKS = MAX_TELEGRAM_MULTIPART_CHUNKS;
+const DIRECT_MULTIPART_ACCESS_MAX_BYTES = MAX_TELEGRAM_MULTIPART_BYTES;
 const DEFAULT_STALE_MULTIPART_UPLOAD_TTL_HOURS = 24;
 const MIN_STALE_MULTIPART_UPLOAD_TTL_HOURS = 1;
 const MAX_STALE_MULTIPART_UPLOAD_TTL_HOURS = 24 * 30;
@@ -6840,10 +6840,10 @@ async function handleHlsAccess(request: Request, env: AppEnv): Promise<Response>
       throw new AppError(
         403,
         "DirectAccessDisabled",
-        "该 HLS 文件分片数量过多，不提供整包直链下载，请在控制台使用加速下载",
+        "该 HLS 文件超过系统直链大小上限，不提供整包直链下载，请在控制台使用加速下载",
         {
           hls_download_part_count: downloadInfo.partCount,
-          direct_access_max_parts: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS
+          direct_access_max_bytes: DIRECT_MULTIPART_ACCESS_MAX_BYTES
         }
       );
     }
@@ -7393,12 +7393,13 @@ function hlsDownloadAvailability(asset: HlsAssetRecord, segments: HlsSegmentReco
         0
       )
     : 0;
+  const totalSize = kind ? hlsDownloadTotalSize(asset, segments, kind) : 0;
 
   return {
     downloadable: kind !== null,
     kind,
     partCount,
-    directAccess: kind !== null && partCount > 0 && partCount <= DIRECT_MULTIPART_ACCESS_MAX_CHUNKS
+    directAccess: kind !== null && partCount > 0 && totalSize <= DIRECT_MULTIPART_ACCESS_MAX_BYTES
   };
 }
 
@@ -7543,10 +7544,11 @@ async function handleMultipartFileAccess(params: {
     throw new AppError(
       403,
       "DirectAccessDisabled",
-      "该文件分片数量过多，不提供完整文件访问链接，请在控制台使用加速下载",
+      "该文件超过系统直链大小上限，不提供完整文件访问链接，请在控制台使用加速下载",
       {
+        size: params.payload.size,
         chunk_count: params.payload.chunk_count,
-        direct_access_max_chunks: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS
+        direct_access_max_bytes: DIRECT_MULTIPART_ACCESS_MAX_BYTES
       }
     );
   }
@@ -8035,7 +8037,7 @@ function serializeMultipartInit(result: MultipartInitResult): Record<string, unk
     chunk_count: result.chunkCount,
     directory_path: result.directoryPath,
     max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
-    direct_access: result.chunkCount <= DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
+    direct_access: canDirectlyAccessMultipartMetadata(result.size, result.chunkCount),
     direct_access_max_chunks: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
     direct_access_max_bytes: DIRECT_MULTIPART_ACCESS_MAX_BYTES,
     thumbnail_source: result.thumbnailSource
@@ -8165,7 +8167,7 @@ function serializeMultipartUploadStatus(upload: MultipartUploadRecord): Record<s
     chunk_count: upload.chunk_count,
     directory_path: upload.directory_path ?? "/",
     max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
-    direct_access: upload.chunk_count <= DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
+    direct_access: canDirectlyAccessMultipartMetadata(upload.size, upload.chunk_count),
     direct_access_max_chunks: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
     direct_access_max_bytes: DIRECT_MULTIPART_ACCESS_MAX_BYTES,
     thumbnail_source: null
@@ -8205,8 +8207,7 @@ function canDirectlyAccessFileRecord(file: FileRecord): boolean {
   }
 
   return Number.isSafeInteger(file.chunk_count) &&
-    Number(file.chunk_count) > 0 &&
-    Number(file.chunk_count) <= DIRECT_MULTIPART_ACCESS_MAX_CHUNKS;
+    canDirectlyAccessMultipartMetadata(file.size, file.chunk_count);
 }
 
 function canDirectlyAccessUploadResult(result: UploadResult): boolean {
@@ -8214,15 +8215,21 @@ function canDirectlyAccessUploadResult(result: UploadResult): boolean {
     return true;
   }
 
-  return Number.isSafeInteger(result.chunkCount) &&
-    Number(result.chunkCount) > 0 &&
-    Number(result.chunkCount) <= DIRECT_MULTIPART_ACCESS_MAX_CHUNKS;
+  return canDirectlyAccessMultipartMetadata(result.size, result.chunkCount);
 }
 
 function canDirectlyAccessMultipartPayload(
   payload: Extract<Awaited<ReturnType<typeof verifySignedToken>>, { v: 2 }>
 ): boolean {
-  return payload.chunk_count <= DIRECT_MULTIPART_ACCESS_MAX_CHUNKS;
+  return canDirectlyAccessMultipartMetadata(payload.size, payload.chunk_count);
+}
+
+function canDirectlyAccessMultipartMetadata(size: number, chunkCount: number | null | undefined): boolean {
+  return Number.isSafeInteger(size) &&
+    size >= 0 &&
+    size <= DIRECT_MULTIPART_ACCESS_MAX_BYTES &&
+    Number.isSafeInteger(chunkCount) &&
+    Number(chunkCount) > 0;
 }
 
 function downloadStrategy(

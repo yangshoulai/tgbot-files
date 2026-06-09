@@ -21,9 +21,10 @@ const AppEnv: AppEnv = {
   LINK_SIGNING_SECRET: "link-secret",
   MAX_FILE_BYTES: "20971520"
 };
-const directAccessMaxChunks = 20;
+const formerDirectAccessMaxChunks = 20;
 const telegramChunkSizeBytes = 10 * 1024 * 1024;
 const maxMultipartFileBytes = 20 * 1024 * 1024 * 1024;
+const directAccessMaxChunks = Math.ceil(maxMultipartFileBytes / telegramChunkSizeBytes);
 
 class FakeDatabase {
   readonly directories: DirectoryRecord[] = [];
@@ -2563,45 +2564,56 @@ describe("worker file access endpoint", () => {
     expect(fetchCalls).toHaveLength(4);
   });
 
-  it("rejects direct multipart file access when the chunk count exceeds the direct-link budget", async () => {
+  it("allows direct multipart file access when the chunk count exceeds the former direct-link budget", async () => {
+    const db = new FakeDatabase();
+    const chunkCount = formerDirectAccessMaxChunks + 1;
     const token = await createSignedToken(
       {
         v: 2,
         file_record_id: "file-large-multipart",
         name: "large.bin",
         mime_type: "application/octet-stream",
-        size: 75,
+        size: chunkCount * 3,
         chunk_size: 3,
-        chunk_count: directAccessMaxChunks + 1,
+        chunk_count: chunkCount,
         iat: 1_768_566_400
       },
       AppEnv.LINK_SIGNING_SECRET
     );
+    db.fileChunks.push(
+      ...Array.from({ length: chunkCount }, (_, index) => ({
+        file_id: "file-large-multipart",
+        chunk_index: index,
+        size: 3,
+        md5: `chunk-${index}`,
+        telegram_file_id: `tg-chunk-${index}`,
+        telegram_file_unique_id: null,
+        created_at: "2026-06-01T00:00:00.000Z"
+      }))
+    );
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await handleRequest(new Request(`https://files.example.com/f/${token}/large.bin`), AppEnv);
-    const body = await response.json() as {
-      error: string;
-      details: { chunk_count: number; direct_access_max_chunks: number };
-    };
+    const response = await handleRequest(
+      new Request(`https://files.example.com/f/${token}/large.bin`),
+      envWithDb(db)
+    );
 
-    expect(response.status).toBe(403);
-    expect(body.error).toBe("DirectAccessDisabled");
-    expect(body.details.chunk_count).toBe(directAccessMaxChunks + 1);
-    expect(body.details.direct_access_max_chunks).toBe(directAccessMaxChunks);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Length")).toBe(String(chunkCount * 3));
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("rejects direct HLS package downloads when the part count exceeds the direct-link budget", async () => {
+  it("allows direct HLS package downloads when the part count exceeds the former direct-link budget", async () => {
     const db = new FakeDatabase();
+    const partCount = formerDirectAccessMaxChunks + 1;
     db.hlsAssets.push(hlsAssetRecord({
-      segment_count: directAccessMaxChunks + 1,
-      duration_seconds: directAccessMaxChunks + 1,
-      estimated_size: directAccessMaxChunks + 1
+      segment_count: partCount,
+      duration_seconds: partCount,
+      estimated_size: partCount
     }));
     db.hlsSegments.push(
-      ...Array.from({ length: directAccessMaxChunks + 1 }, (_, index) =>
+      ...Array.from({ length: partCount }, (_, index) =>
         hlsSegmentRecord(index, {
           size: 1,
           duration_seconds: 1
@@ -2627,15 +2639,9 @@ describe("worker file access endpoint", () => {
       new Request(`https://files.example.com/api/hls/${token}/movie.m3u8?download=1`),
       envWithDb(db)
     );
-    const body = await response.json() as {
-      error: string;
-      details: { hls_download_part_count: number; direct_access_max_parts: number };
-    };
 
-    expect(response.status).toBe(403);
-    expect(body.error).toBe("DirectAccessDisabled");
-    expect(body.details.hls_download_part_count).toBe(directAccessMaxChunks + 1);
-    expect(body.details.direct_access_max_parts).toBe(directAccessMaxChunks);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Length")).toBe(String(partCount));
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -4632,7 +4638,7 @@ video.mp4
     ]);
   });
 
-  it("completes oversized-direct multipart uploads without returning a full file link", async () => {
+  it("completes multipart uploads above the former direct-link budget with a full file link", async () => {
     const db = new FakeDatabase();
     const adminEnv: AppEnv = {
       ...AppEnv,
@@ -4642,7 +4648,7 @@ video.mp4
       ADMIN_PASSWORD: "secret"
     };
     const cookie = await loginAndGetCookie(adminEnv);
-    const chunkCount = directAccessMaxChunks + 1;
+    const chunkCount = formerDirectAccessMaxChunks + 1;
     const upload: MultipartUploadRecord = {
       id: "upload-large",
       source_kind: "local",
@@ -4652,7 +4658,7 @@ video.mp4
       size: chunkCount * 3,
       chunk_size: 3,
       chunk_count: chunkCount,
-      remark: "仅加速下载",
+      remark: "超过旧直链预算",
       uploaded_by: "admin",
       created_at: "2026-06-01T00:00:00.000Z",
       completed_at: null,
@@ -4695,10 +4701,10 @@ video.mp4
     expect(response.status).toBe(200);
     expect(body.ok).toBe(true);
     expect(body.file.file_path).toMatch(/^\/f\//);
-    expect(body.file.url).toBeNull();
-    expect(body.file.download_url).toBeNull();
-    expect(body.file.direct_access).toBe(false);
-    expect(body.file.download_strategy).toBe("accelerated");
+    expect(body.file.url).toMatch(/^https:\/\/cdn\.example\.com\/f\//);
+    expect(body.file.download_url).toBe(`${body.file.url}?download=1`);
+    expect(body.file.direct_access).toBe(true);
+    expect(body.file.download_strategy).toBe("direct_or_accelerated");
     expect(body.file.storage_backend).toBe("telegram_multipart");
     expect(body.file.chunk_count).toBe(chunkCount);
     expect(db.files[0]?.file_path).toBe(body.file.file_path);
@@ -5303,7 +5309,7 @@ video.mp4
     expect(afterDeleteBody.pagination.total).toBe(0);
   });
 
-  it("keeps the HLS playback link but omits the direct download link when HLS parts exceed the direct-link budget", async () => {
+  it("returns an HLS direct download link when HLS parts exceed the former direct-link budget", async () => {
     const db = new FakeDatabase();
     const adminEnv: AppEnv = {
       ...AppEnv,
@@ -5326,12 +5332,12 @@ video.mp4
       chunk_count: null
     }));
     db.hlsAssets.push(hlsAssetRecord({
-      segment_count: directAccessMaxChunks + 1,
-      duration_seconds: directAccessMaxChunks + 1,
-      estimated_size: directAccessMaxChunks + 1
+      segment_count: formerDirectAccessMaxChunks + 1,
+      duration_seconds: formerDirectAccessMaxChunks + 1,
+      estimated_size: formerDirectAccessMaxChunks + 1
     }));
     db.hlsSegments.push(
-      ...Array.from({ length: directAccessMaxChunks + 1 }, (_, index) =>
+      ...Array.from({ length: formerDirectAccessMaxChunks + 1 }, (_, index) =>
         hlsSegmentRecord(index, {
           size: 1,
           duration_seconds: 1
@@ -5368,14 +5374,14 @@ video.mp4
     expect(body.files[0]).toMatchObject({
       id: "file-hls",
       url: "https://cdn.example.com/api/hls/signed-token/movie.m3u8",
-      download_url: null,
+      download_url: "https://cdn.example.com/api/hls/signed-token/movie.m3u8?download=1",
       direct_access: true,
-      direct_download: false,
-      download_strategy: "accelerated"
+      direct_download: true,
+      download_strategy: "direct_or_accelerated"
     });
     expect(body.files[0]?.hls_download).toMatchObject({
-      part_count: directAccessMaxChunks + 1,
-      direct_access: false,
+      part_count: formerDirectAccessMaxChunks + 1,
+      direct_access: true,
       direct_access_max_parts: directAccessMaxChunks,
       downloadable: true
     });
