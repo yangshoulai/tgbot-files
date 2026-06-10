@@ -21,7 +21,7 @@ import { hasFileLinkAccess } from "../../../lib/file-access";
 import { cn } from "../../../lib/cn";
 import { Button } from "../../ui/Button";
 import { Spinner } from "../../ui/Spinner";
-import { MediaControls, type MediaSubtitleOption } from "./MediaControls";
+import { MediaControls, type MediaCacheState, type MediaSubtitleOption } from "./MediaControls";
 
 interface VideoPreviewProps {
   file: FileItem;
@@ -69,6 +69,18 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
     [subtitleTracks]
   );
   const cachedChunkSet = useMemo(() => new Set(cacheState?.cachedChunks ?? []), [cacheState]);
+  const displayedCacheState = useMemo<MediaCacheState | null>(() => {
+    if (cacheState) {
+      return cacheState;
+    }
+
+    const chunkCount = previewMetadata?.chunkCount ?? 0;
+    if (!Number.isSafeInteger(chunkCount) || chunkCount <= 0) {
+      return null;
+    }
+
+    return { chunkCount, cachedChunks: [] };
+  }, [cacheState, previewMetadata?.chunkCount]);
 
   const isCurrentPlaybackPositionCached = useCallback((video: HTMLVideoElement) => {
     const chunkIndex = playbackChunkIndexForVideo(video, previewMetadata, cacheState?.chunkCount ?? 0);
@@ -589,7 +601,7 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
             mediaRef={videoRef}
             fullscreen={fullscreen}
             onToggleFullscreen={onToggleFullscreen}
-            cacheState={cacheState}
+            cacheState={displayedCacheState}
             variant="floating"
             density={controlsDensity}
             interactive={controlsVisible}

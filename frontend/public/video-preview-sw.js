@@ -606,6 +606,7 @@ function parsePreviewMetadata(url) {
       kind,
       fileId,
       sourceUrl,
+      chunkCount: Number.isSafeInteger(chunkCount) && chunkCount > 0 ? chunkCount : undefined,
       mimeType,
       cacheMaxBytes
     };
@@ -787,7 +788,10 @@ function previewCacheStateChunkCount(metadata) {
   if (metadata.kind === "hls") {
     const sources = hlsPreviewSources.get(metadata.fileId);
     const chunkCount = sources?.segments?.length ?? 0;
-    return Number.isSafeInteger(chunkCount) && chunkCount > 0 ? chunkCount : 0;
+    if (Number.isSafeInteger(chunkCount) && chunkCount > 0) {
+      return chunkCount;
+    }
+    return Number.isSafeInteger(metadata.chunkCount) && metadata.chunkCount > 0 ? metadata.chunkCount : 0;
   }
 
   return Number.isSafeInteger(metadata.chunkCount) && metadata.chunkCount > 0 ? metadata.chunkCount : 0;

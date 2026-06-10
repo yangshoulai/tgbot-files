@@ -40,6 +40,7 @@ export function buildVideoPreviewMetadata(file: FileItem, cacheMaxBytes: number)
       kind: "hls",
       fileId: file.id,
       sourceUrl: file.file_path,
+      chunkCount: file.hls_download?.segment_count,
       mimeType: file.mime_type || "application/vnd.apple.mpegurl",
       cacheMaxBytes
     };
