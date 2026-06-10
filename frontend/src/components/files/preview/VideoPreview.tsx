@@ -6,6 +6,7 @@ import {
   VIDEO_PREVIEW_CACHE_HEARTBEAT_MS,
   buildVideoPreviewMetadata,
   buildVideoPreviewUrl,
+  reportVideoPreviewPlaybackProgress,
   startVideoPreviewCacheSession,
   stopVideoPreviewCacheSession
 } from "../../../lib/video-preview";
@@ -29,6 +30,7 @@ interface VideoPreviewProps {
 const VIDEO_PREVIEW_TIMEOUT_MS = 30_000;
 const VIDEO_CONTROLS_HIDE_DELAY_MS = 1_800;
 const VIDEO_LOADING_INDICATOR_DELAY_MS = 360;
+const VIDEO_PREVIEW_PROGRESS_REPORT_MIN_INTERVAL_MS = 900;
 const SUBTITLE_PREVIEW_TIMEOUT_MS = 20_000;
 
 export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPreviewCacheBytes }: VideoPreviewProps) {
@@ -37,6 +39,7 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
   const controlsHideTimerRef = useRef<number | null>(null);
   const loadingTimerRef = useRef<number | null>(null);
   const previewCacheSessionIdRef = useRef(`video-preview-${file.id}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const playbackProgressReportRef = useRef({ sentAt: 0, marker: -1, currentTime: -1 });
   const [ratio, setRatio] = useState(() => initialAspectRatio(file));
   const [controlsVisible, setControlsVisible] = useState(true);
   const [controlsDensity, setControlsDensity] = useState<MediaControlsDensity>("regular");
@@ -60,6 +63,42 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
     () => subtitleTracks.map((track) => ({ id: track.id, label: track.label })),
     [subtitleTracks]
   );
+
+  const reportPlaybackProgress = useCallback((video: HTMLVideoElement, immediate = false) => {
+    if (!previewMetadata) return;
+
+    const currentTime = Number.isFinite(video.currentTime) && video.currentTime >= 0
+      ? video.currentTime
+      : 0;
+    const duration = Number.isFinite(video.duration) && video.duration > 0
+      ? video.duration
+      : undefined;
+    const ratio = duration ? Math.min(1, Math.max(0, currentTime / duration)) : undefined;
+    const byteOffset = duration && previewMetadata.size && previewMetadata.size > 0
+      ? Math.min(previewMetadata.size - 1, Math.max(0, Math.floor((currentTime / duration) * previewMetadata.size)))
+      : undefined;
+    const marker = byteOffset !== undefined && previewMetadata.chunkSize && previewMetadata.chunkSize > 0
+      ? Math.floor(byteOffset / previewMetadata.chunkSize)
+      : Math.floor(currentTime);
+    const now = Date.now();
+    const previous = playbackProgressReportRef.current;
+
+    if (
+      !immediate &&
+      previous.marker === marker &&
+      now - previous.sentAt < VIDEO_PREVIEW_PROGRESS_REPORT_MIN_INTERVAL_MS
+    ) {
+      return;
+    }
+
+    playbackProgressReportRef.current = { sentAt: now, marker, currentTime };
+    reportVideoPreviewPlaybackProgress(previewCacheSessionIdRef.current, previewMetadata, {
+      currentTime,
+      ...(duration ? { duration } : {}),
+      ...(ratio !== undefined ? { ratio } : {}),
+      ...(byteOffset !== undefined ? { byteOffset } : {})
+    });
+  }, [previewMetadata]);
 
   useEffect(() => {
     setRatio(initialAspectRatio(file));
@@ -151,6 +190,10 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
     }
     setFailed(false);
   }, [file.id, hideLoading, showLoading, videoSrc]);
+
+  useEffect(() => {
+    playbackProgressReportRef.current = { sentAt: 0, marker: -1, currentTime: -1 };
+  }, [file.id, previewUrl]);
 
   useEffect(() => {
     setControlsVisible(true);
@@ -410,7 +453,11 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
           className="h-full w-full bg-[#020403] object-contain"
           onLoadStart={() => showLoading(true)}
           onWaiting={() => showLoading()}
-          onSeeking={() => showLoading()}
+          onSeeking={(event) => {
+            showLoading();
+            reportPlaybackProgress(event.currentTarget, true);
+          }}
+          onTimeUpdate={(event) => reportPlaybackProgress(event.currentTarget)}
           onLoadedData={() => {
             hideLoading();
             setFailed(false);
@@ -419,11 +466,13 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
             hideLoading();
             setFailed(false);
           }}
-          onPlaying={() => {
+          onPlaying={(event) => {
             hideLoading();
             setFailed(false);
+            reportPlaybackProgress(event.currentTarget, true);
           }}
           onSeeked={(event) => {
+            reportPlaybackProgress(event.currentTarget, true);
             if (event.currentTarget.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
               hideLoading();
               setFailed(false);
@@ -439,6 +488,7 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
             if (target.videoWidth > 0 && target.videoHeight > 0) {
               setRatio(toAspectRatio(target.videoWidth, target.videoHeight));
             }
+            reportPlaybackProgress(target, true);
           }}
         >
           {subtitleTracks.map((track) => (

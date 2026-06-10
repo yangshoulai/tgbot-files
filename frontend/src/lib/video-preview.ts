@@ -20,6 +20,13 @@ export interface VideoPreviewMetadata {
   cacheMaxBytes: number;
 }
 
+export interface VideoPreviewPlaybackProgress {
+  currentTime: number;
+  duration?: number;
+  ratio?: number;
+  byteOffset?: number;
+}
+
 export function buildVideoPreviewMetadata(file: FileItem, cacheMaxBytes: number): VideoPreviewMetadata | null {
   if (file.storage_backend === "hls_package" && hasFileLinkAccess(file)) {
     return {
@@ -98,6 +105,19 @@ export function stopVideoPreviewCacheSession(sessionId: string): boolean {
   });
 }
 
+export function reportVideoPreviewPlaybackProgress(
+  sessionId: string,
+  metadata: VideoPreviewMetadata,
+  progress: VideoPreviewPlaybackProgress
+): boolean {
+  return postVideoPreviewCacheMessage({
+    type: "VIDEO_PREVIEW_PLAYBACK_PROGRESS",
+    sessionId,
+    metadata,
+    progress
+  });
+}
+
 function postVideoPreviewCacheMessage(message: VideoPreviewCacheMessage): boolean {
   const controller = getVideoPreviewServiceWorkerController();
   if (!controller) {
@@ -117,4 +137,10 @@ type VideoPreviewCacheMessage =
   | {
       type: "VIDEO_PREVIEW_CACHE_STOP";
       sessionId: string;
+    }
+  | {
+      type: "VIDEO_PREVIEW_PLAYBACK_PROGRESS";
+      sessionId: string;
+      metadata: VideoPreviewMetadata;
+      progress: VideoPreviewPlaybackProgress;
     };

@@ -4,10 +4,12 @@ const STORE_NAME = "chunks";
 const DB_VERSION = 1;
 const DEFAULT_MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024;
 const RESPONSE_WINDOW_BYTES = 2 * 1024 * 1024;
-const PREFETCH_CHUNKS = 1;
+const PREVIEW_PREFETCH_CONCURRENCY = 5;
+const PREFETCH_CHUNKS = PREVIEW_PREFETCH_CONCURRENCY;
 const CONTINUOUS_PREFETCH_SESSION_TTL_MS = 12_000;
 const HOT_CHUNK_CACHE_MAX_BYTES = 160 * 1024 * 1024;
 const fullChunkLoads = new Map();
+const hlsPartLoads = new Map();
 const continuousPrefetchSessions = new Map();
 const hotChunkCache = new Map();
 const hlsPreviewSources = new Map();
@@ -51,6 +53,16 @@ self.addEventListener("message", (event) => {
     if (sessionId) {
       stopContinuousPreviewCache(sessionId);
       stopHlsPreviewCacheSession(sessionId);
+    }
+    return;
+  }
+
+  if (event.data?.type === "VIDEO_PREVIEW_PLAYBACK_PROGRESS") {
+    const metadata = normalizePreviewMetadata(event.data.metadata);
+    const sessionId = normalizeSessionId(event.data.sessionId);
+    const progress = normalizePlaybackProgress(event.data.progress);
+    if (metadata && sessionId && progress) {
+      event.waitUntil(updatePreviewCachePlaybackPriority(sessionId, metadata, progress));
     }
   }
 });
@@ -172,7 +184,9 @@ async function handleHlsPartRequest(request, event) {
 function rewriteHlsPlaylist(playlistText, metadata) {
   const lines = playlistText.split(/\r?\n/);
   const segments = [];
+  const durations = [];
   let initSource = null;
+  let pendingDuration = null;
 
   const rewrittenLines = lines.map((line) => {
     const trimmed = line.trim();
@@ -192,6 +206,11 @@ function rewriteHlsPlaylist(playlistText, metadata) {
       return line.replace(match[0], `URI="${hlsPartPreviewUrl(metadata, "init", 0, initSource)}"`);
     }
 
+    if (trimmed.startsWith("#EXTINF:")) {
+      pendingDuration = parseHlsExtinfDuration(trimmed);
+      return line;
+    }
+
     if (trimmed.startsWith("#")) {
       return line;
     }
@@ -202,6 +221,8 @@ function rewriteHlsPlaylist(playlistText, metadata) {
     }
     const index = segments.length;
     segments.push(source);
+    durations.push(pendingDuration);
+    pendingDuration = null;
     return hlsPartPreviewUrl(metadata, "segment", index, source);
   });
 
@@ -209,9 +230,20 @@ function rewriteHlsPlaylist(playlistText, metadata) {
     text: rewrittenLines.join("\n"),
     sources: {
       init: initSource,
-      segments
+      segments,
+      durations
     }
   };
+}
+
+function parseHlsExtinfDuration(value) {
+  const match = /^#EXTINF:([0-9]+(?:\.[0-9]+)?)/i.exec(value);
+  if (!match?.[1]) {
+    return null;
+  }
+
+  const duration = Number(match[1]);
+  return Number.isFinite(duration) && duration > 0 ? duration : null;
 }
 
 function normalizeHlsSource(value, playlistSourceUrl) {
@@ -241,9 +273,30 @@ async function fetchAndCacheHlsPart({ fileId, partKind, partIndex, sourceUrl, ca
     return cached;
   }
 
+  const loadKey = `${fileId}:${partKind}:${partIndex}:${sourceUrl}`;
+  let load = hlsPartLoads.get(loadKey);
+  if (!load) {
+    load = fetchAndCacheHlsPartBytes({
+      fileId,
+      partKind,
+      partIndex,
+      sourceUrl,
+      cacheMaxBytes,
+      cacheKey
+    }).finally(() => {
+      hlsPartLoads.delete(loadKey);
+    });
+    hlsPartLoads.set(loadKey, load);
+  }
+
+  const result = await load;
+  return createHlsPartResponse(result.bytes, result.contentType);
+}
+
+async function fetchAndCacheHlsPartBytes({ fileId, partKind, partIndex, sourceUrl, cacheMaxBytes, cacheKey }) {
   const response = await fetch(sourceUrl, { credentials: "omit" });
   if (!response.ok) {
-    throw new Error(`HLS ${partKind} ${partIndex} 加载失败（HTTP ${response.status}）`);
+    throw new Error(`HLS ${partKind} ${partIndex} preview load failed (HTTP ${response.status})`);
   }
 
   const bytes = await response.arrayBuffer();
@@ -251,6 +304,7 @@ async function fetchAndCacheHlsPart({ fileId, partKind, partIndex, sourceUrl, ca
   const contentType = response.headers.get("Content-Type") || "application/octet-stream";
 
   await cleanupPreviewCache(bytes.byteLength, cacheMaxBytes);
+  const cache = await caches.open(CACHE_NAME);
   await cache.put(cacheKey, new Response(bytes.slice(0), {
     headers: {
       "Content-Type": contentType,
@@ -268,6 +322,10 @@ async function fetchAndCacheHlsPart({ fileId, partKind, partIndex, sourceUrl, ca
   }, true);
   await cleanupPreviewCache(0, cacheMaxBytes);
 
+  return { bytes, contentType };
+}
+
+function createHlsPartResponse(bytes, contentType) {
   return new Response(bytes, {
     headers: {
       "Content-Type": contentType,
@@ -284,19 +342,51 @@ async function prefetchHlsSegments(fileId, startIndex, count, cacheMaxBytes) {
     return;
   }
 
+  const tasks = [];
   for (let index = startIndex; index < Math.min(sources.segments.length, startIndex + count); index += 1) {
-    try {
-      await fetchAndCacheHlsPart({
-        fileId,
-        partKind: "segment",
-        partIndex: index,
-        sourceUrl: sources.segments[index],
-        cacheMaxBytes
-      });
-    } catch {
-      return;
+    tasks.push((async () => {
+      try {
+        await fetchAndCacheHlsPart({
+          fileId,
+          partKind: "segment",
+          partIndex: index,
+          sourceUrl: sources.segments[index],
+          cacheMaxBytes
+        });
+      } catch {
+        // Best-effort lookahead; playback requests will retry on demand.
+      }
+    })());
+  }
+
+  await Promise.allSettled(tasks);
+}
+
+async function runConcurrentPrefetchWorkers(session, generation, sessions, loadNext) {
+  const workerCount = Math.min(PREVIEW_PREFETCH_CONCURRENCY, Math.max(1, session.queue.length));
+  let failed = false;
+
+  async function runWorker() {
+    while (
+      !failed &&
+      isContinuousPrefetchSessionActive(session, sessions) &&
+      generation === session.generation &&
+      session.queue.length > 0
+    ) {
+      const item = session.queue.shift();
+      if (item === undefined) {
+        continue;
+      }
+
+      try {
+        await loadNext(item);
+      } catch {
+        failed = true;
+      }
     }
   }
+
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
 }
 
 function hlsChunkIndex(partKind, partIndex) {
@@ -381,7 +471,6 @@ function setHlsPreviewCachePriority(session, startIndex) {
     session.queue = createHlsPriorityQueue(sources, priorityStart);
     session.completed = false;
     session.generation += 1;
-    session.task = null;
   } else if (session.queue.length === 0 && !session.task) {
     session.queue = createHlsPriorityQueue(sources, priorityStart);
   }
@@ -408,14 +497,25 @@ function scheduleHlsPreviewCacheSession(session) {
   }
 
   const generation = session.generation;
-  session.task = runHlsPreviewCacheQueue(session, generation)
+  const task = runHlsPreviewCacheQueue(session, generation)
     .then(() => {
-      if (hlsPreviewCacheSessions.get(session.sessionId) !== session || generation !== session.generation) {
+      if (hlsPreviewCacheSessions.get(session.sessionId) !== session) {
+        return;
+      }
+
+      if (session.task === task) {
+        session.task = null;
+      }
+
+      if (generation !== session.generation) {
+        if (session.active) {
+          return scheduleHlsPreviewCacheSession(session);
+        }
+        hlsPreviewCacheSessions.delete(session.sessionId);
         return;
       }
 
       const completed = session.queue.length === 0;
-      session.task = null;
 
       if (session.active && completed) {
         session.completed = true;
@@ -425,18 +525,14 @@ function scheduleHlsPreviewCacheSession(session) {
       }
     });
 
+  session.task = task;
   return session.task;
 }
 
 async function runHlsPreviewCacheQueue(session, generation) {
-  while (
-    isContinuousPrefetchSessionActive(session, hlsPreviewCacheSessions) &&
-    generation === session.generation &&
-    session.queue.length > 0
-  ) {
-    const part = session.queue.shift();
+  await runConcurrentPrefetchWorkers(session, generation, hlsPreviewCacheSessions, async (part) => {
     if (!part?.sourceUrl) {
-      continue;
+      return;
     }
 
     try {
@@ -449,9 +545,9 @@ async function runHlsPreviewCacheQueue(session, generation) {
       });
     } catch (error) {
       warnPreviewCacheError(`continuous prefetch HLS ${part.partKind} ${part.partIndex}`, error);
-      return;
+      throw error;
     }
-  }
+  });
 }
 
 function createHlsPriorityQueue(sources, startIndex) {
@@ -612,6 +708,141 @@ function normalizeSameOriginSourceUrl(value) {
 
 function normalizeSessionId(value) {
   return typeof value === "string" && value.trim() ? value : null;
+}
+
+function normalizePlaybackProgress(value) {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+
+  const currentTime = normalizeNonNegativeNumber(value.currentTime);
+  const duration = normalizePositiveNumber(value.duration);
+  const ratio = normalizePlaybackRatio(value.ratio);
+  const byteOffset = normalizeNonNegativeInteger(value.byteOffset);
+
+  if (currentTime === null && ratio === null && byteOffset === null) {
+    return null;
+  }
+
+  return {
+    currentTime,
+    duration,
+    ratio,
+    byteOffset
+  };
+}
+
+function normalizeNonNegativeNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function normalizePositiveNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function normalizeNonNegativeInteger(value) {
+  const parsed = Math.floor(Number(value));
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function normalizePlaybackRatio(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  return Math.min(1, Math.max(0, parsed));
+}
+
+function updatePreviewCachePlaybackPriority(sessionId, metadata, progress) {
+  const startTask = metadata.kind === "hls"
+    ? startHlsPreviewCacheSession(sessionId, metadata)
+    : startContinuousPreviewCache(sessionId, metadata);
+  const startIndex = playbackPriorityStartIndex(metadata, progress);
+  const priorityTask = startIndex === null
+    ? Promise.resolve()
+    : metadata.kind === "hls"
+      ? prioritizeHlsPreviewCache(metadata.fileId, startIndex, metadata.cacheMaxBytes)
+      : prioritizeContinuousPreviewCache(metadata, startIndex);
+
+  return Promise.allSettled([startTask, priorityTask]).then(() => undefined);
+}
+
+function playbackPriorityStartIndex(metadata, progress) {
+  if (metadata.kind === "hls") {
+    return hlsPlaybackPriorityStartIndex(metadata.fileId, progress);
+  }
+
+  if (!Number.isSafeInteger(metadata.chunkCount) || metadata.chunkCount <= 0) {
+    return null;
+  }
+
+  if (progress.byteOffset !== null && Number.isSafeInteger(metadata.chunkSize) && metadata.chunkSize > 0) {
+    return normalizeChunkIndex(Math.floor(progress.byteOffset / metadata.chunkSize) + 1, metadata.chunkCount);
+  }
+
+  const ratio = playbackProgressRatio(progress);
+  if (ratio === null) {
+    return null;
+  }
+
+  return normalizeChunkIndex(Math.floor(ratio * metadata.chunkCount) + 1, metadata.chunkCount);
+}
+
+function hlsPlaybackPriorityStartIndex(fileId, progress) {
+  const sources = hlsPreviewSources.get(fileId);
+  const segmentCount = sources?.segments?.length ?? 0;
+  if (!Number.isSafeInteger(segmentCount) || segmentCount <= 0) {
+    return null;
+  }
+
+  const timedIndex = hlsPlaybackSegmentIndex(sources, progress.currentTime);
+  if (timedIndex !== null) {
+    return normalizeChunkIndex(timedIndex + 1, segmentCount);
+  }
+
+  const ratio = playbackProgressRatio(progress);
+  if (ratio === null) {
+    return null;
+  }
+
+  return normalizeChunkIndex(Math.floor(ratio * segmentCount) + 1, segmentCount);
+}
+
+function hlsPlaybackSegmentIndex(sources, currentTime) {
+  if (currentTime === null || !Array.isArray(sources.durations) || sources.durations.length === 0) {
+    return null;
+  }
+
+  let elapsed = 0;
+  for (let index = 0; index < sources.segments.length; index += 1) {
+    const duration = Number(sources.durations[index]);
+    if (!Number.isFinite(duration) || duration <= 0) {
+      return null;
+    }
+
+    if (currentTime < elapsed + duration) {
+      return index;
+    }
+
+    elapsed += duration;
+  }
+
+  return sources.segments.length > 0 ? sources.segments.length - 1 : null;
+}
+
+function playbackProgressRatio(progress) {
+  if (progress.ratio !== null) {
+    return progress.ratio;
+  }
+
+  if (progress.currentTime === null || progress.duration === null) {
+    return null;
+  }
+
+  return Math.min(1, Math.max(0, progress.currentTime / progress.duration));
 }
 
 function previewMetadataKey(metadata) {
@@ -1057,13 +1288,18 @@ function expectedChunkSize(metadata, chunkIndex) {
 }
 
 async function prefetchChunks(metadata, startIndex, count) {
+  const tasks = [];
   for (let index = startIndex; index < Math.min(metadata.chunkCount, startIndex + count); index += 1) {
-    try {
-      await ensureChunkCached(metadata, index);
-    } catch {
-      return;
-    }
+    tasks.push((async () => {
+      try {
+        await ensureChunkCached(metadata, index);
+      } catch {
+        // Best-effort lookahead; playback requests will retry on demand.
+      }
+    })());
   }
+
+  await Promise.allSettled(tasks);
 }
 
 async function ensureChunkCached(metadata, chunkIndex) {
@@ -1134,7 +1370,6 @@ function setContinuousPrefetchPriority(session, startIndex) {
     session.queue = createPriorityChunkQueue(session.metadata.chunkCount, priorityStart);
     session.completed = false;
     session.generation += 1;
-    session.task = null;
   } else if (session.queue.length === 0 && !session.task) {
     session.queue = createPriorityChunkQueue(session.metadata.chunkCount, priorityStart);
   }
@@ -1156,14 +1391,25 @@ function scheduleContinuousPrefetchSession(session) {
   }
 
   const generation = session.generation;
-  session.task = runContinuousPrefetchQueue(session, generation)
+  const task = runContinuousPrefetchQueue(session, generation)
     .then(() => {
-      if (continuousPrefetchSessions.get(session.sessionId) !== session || generation !== session.generation) {
+      if (continuousPrefetchSessions.get(session.sessionId) !== session) {
+        return;
+      }
+
+      if (session.task === task) {
+        session.task = null;
+      }
+
+      if (generation !== session.generation) {
+        if (session.active) {
+          return scheduleContinuousPrefetchSession(session);
+        }
+        continuousPrefetchSessions.delete(session.sessionId);
         return;
       }
 
       const completed = session.queue.length === 0;
-      session.task = null;
 
       if (session.active && completed) {
         session.completed = true;
@@ -1173,6 +1419,7 @@ function scheduleContinuousPrefetchSession(session) {
       }
     });
 
+  session.task = task;
   return session.task;
 }
 
@@ -1187,23 +1434,14 @@ function stopContinuousPreviewCache(sessionId) {
 }
 
 async function runContinuousPrefetchQueue(session, generation) {
-  while (
-    isContinuousPrefetchSessionActive(session, continuousPrefetchSessions) &&
-    generation === session.generation &&
-    session.queue.length > 0
-  ) {
-    const chunkIndex = session.queue.shift();
-    if (chunkIndex === undefined) {
-      continue;
-    }
-
+  await runConcurrentPrefetchWorkers(session, generation, continuousPrefetchSessions, async (chunkIndex) => {
     try {
       await ensureChunkCached(session.metadata, chunkIndex);
     } catch (error) {
       warnPreviewCacheError(`continuous prefetch chunk ${chunkIndex}`, error);
-      return;
+      throw error;
     }
-  }
+  });
 }
 
 function createPriorityChunkQueue(chunkCount, startIndex) {
