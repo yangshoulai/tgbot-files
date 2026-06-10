@@ -267,7 +267,7 @@ function statusText(state: AcceleratedDownloadState, stats: DownloadStats): stri
     case "cancelled":
       return "下载已取消，未完成的本地文件已丢弃。";
     case "error":
-      return "任务失败，请保留普通下载链接作为兜底。";
+      return "任务失败，可重试失败分片或取消后重新开始。";
     default:
       return "正在处理下载任务";
   }

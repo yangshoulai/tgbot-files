@@ -32,6 +32,10 @@ export interface Aria2Config {
   rpcSecret: string;
   downloadDir: string;
   btTrackers: string | undefined;
+  split: number;
+  maxConnectionPerServer: number;
+  minSplitSize: string;
+  btMaxPeers: number;
   metadataTimeoutMs: number;
   downloadMaxBytes: number;
   downloadMinFreeBytes: number;
@@ -73,6 +77,16 @@ export function requireAria2Config(env: AppEnv): Aria2Config {
     rpcUrl,
     rpcSecret,
     btTrackers: parseBtTrackers(env.ARIA2_BT_TRACKERS),
+    split: parseBoundedInteger(env.ARIA2_SPLIT, 16, "ARIA2_SPLIT", 1, 64),
+    maxConnectionPerServer: parseBoundedInteger(
+      env.ARIA2_MAX_CONNECTION_PER_SERVER,
+      16,
+      "ARIA2_MAX_CONNECTION_PER_SERVER",
+      1,
+      16
+    ),
+    minSplitSize: parseAria2SizeOption(env.ARIA2_MIN_SPLIT_SIZE, "1M", "ARIA2_MIN_SPLIT_SIZE"),
+    btMaxPeers: parseBoundedInteger(env.ARIA2_BT_MAX_PEERS, 128, "ARIA2_BT_MAX_PEERS", 1, 1000),
     ...downloadConfig,
     metadataTimeoutMs: parseMetadataTimeoutMs(env.ARIA2_METADATA_TIMEOUT_SECONDS)
   };
@@ -197,6 +211,39 @@ function parseNonNegativeBytes(value: string | undefined, fallback: number, name
   }
 
   return parsed;
+}
+
+function parseBoundedInteger(
+  value: string | undefined,
+  fallback: number,
+  name: string,
+  min: number,
+  max: number
+): number {
+  const raw = value?.trim();
+  if (!raw) {
+    return fallback;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
+    throw new AppError(500, "ServerMisconfigured", `${name} must be an integer between ${min} and ${max}`);
+  }
+
+  return parsed;
+}
+
+function parseAria2SizeOption(value: string | undefined, fallback: string, name: string): string {
+  const raw = value?.trim();
+  if (!raw) {
+    return fallback;
+  }
+
+  if (!/^[1-9]\d*(?:[KMG])?$/i.test(raw)) {
+    throw new AppError(500, "ServerMisconfigured", `${name} must be a positive aria2 size value, for example 1M`);
+  }
+
+  return raw.toUpperCase();
 }
 
 function parseRetentionMs(value: string | undefined): number {

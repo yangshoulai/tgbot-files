@@ -2,10 +2,7 @@ import { useEffect, useState } from "react";
 import { Copy, Download, Maximize2, Minimize2 } from "lucide-react";
 import type { FileItem } from "../../api";
 import { fileKind, formatBytes, previewKind } from "../../utils";
-import { canUseAcceleratedDownload } from "../../lib/accelerated-download";
 import {
-  canUseHlsAcceleratedDownload,
-  hasDirectDownloadAccess,
   hasFileLinkAccess,
   TEXT_PREVIEW_MAX_BYTES
 } from "../../lib/file-access";
@@ -106,8 +103,7 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload }: 
   }
 
   const linkFile = hasFileLinkAccess(file) ? file : null;
-  const directFile = hasDirectDownloadAccess(file) ? file : null;
-  const canAccelerateDownload = canUseAcceleratedDownload(file) || canUseHlsAcceleratedDownload(file);
+  const canAccelerateDownload = Boolean(onAcceleratedDownload);
   const canCopyContent = (preview === "text" || preview === "markdown") && textState.status === "ready";
   const isMediaPreview = preview === "video" || preview === "audio";
   const toggleFullscreen = () => setFullscreen((value) => !value);
@@ -160,22 +156,14 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload }: 
               {fullscreen ? "退出全屏" : "全屏"}
             </Button>
           ) : null}
-          {onAcceleratedDownload && canAccelerateDownload ? (
+          {canAccelerateDownload ? (
             <Button
               variant="primary"
               leadingIcon={<Download size={15} />}
-              onClick={() => onAcceleratedDownload(file)}
+              onClick={() => onAcceleratedDownload?.(file)}
             >
               加速下载
             </Button>
-          ) : directFile ? (
-            <a
-              href={directFile.download_url}
-              className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-primary bg-primary px-4 text-sm font-medium text-white shadow-card transition-colors duration-150 hover:border-primary-strong hover:bg-primary-strong"
-            >
-              <Download size={15} />
-              下载
-            </a>
           ) : null}
         </>
       }

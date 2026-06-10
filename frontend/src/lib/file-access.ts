@@ -13,8 +13,7 @@ export interface DirectDownloadableFile extends LinkAccessibleFile {
 }
 
 export function hasFileLinkAccess(file: FileItem): file is LinkAccessibleFile {
-  return file.direct_access !== false &&
-    typeof file.url === "string" &&
+  return typeof file.url === "string" &&
     file.url.length > 0;
 }
 

@@ -1,10 +1,7 @@
 import { Copy, Download, ExternalLink } from "lucide-react";
 import type { FileItem } from "../../api";
-import { canUseAcceleratedDownload } from "../../lib/accelerated-download";
 import {
-  canUseHlsAcceleratedDownload,
   fileAccessLabel,
-  hasDirectDownloadAccess,
   hasFileLinkAccess
 } from "../../lib/file-access";
 import { fileKind, formatBytes, formatDateTime } from "../../utils";
@@ -28,8 +25,7 @@ export function FileDetailDialog({ file, onClose, onCopy, onAcceleratedDownload 
   const kind = fileKind(file);
   const isMultipart = file.storage_backend === "telegram_multipart";
   const linkFile = hasFileLinkAccess(file) ? file : null;
-  const directFile = hasDirectDownloadAccess(file) ? file : null;
-  const canAccelerateDownload = onAcceleratedDownload && (canUseAcceleratedDownload(file) || canUseHlsAcceleratedDownload(file));
+  const canAccelerateDownload = Boolean(onAcceleratedDownload);
 
   return (
     <Modal
@@ -76,19 +72,10 @@ export function FileDetailDialog({ file, onClose, onCopy, onAcceleratedDownload 
                 <ExternalLink size={15} />
                 打开
               </a>
-              {!canAccelerateDownload && directFile ? (
-                <a
-                  href={directFile.download_url}
-                  className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-primary bg-primary px-4 text-sm font-medium text-white shadow-card transition-colors duration-150 hover:border-primary-strong hover:bg-primary-strong"
-                >
-                  <Download size={15} />
-                  下载
-                </a>
-              ) : null}
             </>
           ) : null}
           {canAccelerateDownload ? (
-            <Button variant="primary" leadingIcon={<Download size={15} />} onClick={() => onAcceleratedDownload(file)}>
+            <Button variant="primary" leadingIcon={<Download size={15} />} onClick={() => onAcceleratedDownload?.(file)}>
               加速下载
             </Button>
           ) : null}
@@ -110,7 +97,7 @@ export function FileDetailDialog({ file, onClose, onCopy, onAcceleratedDownload 
         <DetailRow label="上传时间" value={formatDateTime(file.created_at)} />
         <DetailRow label="上传者" value={file.uploaded_by || "接口上传"} />
         <DetailRow label="备注" value={file.remark || "无备注"} fullWidth />
-        <DetailRow label="链接" value={linkFile ? linkFile.url : "该文件超过直链能力，仅支持控制台加速下载"} mono={Boolean(linkFile)} fullWidth />
+        <DetailRow label="链接" value={linkFile ? linkFile.url : "暂无可复制链接"} mono={Boolean(linkFile)} fullWidth />
       </div>
     </Modal>
   );

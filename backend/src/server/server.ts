@@ -64,7 +64,11 @@ const env: AppEnv = {
   ...optionalEnv("ARIA2_DOWNLOAD_MAX_BYTES"),
   ...optionalEnv("ARIA2_DOWNLOAD_MIN_FREE_BYTES"),
   ...optionalEnv("ARIA2_DOWNLOAD_RETENTION_HOURS"),
-  ...optionalEnv("ARIA2_BT_TRACKERS")
+  ...optionalEnv("ARIA2_BT_TRACKERS"),
+  ...optionalEnv("ARIA2_SPLIT"),
+  ...optionalEnv("ARIA2_MAX_CONNECTION_PER_SERVER"),
+  ...optionalEnv("ARIA2_MIN_SPLIT_SIZE"),
+  ...optionalEnv("ARIA2_BT_MAX_PEERS")
 };
 
 const server = createServer((request, response) => {

@@ -20,6 +20,10 @@ export interface AppEnv {
   ARIA2_DOWNLOAD_MIN_FREE_BYTES?: string;
   ARIA2_DOWNLOAD_RETENTION_HOURS?: string;
   ARIA2_BT_TRACKERS?: string;
+  ARIA2_SPLIT?: string;
+  ARIA2_MAX_CONNECTION_PER_SERVER?: string;
+  ARIA2_MIN_SPLIT_SIZE?: string;
+  ARIA2_BT_MAX_PEERS?: string;
 }
 
 export interface StaticAssetHandler {

@@ -33,6 +33,10 @@ services:
       ARIA2_DOWNLOAD_MIN_FREE_BYTES: "${ARIA2_DOWNLOAD_MIN_FREE_BYTES:-5368709120}"
       ARIA2_DOWNLOAD_RETENTION_HOURS: "${ARIA2_DOWNLOAD_RETENTION_HOURS:-24}"
       ARIA2_BT_TRACKERS: "${ARIA2_BT_TRACKERS:-}"
+      ARIA2_SPLIT: "${ARIA2_SPLIT:-16}"
+      ARIA2_MAX_CONNECTION_PER_SERVER: "${ARIA2_MAX_CONNECTION_PER_SERVER:-16}"
+      ARIA2_MIN_SPLIT_SIZE: "${ARIA2_MIN_SPLIT_SIZE:-1M}"
+      ARIA2_BT_MAX_PEERS: "${ARIA2_BT_MAX_PEERS:-128}"
 
   aria2:
     build:
@@ -61,3 +65,7 @@ services:
       - "--bt-enable-lpd=true"
       - "--seed-time=0"
       - "--max-overall-upload-limit=64K"
+      - "--split=${ARIA2_SPLIT:-16}"
+      - "--max-connection-per-server=${ARIA2_MAX_CONNECTION_PER_SERVER:-16}"
+      - "--min-split-size=${ARIA2_MIN_SPLIT_SIZE:-1M}"
+      - "--bt-max-peers=${ARIA2_BT_MAX_PEERS:-128}"

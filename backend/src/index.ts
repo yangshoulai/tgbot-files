@@ -1759,9 +1759,17 @@ async function refreshMagnetImportStatus(
 }
 
 function aria2MagnetOptions(config: ReturnType<typeof requireAria2Config>, options: Record<string, string>): Record<string, string> {
+  const tunedOptions = {
+    split: String(config.split),
+    "max-connection-per-server": String(config.maxConnectionPerServer),
+    "min-split-size": config.minSplitSize,
+    "bt-max-peers": String(config.btMaxPeers),
+    ...options
+  };
+
   return config.btTrackers
-    ? { ...options, "bt-tracker": config.btTrackers }
-    : options;
+    ? { ...tunedOptions, "bt-tracker": config.btTrackers }
+    : tunedOptions;
 }
 
 async function cleanupRestartableMagnetImportsBySource(
@@ -7991,7 +7999,7 @@ async function serializeFileRecord(file: FileRecord, baseUrl: string, db: AppDat
   const storageBackend = fileStorageBackend(file);
   const directAccess = canDirectlyAccessFileRecord(file);
   const filePath = publicFilePathForResponse(file.file_path, storageBackend);
-  const url = directAccess ? `${baseUrl}${filePath}` : null;
+  const url = `${baseUrl}${filePath}`;
   const hlsDownload = storageBackend === "hls_package"
     ? await hlsDownloadSummaryForFile(db, file)
     : null;
@@ -8012,7 +8020,7 @@ async function serializeFileRecord(file: FileRecord, baseUrl: string, db: AppDat
     direct_download: directDownload,
     download_strategy: downloadStrategy(storageBackend, directDownload),
     url,
-    download_url: url && directDownload ? appendDownloadParam(url) : null,
+    download_url: directDownload ? appendDownloadParam(url) : null,
     hls_download: hlsDownload,
     thumbnail_status: file.thumbnail_status ?? "none",
     thumbnail_url: thumbnailUrl,
@@ -8117,7 +8125,7 @@ function serializeUploadedFileResult(result: UploadResult, username: string | nu
   const directAccess = canDirectlyAccessUploadResult(result);
   const filePath = publicUploadFilePathForResponse(result);
   const publicUrl = `${new URL(result.publicUrl).origin}${filePath}`;
-  const url = directAccess ? publicUrl : null;
+  const url = publicUrl;
   const thumbnailUrl = result.thumbnail?.status === "ready" && result.thumbnail.filePath
     ? `${new URL(result.publicUrl).origin}${result.thumbnail.filePath}`
     : null;
@@ -8134,7 +8142,7 @@ function serializeUploadedFileResult(result: UploadResult, username: string | nu
     file_path: filePath,
     remark: result.remark ?? null,
     url,
-    download_url: url ? appendDownloadParam(url) : null,
+    download_url: directAccess ? appendDownloadParam(url) : null,
     uploaded_by: username,
     created_at: result.createdAt,
     directory_id: result.directoryId ?? null,

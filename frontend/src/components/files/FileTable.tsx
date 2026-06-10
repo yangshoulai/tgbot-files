@@ -14,11 +14,8 @@ import {
 } from "lucide-react";
 import type { DirectoryItem, FileItem } from "../../api";
 import {
-  canUseAnyAcceleratedDownload,
   canPreviewThroughAvailableAccess,
-  hasDirectDownloadAccess,
-  hasFileLinkAccess,
-  type DirectDownloadableFile
+  hasFileLinkAccess
 } from "../../lib/file-access";
 import { fileKind, formatBytes, formatDateTime } from "../../utils";
 import { FileVisual } from "../ui/FileVisual";
@@ -97,41 +94,20 @@ function SortHeader({
 
 function DownloadIconAction({
   file,
-  directFile,
-  canAccelerateDownload,
   onAcceleratedDownload
 }: {
   file: FileItem;
-  directFile: DirectDownloadableFile | null;
-  canAccelerateDownload: boolean;
   onAcceleratedDownload: (file: FileItem) => void;
 }) {
-  if (canAccelerateDownload) {
-    return (
-      <IconButton
-        variant="ghost"
-        size="sm"
-        label="加速下载"
-        onClick={() => onAcceleratedDownload(file)}
-      >
-        <Download size={16} />
-      </IconButton>
-    );
-  }
-
-  if (!directFile) {
-    return null;
-  }
-
   return (
-    <a
-      href={directFile.download_url}
-      title="下载"
-      aria-label="下载"
-      className="inline-grid size-8 shrink-0 place-items-center rounded-lg border border-transparent bg-transparent text-muted transition-colors duration-150 hover:bg-primary-soft hover:text-primary-strong"
+    <IconButton
+      variant="ghost"
+      size="sm"
+      label="加速下载"
+      onClick={() => onAcceleratedDownload(file)}
     >
       <Download size={16} />
-    </a>
+    </IconButton>
   );
 }
 
@@ -236,8 +212,6 @@ export function FileTable({
         ))}
         {files.map((file) => {
           const linkFile = hasFileLinkAccess(file) ? file : null;
-          const directFile = hasDirectDownloadAccess(file) ? file : null;
-          const canAccelerateDownload = canUseAnyAcceleratedDownload(file);
           const canPreviewFile = canPreviewThroughAvailableAccess(file);
           const kind = fileKind(file);
           const mimeLabel = file.mime_type || "未知 MIME";
@@ -326,8 +300,6 @@ export function FileTable({
                 ) : null}
                 <DownloadIconAction
                   file={file}
-                  directFile={directFile}
-                  canAccelerateDownload={canAccelerateDownload}
                   onAcceleratedDownload={onAcceleratedDownload}
                 />
                 <IconButton
@@ -485,8 +457,6 @@ export function FileTable({
             ))}
             {files.map((file) => {
               const linkFile = hasFileLinkAccess(file) ? file : null;
-              const directFile = hasDirectDownloadAccess(file) ? file : null;
-              const canAccelerateDownload = canUseAnyAcceleratedDownload(file);
               const canPreviewFile = canPreviewThroughAvailableAccess(file);
               const kind = fileKind(file);
               const mimeLabel = file.mime_type || "未知 MIME";
@@ -589,8 +559,6 @@ export function FileTable({
                       ) : null}
                       <DownloadIconAction
                         file={file}
-                        directFile={directFile}
-                        canAccelerateDownload={canAccelerateDownload}
                         onAcceleratedDownload={onAcceleratedDownload}
                       />
                       <IconButton

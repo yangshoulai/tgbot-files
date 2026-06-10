@@ -52,7 +52,7 @@ import {
   isAbortError,
   supportsNativeFileSave
 } from "../lib/accelerated-download";
-import { canUseHlsAcceleratedDownload, hasDirectDownloadAccess, hasFileLinkAccess } from "../lib/file-access";
+import { canUseHlsAcceleratedDownload, hasFileLinkAccess, type LinkAccessibleFile } from "../lib/file-access";
 
 type FileTypeFilter = "all" | "image" | "video" | "text" | "pdf" | "archive" | "other";
 type FileSortKey = "name" | "size" | "created_at" | "type";
@@ -629,7 +629,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
 
   function onCopy(file: FileItem) {
     if (!hasFileLinkAccess(file)) {
-      toast.info("该文件仅支持加速下载，不提供完整文件链接");
+      toast.info("该文件暂无可复制链接");
       return;
     }
 
@@ -644,18 +644,21 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
 
     const isMultipart = canUseAcceleratedDownload(file);
     const isHls = canUseHlsAcceleratedDownload(file);
-    if (!isMultipart && !isHls) {
-      toast.info("该文件不支持加速下载，已保留普通下载入口");
+    const isHlsPackage = file.storage_backend === "hls_package";
+    const linkFile = hasFileLinkAccess(file) ? file : null;
+
+    if (isHlsPackage && !isHls) {
+      toast.info("该 HLS 文件暂不支持加速下载");
+      return;
+    }
+
+    if (!isMultipart && !isHls && !linkFile) {
+      toast.info("该文件暂无可下载链接");
       return;
     }
 
     if (!supportsNativeFileSave()) {
-      if (!hasDirectDownloadAccess(file)) {
-        toast.info("当前浏览器不支持加速下载，该文件也不提供普通下载链接");
-        return;
-      }
-      toast.info("当前浏览器不支持加速下载，已切换为普通下载");
-      triggerFallbackDownload(file);
+      toast.info("当前浏览器不支持加速下载，请使用支持本地文件保存的浏览器");
       return;
     }
 
@@ -665,22 +668,27 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
 
     try {
       if (isMultipart) {
-        const token = extractSignedFileToken(file.file_path);
+        const token = extractSignedFileToken(file.file_path) || (linkFile ? extractSignedFileToken(linkFile.url) : null);
         if (!token) {
-          if (!hasDirectDownloadAccess(file)) {
-            toast.info("无法解析分片下载 token，该文件也不提供普通下载链接");
+          if (!linkFile) {
+            toast.info("无法解析分片下载 token，且该文件暂无可下载链接");
             return;
           }
-          toast.info("无法解析分片下载 token，已切换为普通下载");
-          triggerFallbackDownload(file);
-          return;
+          parts = createSingleFileAcceleratedParts(linkFile);
+        } else {
+          parts = createMultipartAcceleratedParts(file, token);
         }
-        parts = createMultipartAcceleratedParts(file, token);
-      } else {
+      } else if (isHls) {
         const plan = (await getHlsDownloadPlan(file.id)).hls_download;
         fileName = plan.file_name;
         totalBytes = plan.total_size;
         parts = createHlsAcceleratedParts(plan.parts);
+      } else {
+        if (!linkFile) {
+          toast.info("该文件暂无可下载链接");
+          return;
+        }
+        parts = createSingleFileAcceleratedParts(linkFile);
       }
     } catch (error) {
       toast.danger(errorMessage(error));
@@ -959,20 +967,6 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     toast.info("下载已取消");
   }
 
-  function triggerFallbackDownload(file: FileItem) {
-    if (!hasDirectDownloadAccess(file)) {
-      toast.info("该文件仅支持加速下载，不提供普通下载链接");
-      return;
-    }
-
-    const link = document.createElement("a");
-    link.href = file.download_url;
-    link.download = file.file_name;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-  }
-
   function updateAcceleratedChunk(
     fileId: string,
     chunkIndex: number,
@@ -1034,6 +1028,22 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
           onProgress: (progress) => onProgress(progress.downloadedBytes)
         })
     }));
+  }
+
+  function createSingleFileAcceleratedParts(file: LinkAccessibleFile): AcceleratedDownloadPartTask[] {
+    return [{
+      index: 0,
+      size: file.size,
+      offset: 0,
+      download: (signal, onProgress) =>
+        downloadAcceleratedPart({
+          url: file.url,
+          expectedSize: file.size,
+          label: "文件",
+          signal,
+          onProgress: (progress) => onProgress(progress.downloadedBytes)
+        })
+    }];
   }
 
   function createHlsAcceleratedParts(parts: HlsDownloadPart[]): AcceleratedDownloadPartTask[] {
