@@ -2,8 +2,7 @@ const CACHE_NAME = "tgbot-files-video-preview-v1";
 const DB_NAME = "tgbot-files-video-preview-cache";
 const STORE_NAME = "chunks";
 const DB_VERSION = 1;
-const MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024;
-const TARGET_CACHE_BYTES = Math.floor(1.8 * 1024 * 1024 * 1024);
+const DEFAULT_MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024;
 const RESPONSE_WINDOW_BYTES = 2 * 1024 * 1024;
 const PREFETCH_CHUNKS = 1;
 const CONTINUOUS_PREFETCH_RATIOS = [0];
@@ -12,6 +11,7 @@ const HOT_CHUNK_CACHE_MAX_BYTES = 160 * 1024 * 1024;
 const fullChunkLoads = new Map();
 const continuousPrefetchSessions = new Map();
 const hotChunkCache = new Map();
+const hlsPreviewSources = new Map();
 let hotChunkCacheBytes = 0;
 
 self.addEventListener("install", (event) => {
@@ -36,7 +36,7 @@ self.addEventListener("message", (event) => {
   if (event.data?.type === "VIDEO_PREVIEW_CACHE_START") {
     const metadata = normalizePreviewMetadata(event.data.metadata);
     const sessionId = normalizeSessionId(event.data.sessionId);
-    if (metadata && sessionId) {
+    if (metadata && sessionId && metadata.kind !== "hls") {
       event.waitUntil(startContinuousPreviewCache(sessionId, metadata));
     }
     return;
@@ -57,6 +57,11 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
+  if (url.pathname.startsWith("/__video-preview/hls-part/")) {
+    event.respondWith(handleHlsPartRequest(event.request, event));
+    return;
+  }
+
   if (!url.pathname.startsWith("/__video-preview/")) {
     return;
   }
@@ -68,6 +73,10 @@ async function handleVideoPreviewRequest(request, event) {
   const metadata = parsePreviewMetadata(new URL(request.url));
   if (!metadata) {
     return new Response("Invalid video preview metadata", { status: 400 });
+  }
+
+  if (metadata.kind === "hls") {
+    return handleHlsPlaylistRequest(metadata);
   }
 
   const range = parseRange(request.headers.get("Range"), metadata.size, metadata.chunkSize);
@@ -102,34 +111,241 @@ async function handleVideoPreviewRequest(request, event) {
   }
 }
 
+async function handleHlsPlaylistRequest(metadata) {
+  const response = await fetch(metadata.sourceUrl, { credentials: "omit" });
+  if (!response.ok) {
+    return new Response(`HLS playlist load failed (${response.status})`, { status: 502 });
+  }
+
+  const playlistText = await response.text();
+  const rewritten = rewriteHlsPlaylist(playlistText, metadata);
+  hlsPreviewSources.set(metadata.fileId, rewritten.sources);
+
+  return new Response(rewritten.text, {
+    headers: {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+      "X-Preview-Cache": "hls-playlist"
+    }
+  });
+}
+
+async function handleHlsPartRequest(request, event) {
+  const url = new URL(request.url);
+  const parts = url.pathname.split("/").filter(Boolean);
+  const fileId = parts[2];
+  const partKind = parts[3] === "init" ? "init" : "segment";
+  const partIndex = Number(parts[4] || "0");
+  const sourceUrl = normalizeSameOriginSourceUrl(url.searchParams.get("source"));
+  const cacheMaxBytes = normalizeCacheMaxBytes(url.searchParams.get("cache_max"));
+
+  if (!fileId || !Number.isSafeInteger(partIndex) || partIndex < 0 || !sourceUrl) {
+    return new Response("Invalid HLS preview part", { status: 400 });
+  }
+
+  try {
+    const response = await fetchAndCacheHlsPart({ fileId, partKind, partIndex, sourceUrl, cacheMaxBytes });
+    if (partKind === "segment") {
+      event.waitUntil(prefetchHlsSegments(fileId, partIndex + 1, PREFETCH_CHUNKS, cacheMaxBytes));
+    }
+    return response;
+  } catch (error) {
+    return new Response(error instanceof Error ? error.message : "HLS preview segment failed", {
+      status: 502,
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-store"
+      }
+    });
+  }
+}
+
+function rewriteHlsPlaylist(playlistText, metadata) {
+  const lines = playlistText.split(/\r?\n/);
+  const segments = [];
+  let initSource = null;
+
+  const rewrittenLines = lines.map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return line;
+    }
+
+    if (trimmed.startsWith("#EXT-X-MAP:")) {
+      const match = /URI="([^"]+)"/.exec(line);
+      if (!match?.[1]) {
+        return line;
+      }
+      initSource = normalizeHlsSource(match[1], metadata.sourceUrl);
+      if (!initSource) {
+        return line;
+      }
+      return line.replace(match[0], `URI="${hlsPartPreviewUrl(metadata, "init", 0, initSource)}"`);
+    }
+
+    if (trimmed.startsWith("#")) {
+      return line;
+    }
+
+    const source = normalizeHlsSource(trimmed, metadata.sourceUrl);
+    if (!source) {
+      return line;
+    }
+    const index = segments.length;
+    segments.push(source);
+    return hlsPartPreviewUrl(metadata, "segment", index, source);
+  });
+
+  return {
+    text: rewrittenLines.join("\n"),
+    sources: {
+      init: initSource,
+      segments
+    }
+  };
+}
+
+function normalizeHlsSource(value, playlistSourceUrl) {
+  try {
+    const baseUrl = new URL(playlistSourceUrl, self.location.origin);
+    const sourceUrl = new URL(value, baseUrl);
+    return sourceUrl.origin === self.location.origin ? `${sourceUrl.pathname}${sourceUrl.search}` : null;
+  } catch {
+    return null;
+  }
+}
+
+function hlsPartPreviewUrl(metadata, partKind, index, sourceUrl) {
+  const params = new URLSearchParams({
+    source: sourceUrl,
+    cache_max: String(metadata.cacheMaxBytes)
+  });
+  return `/__video-preview/hls-part/${encodeURIComponent(metadata.fileId)}/${partKind}/${index}?${params.toString()}`;
+}
+
+async function fetchAndCacheHlsPart({ fileId, partKind, partIndex, sourceUrl, cacheMaxBytes }) {
+  const cacheKey = `${self.location.origin}/__preview-cache/hls/${encodeURIComponent(fileId)}/${partKind}/${partIndex}`;
+  const cache = await caches.open(CACHE_NAME);
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    touchPreviewCacheMetadata(fileId, hlsChunkIndex(partKind, partIndex), safeSize(Number(cached.headers.get("Content-Length"))), cacheKey);
+    return cached;
+  }
+
+  const response = await fetch(sourceUrl, { credentials: "omit" });
+  if (!response.ok) {
+    throw new Error(`HLS ${partKind} ${partIndex} 加载失败（HTTP ${response.status}）`);
+  }
+
+  const bytes = await response.arrayBuffer();
+  const now = Date.now();
+  const contentType = response.headers.get("Content-Type") || "application/octet-stream";
+
+  await cleanupPreviewCache(bytes.byteLength, cacheMaxBytes);
+  await cache.put(cacheKey, new Response(bytes.slice(0), {
+    headers: {
+      "Content-Type": contentType,
+      "Content-Length": String(bytes.byteLength),
+      "Cache-Control": "public, max-age=31536000, immutable"
+    }
+  }));
+  await putChunkMetadata({
+    cacheKey,
+    fileId,
+    chunkIndex: hlsChunkIndex(partKind, partIndex),
+    size: bytes.byteLength,
+    createdAt: now,
+    lastAccessed: now
+  }, true);
+  await cleanupPreviewCache(0, cacheMaxBytes);
+
+  return new Response(bytes, {
+    headers: {
+      "Content-Type": contentType,
+      "Content-Length": String(bytes.byteLength),
+      "Cache-Control": "public, max-age=31536000, immutable",
+      "X-Preview-Cache": "hls-segment"
+    }
+  });
+}
+
+async function prefetchHlsSegments(fileId, startIndex, count, cacheMaxBytes) {
+  const sources = hlsPreviewSources.get(fileId);
+  if (!sources?.segments) {
+    return;
+  }
+
+  for (let index = startIndex; index < Math.min(sources.segments.length, startIndex + count); index += 1) {
+    try {
+      await fetchAndCacheHlsPart({
+        fileId,
+        partKind: "segment",
+        partIndex: index,
+        sourceUrl: sources.segments[index],
+        cacheMaxBytes
+      });
+    } catch {
+      return;
+    }
+  }
+}
+
+function hlsChunkIndex(partKind, partIndex) {
+  return partKind === "init" ? -1 : partIndex;
+}
+
 function parsePreviewMetadata(url) {
-  const fileId = url.pathname.split("/").filter(Boolean)[1];
+  const parts = url.pathname.split("/").filter(Boolean);
+  const pathKind = parts[1];
+  const fileId = parts[2] || parts[1];
+  const kind = normalizePreviewKind(url.searchParams.get("kind") || pathKind);
   const token = url.searchParams.get("token");
+  const sourceUrl = normalizeSameOriginSourceUrl(url.searchParams.get("source"));
   const size = Number(url.searchParams.get("size"));
   const chunkSize = Number(url.searchParams.get("chunk_size"));
   const chunkCount = Number(url.searchParams.get("chunk_count"));
   const mimeType = url.searchParams.get("mime") || "application/octet-stream";
+  const cacheMaxBytes = normalizeCacheMaxBytes(url.searchParams.get("cache_max"));
 
-  if (
-    !fileId ||
-    !token ||
-    !Number.isSafeInteger(size) ||
-    size <= 0 ||
-    !Number.isSafeInteger(chunkSize) ||
-    chunkSize <= 0 ||
-    !Number.isSafeInteger(chunkCount) ||
-    chunkCount <= 0
-  ) {
+  if (!fileId || !kind) {
+    return null;
+  }
+
+  if (kind === "hls") {
+    if (!sourceUrl) {
+      return null;
+    }
+    return {
+      kind,
+      fileId,
+      sourceUrl,
+      mimeType,
+      cacheMaxBytes
+    };
+  }
+
+  if (!Number.isSafeInteger(size) || size <= 0 || !Number.isSafeInteger(chunkSize) || chunkSize <= 0 || !Number.isSafeInteger(chunkCount) || chunkCount <= 0) {
+    return null;
+  }
+
+  if (kind === "multipart" && !token) {
+    return null;
+  }
+
+  if (kind === "single" && !sourceUrl) {
     return null;
   }
 
   return {
+    kind,
     fileId,
     token,
+    sourceUrl,
     size,
     chunkSize,
     chunkCount,
-    mimeType
+    mimeType,
+    cacheMaxBytes
   };
 }
 
@@ -139,33 +355,77 @@ function normalizePreviewMetadata(value) {
   }
 
   const fileId = typeof value.fileId === "string" ? value.fileId : "";
+  const kind = normalizePreviewKind(value.kind);
   const token = typeof value.token === "string" ? value.token : "";
+  const sourceUrl = normalizeSameOriginSourceUrl(value.sourceUrl);
   const size = Number(value.size);
   const chunkSize = Number(value.chunkSize);
   const chunkCount = Number(value.chunkCount);
   const mimeType = typeof value.mimeType === "string" && value.mimeType ? value.mimeType : "application/octet-stream";
+  const cacheMaxBytes = normalizeCacheMaxBytes(value.cacheMaxBytes);
 
-  if (
-    !fileId ||
-    !token ||
-    !Number.isSafeInteger(size) ||
-    size <= 0 ||
-    !Number.isSafeInteger(chunkSize) ||
-    chunkSize <= 0 ||
-    !Number.isSafeInteger(chunkCount) ||
-    chunkCount <= 0
-  ) {
+  if (!fileId || !kind) {
+    return null;
+  }
+
+  if (kind === "hls") {
+    if (!sourceUrl) {
+      return null;
+    }
+    return {
+      kind,
+      fileId,
+      sourceUrl,
+      mimeType,
+      cacheMaxBytes
+    };
+  }
+
+  if (!Number.isSafeInteger(size) || size <= 0 || !Number.isSafeInteger(chunkSize) || chunkSize <= 0 || !Number.isSafeInteger(chunkCount) || chunkCount <= 0) {
+    return null;
+  }
+
+  if (kind === "multipart" && !token) {
+    return null;
+  }
+
+  if (kind === "single" && !sourceUrl) {
     return null;
   }
 
   return {
+    kind,
     fileId,
     token,
+    sourceUrl,
     size,
     chunkSize,
     chunkCount,
-    mimeType
+    mimeType,
+    cacheMaxBytes
   };
+}
+
+function normalizePreviewKind(value) {
+  return value === "single" || value === "multipart" || value === "hls" ? value : null;
+}
+
+function normalizeCacheMaxBytes(value) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_CACHE_BYTES;
+}
+
+function normalizeSameOriginSourceUrl(value) {
+  if (typeof value !== "string" || !value) {
+    return null;
+  }
+
+  try {
+    const url = new URL(value, self.location.origin);
+    return url.origin === self.location.origin ? `${url.pathname}${url.search}` : null;
+  } catch {
+    return null;
+  }
 }
 
 function normalizeSessionId(value) {
@@ -175,11 +435,14 @@ function normalizeSessionId(value) {
 function previewMetadataKey(metadata) {
   return [
     metadata.fileId,
+    metadata.kind,
+    metadata.sourceUrl || "",
     metadata.token,
     metadata.size,
     metadata.chunkSize,
     metadata.chunkCount,
-    metadata.mimeType
+    metadata.mimeType,
+    metadata.cacheMaxBytes
   ].join(":");
 }
 
@@ -339,10 +602,10 @@ async function fetchChunkByteRange(metadata, segment) {
     throw new Error("Chunk byte range is out of range");
   }
 
-  const response = await fetch(`/f/${encodeURIComponent(metadata.token)}/chunks/${segment.chunkIndex}`, {
+  const response = await fetch(chunkSourceUrl(metadata, segment.chunkIndex), {
     credentials: "omit",
     headers: {
-      Range: `bytes=${segment.start}-${segment.endExclusive - 1}`
+      Range: chunkRangeHeader(metadata, segment.chunkIndex, segment.start, segment.endExclusive)
     }
   });
 
@@ -496,10 +759,14 @@ function cachedChunkContentLength(response) {
 }
 
 function touchChunkMetadata(metadata, chunkIndex, size, cacheKey = chunkCacheKey(metadata.fileId, chunkIndex)) {
+  touchPreviewCacheMetadata(metadata.fileId, chunkIndex, size, cacheKey);
+}
+
+function touchPreviewCacheMetadata(fileId, chunkIndex, size, cacheKey) {
   const now = Date.now();
   void putChunkMetadata({
     cacheKey,
-    fileId: metadata.fileId,
+    fileId,
     chunkIndex,
     size,
     createdAt: now,
@@ -535,8 +802,12 @@ async function getChunkBytes(metadata, chunkIndex) {
 }
 
 async function fetchAndCacheChunkBytes(metadata, chunkIndex) {
-  const response = await fetch(`/f/${encodeURIComponent(metadata.token)}/chunks/${chunkIndex}`, {
-    credentials: "omit"
+  const expectedSize = expectedChunkSize(metadata, chunkIndex);
+  const response = await fetch(chunkSourceUrl(metadata, chunkIndex), {
+    credentials: "omit",
+    headers: metadata.kind === "single"
+      ? { Range: chunkRangeHeader(metadata, chunkIndex, 0, expectedSize) }
+      : undefined
   });
 
   if (!response.ok) {
@@ -544,7 +815,6 @@ async function fetchAndCacheChunkBytes(metadata, chunkIndex) {
   }
 
   const bytes = await response.arrayBuffer();
-  const expectedSize = expectedChunkSize(metadata, chunkIndex);
   if (bytes.byteLength !== expectedSize) {
     throw new Error(`分片 ${chunkIndex + 1} 大小不匹配`);
   }
@@ -556,7 +826,7 @@ async function fetchAndCacheChunkBytes(metadata, chunkIndex) {
     const cacheKey = chunkCacheKey(metadata.fileId, chunkIndex);
     const now = Date.now();
 
-    await cleanupPreviewCache(bytes.byteLength);
+    await cleanupPreviewCache(bytes.byteLength, metadata.cacheMaxBytes);
     await cache.put(cacheKey, new Response(bytes.slice(0), {
       headers: {
         "Content-Type": "application/octet-stream",
@@ -572,12 +842,30 @@ async function fetchAndCacheChunkBytes(metadata, chunkIndex) {
       createdAt: now,
       lastAccessed: now
     }, true);
-    await cleanupPreviewCache();
+    await cleanupPreviewCache(0, metadata.cacheMaxBytes);
   } catch (error) {
     warnPreviewCacheError(`write chunk ${chunkIndex}`, error);
   }
 
   return bytes;
+}
+
+function chunkSourceUrl(metadata, chunkIndex) {
+  if (metadata.kind === "multipart") {
+    return `/f/${encodeURIComponent(metadata.token)}/chunks/${chunkIndex}`;
+  }
+
+  return metadata.sourceUrl;
+}
+
+function chunkRangeHeader(metadata, chunkIndex, start, endExclusive) {
+  if (metadata.kind === "single") {
+    const absoluteStart = chunkIndex * metadata.chunkSize + start;
+    const absoluteEndExclusive = chunkIndex * metadata.chunkSize + endExclusive;
+    return `bytes=${absoluteStart}-${absoluteEndExclusive - 1}`;
+  }
+
+  return `bytes=${start}-${endExclusive - 1}`;
 }
 
 function expectedChunkSize(metadata, chunkIndex) {
@@ -769,11 +1057,13 @@ function chunkCacheKey(fileId, chunkIndex) {
   return `${self.location.origin}/__preview-cache/files/${encodeURIComponent(fileId)}/chunks/${chunkIndex}`;
 }
 
-async function cleanupPreviewCache(incomingBytes = 0) {
+async function cleanupPreviewCache(incomingBytes = 0, cacheMaxBytes = DEFAULT_MAX_CACHE_BYTES) {
   const entries = await getAllChunkMetadata();
   let total = entries.reduce((sum, entry) => sum + safeSize(entry.size), 0) + safeSize(incomingBytes);
+  const maxBytes = Math.max(1, cacheMaxBytes);
+  const targetBytes = Math.floor(maxBytes * 0.9);
 
-  if (total <= MAX_CACHE_BYTES) {
+  if (total <= maxBytes) {
     return;
   }
 
@@ -784,7 +1074,7 @@ async function cleanupPreviewCache(incomingBytes = 0) {
   for (const entry of victims) {
     await deleteChunk(entry.cacheKey);
     total -= safeSize(entry.size);
-    if (total <= TARGET_CACHE_BYTES) {
+    if (total <= targetBytes) {
       break;
     }
   }

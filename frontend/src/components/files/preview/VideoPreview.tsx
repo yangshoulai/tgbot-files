@@ -2,19 +2,18 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Hls from "hls.js";
 import { RotateCcw } from "lucide-react";
 import { listFiles, type FileItem } from "../../../api";
-import { canUseAcceleratedDownload, extractSignedFileToken } from "../../../lib/accelerated-download";
-import { hasFileLinkAccess } from "../../../lib/file-access";
 import {
   VIDEO_PREVIEW_CACHE_HEARTBEAT_MS,
-  buildChunkedVideoPreviewMetadata,
-  buildChunkedVideoPreviewUrl,
-  startChunkedVideoPreviewCacheSession,
-  stopChunkedVideoPreviewCacheSession
+  buildVideoPreviewMetadata,
+  buildVideoPreviewUrl,
+  startVideoPreviewCacheSession,
+  stopVideoPreviewCacheSession
 } from "../../../lib/video-preview";
 import {
   ensureVideoPreviewServiceWorker,
   isVideoPreviewServiceWorkerControlling
 } from "../../../lib/video-preview-service-worker";
+import { hasFileLinkAccess } from "../../../lib/file-access";
 import { cn } from "../../../lib/cn";
 import { Button } from "../../ui/Button";
 import { Spinner } from "../../ui/Spinner";
@@ -24,6 +23,7 @@ interface VideoPreviewProps {
   file: FileItem;
   fullscreen: boolean;
   onToggleFullscreen: () => void;
+  videoPreviewCacheBytes: number;
 }
 
 const VIDEO_PREVIEW_TIMEOUT_MS = 30_000;
@@ -31,7 +31,7 @@ const VIDEO_CONTROLS_HIDE_DELAY_MS = 1_800;
 const VIDEO_LOADING_INDICATOR_DELAY_MS = 360;
 const SUBTITLE_PREVIEW_TIMEOUT_MS = 20_000;
 
-export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPreviewProps) {
+export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPreviewCacheBytes }: VideoPreviewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const frameRef = useRef<HTMLDivElement>(null);
   const controlsHideTimerRef = useRef<number | null>(null);
@@ -46,19 +46,15 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
   const [subtitleTracks, setSubtitleTracks] = useState<LoadedSubtitleTrack[]>([]);
   const [selectedSubtitleId, setSelectedSubtitleId] = useState<string | null>(null);
   const heightLimit = fullscreen ? "calc(100dvh - 9rem)" : "min(68dvh, 760px)";
-  const linkFile = hasFileLinkAccess(file) ? file : null;
   const isHlsPackage = file.storage_backend === "hls_package";
-  const directAccessAvailable = Boolean(linkFile);
-  const canUseMultipartPreview = canUseAcceleratedDownload(file);
-  const signedFileToken = canUseMultipartPreview ? extractSignedFileToken(file.file_path) : null;
   const serviceWorkerReady = serviceWorkerState.status === "controlled";
-  const requiresChunkedPreview = !directAccessAvailable && canUseMultipartPreview && Boolean(signedFileToken);
-  const chunkedPreviewMetadata = useMemo(
-    () => serviceWorkerReady ? buildChunkedVideoPreviewMetadata(file) : null,
-    [file.chunk_count, file.chunk_size, file.file_path, file.id, file.mime_type, file.size, file.storage_backend, serviceWorkerReady]
+  const previewCandidate = useMemo(
+    () => buildVideoPreviewMetadata(file, videoPreviewCacheBytes),
+    [file.chunk_count, file.chunk_size, file.file_path, file.id, file.mime_type, file.size, file.storage_backend, file.url, videoPreviewCacheBytes]
   );
-  const chunkedPreviewUrl = chunkedPreviewMetadata ? buildChunkedVideoPreviewUrl(file, chunkedPreviewMetadata) : null;
-  const videoSrc = chunkedPreviewUrl ?? (linkFile ? file.file_path : null);
+  const previewMetadata = serviceWorkerReady ? previewCandidate : null;
+  const previewUrl = previewMetadata ? buildVideoPreviewUrl(file, previewMetadata) : null;
+  const videoSrc = previewUrl;
   const poster = file.thumbnail_url || undefined;
   const subtitleOptions = useMemo<MediaSubtitleOption[]>(
     () => subtitleTracks.map((track) => ({ id: track.id, label: track.label })),
@@ -198,7 +194,7 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
   }, [failed, loading, videoSrc]);
 
   useEffect(() => {
-    if (!requiresChunkedPreview) return;
+    if (!previewCandidate || serviceWorkerReady) return;
 
     if (!("serviceWorker" in navigator)) {
       void refreshServiceWorker();
@@ -220,14 +216,14 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
       disposed = true;
       navigator.serviceWorker.removeEventListener("controllerchange", refresh);
     };
-  }, [refreshServiceWorker, requiresChunkedPreview]);
+  }, [previewCandidate, refreshServiceWorker, serviceWorkerReady]);
 
   useEffect(() => {
-    if (!chunkedPreviewMetadata || !chunkedPreviewUrl) return;
+    if (!previewMetadata || !previewUrl) return;
 
     const sessionId = previewCacheSessionIdRef.current;
     const keepAlivePreviewCache = () => {
-      startChunkedVideoPreviewCacheSession(sessionId, chunkedPreviewMetadata);
+      startVideoPreviewCacheSession(sessionId, previewMetadata);
     };
 
     keepAlivePreviewCache();
@@ -235,9 +231,9 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
 
     return () => {
       window.clearInterval(heartbeatId);
-      stopChunkedVideoPreviewCacheSession(sessionId);
+      stopVideoPreviewCacheSession(sessionId);
     };
-  }, [chunkedPreviewMetadata, chunkedPreviewUrl]);
+  }, [previewMetadata, previewUrl]);
 
   useEffect(() => {
     let disposed = false;
@@ -359,9 +355,9 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen }: VideoPrev
         <div className="max-w-md rounded-3xl border border-white/10 bg-white/[0.07] px-6 py-5 shadow-[0_24px_70px_rgba(0,0,0,0.36)] ring-1 ring-white/[0.08] backdrop-blur-xl">
           <p className="text-sm font-semibold">该视频暂时无法直接预览</p>
           <p className="mt-2 text-xs leading-6 text-white/65">
-            {videoPreviewUnavailableMessage({ canUseMultipartPreview, hasSignedFileToken: Boolean(signedFileToken), serviceWorkerState })}
+            {videoPreviewUnavailableMessage({ hasPreviewPlan: Boolean(previewCandidate), serviceWorkerState })}
           </p>
-          {requiresChunkedPreview ? (
+          {previewCandidate ? (
             <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
               <Button variant="secondary" leadingIcon={<RotateCcw size={15} />} onClick={() => void refreshServiceWorker()}>
                 重新检查
@@ -516,23 +512,20 @@ function initialVideoPreviewServiceWorkerState(): VideoPreviewServiceWorkerState
 }
 
 function videoPreviewUnavailableMessage({
-  canUseMultipartPreview,
-  hasSignedFileToken,
+  hasPreviewPlan,
   serviceWorkerState
 }: {
-  canUseMultipartPreview: boolean;
-  hasSignedFileToken: boolean;
+  hasPreviewPlan: boolean;
   serviceWorkerState: VideoPreviewServiceWorkerState;
 }): string {
-  if (!canUseMultipartPreview) return "该视频缺少分片下载元数据，无法通过分片代理进行预览。";
-  if (!hasSignedFileToken) return "该视频缺少签名访问令牌，无法生成分片预览地址。";
+  if (!hasPreviewPlan) return "该视频缺少可代理的访问链接，无法通过预览代理播放。";
   if (serviceWorkerState.status === "checking") return "正在注册并等待 Service Worker 接管页面；如果长时间没有变化，请点击“重新检查”。";
   if (serviceWorkerState.status === "need-reload") {
     return serviceWorkerState.message ? `${serviceWorkerState.message}，请点击“刷新页面”后再预览。` : "Service Worker 已注册，但当前页面还没有被它接管，请点击“刷新页面”后再预览。";
   }
-  if (serviceWorkerState.status === "unsupported") return serviceWorkerState.message || "当前浏览器不支持 Service Worker，无法通过分片代理预览该视频。";
-  if (serviceWorkerState.status === "failed") return serviceWorkerState.message ? `Service Worker 注册或激活失败：${serviceWorkerState.message}` : "Service Worker 注册或激活失败，无法接管分片预览请求。";
-  return "Service Worker 已接管页面，但分片预览地址未生成，请重新打开预览窗口。";
+  if (serviceWorkerState.status === "unsupported") return serviceWorkerState.message || "当前浏览器不支持 Service Worker，无法通过预览代理播放该视频。";
+  if (serviceWorkerState.status === "failed") return serviceWorkerState.message ? `Service Worker 注册或激活失败：${serviceWorkerState.message}` : "Service Worker 注册或激活失败，无法接管视频预览请求。";
+  return "Service Worker 已接管页面，但预览代理地址未生成，请重新打开预览窗口。";
 }
 
 async function loadSubtitleFile(

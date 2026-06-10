@@ -1,61 +1,89 @@
 import type { FileItem } from "../api";
 import { canUseAcceleratedDownload, extractSignedFileToken } from "./accelerated-download";
-import { getVideoPreviewServiceWorkerController, isVideoPreviewServiceWorkerControlling } from "./video-preview-service-worker";
+import { hasFileLinkAccess } from "./file-access";
+import { getVideoPreviewServiceWorkerController } from "./video-preview-service-worker";
 
 export const VIDEO_PREVIEW_CACHE_HEARTBEAT_MS = 4_000;
+const DEFAULT_PREVIEW_CHUNK_BYTES = 2 * 1024 * 1024;
 
-export interface ChunkedVideoPreviewMetadata {
+export type VideoPreviewKind = "single" | "multipart" | "hls";
+
+export interface VideoPreviewMetadata {
+  kind: VideoPreviewKind;
   fileId: string;
-  token: string;
-  size: number;
-  chunkSize: number;
-  chunkCount: number;
+  sourceUrl?: string;
+  token?: string;
+  size?: number;
+  chunkSize?: number;
+  chunkCount?: number;
   mimeType: string;
+  cacheMaxBytes: number;
 }
 
-export function canUseChunkedVideoPreview(file: FileItem): boolean {
-  return canUseAcceleratedDownload(file) &&
-    file.mime_type.toLowerCase().startsWith("video/") &&
-    isVideoPreviewServiceWorkerControlling();
-}
-
-export function buildChunkedVideoPreviewMetadata(file: FileItem): ChunkedVideoPreviewMetadata | null {
-  if (!canUseAcceleratedDownload(file)) {
-    return null;
+export function buildVideoPreviewMetadata(file: FileItem, cacheMaxBytes: number): VideoPreviewMetadata | null {
+  if (file.storage_backend === "hls_package" && hasFileLinkAccess(file)) {
+    return {
+      kind: "hls",
+      fileId: file.id,
+      sourceUrl: file.file_path,
+      mimeType: file.mime_type || "application/vnd.apple.mpegurl",
+      cacheMaxBytes
+    };
   }
 
-  const token = extractSignedFileToken(file.file_path);
-  if (!token) {
-    return null;
+  if (canUseAcceleratedDownload(file)) {
+    const token = extractSignedFileToken(file.file_path) || (hasFileLinkAccess(file) ? extractSignedFileToken(file.url) : null);
+    if (token) {
+      return {
+        kind: "multipart",
+        fileId: file.id,
+        token,
+        size: file.size,
+        chunkSize: file.chunk_size,
+        chunkCount: file.chunk_count,
+        mimeType: file.mime_type || "application/octet-stream",
+        cacheMaxBytes
+      };
+    }
   }
 
-  return {
-    fileId: file.id,
-    token,
-    size: file.size,
-    chunkSize: file.chunk_size,
-    chunkCount: file.chunk_count,
-    mimeType: file.mime_type
-  };
+  if (hasFileLinkAccess(file)) {
+    return {
+      kind: "single",
+      fileId: file.id,
+      sourceUrl: file.file_path,
+      size: file.size,
+      chunkSize: DEFAULT_PREVIEW_CHUNK_BYTES,
+      chunkCount: Math.max(1, Math.ceil(file.size / DEFAULT_PREVIEW_CHUNK_BYTES)),
+      mimeType: file.mime_type || "application/octet-stream",
+      cacheMaxBytes
+    };
+  }
+
+  return null;
 }
 
-export function buildChunkedVideoPreviewUrl(file: FileItem, metadata = buildChunkedVideoPreviewMetadata(file)): string | null {
+export function buildVideoPreviewUrl(file: FileItem, metadata: VideoPreviewMetadata | null): string | null {
   if (!metadata) {
     return null;
   }
 
   const params = new URLSearchParams({
-    token: metadata.token,
-    size: String(metadata.size),
-    chunk_size: String(metadata.chunkSize),
-    chunk_count: String(metadata.chunkCount),
-    mime: metadata.mimeType
+    kind: metadata.kind,
+    mime: metadata.mimeType,
+    cache_max: String(metadata.cacheMaxBytes)
   });
 
-  return `/__video-preview/${encodeURIComponent(file.id)}/${encodeURIComponent(file.file_name)}?${params.toString()}`;
+  if (metadata.sourceUrl) params.set("source", metadata.sourceUrl);
+  if (metadata.token) params.set("token", metadata.token);
+  if (metadata.size !== undefined) params.set("size", String(metadata.size));
+  if (metadata.chunkSize !== undefined) params.set("chunk_size", String(metadata.chunkSize));
+  if (metadata.chunkCount !== undefined) params.set("chunk_count", String(metadata.chunkCount));
+
+  return `/__video-preview/${metadata.kind}/${encodeURIComponent(file.id)}/${encodeURIComponent(file.file_name)}?${params.toString()}`;
 }
 
-export function startChunkedVideoPreviewCacheSession(sessionId: string, metadata: ChunkedVideoPreviewMetadata): boolean {
+export function startVideoPreviewCacheSession(sessionId: string, metadata: VideoPreviewMetadata): boolean {
   return postVideoPreviewCacheMessage({
     type: "VIDEO_PREVIEW_CACHE_START",
     sessionId,
@@ -63,7 +91,7 @@ export function startChunkedVideoPreviewCacheSession(sessionId: string, metadata
   });
 }
 
-export function stopChunkedVideoPreviewCacheSession(sessionId: string): boolean {
+export function stopVideoPreviewCacheSession(sessionId: string): boolean {
   return postVideoPreviewCacheMessage({
     type: "VIDEO_PREVIEW_CACHE_STOP",
     sessionId
@@ -84,7 +112,7 @@ type VideoPreviewCacheMessage =
   | {
       type: "VIDEO_PREVIEW_CACHE_START";
       sessionId: string;
-      metadata: ChunkedVideoPreviewMetadata;
+      metadata: VideoPreviewMetadata;
     }
   | {
       type: "VIDEO_PREVIEW_CACHE_STOP";

@@ -37,6 +37,7 @@ export function ConfigPanel({ session }: ConfigPanelProps) {
         <RuntimeValue label="直传上限" value={formatBytes(session.max_file_bytes)} />
         <RuntimeValue label="分片上限" value={formatBytes(session.max_multipart_file_bytes)} />
         <RuntimeValue label="整文件直链" value={formatBytes(session.direct_access_max_bytes)} />
+        <RuntimeValue label="视频预览缓存" value={formatBytes(session.video_preview_cache_bytes)} />
       </div>
 
       <ul className="flex flex-col gap-2">

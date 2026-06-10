@@ -409,6 +409,10 @@ export const UPLOAD_CONCURRENCY_SETTING_KEY = "upload_concurrency";
 export const DEFAULT_UPLOAD_CONCURRENCY = 5;
 export const MIN_UPLOAD_CONCURRENCY = 1;
 export const MAX_UPLOAD_CONCURRENCY = 32;
+export const VIDEO_PREVIEW_CACHE_BYTES_SETTING_KEY = "video_preview_cache_bytes";
+export const DEFAULT_VIDEO_PREVIEW_CACHE_BYTES = 2 * 1024 * 1024 * 1024;
+export const MIN_VIDEO_PREVIEW_CACHE_BYTES = 256 * 1024 * 1024;
+export const MAX_VIDEO_PREVIEW_CACHE_BYTES = 20 * 1024 * 1024 * 1024;
 
 export function requireDb(env: { DATABASE?: AppDatabase }): AppDatabase {
   if (!env.DATABASE) {
@@ -3022,8 +3026,45 @@ export async function setUploadConcurrencySetting(db: AppDatabase, value: number
   return normalized;
 }
 
+export async function getVideoPreviewCacheBytesSetting(db: AppDatabase): Promise<number> {
+  let row: { value: string } | null = null;
+  try {
+    row = await db
+      .prepare("SELECT value FROM app_settings WHERE key = ?")
+      .bind(VIDEO_PREVIEW_CACHE_BYTES_SETTING_KEY)
+      .first<{ value: string }>();
+  } catch {
+    return DEFAULT_VIDEO_PREVIEW_CACHE_BYTES;
+  }
+  const parsed = row ? Number(row.value) : DEFAULT_VIDEO_PREVIEW_CACHE_BYTES;
+
+  if (!Number.isSafeInteger(parsed)) {
+    return DEFAULT_VIDEO_PREVIEW_CACHE_BYTES;
+  }
+
+  return clampVideoPreviewCacheBytes(parsed);
+}
+
+export async function setVideoPreviewCacheBytesSetting(db: AppDatabase, value: number, updatedAt: string): Promise<number> {
+  const normalized = clampVideoPreviewCacheBytes(value);
+  await db
+    .prepare(
+      `INSERT INTO app_settings (key, value, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+    )
+    .bind(VIDEO_PREVIEW_CACHE_BYTES_SETTING_KEY, String(normalized), updatedAt)
+    .run();
+
+  return normalized;
+}
+
 function clampUploadConcurrency(value: number): number {
   return Math.min(MAX_UPLOAD_CONCURRENCY, Math.max(MIN_UPLOAD_CONCURRENCY, value));
+}
+
+function clampVideoPreviewCacheBytes(value: number): number {
+  return Math.min(MAX_VIDEO_PREVIEW_CACHE_BYTES, Math.max(MIN_VIDEO_PREVIEW_CACHE_BYTES, value));
 }
 
 function escapeLikePattern(value: string): string {

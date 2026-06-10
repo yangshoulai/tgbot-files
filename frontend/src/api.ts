@@ -9,6 +9,9 @@ export interface SessionResponse {
   upload_concurrency: number;
   upload_concurrency_min: number;
   upload_concurrency_max: number;
+  video_preview_cache_bytes: number;
+  video_preview_cache_bytes_min: number;
+  video_preview_cache_bytes_max: number;
   base_url: string;
   config: {
     database: boolean;
@@ -35,6 +38,7 @@ export interface SessionResponse {
     max_file_bytes: string;
     max_multipart_file_bytes: string;
     direct_access_max_bytes: string;
+    video_preview_cache_bytes: string;
   };
 }
 
@@ -87,6 +91,9 @@ export interface SettingsUpdateResponse {
     upload_concurrency: number;
     upload_concurrency_min: number;
     upload_concurrency_max: number;
+    video_preview_cache_bytes: number;
+    video_preview_cache_bytes_min: number;
+    video_preview_cache_bytes_max: number;
   };
 }
 
@@ -594,7 +601,7 @@ export function logout() {
   });
 }
 
-export function updateSettings(body: { upload_concurrency: number }) {
+export function updateSettings(body: { upload_concurrency?: number; video_preview_cache_bytes?: number }) {
   return requestJson<SettingsUpdateResponse>("/api/admin/settings", {
     method: "PATCH",
     headers: {

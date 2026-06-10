@@ -26,9 +26,10 @@ interface PreviewDialogProps {
   onClose: () => void;
   onCopy: (value: string) => void;
   onAcceleratedDownload?: (file: FileItem) => void;
+  videoPreviewCacheBytes: number;
 }
 
-export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload }: PreviewDialogProps) {
+export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, videoPreviewCacheBytes }: PreviewDialogProps) {
   const preview = file ? previewKind(file) : null;
   const kind = file ? fileKind(file) : null;
   const [fullscreen, setFullscreen] = useState(false);
@@ -173,7 +174,12 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload }: 
         {preview === "image" ? (
           <ImagePreview file={file} fullscreen={fullscreen} />
         ) : preview === "video" ? (
-          <VideoPreview file={file} fullscreen={fullscreen} onToggleFullscreen={toggleFullscreen} />
+          <VideoPreview
+            file={file}
+            fullscreen={fullscreen}
+            onToggleFullscreen={toggleFullscreen}
+            videoPreviewCacheBytes={videoPreviewCacheBytes}
+          />
         ) : preview === "audio" ? (
           <AudioPreview file={file} fullscreen={fullscreen} onToggleFullscreen={toggleFullscreen} />
         ) : preview === "text" ? (

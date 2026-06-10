@@ -74,6 +74,7 @@ import {
   softDeleteApiKeyRecord,
   deleteDirectoryTree,
   deleteFileRecord,
+  DEFAULT_VIDEO_PREVIEW_CACHE_BYTES,
   DEFAULT_UPLOAD_CONCURRENCY,
   touchApiKeyRecord,
   updateApiKeyRecord,
@@ -83,10 +84,14 @@ import {
   upsertFileChunkRecord,
   deleteTelegramChannelRecord,
   getUploadConcurrencySetting,
+  getVideoPreviewCacheBytesSetting,
   setUploadConcurrencySetting,
+  setVideoPreviewCacheBytesSetting,
   selectMagnetImportFiles,
   MIN_UPLOAD_CONCURRENCY,
   MAX_UPLOAD_CONCURRENCY,
+  MIN_VIDEO_PREVIEW_CACHE_BYTES,
+  MAX_VIDEO_PREVIEW_CACHE_BYTES,
   type ApiKeyRecord,
   type ApiKeyStatus,
   type DirectoryRecord,
@@ -721,6 +726,9 @@ async function handleAdminSession(request: Request, env: AppEnv, username: strin
   const uploadConcurrency = env.DATABASE
     ? await getUploadConcurrencySetting(env.DATABASE)
     : DEFAULT_UPLOAD_CONCURRENCY;
+  const videoPreviewCacheBytes = env.DATABASE
+    ? await getVideoPreviewCacheBytesSetting(env.DATABASE)
+    : DEFAULT_VIDEO_PREVIEW_CACHE_BYTES;
 
   return jsonResponse({
     ok: true,
@@ -733,6 +741,9 @@ async function handleAdminSession(request: Request, env: AppEnv, username: strin
     upload_concurrency: uploadConcurrency,
     upload_concurrency_min: MIN_UPLOAD_CONCURRENCY,
     upload_concurrency_max: MAX_UPLOAD_CONCURRENCY,
+    video_preview_cache_bytes: videoPreviewCacheBytes,
+    video_preview_cache_bytes_min: MIN_VIDEO_PREVIEW_CACHE_BYTES,
+    video_preview_cache_bytes_max: MAX_VIDEO_PREVIEW_CACHE_BYTES,
     base_url: baseUrl,
     config: {
       database: Boolean(env.DATABASE),
@@ -760,7 +771,8 @@ async function handleAdminSession(request: Request, env: AppEnv, username: strin
       public_base_url: baseUrl,
       max_file_bytes: String(maxFileBytes),
       max_multipart_file_bytes: String(MAX_TELEGRAM_MULTIPART_BYTES),
-      direct_access_max_bytes: String(DIRECT_MULTIPART_ACCESS_MAX_BYTES)
+      direct_access_max_bytes: String(DIRECT_MULTIPART_ACCESS_MAX_BYTES),
+      video_preview_cache_bytes: String(videoPreviewCacheBytes)
     }
   });
 }
@@ -770,14 +782,26 @@ async function handleAdminSettings(request: Request, env: AppEnv): Promise<Respo
 
   if (request.method === "PATCH") {
     const body = await readJsonObject(request);
-    const uploadConcurrency = positiveIntegerField(body.upload_concurrency, "upload_concurrency");
-    const savedUploadConcurrency = await setUploadConcurrencySetting(db, uploadConcurrency, new Date().toISOString());
+    const currentUploadConcurrency = await getUploadConcurrencySetting(db);
+    const currentVideoPreviewCacheBytes = await getVideoPreviewCacheBytesSetting(db);
+    const uploadConcurrency = body.upload_concurrency === undefined
+      ? currentUploadConcurrency
+      : positiveIntegerField(body.upload_concurrency, "upload_concurrency");
+    const videoPreviewCacheBytes = body.video_preview_cache_bytes === undefined
+      ? currentVideoPreviewCacheBytes
+      : positiveIntegerField(body.video_preview_cache_bytes, "video_preview_cache_bytes");
+    const updatedAt = new Date().toISOString();
+    const savedUploadConcurrency = await setUploadConcurrencySetting(db, uploadConcurrency, updatedAt);
+    const savedVideoPreviewCacheBytes = await setVideoPreviewCacheBytesSetting(db, videoPreviewCacheBytes, updatedAt);
     return jsonResponse({
       ok: true,
       settings: {
         upload_concurrency: savedUploadConcurrency,
         upload_concurrency_min: MIN_UPLOAD_CONCURRENCY,
-        upload_concurrency_max: MAX_UPLOAD_CONCURRENCY
+        upload_concurrency_max: MAX_UPLOAD_CONCURRENCY,
+        video_preview_cache_bytes: savedVideoPreviewCacheBytes,
+        video_preview_cache_bytes_min: MIN_VIDEO_PREVIEW_CACHE_BYTES,
+        video_preview_cache_bytes_max: MAX_VIDEO_PREVIEW_CACHE_BYTES
       }
     });
   }

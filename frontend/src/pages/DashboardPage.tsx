@@ -40,7 +40,6 @@ import {
   type AcceleratedDownloadState
 } from "../components/files/AcceleratedDownloadDialog";
 import {
-  DEFAULT_ACCELERATED_DOWNLOAD_CONCURRENCY,
   type MultipartDownloadFile,
   type NativeFileWritableStream,
   canUseAcceleratedDownload,
@@ -665,6 +664,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     let fileName = file.file_name;
     let totalBytes = file.size;
     let parts: AcceleratedDownloadPartTask[];
+    const downloadConcurrency = session.upload_concurrency;
 
     try {
       if (isMultipart) {
@@ -699,7 +699,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       fileId: file.id,
       fileName,
       status: "preparing",
-      concurrency: DEFAULT_ACCELERATED_DOWNLOAD_CONCURRENCY,
+      concurrency: downloadConcurrency,
       totalBytes,
       chunks: createInitialAcceleratedChunks(parts)
     });
@@ -719,7 +719,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       fileId: file.id,
       fileName,
       writable,
-      concurrency: DEFAULT_ACCELERATED_DOWNLOAD_CONCURRENCY,
+      concurrency: downloadConcurrency,
       parts,
       queue: parts.map((part) => part.index),
       running: new Set(),
@@ -1338,6 +1338,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         onClose={() => setPreviewFile(null)}
         onCopy={copyText}
         onAcceleratedDownload={(file) => void onAcceleratedDownload(file)}
+        videoPreviewCacheBytes={session.video_preview_cache_bytes}
       />
       <ThumbnailPreviewDialog
         file={thumbnailPreviewFile}
