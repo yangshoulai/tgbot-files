@@ -27,6 +27,13 @@ export interface VideoPreviewPlaybackProgress {
   byteOffset?: number;
 }
 
+export interface VideoPreviewCacheState {
+  fileId: string;
+  kind: VideoPreviewKind;
+  chunkCount: number;
+  cachedChunks: number[];
+}
+
 export function buildVideoPreviewMetadata(file: FileItem, cacheMaxBytes: number): VideoPreviewMetadata | null {
   if (file.storage_backend === "hls_package" && hasFileLinkAccess(file)) {
     return {
@@ -118,6 +125,49 @@ export function reportVideoPreviewPlaybackProgress(
   });
 }
 
+export function requestVideoPreviewCacheState(metadata: VideoPreviewMetadata, timeoutMs = 1500): Promise<VideoPreviewCacheState | null> {
+  const controller = getVideoPreviewServiceWorkerController();
+  if (!controller || typeof MessageChannel === "undefined") {
+    return Promise.resolve(null);
+  }
+
+  const requestId = `video-preview-cache-state-${metadata.fileId}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const channel = new MessageChannel();
+
+  return new Promise((resolve) => {
+    const timerId = window.setTimeout(() => {
+      cleanup();
+      resolve(null);
+    }, timeoutMs);
+
+    const cleanup = () => {
+      window.clearTimeout(timerId);
+      channel.port1.onmessage = null;
+      channel.port1.close();
+    };
+
+    channel.port1.onmessage = (event: MessageEvent<VideoPreviewCacheStateResponse>) => {
+      if (event.data?.type !== "VIDEO_PREVIEW_CACHE_STATE_RESPONSE" || event.data.requestId !== requestId) {
+        return;
+      }
+
+      cleanup();
+      resolve(normalizeVideoPreviewCacheState(event.data.state, metadata));
+    };
+
+    try {
+      controller.postMessage({
+        type: "VIDEO_PREVIEW_CACHE_STATE_REQUEST",
+        requestId,
+        metadata
+      }, [channel.port2]);
+    } catch {
+      cleanup();
+      resolve(null);
+    }
+  });
+}
+
 function postVideoPreviewCacheMessage(message: VideoPreviewCacheMessage): boolean {
   const controller = getVideoPreviewServiceWorkerController();
   if (!controller) {
@@ -143,4 +193,47 @@ type VideoPreviewCacheMessage =
       sessionId: string;
       metadata: VideoPreviewMetadata;
       progress: VideoPreviewPlaybackProgress;
+    }
+  | {
+      type: "VIDEO_PREVIEW_CACHE_STATE_REQUEST";
+      requestId: string;
+      metadata: VideoPreviewMetadata;
     };
+
+interface VideoPreviewCacheStateResponse {
+  type: "VIDEO_PREVIEW_CACHE_STATE_RESPONSE";
+  requestId: string;
+  state: unknown;
+  error?: string;
+}
+
+function normalizeVideoPreviewCacheState(value: unknown, metadata: VideoPreviewMetadata): VideoPreviewCacheState | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+
+  const state = value as Partial<VideoPreviewCacheState>;
+  const chunkCount = Number(state.chunkCount);
+  if (!Number.isSafeInteger(chunkCount) || chunkCount <= 0 || state.fileId !== metadata.fileId || state.kind !== metadata.kind) {
+    return null;
+  }
+
+  const seen = new Set<number>();
+  const cachedChunks = Array.isArray(state.cachedChunks)
+    ? state.cachedChunks
+        .map((chunkIndex) => Number(chunkIndex))
+        .filter((chunkIndex) => {
+          const valid = Number.isSafeInteger(chunkIndex) && chunkIndex >= 0 && chunkIndex < chunkCount && !seen.has(chunkIndex);
+          if (valid) seen.add(chunkIndex);
+          return valid;
+        })
+        .sort((left, right) => left - right)
+    : [];
+
+  return {
+    fileId: metadata.fileId,
+    kind: metadata.kind,
+    chunkCount,
+    cachedChunks
+  };
+}

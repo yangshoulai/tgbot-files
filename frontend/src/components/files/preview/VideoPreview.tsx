@@ -7,8 +7,11 @@ import {
   buildVideoPreviewMetadata,
   buildVideoPreviewUrl,
   reportVideoPreviewPlaybackProgress,
+  requestVideoPreviewCacheState,
   startVideoPreviewCacheSession,
-  stopVideoPreviewCacheSession
+  stopVideoPreviewCacheSession,
+  type VideoPreviewCacheState,
+  type VideoPreviewMetadata
 } from "../../../lib/video-preview";
 import {
   ensureVideoPreviewServiceWorker,
@@ -31,6 +34,7 @@ const VIDEO_PREVIEW_TIMEOUT_MS = 30_000;
 const VIDEO_CONTROLS_HIDE_DELAY_MS = 1_800;
 const VIDEO_LOADING_INDICATOR_DELAY_MS = 360;
 const VIDEO_PREVIEW_PROGRESS_REPORT_MIN_INTERVAL_MS = 900;
+const VIDEO_PREVIEW_CACHE_STATE_POLL_MS = 1_200;
 const SUBTITLE_PREVIEW_TIMEOUT_MS = 20_000;
 
 export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPreviewCacheBytes }: VideoPreviewProps) {
@@ -46,9 +50,10 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
   const [serviceWorkerState, setServiceWorkerState] = useState<VideoPreviewServiceWorkerState>(initialVideoPreviewServiceWorkerState);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
+  const [cacheState, setCacheState] = useState<VideoPreviewCacheState | null>(null);
   const [subtitleTracks, setSubtitleTracks] = useState<LoadedSubtitleTrack[]>([]);
   const [selectedSubtitleId, setSelectedSubtitleId] = useState<string | null>(null);
-  const heightLimit = fullscreen ? "calc(100dvh - 9rem)" : "min(68dvh, 760px)";
+  const videoHeightLimit = fullscreen ? "calc(100dvh - 13.5rem)" : "min(62dvh, 700px)";
   const isHlsPackage = file.storage_backend === "hls_package";
   const serviceWorkerReady = serviceWorkerState.status === "controlled";
   const previewCandidate = useMemo(
@@ -63,6 +68,12 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
     () => subtitleTracks.map((track) => ({ id: track.id, label: track.label })),
     [subtitleTracks]
   );
+  const cachedChunkSet = useMemo(() => new Set(cacheState?.cachedChunks ?? []), [cacheState]);
+
+  const isCurrentPlaybackPositionCached = useCallback((video: HTMLVideoElement) => {
+    const chunkIndex = playbackChunkIndexForVideo(video, previewMetadata, cacheState?.chunkCount ?? 0);
+    return chunkIndex !== null && cachedChunkSet.has(chunkIndex);
+  }, [cacheState?.chunkCount, cachedChunkSet, previewMetadata]);
 
   const reportPlaybackProgress = useCallback((video: HTMLVideoElement, immediate = false) => {
     if (!previewMetadata) return;
@@ -182,6 +193,15 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
     setLoading(false);
   }, [clearLoadingTimer]);
 
+  const maybeShowLoading = useCallback((video: HTMLVideoElement, immediate = false) => {
+    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA || isCurrentPlaybackPositionCached(video)) {
+      hideLoading();
+      return;
+    }
+
+    showLoading(immediate);
+  }, [hideLoading, isCurrentPlaybackPositionCached, showLoading]);
+
   useEffect(() => {
     if (videoSrc) {
       showLoading(true);
@@ -193,6 +213,7 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
 
   useEffect(() => {
     playbackProgressReportRef.current = { sentAt: 0, marker: -1, currentTime: -1 };
+    setCacheState(null);
   }, [file.id, previewUrl]);
 
   useEffect(() => {
@@ -275,6 +296,40 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
     return () => {
       window.clearInterval(heartbeatId);
       stopVideoPreviewCacheSession(sessionId);
+    };
+  }, [previewMetadata, previewUrl]);
+
+  useEffect(() => {
+    if (!previewMetadata || !previewUrl) {
+      setCacheState(null);
+      return undefined;
+    }
+
+    let disposed = false;
+    let requestInFlight = false;
+
+    const syncCacheState = async () => {
+      if (requestInFlight) return;
+      requestInFlight = true;
+
+      try {
+        const nextState = await requestVideoPreviewCacheState(previewMetadata);
+        if (!disposed) {
+          setCacheState(nextState);
+        }
+      } finally {
+        requestInFlight = false;
+      }
+    };
+
+    void syncCacheState();
+    const intervalId = window.setInterval(() => {
+      void syncCacheState();
+    }, VIDEO_PREVIEW_CACHE_STATE_POLL_MS);
+
+    return () => {
+      disposed = true;
+      window.clearInterval(intervalId);
     };
   }, [previewMetadata, previewUrl]);
 
@@ -424,14 +479,13 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
     >
       <div
         ref={frameRef}
-        className="relative isolate max-h-full max-w-full overflow-hidden bg-[#020403] shadow-[0_28px_90px_rgba(0,0,0,0.42)] ring-1 ring-white/12 sm:rounded-[1rem]"
+        className="relative isolate flex max-h-full max-w-full flex-col overflow-hidden bg-[#020403] shadow-[0_28px_90px_rgba(0,0,0,0.42)] ring-1 ring-white/12 sm:rounded-[1rem]"
         style={{
-          aspectRatio: ratio.label.replace(":", " / "),
-          width: `min(100%, calc(${heightLimit} * ${ratio.value}))`
+          width: `min(100%, calc(${videoHeightLimit} * ${ratio.value}))`
         }}
         onPointerEnter={showControls}
         onPointerMove={showControls}
-        onPointerLeave={() => scheduleControlsHide()}
+        onPointerLeave={() => scheduleControlsHide(300)}
         onTouchStart={() => {
           showControls();
           scheduleControlsHide(3_000);
@@ -444,53 +498,57 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
           }
         }}
       >
-        <video
-          ref={videoRef}
-          src={isHlsPackage ? undefined : videoSrc ?? undefined}
-          poster={poster}
-          playsInline
-          preload="auto"
-          className="h-full w-full bg-[#020403] object-contain"
-          onLoadStart={() => showLoading(true)}
-          onWaiting={() => showLoading()}
-          onSeeking={(event) => {
-            showLoading();
-            reportPlaybackProgress(event.currentTarget, true);
-          }}
-          onTimeUpdate={(event) => reportPlaybackProgress(event.currentTarget)}
-          onLoadedData={() => {
-            hideLoading();
-            setFailed(false);
-          }}
-          onCanPlay={() => {
-            hideLoading();
-            setFailed(false);
-          }}
-          onPlaying={(event) => {
-            hideLoading();
-            setFailed(false);
-            reportPlaybackProgress(event.currentTarget, true);
-          }}
-          onSeeked={(event) => {
-            reportPlaybackProgress(event.currentTarget, true);
-            if (event.currentTarget.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+        <div
+          className="relative w-full overflow-hidden bg-[#020403]"
+          style={{ aspectRatio: ratio.label.replace(":", " / ") }}
+        >
+          <video
+            ref={videoRef}
+            src={isHlsPackage ? undefined : videoSrc ?? undefined}
+            poster={poster}
+            playsInline
+            preload="auto"
+            className="h-full w-full bg-[#020403] object-contain"
+            onLoadStart={() => showLoading(true)}
+            onWaiting={(event) => maybeShowLoading(event.currentTarget)}
+            onSeeking={(event) => {
+              reportPlaybackProgress(event.currentTarget, true);
+              maybeShowLoading(event.currentTarget);
+            }}
+            onTimeUpdate={(event) => reportPlaybackProgress(event.currentTarget)}
+            onLoadedData={() => {
               hideLoading();
               setFailed(false);
-            }
-          }}
-          onError={() => {
-            hideLoading();
-            setFailed(true);
-          }}
-          onLoadedMetadata={(event) => {
-            const target = event.currentTarget;
-            setFailed(false);
-            if (target.videoWidth > 0 && target.videoHeight > 0) {
-              setRatio(toAspectRatio(target.videoWidth, target.videoHeight));
-            }
-            reportPlaybackProgress(target, true);
-          }}
-        >
+            }}
+            onCanPlay={() => {
+              hideLoading();
+              setFailed(false);
+            }}
+            onPlaying={(event) => {
+              hideLoading();
+              setFailed(false);
+              reportPlaybackProgress(event.currentTarget, true);
+            }}
+            onSeeked={(event) => {
+              reportPlaybackProgress(event.currentTarget, true);
+              if (event.currentTarget.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+                hideLoading();
+                setFailed(false);
+              }
+            }}
+            onError={() => {
+              hideLoading();
+              setFailed(true);
+            }}
+            onLoadedMetadata={(event) => {
+              const target = event.currentTarget;
+              setFailed(false);
+              if (target.videoWidth > 0 && target.videoHeight > 0) {
+                setRatio(toAspectRatio(target.videoWidth, target.videoHeight));
+              }
+              reportPlaybackProgress(target, true);
+            }}
+          >
           {subtitleTracks.map((track) => (
             <track
               key={track.id}
@@ -519,17 +577,19 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
             视频加载失败，请尝试下载后播放。
           </div>
         ) : null}
+        </div>
 
         <div
           className={cn(
-            "absolute inset-x-0 bottom-0 z-20 bg-gradient-to-t from-black/82 via-black/30 to-transparent px-2 pb-2 pt-16 transition-all duration-200 ease-out sm:px-4 sm:pb-4 sm:pt-24",
-            controlsVisible ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-3 opacity-0"
+            "w-full overflow-hidden border-t border-white/10 bg-[#050a09]/95 transition-[max-height,opacity,padding] duration-200 ease-out",
+            controlsVisible ? "max-h-44 p-2 opacity-100 sm:p-3" : "pointer-events-none max-h-0 p-0 opacity-0"
           )}
         >
           <MediaControls
             mediaRef={videoRef}
             fullscreen={fullscreen}
             onToggleFullscreen={onToggleFullscreen}
+            cacheState={cacheState}
             variant="floating"
             density={controlsDensity}
             interactive={controlsVisible}
@@ -746,6 +806,31 @@ function initialAspectRatio(file: FileItem): { label: string; value: number } {
   }
 
   return { label: "16:9", value: 16 / 9 };
+}
+
+function playbackChunkIndexForVideo(
+  video: HTMLVideoElement,
+  metadata: VideoPreviewMetadata | null,
+  fallbackChunkCount: number
+): number | null {
+  const currentTime = Number.isFinite(video.currentTime) && video.currentTime >= 0
+    ? video.currentTime
+    : 0;
+  const duration = Number.isFinite(video.duration) && video.duration > 0
+    ? video.duration
+    : 0;
+  if (duration <= 0) return null;
+
+  const ratio = Math.min(1, Math.max(0, currentTime / duration));
+  if (metadata?.kind !== "hls" && metadata?.size && metadata.size > 0 && metadata.chunkSize && metadata.chunkSize > 0) {
+    const byteOffset = Math.min(metadata.size - 1, Math.max(0, Math.floor(ratio * metadata.size)));
+    return Math.floor(byteOffset / metadata.chunkSize);
+  }
+
+  const chunkCount = fallbackChunkCount || metadata?.chunkCount || 0;
+  if (!Number.isSafeInteger(chunkCount) || chunkCount <= 0) return null;
+
+  return Math.min(chunkCount - 1, Math.max(0, Math.floor(ratio * chunkCount)));
 }
 
 function controlsDensityForFrame(width: number, aspectRatio: number): MediaControlsDensity {

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode, type RefObject } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode, type RefObject } from "react";
 import { Captions, FastForward, Maximize2, Minimize2, Pause, Play, Rewind, Square, Volume2, VolumeX } from "lucide-react";
 import { cn } from "../../../lib/cn";
 
@@ -7,10 +7,16 @@ export interface MediaSubtitleOption {
   label: string;
 }
 
+export interface MediaCacheState {
+  chunkCount: number;
+  cachedChunks: number[];
+}
+
 interface MediaControlsProps {
   mediaRef: RefObject<HTMLMediaElement>;
   fullscreen: boolean;
   onToggleFullscreen: () => void;
+  cacheState?: MediaCacheState | null;
   subtitles?: MediaSubtitleOption[];
   selectedSubtitleId?: string | null;
   onSubtitleChange?: (subtitleId: string | null) => void;
@@ -37,6 +43,7 @@ export function MediaControls({
   mediaRef,
   fullscreen,
   onToggleFullscreen,
+  cacheState = null,
   subtitles = [],
   selectedSubtitleId = null,
   onSubtitleChange,
@@ -165,6 +172,7 @@ export function MediaControls({
   const currentTime = Math.min(state.currentTime, duration || state.currentTime);
   const bufferedPercent = duration > 0 ? Math.min(100, (state.bufferedEnd / duration) * 100) : 0;
   const progressPercent = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
+  const cacheRanges = useMemo(() => cachedChunkRanges(cacheState), [cacheState]);
   const canChooseSubtitle = subtitles.length > 0 && Boolean(onSubtitleChange);
 
   return (
@@ -199,6 +207,23 @@ export function MediaControls({
           )}
           style={{ width: `${progressPercent}%` }}
         />
+        {cacheState?.chunkCount ? (
+          <div
+            aria-hidden
+            className={cn(
+              "pointer-events-none absolute inset-x-0 bottom-0 h-[2px] overflow-hidden rounded-full",
+              inline ? "bg-border-strong/70" : floating ? "bg-white/35" : "bg-white/30"
+            )}
+          >
+            {cacheRanges.map((range) => (
+              <span
+                key={`${range.left}-${range.width}`}
+                className="absolute inset-y-0 rounded-full bg-primary"
+                style={{ left: `${range.left}%`, width: `${range.width}%` }}
+              />
+            ))}
+          </div>
+        ) : null}
         <input
           type="range"
           min={0}
@@ -305,10 +330,10 @@ export function MediaControls({
                 tabIndex={controlTabIndex}
                 className={cn(
                   "border text-xs outline-none transition-colors focus-visible:focus-ring",
-                  floating ? "h-8 w-[3.1rem] rounded-full px-1 sm:w-[3.35rem] sm:px-1.5" : "rounded-md",
-                  inline ? "h-8 w-[3.35rem] border-border bg-surface px-1.5 text-foreground hover:bg-primary-soft/50" : "border-white/10 bg-white/[0.08] text-white hover:bg-white/15",
-                  dense && !floating ? "h-8 w-14 px-1.5" : null,
-                  !dense ? "h-9 w-16 px-2" : null
+                  floating ? "h-8 w-[4.25rem] rounded-full px-2 sm:w-[4.75rem] sm:px-2.5" : "rounded-md",
+                  inline ? "h-8 w-[4.4rem] border-border bg-surface px-2 text-foreground hover:bg-primary-soft/50" : "border-white/10 bg-white/[0.08] text-white hover:bg-white/15",
+                  dense && !floating ? "h-8 w-[4.25rem] px-2" : null,
+                  !dense ? "h-9 w-[4.75rem] px-2" : null
                 )}
                 aria-label="切换播放速度"
               >
@@ -336,10 +361,10 @@ export function MediaControls({
                 tabIndex={controlTabIndex}
                 className={cn(
                   "border text-xs outline-none transition-colors focus-visible:focus-ring",
-                  floating ? "h-8 w-[4.35rem] rounded-full px-1 sm:w-[5.25rem] sm:px-1.5" : "rounded-md",
-                  inline ? "h-8 w-[5.25rem] border-border bg-surface px-1.5 text-foreground hover:bg-primary-soft/50" : "border-white/10 bg-white/[0.08] text-white hover:bg-white/15",
-                  dense && !floating ? "h-8 w-[4.8rem] px-1.5" : null,
-                  !dense ? "h-9 w-[5.6rem] px-2" : null
+                  floating ? "h-8 w-[6.25rem] rounded-full px-2 sm:w-[7.5rem] sm:px-2.5" : "rounded-md",
+                  inline ? "h-8 w-[7.5rem] border-border bg-surface px-2 text-foreground hover:bg-primary-soft/50" : "border-white/10 bg-white/[0.08] text-white hover:bg-white/15",
+                  dense && !floating ? "h-8 w-[6.8rem] px-2" : null,
+                  !dense ? "h-9 w-[8rem] px-2.5" : null
                 )}
                 aria-label="切换字幕"
               >
@@ -359,6 +384,53 @@ export function MediaControls({
       </div>
     </div>
   );
+}
+
+function cachedChunkRanges(cacheState: MediaCacheState | null): Array<{ left: number; width: number }> {
+  const chunkCount = cacheState?.chunkCount ?? 0;
+  if (!Number.isSafeInteger(chunkCount) || chunkCount <= 0 || !Array.isArray(cacheState?.cachedChunks)) {
+    return [];
+  }
+
+  const seen = new Set<number>();
+  const cachedChunks = cacheState.cachedChunks
+    .map((chunkIndex) => Math.floor(Number(chunkIndex)))
+    .filter((chunkIndex) => {
+      const valid = Number.isSafeInteger(chunkIndex) && chunkIndex >= 0 && chunkIndex < chunkCount && !seen.has(chunkIndex);
+      if (valid) seen.add(chunkIndex);
+      return valid;
+    })
+    .sort((left, right) => left - right);
+
+  if (cachedChunks.length === 0) {
+    return [];
+  }
+
+  const ranges: Array<{ left: number; width: number }> = [];
+  let start = cachedChunks[0];
+  let end = cachedChunks[0];
+
+  for (let index = 1; index < cachedChunks.length; index += 1) {
+    const chunkIndex = cachedChunks[index];
+    if (chunkIndex === end + 1) {
+      end = chunkIndex;
+      continue;
+    }
+
+    ranges.push(chunkRangeToPercent(start, end, chunkCount));
+    start = chunkIndex;
+    end = chunkIndex;
+  }
+
+  ranges.push(chunkRangeToPercent(start, end, chunkCount));
+  return ranges;
+}
+
+function chunkRangeToPercent(start: number, end: number, chunkCount: number): { left: number; width: number } {
+  return {
+    left: (start / chunkCount) * 100,
+    width: ((end - start + 1) / chunkCount) * 100
+  };
 }
 
 function MediaButton({ label, onClick, children, emphasis = false, dense = false, floating = false, inline = false, tabIndex, className }: {

@@ -64,6 +64,15 @@ self.addEventListener("message", (event) => {
     if (metadata && sessionId && progress) {
       event.waitUntil(updatePreviewCachePlaybackPriority(sessionId, metadata, progress));
     }
+    return;
+  }
+
+  if (event.data?.type === "VIDEO_PREVIEW_CACHE_STATE_REQUEST") {
+    const metadata = normalizePreviewMetadata(event.data.metadata);
+    const requestId = normalizeRequestId(event.data.requestId);
+    if (metadata && requestId) {
+      event.waitUntil(replyPreviewCacheState(event, requestId, metadata));
+    }
   }
 });
 
@@ -708,6 +717,80 @@ function normalizeSameOriginSourceUrl(value) {
 
 function normalizeSessionId(value) {
   return typeof value === "string" && value.trim() ? value : null;
+}
+
+function normalizeRequestId(value) {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+async function replyPreviewCacheState(event, requestId, metadata) {
+  try {
+    postPreviewCacheStateResponse(event, {
+      type: "VIDEO_PREVIEW_CACHE_STATE_RESPONSE",
+      requestId,
+      state: await readPreviewCacheState(metadata)
+    });
+  } catch (error) {
+    postPreviewCacheStateResponse(event, {
+      type: "VIDEO_PREVIEW_CACHE_STATE_RESPONSE",
+      requestId,
+      state: null,
+      error: error instanceof Error ? error.message : "Failed to read preview cache state"
+    });
+  }
+}
+
+function postPreviewCacheStateResponse(event, response) {
+  const port = event.ports?.[0];
+  if (port) {
+    port.postMessage(response);
+    return;
+  }
+
+  event.source?.postMessage(response);
+}
+
+async function readPreviewCacheState(metadata) {
+  const chunkCount = previewCacheStateChunkCount(metadata);
+  const cachedChunks = [];
+
+  if (chunkCount > 0) {
+    const entries = await getAllChunkMetadata();
+    const seen = new Set();
+
+    for (const entry of entries) {
+      if (entry?.fileId !== metadata.fileId) {
+        continue;
+      }
+
+      const chunkIndex = Math.floor(Number(entry.chunkIndex));
+      if (!Number.isSafeInteger(chunkIndex) || chunkIndex < 0 || chunkIndex >= chunkCount || seen.has(chunkIndex)) {
+        continue;
+      }
+
+      seen.add(chunkIndex);
+      cachedChunks.push(chunkIndex);
+    }
+  }
+
+  cachedChunks.sort((left, right) => left - right);
+
+  return {
+    fileId: metadata.fileId,
+    kind: metadata.kind,
+    chunkCount,
+    cachedChunks
+  };
+}
+
+function previewCacheStateChunkCount(metadata) {
+  if (metadata.kind === "hls") {
+    const sources = hlsPreviewSources.get(metadata.fileId);
+    const chunkCount = sources?.segments?.length ?? 0;
+    return Number.isSafeInteger(chunkCount) && chunkCount > 0 ? chunkCount : 0;
+  }
+
+  return Number.isSafeInteger(metadata.chunkCount) && metadata.chunkCount > 0 ? metadata.chunkCount : 0;
 }
 
 function normalizePlaybackProgress(value) {
