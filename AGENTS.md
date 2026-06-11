@@ -59,8 +59,8 @@ tgbot-files/
 |---|---|---|
 | POST | `/api/admin/login` | body `{username, password}` |
 | POST | `/api/admin/logout` | 退出登录 |
-| GET | `/api/admin/session` | 返回 `username` / 上传限制 / 上传并发 / `config{...}` 布尔标志 |
-| PATCH | `/api/admin/settings` | 更新系统设置，目前支持 `upload_concurrency` |
+| GET | `/api/admin/session` | 返回 `username` / 上传限制 / 上传并发 / 分片大小 / 视频预览缓存 / `config{...}` 布尔标志 |
+| PATCH | `/api/admin/settings` | 更新系统设置，支持 `upload_concurrency` / `telegram_chunk_size_bytes` / `video_preview_cache_bytes` |
 | GET | `/api/admin/files` | 查询 `q`, `page`, `limit`（≤100） |
 | POST | `/api/admin/files` | multipart `file` + 可选 `remark` |
 | DELETE | `/api/admin/files/:id` | 软删除索引（不动 Telegram 原消息） |
@@ -121,9 +121,11 @@ frontend/src/
 ## 后端约束（前端工程师视角）
 
 - 上传大小由 `MAX_FILE_BYTES` 环境变量控制，前端在 `session.max_file_bytes` 拿到，应在前端提前校验。
+- 分片大小可通过设置页配置（1MB-18MB），默认 10MB，保存到 `app_settings` 表的 `telegram_chunk_size_bytes` 键。
 - API key 明文存储在 SQLite（用户已知权衡）。前端列表只展示 masked，明文必须通过 `GET /api/admin/api-keys/:id` 显式 reveal。
 - 删除文件是软删除，**不会**删除 Telegram 中的原始消息，已分发的签名链接仍然有效。该语义要在删除确认对话框里说清楚。
 - 分片并发由设置页 `upload_concurrency` 控制，默认 `5`，保存到 `app_settings` 表。
+- 视频预览缓存上限由设置页 `video_preview_cache_bytes` 控制，默认 2GiB，范围 256MiB-20GiB。
 
 ## 工作约定
 

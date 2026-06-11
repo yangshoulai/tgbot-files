@@ -174,6 +174,7 @@ export function MediaControls({
   const progressPercent = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
   const cacheRanges = useMemo(() => cachedChunkRanges(cacheState), [cacheState]);
   const canChooseSubtitle = subtitles.length > 0 && Boolean(onSubtitleChange);
+  const hasCacheData = Boolean(cacheState?.chunkCount);
 
   return (
     <div
@@ -199,14 +200,29 @@ export function MediaControls({
           tiny && "mb-1.5 h-1.5"
         )}
       >
-        <div className={cn("absolute inset-y-0 left-0 rounded-full", inline ? "bg-border-strong/60" : floating ? "bg-white/28" : "bg-white/35")} style={{ width: `${bufferedPercent}%` }} />
+        <div className={cn("absolute inset-y-0 left-0 rounded-full", inline ? "bg-border-strong/30" : floating ? "bg-white/18" : "bg-white/20")} style={{ width: `${bufferedPercent}%` }} />
+        {hasCacheData && cacheRanges.map((range) => (
+          <span
+            key={`${range.left}-${range.width}`}
+            className={cn("absolute inset-y-0 rounded-full", inline ? "bg-primary/60" : "bg-primary/70")}
+            style={{ left: `${range.left}%`, width: `${range.width}%` }}
+          />
+        ))}
         <div
           className={cn(
-            "absolute inset-y-0 left-0 rounded-full",
-            floating ? "bg-primary shadow-[0_0_18px_rgba(16,185,129,0.48)]" : "bg-primary"
+            "pointer-events-none absolute inset-y-0 flex items-center",
+            floating ? "left-[-0.375rem]" : "left-[-0.5rem]"
           )}
-          style={{ width: `${progressPercent}%` }}
-        />
+          style={{ left: `calc(${progressPercent}% - ${floating ? "0.375rem" : "0.5rem"})` }}
+        >
+          <div
+            className={cn(
+              "rounded-full border-2",
+              inline ? "border-white bg-primary shadow-[0_0_8px_rgba(16,185,129,0.4)]" : "border-black/20 bg-white shadow-[0_0_12px_rgba(255,255,255,0.6)]",
+              floating ? "h-3 w-3" : "h-4 w-4"
+            )}
+          />
+        </div>
         <input
           type="range"
           min={0}
@@ -219,24 +235,6 @@ export function MediaControls({
           className={cn("absolute inset-x-0 -inset-y-2 h-5 w-full cursor-pointer opacity-0", floating && "sm:-inset-y-2.5 sm:h-6")}
         />
       </div>
-      {cacheState?.chunkCount ? (
-        <div
-          aria-hidden
-          className={cn(
-            "relative h-[3px] w-full overflow-hidden rounded-full",
-            floating ? "mb-3 bg-[#68726d]/80 shadow-[0_0_0_1px_rgba(255,255,255,0.05)]" : inline ? "mb-3 bg-border-strong/75" : "mb-3 bg-white/35",
-            tiny && "mb-2"
-          )}
-        >
-          {cacheRanges.map((range) => (
-            <span
-              key={`${range.left}-${range.width}`}
-              className="absolute inset-y-0 rounded-full bg-[#22c55e] shadow-[0_0_10px_rgba(34,197,94,0.48)]"
-              style={{ left: `${range.left}%`, width: `${range.width}%` }}
-            />
-          ))}
-        </div>
-      ) : null}
 
       <div className={cn("flex min-w-0 items-center", inline ? "flex-wrap gap-y-2" : "flex-nowrap", floating ? "gap-1.5 sm:gap-2" : "gap-2", tiny && "gap-1")}>
         <div className="flex shrink-0 items-center gap-1 sm:gap-1.5">

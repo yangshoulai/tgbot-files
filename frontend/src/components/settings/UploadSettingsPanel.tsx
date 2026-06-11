@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { Gauge, HardDrive, Save } from "lucide-react";
+import { Gauge, HardDrive, Package, Save } from "lucide-react";
 import { ApiError, type SessionResponse, updateSettings } from "../../api";
 import { useToast } from "../../lib/toast";
 import { formatBytes } from "../../utils";
@@ -18,6 +18,7 @@ function errorMessage(error: unknown): string {
 }
 
 const GIB_BYTES = 1024 * 1024 * 1024;
+const MB_BYTES = 1024 * 1024;
 
 export function UploadSettingsPanel({ session, onSessionChange }: UploadSettingsPanelProps) {
   const toast = useToast();
@@ -25,6 +26,7 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
   const max = session.upload_concurrency_max;
   const [draft, setDraft] = useState(String(session.upload_concurrency));
   const [cacheDraft, setCacheDraft] = useState(cacheBytesToGiBInput(session.video_preview_cache_bytes));
+  const [chunkDraft, setChunkDraft] = useState(bytesToMBInput(session.telegram_chunk_size_bytes));
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -35,6 +37,10 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
     setCacheDraft(cacheBytesToGiBInput(session.video_preview_cache_bytes));
   }, [session.video_preview_cache_bytes]);
 
+  useEffect(() => {
+    setChunkDraft(bytesToMBInput(session.telegram_chunk_size_bytes));
+  }, [session.telegram_chunk_size_bytes]);
+
   const parsedDraft = useMemo(() => Number(draft), [draft]);
   const invalid = !Number.isSafeInteger(parsedDraft) || parsedDraft < min || parsedDraft > max;
   const parsedCacheGiB = useMemo(() => Number(cacheDraft), [cacheDraft]);
@@ -42,8 +48,14 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
   const cacheInvalid = !Number.isFinite(parsedCacheGiB) ||
     parsedCacheBytes < session.video_preview_cache_bytes_min ||
     parsedCacheBytes > session.video_preview_cache_bytes_max;
+  const parsedChunkMB = useMemo(() => Number(chunkDraft), [chunkDraft]);
+  const parsedChunkBytes = useMemo(() => Math.round(parsedChunkMB * MB_BYTES), [parsedChunkMB]);
+  const chunkInvalid = !Number.isFinite(parsedChunkMB) ||
+    parsedChunkBytes < session.telegram_chunk_size_bytes_min ||
+    parsedChunkBytes > session.telegram_chunk_size_bytes_max;
   const dirty = (!invalid && parsedDraft !== session.upload_concurrency) ||
-    (!cacheInvalid && parsedCacheBytes !== session.video_preview_cache_bytes);
+    (!cacheInvalid && parsedCacheBytes !== session.video_preview_cache_bytes) ||
+    (!chunkInvalid && parsedChunkBytes !== session.telegram_chunk_size_bytes);
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -55,12 +67,17 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
       toast.danger(`视频预览缓存需要在 ${formatBytes(session.video_preview_cache_bytes_min)}-${formatBytes(session.video_preview_cache_bytes_max)} 之间`);
       return;
     }
+    if (chunkInvalid) {
+      toast.danger(`分片大小需要在 ${formatBytes(session.telegram_chunk_size_bytes_min)}-${formatBytes(session.telegram_chunk_size_bytes_max)} 之间`);
+      return;
+    }
 
     setSaving(true);
     try {
       const response = await updateSettings({
         upload_concurrency: parsedDraft,
-        video_preview_cache_bytes: parsedCacheBytes
+        video_preview_cache_bytes: parsedCacheBytes,
+        telegram_chunk_size_bytes: parsedChunkBytes
       });
       onSessionChange({
         ...session,
@@ -69,10 +86,14 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
         upload_concurrency_max: response.settings.upload_concurrency_max,
         video_preview_cache_bytes: response.settings.video_preview_cache_bytes,
         video_preview_cache_bytes_min: response.settings.video_preview_cache_bytes_min,
-        video_preview_cache_bytes_max: response.settings.video_preview_cache_bytes_max
+        video_preview_cache_bytes_max: response.settings.video_preview_cache_bytes_max,
+        telegram_chunk_size_bytes: response.settings.telegram_chunk_size_bytes,
+        telegram_chunk_size_bytes_min: response.settings.telegram_chunk_size_bytes_min,
+        telegram_chunk_size_bytes_max: response.settings.telegram_chunk_size_bytes_max
       });
       setDraft(String(response.settings.upload_concurrency));
       setCacheDraft(cacheBytesToGiBInput(response.settings.video_preview_cache_bytes));
+      setChunkDraft(bytesToMBInput(response.settings.telegram_chunk_size_bytes));
       toast.success("传输与预览设置已保存");
     } catch (error) {
       toast.danger(errorMessage(error));
@@ -86,12 +107,15 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
       <header className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <p className="text-xs font-medium uppercase tracking-wide text-muted">传输任务</p>
-          <h2 className="mt-1 text-lg font-semibold text-foreground">并发与预览缓存</h2>
+          <h2 className="mt-1 text-lg font-semibold text-foreground">并发、分片与预览缓存</h2>
           <p className="mt-0.5 text-xs text-muted">保存后对下一次上传、加速下载和视频预览缓存生效。</p>
         </div>
         <div className="flex flex-wrap gap-2">
           <Badge tone="primary" icon={<Gauge size={12} />}>
             {session.upload_concurrency} 并发
+          </Badge>
+          <Badge tone="info" icon={<Package size={12} />}>
+            {formatBytes(session.telegram_chunk_size_bytes)}
           </Badge>
           <Badge tone="neutral" icon={<HardDrive size={12} />}>
             {formatBytes(session.video_preview_cache_bytes)}
@@ -133,6 +157,37 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
 
         <div className="grid gap-3 sm:grid-cols-[1fr_9rem] sm:items-end">
           <label className="flex flex-col gap-2">
+            <span className="text-xs font-medium text-muted">分片大小</span>
+            <input
+              type="range"
+              min={bytesToMB(session.telegram_chunk_size_bytes_min)}
+              max={bytesToMB(session.telegram_chunk_size_bytes_max)}
+              step={1}
+              value={chunkInvalid ? bytesToMB(session.telegram_chunk_size_bytes) : parsedChunkMB}
+              disabled={saving}
+              onChange={(event) => setChunkDraft(event.currentTarget.value)}
+              className="h-11 w-full accent-primary"
+            />
+          </label>
+
+          <label className="flex flex-col gap-2">
+            <span className="text-xs font-medium text-muted">大小</span>
+            <Input
+              type="number"
+              min={bytesToMB(session.telegram_chunk_size_bytes_min)}
+              max={bytesToMB(session.telegram_chunk_size_bytes_max)}
+              step={1}
+              value={chunkDraft}
+              disabled={saving}
+              invalid={chunkInvalid}
+              onChange={(event) => setChunkDraft(event.currentTarget.value)}
+              trailingNode={<span className="text-xs text-muted">MB</span>}
+            />
+          </label>
+        </div>
+
+        <div className="grid gap-3 sm:grid-cols-[1fr_9rem] sm:items-end">
+          <label className="flex flex-col gap-2">
             <span className="text-xs font-medium text-muted">视频预览缓存上限</span>
             <input
               type="range"
@@ -164,14 +219,14 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
 
         <div className="flex flex-wrap items-center justify-between gap-3">
           <p className="text-xs text-muted">
-            并发范围 {min}-{max}；缓存范围 {formatBytes(session.video_preview_cache_bytes_min)}-{formatBytes(session.video_preview_cache_bytes_max)}。
+            并发 {min}-{max}；分片 {formatBytes(session.telegram_chunk_size_bytes_min)}-{formatBytes(session.telegram_chunk_size_bytes_max)}；缓存 {formatBytes(session.video_preview_cache_bytes_min)}-{formatBytes(session.video_preview_cache_bytes_max)}。
           </p>
           <Button
             type="submit"
             size="sm"
             variant="primary"
             loading={saving}
-            disabled={!dirty || invalid}
+            disabled={!dirty || invalid || chunkInvalid}
             leadingIcon={<Save size={15} />}
           >
             保存设置
@@ -186,6 +241,14 @@ function bytesToGiB(value: number): number {
   return value / GIB_BYTES;
 }
 
+function bytesToMB(value: number): number {
+  return value / MB_BYTES;
+}
+
 function cacheBytesToGiBInput(value: number): string {
   return Number(bytesToGiB(value).toFixed(2)).toString();
+}
+
+function bytesToMBInput(value: number): string {
+  return Math.round(bytesToMB(value)).toString();
 }

@@ -76,6 +76,7 @@ import {
   deleteFileRecord,
   DEFAULT_VIDEO_PREVIEW_CACHE_BYTES,
   DEFAULT_UPLOAD_CONCURRENCY,
+  DEFAULT_TELEGRAM_CHUNK_SIZE_BYTES,
   touchApiKeyRecord,
   updateApiKeyRecord,
   updateFileRecordMetadata,
@@ -85,13 +86,17 @@ import {
   deleteTelegramChannelRecord,
   getUploadConcurrencySetting,
   getVideoPreviewCacheBytesSetting,
+  getTelegramChunkSizeBytesSetting,
   setUploadConcurrencySetting,
   setVideoPreviewCacheBytesSetting,
+  setTelegramChunkSizeBytesSetting,
   selectMagnetImportFiles,
   MIN_UPLOAD_CONCURRENCY,
   MAX_UPLOAD_CONCURRENCY,
   MIN_VIDEO_PREVIEW_CACHE_BYTES,
   MAX_VIDEO_PREVIEW_CACHE_BYTES,
+  MIN_TELEGRAM_CHUNK_SIZE_BYTES,
+  MAX_TELEGRAM_CHUNK_SIZE_BYTES,
   type ApiKeyRecord,
   type ApiKeyStatus,
   type DirectoryRecord,
@@ -729,12 +734,15 @@ async function handleAdminSession(request: Request, env: AppEnv, username: strin
   const videoPreviewCacheBytes = env.DATABASE
     ? await getVideoPreviewCacheBytesSetting(env.DATABASE)
     : DEFAULT_VIDEO_PREVIEW_CACHE_BYTES;
+  const telegramChunkSizeBytes = env.DATABASE
+    ? await getTelegramChunkSizeBytesSetting(env.DATABASE)
+    : DEFAULT_TELEGRAM_CHUNK_SIZE_BYTES;
 
   return jsonResponse({
     ok: true,
     username,
     max_file_bytes: maxFileBytes,
-    multipart_chunk_bytes: TELEGRAM_CHUNK_SIZE_BYTES,
+    multipart_chunk_bytes: telegramChunkSizeBytes,
     max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
     direct_access_max_chunks: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
     direct_access_max_bytes: DIRECT_MULTIPART_ACCESS_MAX_BYTES,
@@ -744,6 +752,9 @@ async function handleAdminSession(request: Request, env: AppEnv, username: strin
     video_preview_cache_bytes: videoPreviewCacheBytes,
     video_preview_cache_bytes_min: MIN_VIDEO_PREVIEW_CACHE_BYTES,
     video_preview_cache_bytes_max: MAX_VIDEO_PREVIEW_CACHE_BYTES,
+    telegram_chunk_size_bytes: telegramChunkSizeBytes,
+    telegram_chunk_size_bytes_min: MIN_TELEGRAM_CHUNK_SIZE_BYTES,
+    telegram_chunk_size_bytes_max: MAX_TELEGRAM_CHUNK_SIZE_BYTES,
     base_url: baseUrl,
     config: {
       database: Boolean(env.DATABASE),
@@ -784,15 +795,20 @@ async function handleAdminSettings(request: Request, env: AppEnv): Promise<Respo
     const body = await readJsonObject(request);
     const currentUploadConcurrency = await getUploadConcurrencySetting(db);
     const currentVideoPreviewCacheBytes = await getVideoPreviewCacheBytesSetting(db);
+    const currentTelegramChunkSizeBytes = await getTelegramChunkSizeBytesSetting(db);
     const uploadConcurrency = body.upload_concurrency === undefined
       ? currentUploadConcurrency
       : positiveIntegerField(body.upload_concurrency, "upload_concurrency");
     const videoPreviewCacheBytes = body.video_preview_cache_bytes === undefined
       ? currentVideoPreviewCacheBytes
       : positiveIntegerField(body.video_preview_cache_bytes, "video_preview_cache_bytes");
+    const telegramChunkSizeBytes = body.telegram_chunk_size_bytes === undefined
+      ? currentTelegramChunkSizeBytes
+      : positiveIntegerField(body.telegram_chunk_size_bytes, "telegram_chunk_size_bytes");
     const updatedAt = new Date().toISOString();
     const savedUploadConcurrency = await setUploadConcurrencySetting(db, uploadConcurrency, updatedAt);
     const savedVideoPreviewCacheBytes = await setVideoPreviewCacheBytesSetting(db, videoPreviewCacheBytes, updatedAt);
+    const savedTelegramChunkSizeBytes = await setTelegramChunkSizeBytesSetting(db, telegramChunkSizeBytes, updatedAt);
     return jsonResponse({
       ok: true,
       settings: {
@@ -801,7 +817,10 @@ async function handleAdminSettings(request: Request, env: AppEnv): Promise<Respo
         upload_concurrency_max: MAX_UPLOAD_CONCURRENCY,
         video_preview_cache_bytes: savedVideoPreviewCacheBytes,
         video_preview_cache_bytes_min: MIN_VIDEO_PREVIEW_CACHE_BYTES,
-        video_preview_cache_bytes_max: MAX_VIDEO_PREVIEW_CACHE_BYTES
+        video_preview_cache_bytes_max: MAX_VIDEO_PREVIEW_CACHE_BYTES,
+        telegram_chunk_size_bytes: savedTelegramChunkSizeBytes,
+        telegram_chunk_size_bytes_min: MIN_TELEGRAM_CHUNK_SIZE_BYTES,
+        telegram_chunk_size_bytes_max: MAX_TELEGRAM_CHUNK_SIZE_BYTES
       }
     });
   }
