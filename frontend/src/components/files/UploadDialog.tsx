@@ -4962,12 +4962,24 @@ function MagnetUploadDetails({
     return null;
   }
 
+  const validFiles = info.files.filter((file) => !file.file_name.startsWith("[METADATA]"));
   const selected = new Set(magnet.selectedIndexes);
   const decisions = magnet.fileDecisions ?? {};
-  const selectedFiles = info.files.filter((file) => selected.has(file.file_index));
+  const selectedFiles = validFiles.filter((file) => selected.has(file.file_index));
   const selectedBytes = selectedFiles.reduce((total, file) => total + file.size, 0);
-  const uploadableCount = info.files.filter((file) => file.size <= maxMultipartBytes).length;
+  const uploadableCount = validFiles.filter((file) => file.size <= maxMultipartBytes).length;
   const selectedConflictCount = selectedFiles.filter((file) => Boolean(decisions[file.file_index]?.conflict)).length;
+
+  if (info.status === "probing" && validFiles.length === 0) {
+    return (
+      <div className="mt-2 rounded-lg border border-border bg-background/70 p-3">
+        <div className="flex items-center gap-2 text-sm text-muted">
+          <Spinner size={14} />
+          <span>正在解析磁力链接元数据，请稍候...</span>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="mt-2 flex flex-col gap-2 rounded-lg border border-border bg-background/70 p-2">
@@ -4975,7 +4987,7 @@ function MagnetUploadDetails({
         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
           <HlsMetaPill tone="strong">Magnet</HlsMetaPill>
           <HlsMetaPill>{magnetStatusLabel(info.status)}</HlsMetaPill>
-          <HlsMetaPill>{info.files.length} 个文件</HlsMetaPill>
+          <HlsMetaPill>{validFiles.length} 个文件</HlsMetaPill>
           <HlsMetaPill>已选 {selectedFiles.length} 个 · {formatBytes(selectedBytes)}</HlsMetaPill>
         </div>
         <div className="flex shrink-0 items-center gap-1">
@@ -5011,9 +5023,9 @@ function MagnetUploadDetails({
         <p className="rounded-md bg-danger-soft px-2 py-1.5 text-xs text-danger">{info.error_message}</p>
       ) : null}
       <div className="max-h-60 overflow-auto rounded-lg border border-border bg-surface">
-        {info.files.length > 0 ? (
+        {validFiles.length > 0 ? (
           <div className="divide-y divide-border">
-            {info.files.map((file) => {
+            {validFiles.map((file) => {
               const tooLarge = file.size > maxMultipartBytes;
               const isSelected = selected.has(file.file_index);
               const decision = decisions[file.file_index];
