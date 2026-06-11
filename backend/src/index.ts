@@ -2011,7 +2011,7 @@ async function initMagnetImportSelection(params: MagnetImportSelectionParams): P
   const gid = await aria2AddUri(config, [importRecord.magnet_uri], aria2MagnetOptions(config, {
     dir: importRecord.download_dir,
     "select-file": params.fileIndexes.join(","),
-    "bt-save-metadata": "true",
+    "bt-save-metadata": "false",
     "seed-time": "0",
     "max-upload-limit": "64K"
   }));

@@ -54,6 +54,7 @@ services:
       - "--rpc-listen-all=true"
       - "--rpc-listen-port=6800"
       - "--rpc-secret=${ARIA2_RPC_SECRET:?ARIA2_RPC_SECRET is required}"
+      - "--disable-ipv6=true"
       - "--dir=/data/aria2/downloads"
       - "--save-session=/data/aria2/session.txt"
       - "--input-file=/data/aria2/session.txt"
@@ -89,4 +90,4 @@ services:
       - "--disk-cache=64M"
       - "--continue=true"
       - "--always-resume=true"
-      - "--check-integrity=true"
+      - "--check-integrity=false"
