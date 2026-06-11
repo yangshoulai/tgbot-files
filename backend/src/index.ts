@@ -116,6 +116,7 @@ import {
 import {
   aria2AddUri,
   aria2Forget,
+  aria2RemoveTasksByInfoHash,
   aria2TellStatus,
   requireAria2Config,
   resolveAria2DownloadConfig,
@@ -1843,6 +1844,9 @@ async function cleanupRestartableMagnetImportsBySource(
     await forgetAria2MagnetTask(config, record);
     await deleteMagnetImportDownloadDir(config, record);
   }
+
+  // 兜底：按 InfoHash 扫描并清除 aria2 中任何残留的任务（以防 gid 已失效）
+  await aria2RemoveTasksByInfoHash(config, infoHash);
 }
 
 async function forgetAria2MagnetTask(config: ReturnType<typeof requireAria2Config>, record: MagnetImportRecord): Promise<void> {

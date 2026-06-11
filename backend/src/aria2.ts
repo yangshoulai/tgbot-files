@@ -19,6 +19,7 @@ export interface Aria2Status {
   errorMessage?: string;
   followedBy?: string[];
   following?: string;
+  infoHash?: string;
   files?: Aria2File[];
   bittorrent?: {
     info?: {
@@ -93,7 +94,46 @@ export function requireAria2Config(env: AppEnv): Aria2Config {
 }
 
 export async function aria2AddUri(config: Aria2Config, uris: string[], options: Record<string, string>): Promise<string> {
-  return aria2Rpc<string>(config, "aria2.addUri", [uris, options]);
+  try {
+    return await aria2Rpc<string>(config, "aria2.addUri", [uris, options]);
+  } catch (error) {
+    // 如果遇到 InfoHash 已注册错误，清理 aria2 中残留的同 InfoHash 任务后重试
+    if (error instanceof AppError && error.error === "Aria2RpcFailed" && error.message.includes("already registered")) {
+      const infoHash = extractInfoHash(error.message);
+      console.log(`InfoHash ${infoHash ?? "(unknown)"} already registered, purging stale tasks and retrying`);
+      await aria2RemoveTasksByInfoHash(config, infoHash);
+      return aria2Rpc<string>(config, "aria2.addUri", [uris, options]);
+    }
+    throw error;
+  }
+}
+
+function extractInfoHash(message: string): string | null {
+  const match = message.match(/InfoHash\s+([0-9a-fA-F]{40})/);
+  return match?.[1]?.toLowerCase() ?? null;
+}
+
+// 扫描 active/waiting/stopped 三个队列，强制删除并清除匹配 InfoHash 的残留任务。
+// active/paused 任务无法被 purgeDownloadResult 清理，必须先 forceRemove。
+export async function aria2RemoveTasksByInfoHash(config: Aria2Config, infoHash: string | null): Promise<void> {
+  const keys = ["gid", "status", "infoHash"];
+  const [active, waiting, stopped] = await Promise.all([
+    aria2Rpc<Aria2Status[]>(config, "aria2.tellActive", [keys]).catch(() => []),
+    aria2Rpc<Aria2Status[]>(config, "aria2.tellWaiting", [0, 1000, keys]).catch(() => []),
+    aria2Rpc<Aria2Status[]>(config, "aria2.tellStopped", [0, 1000, keys]).catch(() => [])
+  ]);
+
+  const matches = [...active, ...waiting, ...stopped].filter(
+    (task) => !infoHash || task.infoHash?.toLowerCase() === infoHash
+  );
+
+  for (const task of matches) {
+    await aria2ForceRemove(config, task.gid);
+    await aria2RemoveDownloadResult(config, task.gid);
+  }
+
+  // 兜底：清掉所有已停止/出错的残留结果
+  await aria2PurgeDownloadResult(config);
 }
 
 export async function aria2TellStatus(config: Aria2Config, gid: string): Promise<Aria2Status> {
@@ -126,6 +166,15 @@ export async function aria2ForceRemove(config: Aria2Config, gid: string): Promis
 
 export async function aria2RemoveDownloadResult(config: Aria2Config, gid: string): Promise<void> {
   await aria2Rpc<string>(config, "aria2.removeDownloadResult", [gid]).catch(async (error) => {
+    if (error instanceof AppError && error.error === "Aria2RpcFailed") {
+      return;
+    }
+    throw error;
+  });
+}
+
+export async function aria2PurgeDownloadResult(config: Aria2Config): Promise<void> {
+  await aria2Rpc<string>(config, "aria2.purgeDownloadResult", []).catch(async (error) => {
     if (error instanceof AppError && error.error === "Aria2RpcFailed") {
       return;
     }
