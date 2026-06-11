@@ -40,12 +40,10 @@ const SUBTITLE_PREVIEW_TIMEOUT_MS = 20_000;
 export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPreviewCacheBytes }: VideoPreviewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const frameRef = useRef<HTMLDivElement>(null);
-  const controlsHideTimerRef = useRef<number | null>(null);
   const loadingTimerRef = useRef<number | null>(null);
   const previewCacheSessionIdRef = useRef(`video-preview-${file.id}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   const playbackProgressReportRef = useRef({ sentAt: 0, marker: -1, currentTime: -1 });
   const [ratio, setRatio] = useState(() => initialAspectRatio(file));
-  const [controlsVisible, setControlsVisible] = useState(true);
   const [controlsDensity, setControlsDensity] = useState<MediaControlsDensity>("regular");
   const [serviceWorkerState, setServiceWorkerState] = useState<VideoPreviewServiceWorkerState>(initialVideoPreviewServiceWorkerState);
   const [loading, setLoading] = useState(true);
@@ -154,32 +152,6 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
     setServiceWorkerState({ status: "need-reload", message: "Service Worker 已注册，但当前页面还没有被它接管" });
   }, []);
 
-  const clearControlsHideTimer = useCallback(() => {
-    if (controlsHideTimerRef.current === null) return;
-    window.clearTimeout(controlsHideTimerRef.current);
-    controlsHideTimerRef.current = null;
-  }, []);
-
-  const showControls = useCallback(() => {
-    clearControlsHideTimer();
-    setControlsVisible(true);
-  }, [clearControlsHideTimer]);
-
-  const scheduleControlsHide = useCallback((delay = VIDEO_CONTROLS_HIDE_DELAY_MS) => {
-    clearControlsHideTimer();
-    controlsHideTimerRef.current = window.setTimeout(() => {
-      const activeElement = document.activeElement;
-      if (activeElement && frameRef.current?.contains(activeElement)) {
-        setControlsVisible(true);
-        controlsHideTimerRef.current = null;
-        return;
-      }
-
-      setControlsVisible(false);
-      controlsHideTimerRef.current = null;
-    }, delay);
-  }, [clearControlsHideTimer]);
-
   const clearLoadingTimer = useCallback(() => {
     if (loadingTimerRef.current === null) return;
     window.clearTimeout(loadingTimerRef.current);
@@ -227,18 +199,6 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
     playbackProgressReportRef.current = { sentAt: 0, marker: -1, currentTime: -1 };
     setCacheState(null);
   }, [file.id, previewUrl]);
-
-  useEffect(() => {
-    setControlsVisible(true);
-    clearControlsHideTimer();
-  }, [clearControlsHideTimer, file.id]);
-
-  useEffect(() => {
-    return () => {
-      clearControlsHideTimer();
-      clearLoadingTimer();
-    };
-  }, [clearControlsHideTimer, clearLoadingTimer]);
 
   useEffect(() => {
     const frame = frameRef.current;
@@ -495,20 +455,6 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
         style={{
           width: `min(100%, calc(${videoHeightLimit} * ${ratio.value}))`
         }}
-        onPointerEnter={showControls}
-        onPointerMove={showControls}
-        onPointerLeave={() => scheduleControlsHide(300)}
-        onTouchStart={() => {
-          showControls();
-          scheduleControlsHide(3_000);
-        }}
-        onFocusCapture={showControls}
-        onBlurCapture={(event) => {
-          const nextTarget = event.relatedTarget;
-          if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) {
-            scheduleControlsHide();
-          }
-        }}
       >
         <div
           className="relative w-full overflow-hidden bg-[#020403]"
@@ -591,12 +537,7 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
         ) : null}
         </div>
 
-        <div
-          className={cn(
-            "w-full overflow-hidden border-t border-white/10 bg-[#050a09]/95 transition-[max-height,opacity,padding] duration-200 ease-out",
-            controlsVisible ? "max-h-44 p-2 opacity-100 sm:p-3" : "pointer-events-none max-h-0 p-0 opacity-0"
-          )}
-        >
+        <div className="w-full bg-[#050a09]/95 p-2 sm:p-3">
           <MediaControls
             mediaRef={videoRef}
             fullscreen={fullscreen}
@@ -604,7 +545,7 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
             cacheState={displayedCacheState}
             variant="floating"
             density={controlsDensity}
-            interactive={controlsVisible}
+            interactive={true}
             subtitles={subtitleOptions}
             selectedSubtitleId={selectedSubtitleId}
             onSubtitleChange={setSelectedSubtitleId}
