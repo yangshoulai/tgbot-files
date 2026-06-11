@@ -28,6 +28,7 @@ interface VideoPreviewProps {
   fullscreen: boolean;
   onToggleFullscreen: () => void;
   videoPreviewCacheBytes: number;
+  videoPreviewConcurrency: number;
 }
 
 const VIDEO_PREVIEW_TIMEOUT_MS = 30_000;
@@ -37,7 +38,7 @@ const VIDEO_PREVIEW_PROGRESS_REPORT_MIN_INTERVAL_MS = 900;
 const VIDEO_PREVIEW_CACHE_STATE_POLL_MS = 1_200;
 const SUBTITLE_PREVIEW_TIMEOUT_MS = 20_000;
 
-export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPreviewCacheBytes }: VideoPreviewProps) {
+export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPreviewCacheBytes, videoPreviewConcurrency }: VideoPreviewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const frameRef = useRef<HTMLDivElement>(null);
   const loadingTimerRef = useRef<number | null>(null);
@@ -55,8 +56,8 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
   const isHlsPackage = file.storage_backend === "hls_package";
   const serviceWorkerReady = serviceWorkerState.status === "controlled";
   const previewCandidate = useMemo(
-    () => buildVideoPreviewMetadata(file, videoPreviewCacheBytes),
-    [file.chunk_count, file.chunk_size, file.file_path, file.id, file.mime_type, file.size, file.storage_backend, file.url, videoPreviewCacheBytes]
+    () => buildVideoPreviewMetadata(file, videoPreviewCacheBytes, videoPreviewConcurrency),
+    [file.chunk_count, file.chunk_size, file.file_path, file.id, file.mime_type, file.size, file.storage_backend, file.url, videoPreviewCacheBytes, videoPreviewConcurrency]
   );
   const previewMetadata = serviceWorkerReady ? previewCandidate : null;
   const previewUrl = previewMetadata ? buildVideoPreviewUrl(file, previewMetadata) : null;

@@ -1339,6 +1339,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         onCopy={copyText}
         onAcceleratedDownload={(file) => void onAcceleratedDownload(file)}
         videoPreviewCacheBytes={session.video_preview_cache_bytes}
+        videoPreviewConcurrency={session.upload_concurrency}
       />
       <ThumbnailPreviewDialog
         file={thumbnailPreviewFile}

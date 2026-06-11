@@ -3120,6 +3120,80 @@ describe("admin file manager", () => {
     expect(sessionResponse.status).toBe(200);
     expect(sessionBody.upload_concurrency).toBe(32);
   });
+
+  it("uses configured Telegram chunk size for new multipart upload sessions", async () => {
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const cookie = await loginAndGetCookie(adminEnv);
+    const configuredChunkSize = 5 * 1024 * 1024;
+
+    const updateResponse = await handleRequest(
+      new Request("https://files.example.com/api/admin/settings", {
+        method: "PATCH",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ telegram_chunk_size_bytes: configuredChunkSize })
+      }),
+      adminEnv
+    );
+    const updateBody = await updateResponse.json() as { settings: { telegram_chunk_size_bytes: number } };
+
+    expect(updateResponse.status).toBe(200);
+    expect(updateBody.settings.telegram_chunk_size_bytes).toBe(configuredChunkSize);
+
+    const initResponse = await handleRequest(
+      new Request("https://files.example.com/api/admin/uploads/init", {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          file_name: "movie.bin",
+          mime_type: "application/octet-stream",
+          size: 12 * 1024 * 1024
+        })
+      }),
+      adminEnv
+    );
+    const initBody = await initResponse.json() as {
+      upload: {
+        chunk_size: number;
+        chunk_count: number;
+        direct_access_max_chunks: number;
+      };
+    };
+
+    expect(initResponse.status).toBe(201);
+    expect(initBody.upload.chunk_size).toBe(configuredChunkSize);
+    expect(initBody.upload.chunk_count).toBe(3);
+    expect(initBody.upload.direct_access_max_chunks).toBe(Math.ceil(maxMultipartFileBytes / configuredChunkSize));
+    expect(db.multipartUploads[0]?.chunk_size).toBe(configuredChunkSize);
+    expect(db.multipartUploads[0]?.chunk_count).toBe(3);
+
+    const listResponse = await handleRequest(
+      new Request("https://files.example.com/api/admin/files", {
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const listBody = await listResponse.json() as {
+      multipart_chunk_bytes: number;
+      direct_access_max_chunks: number;
+    };
+
+    expect(listResponse.status).toBe(200);
+    expect(listBody.multipart_chunk_bytes).toBe(configuredChunkSize);
+    expect(listBody.direct_access_max_chunks).toBe(Math.ceil(maxMultipartFileBytes / configuredChunkSize));
+  });
+
   it("creates, lists, reveals, disables, and deletes upload API keys", async () => {
     const db = new FakeDatabase();
     const adminEnv: AppEnv = {

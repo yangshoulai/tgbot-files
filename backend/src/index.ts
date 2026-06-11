@@ -264,7 +264,7 @@ interface ParsedByteRange {
   partial: boolean;
 }
 
-const TELEGRAM_CHUNK_SIZE_BYTES = 10 * 1024 * 1024;
+const TELEGRAM_CHUNK_SIZE_BYTES = DEFAULT_TELEGRAM_CHUNK_SIZE_BYTES;
 const MAX_TELEGRAM_MULTIPART_BYTES = 20 * 1024 * 1024 * 1024;
 const MAX_TELEGRAM_MULTIPART_CHUNKS = Math.ceil(MAX_TELEGRAM_MULTIPART_BYTES / TELEGRAM_CHUNK_SIZE_BYTES);
 const DIRECT_MULTIPART_ACCESS_MAX_CHUNKS = MAX_TELEGRAM_MULTIPART_CHUNKS;
@@ -289,6 +289,10 @@ const HLS_AES_128_KEY_BYTES = 16;
 const HLS_SEGMENT_IMPORT_TIMEOUT_MS = 10 * 60 * 1000;
 const HLS_PREVIEW_SEGMENT_COUNT = 4;
 const ARIA2_CACHE_DIRECTORY_NAME_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function maxTelegramMultipartChunks(chunkSizeBytes: number): number {
+  return Math.ceil(MAX_TELEGRAM_MULTIPART_BYTES / chunkSizeBytes);
+}
 
 type TelegramRateLimitScope = "sendDocument" | "getFile";
 
@@ -746,7 +750,7 @@ async function handleAdminSession(request: Request, env: AppEnv, username: strin
     max_file_bytes: maxFileBytes,
     multipart_chunk_bytes: telegramChunkSizeBytes,
     max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
-    direct_access_max_chunks: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
+    direct_access_max_chunks: maxTelegramMultipartChunks(telegramChunkSizeBytes),
     direct_access_max_bytes: DIRECT_MULTIPART_ACCESS_MAX_BYTES,
     upload_concurrency: uploadConcurrency,
     upload_concurrency_min: MIN_UPLOAD_CONCURRENCY,
@@ -861,6 +865,7 @@ async function handleAdminFiles(request: Request, env: AppEnv, username: string)
     ]);
     const directoryStats = await getDirectoryUsageStats(db, directories);
     const baseUrl = getPublicBaseUrl(request, env);
+    const telegramChunkSizeBytes = await getTelegramChunkSizeBytesSetting(db);
     const files = await Promise.all(result.files.map((file) => serializeFileRecord(file, baseUrl, db)));
 
     return jsonResponse({
@@ -877,9 +882,9 @@ async function handleAdminFiles(request: Request, env: AppEnv, username: string)
       },
       global_stats: globalStats,
       max_file_bytes: parseMaxFileBytes(env.MAX_FILE_BYTES),
-      multipart_chunk_bytes: TELEGRAM_CHUNK_SIZE_BYTES,
+      multipart_chunk_bytes: telegramChunkSizeBytes,
       max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
-      direct_access_max_chunks: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
+      direct_access_max_chunks: maxTelegramMultipartChunks(telegramChunkSizeBytes),
       direct_access_max_bytes: DIRECT_MULTIPART_ACCESS_MAX_BYTES
     });
   }
@@ -1878,6 +1883,7 @@ async function refreshMagnetMetadataFromStatus(
     const torrentFiles = await loadMagnetFilesFromSavedTorrent(importRecord.download_dir);
     if (torrentFiles && torrentFiles.length > 0) {
       const now = new Date().toISOString();
+      const telegramChunkSizeBytes = await getTelegramChunkSizeBytesSetting(db);
       await replaceMagnetImportFiles(
         db,
         importRecord.id,
@@ -1890,8 +1896,8 @@ async function refreshMagnetMetadataFromStatus(
           relativeDirectoryPath: file.relativeDirectoryPath,
           size: file.size,
           mimeType: file.mimeType,
-          chunkSize: TELEGRAM_CHUNK_SIZE_BYTES,
-          chunkCount: Math.ceil(file.size / TELEGRAM_CHUNK_SIZE_BYTES),
+          chunkSize: telegramChunkSizeBytes,
+          chunkCount: Math.ceil(file.size / telegramChunkSizeBytes),
           createdAt: now,
           updatedAt: now
         })),
@@ -1910,6 +1916,7 @@ async function refreshMagnetMetadataFromStatus(
   }
 
   const now = new Date().toISOString();
+  const telegramChunkSizeBytes = await getTelegramChunkSizeBytesSetting(db);
   await replaceMagnetImportFiles(
     db,
     importRecord.id,
@@ -1922,8 +1929,8 @@ async function refreshMagnetMetadataFromStatus(
       relativeDirectoryPath: file.relativeDirectoryPath,
       size: file.size,
       mimeType: file.mimeType,
-      chunkSize: TELEGRAM_CHUNK_SIZE_BYTES,
-      chunkCount: Math.ceil(file.size / TELEGRAM_CHUNK_SIZE_BYTES),
+      chunkSize: telegramChunkSizeBytes,
+      chunkCount: Math.ceil(file.size / telegramChunkSizeBytes),
       createdAt: now,
       updatedAt: now
     })),
@@ -1980,8 +1987,9 @@ async function initMagnetImportSelection(params: MagnetImportSelectionParams): P
 
   const uploadByFileIndex = new Map<number, string>();
   const uploads: Array<{ file_index: number; upload: Record<string, unknown>; target_directory_path: string }> = [];
+  const telegramChunkSizeBytes = await getTelegramChunkSizeBytesSetting(params.db);
   for (const file of files) {
-    validateMultipartFileSize(file.size);
+    validateMultipartFileSize(file.size, telegramChunkSizeBytes);
     const fileOption = params.fileOptions.get(file.file_index);
     const targetFileName = fileOption?.fileName ?? file.file_name;
     const targetConflictAction = fileOption?.conflictAction ?? params.conflictAction;
@@ -1993,6 +2001,7 @@ async function initMagnetImportSelection(params: MagnetImportSelectionParams): P
       fileName: targetFileName,
       mimeType: file.mime_type,
       size: file.size,
+      chunkSizeBytes: telegramChunkSizeBytes,
       uploadedBy: params.uploadedBy,
       directoryId: null,
       directoryPath: targetDirectoryPath,
@@ -5621,20 +5630,22 @@ async function createMultipartUpload(params: {
   fileName: string;
   mimeType: string;
   size: number;
+  chunkSizeBytes?: number;
   uploadedBy?: string;
   remark?: string;
   directoryId?: string | null;
   directoryPath: string;
   conflictAction?: FileNameConflictAction;
 }): Promise<MultipartInitResult> {
-  validateMultipartFileSize(params.size);
+  const chunkSizeBytes = params.chunkSizeBytes ?? await getTelegramChunkSizeBytesSetting(params.db);
+  validateMultipartFileSize(params.size, chunkSizeBytes);
   await requireFileNameWritable({
     db: params.db,
     directoryPath: params.directoryPath,
     fileName: params.fileName,
     conflictAction: params.conflictAction ?? "error"
   });
-  const chunkCount = Math.ceil(params.size / TELEGRAM_CHUNK_SIZE_BYTES);
+  const chunkCount = Math.ceil(params.size / chunkSizeBytes);
   const createdAt = new Date().toISOString();
   const record = await insertMultipartUploadRecord(params.db, {
     id: crypto.randomUUID(),
@@ -5644,7 +5655,7 @@ async function createMultipartUpload(params: {
     fileName: params.fileName,
     mimeType: params.mimeType,
     size: params.size,
-    chunkSize: TELEGRAM_CHUNK_SIZE_BYTES,
+    chunkSize: chunkSizeBytes,
     chunkCount,
     ...(params.uploadedBy ? { uploadedBy: params.uploadedBy } : {}),
     directoryId: params.directoryId ?? null,
@@ -5664,16 +5675,16 @@ async function createMultipartUpload(params: {
   };
 }
 
-function validateMultipartFileSize(size: number): void {
+function validateMultipartFileSize(size: number, chunkSizeBytes = TELEGRAM_CHUNK_SIZE_BYTES): void {
   if (!Number.isSafeInteger(size) || size <= 0) {
     throw new AppError(400, "EmptyFile", "File must not be empty");
   }
 
   if (size > MAX_TELEGRAM_MULTIPART_BYTES) {
     throw fileTooLargeError(MAX_TELEGRAM_MULTIPART_BYTES, size, {
-      chunk_size_bytes: TELEGRAM_CHUNK_SIZE_BYTES,
-      chunk_size: formatHumanFileSize(TELEGRAM_CHUNK_SIZE_BYTES),
-      max_chunks: MAX_TELEGRAM_MULTIPART_CHUNKS
+      chunk_size_bytes: chunkSizeBytes,
+      chunk_size: formatHumanFileSize(chunkSizeBytes),
+      max_chunks: maxTelegramMultipartChunks(chunkSizeBytes)
     });
   }
 }
@@ -8123,7 +8134,7 @@ function serializeMultipartInit(result: MultipartInitResult): Record<string, unk
     directory_path: result.directoryPath,
     max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
     direct_access: canDirectlyAccessMultipartMetadata(result.size, result.chunkCount),
-    direct_access_max_chunks: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
+    direct_access_max_chunks: maxTelegramMultipartChunks(result.chunkSize),
     direct_access_max_bytes: DIRECT_MULTIPART_ACCESS_MAX_BYTES,
     thumbnail_source: result.thumbnailSource
       ? {
@@ -8253,7 +8264,7 @@ function serializeMultipartUploadStatus(upload: MultipartUploadRecord): Record<s
     directory_path: upload.directory_path ?? "/",
     max_multipart_file_bytes: MAX_TELEGRAM_MULTIPART_BYTES,
     direct_access: canDirectlyAccessMultipartMetadata(upload.size, upload.chunk_count),
-    direct_access_max_chunks: DIRECT_MULTIPART_ACCESS_MAX_CHUNKS,
+    direct_access_max_chunks: maxTelegramMultipartChunks(upload.chunk_size),
     direct_access_max_bytes: DIRECT_MULTIPART_ACCESS_MAX_BYTES,
     thumbnail_source: null
   };

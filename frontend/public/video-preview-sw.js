@@ -4,8 +4,8 @@ const STORE_NAME = "chunks";
 const DB_VERSION = 1;
 const DEFAULT_MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024;
 const RESPONSE_WINDOW_BYTES = 2 * 1024 * 1024;
-const PREVIEW_PREFETCH_CONCURRENCY = 5;
-const PREFETCH_CHUNKS = PREVIEW_PREFETCH_CONCURRENCY;
+const DEFAULT_PREVIEW_PREFETCH_CONCURRENCY = 5;
+const MAX_PREVIEW_PREFETCH_CONCURRENCY = 32;
 const CONTINUOUS_PREFETCH_SESSION_TTL_MS = 12_000;
 const HOT_CHUNK_CACHE_MAX_BYTES = 160 * 1024 * 1024;
 const fullChunkLoads = new Map();
@@ -115,7 +115,7 @@ async function handleVideoPreviewRequest(request, event) {
     const firstChunk = Math.floor(range.start / metadata.chunkSize);
     const endChunk = Math.floor(range.end / metadata.chunkSize);
     event.waitUntil(prioritizeContinuousPreviewCache(metadata, firstChunk));
-    event.waitUntil(prefetchChunks(metadata, endChunk + 1, PREFETCH_CHUNKS));
+    event.waitUntil(prefetchChunks(metadata, endChunk + 1, metadata.prefetchConcurrency));
 
     return new Response(body, {
       status: 206,
@@ -148,7 +148,7 @@ async function handleHlsPlaylistRequest(metadata, event) {
   const playlistText = await response.text();
   const rewritten = rewriteHlsPlaylist(playlistText, metadata);
   hlsPreviewSources.set(metadata.fileId, rewritten.sources);
-  event.waitUntil(prioritizeHlsPreviewCache(metadata.fileId, 0, metadata.cacheMaxBytes));
+  event.waitUntil(prioritizeHlsPreviewCache(metadata.fileId, 0, metadata.cacheMaxBytes, metadata.prefetchConcurrency));
 
   return new Response(rewritten.text, {
     headers: {
@@ -167,6 +167,7 @@ async function handleHlsPartRequest(request, event) {
   const partIndex = Number(parts[4] || "0");
   const sourceUrl = normalizeSameOriginSourceUrl(url.searchParams.get("source"));
   const cacheMaxBytes = normalizeCacheMaxBytes(url.searchParams.get("cache_max"));
+  const prefetchConcurrency = normalizePreviewPrefetchConcurrency(url.searchParams.get("prefetch_concurrency"));
 
   if (!fileId || !Number.isSafeInteger(partIndex) || partIndex < 0 || !sourceUrl) {
     return new Response("Invalid HLS preview part", { status: 400 });
@@ -175,8 +176,8 @@ async function handleHlsPartRequest(request, event) {
   try {
     const response = await fetchAndCacheHlsPart({ fileId, partKind, partIndex, sourceUrl, cacheMaxBytes });
     if (partKind === "segment") {
-      event.waitUntil(prioritizeHlsPreviewCache(fileId, partIndex, cacheMaxBytes));
-      event.waitUntil(prefetchHlsSegments(fileId, partIndex + 1, PREFETCH_CHUNKS, cacheMaxBytes));
+      event.waitUntil(prioritizeHlsPreviewCache(fileId, partIndex, cacheMaxBytes, prefetchConcurrency));
+      event.waitUntil(prefetchHlsSegments(fileId, partIndex + 1, prefetchConcurrency, cacheMaxBytes));
     }
     return response;
   } catch (error) {
@@ -268,7 +269,8 @@ function normalizeHlsSource(value, playlistSourceUrl) {
 function hlsPartPreviewUrl(metadata, partKind, index, sourceUrl) {
   const params = new URLSearchParams({
     source: sourceUrl,
-    cache_max: String(metadata.cacheMaxBytes)
+    cache_max: String(metadata.cacheMaxBytes),
+    prefetch_concurrency: String(metadata.prefetchConcurrency)
   });
   return `/__video-preview/hls-part/${encodeURIComponent(metadata.fileId)}/${partKind}/${index}?${params.toString()}`;
 }
@@ -372,7 +374,8 @@ async function prefetchHlsSegments(fileId, startIndex, count, cacheMaxBytes) {
 }
 
 async function runConcurrentPrefetchWorkers(session, generation, sessions, loadNext) {
-  const workerCount = Math.min(PREVIEW_PREFETCH_CONCURRENCY, Math.max(1, session.queue.length));
+  const concurrency = normalizePreviewPrefetchConcurrency(session.metadata?.prefetchConcurrency);
+  const workerCount = Math.min(concurrency, Math.max(1, session.queue.length));
   let failed = false;
 
   async function runWorker() {
@@ -447,7 +450,7 @@ function stopHlsPreviewCacheSession(sessionId) {
   hlsPreviewCacheSessions.delete(sessionId);
 }
 
-function prioritizeHlsPreviewCache(fileId, startIndex, cacheMaxBytes) {
+function prioritizeHlsPreviewCache(fileId, startIndex, cacheMaxBytes, prefetchConcurrency) {
   const tasks = [];
 
   for (const session of hlsPreviewCacheSessions.values()) {
@@ -461,6 +464,11 @@ function prioritizeHlsPreviewCache(fileId, startIndex, cacheMaxBytes) {
         cacheMaxBytes
       };
     }
+
+    session.metadata = {
+      ...session.metadata,
+      prefetchConcurrency: normalizePreviewPrefetchConcurrency(prefetchConcurrency ?? session.metadata.prefetchConcurrency)
+    };
 
     tasks.push(setHlsPreviewCachePriority(session, startIndex));
   }
@@ -593,6 +601,7 @@ function parsePreviewMetadata(url) {
   const chunkCount = Number(url.searchParams.get("chunk_count"));
   const mimeType = url.searchParams.get("mime") || "application/octet-stream";
   const cacheMaxBytes = normalizeCacheMaxBytes(url.searchParams.get("cache_max"));
+  const prefetchConcurrency = normalizePreviewPrefetchConcurrency(url.searchParams.get("prefetch_concurrency"));
 
   if (!fileId || !kind) {
     return null;
@@ -608,7 +617,8 @@ function parsePreviewMetadata(url) {
       sourceUrl,
       chunkCount: Number.isSafeInteger(chunkCount) && chunkCount > 0 ? chunkCount : undefined,
       mimeType,
-      cacheMaxBytes
+      cacheMaxBytes,
+      prefetchConcurrency
     };
   }
 
@@ -633,7 +643,8 @@ function parsePreviewMetadata(url) {
     chunkSize,
     chunkCount,
     mimeType,
-    cacheMaxBytes
+    cacheMaxBytes,
+    prefetchConcurrency
   };
 }
 
@@ -651,6 +662,7 @@ function normalizePreviewMetadata(value) {
   const chunkCount = Number(value.chunkCount);
   const mimeType = typeof value.mimeType === "string" && value.mimeType ? value.mimeType : "application/octet-stream";
   const cacheMaxBytes = normalizeCacheMaxBytes(value.cacheMaxBytes);
+  const prefetchConcurrency = normalizePreviewPrefetchConcurrency(value.prefetchConcurrency);
 
   if (!fileId || !kind) {
     return null;
@@ -665,7 +677,8 @@ function normalizePreviewMetadata(value) {
       fileId,
       sourceUrl,
       mimeType,
-      cacheMaxBytes
+      cacheMaxBytes,
+      prefetchConcurrency
     };
   }
 
@@ -690,7 +703,8 @@ function normalizePreviewMetadata(value) {
     chunkSize,
     chunkCount,
     mimeType,
-    cacheMaxBytes
+    cacheMaxBytes,
+    prefetchConcurrency
   };
 }
 
@@ -701,6 +715,14 @@ function normalizePreviewKind(value) {
 function normalizeCacheMaxBytes(value) {
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_CACHE_BYTES;
+}
+
+function normalizePreviewPrefetchConcurrency(value) {
+  const parsed = Math.floor(Number(value));
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    return DEFAULT_PREVIEW_PREFETCH_CONCURRENCY;
+  }
+  return Math.min(MAX_PREVIEW_PREFETCH_CONCURRENCY, parsed);
 }
 
 function normalizeSameOriginSourceUrl(value) {
@@ -851,7 +873,7 @@ function updatePreviewCachePlaybackPriority(sessionId, metadata, progress) {
   const priorityTask = startIndex === null
     ? Promise.resolve()
     : metadata.kind === "hls"
-      ? prioritizeHlsPreviewCache(metadata.fileId, startIndex, metadata.cacheMaxBytes)
+      ? prioritizeHlsPreviewCache(metadata.fileId, startIndex, metadata.cacheMaxBytes, metadata.prefetchConcurrency)
       : prioritizeContinuousPreviewCache(metadata, startIndex);
 
   return Promise.allSettled([startTask, priorityTask]).then(() => undefined);
@@ -942,7 +964,8 @@ function previewMetadataKey(metadata) {
     metadata.chunkSize,
     metadata.chunkCount,
     metadata.mimeType,
-    metadata.cacheMaxBytes
+    metadata.cacheMaxBytes,
+    metadata.prefetchConcurrency
   ].join(":");
 }
 

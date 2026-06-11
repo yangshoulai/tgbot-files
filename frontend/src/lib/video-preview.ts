@@ -5,6 +5,7 @@ import { getVideoPreviewServiceWorkerController } from "./video-preview-service-
 
 export const VIDEO_PREVIEW_CACHE_HEARTBEAT_MS = 4_000;
 const DEFAULT_PREVIEW_CHUNK_BYTES = 2 * 1024 * 1024;
+const DEFAULT_PREVIEW_PREFETCH_CONCURRENCY = 5;
 
 export type VideoPreviewKind = "single" | "multipart" | "hls";
 
@@ -18,6 +19,7 @@ export interface VideoPreviewMetadata {
   chunkCount?: number;
   mimeType: string;
   cacheMaxBytes: number;
+  prefetchConcurrency: number;
 }
 
 export interface VideoPreviewPlaybackProgress {
@@ -34,7 +36,9 @@ export interface VideoPreviewCacheState {
   cachedChunks: number[];
 }
 
-export function buildVideoPreviewMetadata(file: FileItem, cacheMaxBytes: number): VideoPreviewMetadata | null {
+export function buildVideoPreviewMetadata(file: FileItem, cacheMaxBytes: number, prefetchConcurrency: number): VideoPreviewMetadata | null {
+  const normalizedPrefetchConcurrency = normalizePreviewPrefetchConcurrency(prefetchConcurrency);
+
   if (file.storage_backend === "hls_package" && hasFileLinkAccess(file)) {
     return {
       kind: "hls",
@@ -42,7 +46,8 @@ export function buildVideoPreviewMetadata(file: FileItem, cacheMaxBytes: number)
       sourceUrl: file.file_path,
       chunkCount: file.hls_download?.segment_count,
       mimeType: file.mime_type || "application/vnd.apple.mpegurl",
-      cacheMaxBytes
+      cacheMaxBytes,
+      prefetchConcurrency: normalizedPrefetchConcurrency
     };
   }
 
@@ -57,7 +62,8 @@ export function buildVideoPreviewMetadata(file: FileItem, cacheMaxBytes: number)
         chunkSize: file.chunk_size,
         chunkCount: file.chunk_count,
         mimeType: file.mime_type || "application/octet-stream",
-        cacheMaxBytes
+        cacheMaxBytes,
+        prefetchConcurrency: normalizedPrefetchConcurrency
       };
     }
   }
@@ -71,7 +77,8 @@ export function buildVideoPreviewMetadata(file: FileItem, cacheMaxBytes: number)
       chunkSize: DEFAULT_PREVIEW_CHUNK_BYTES,
       chunkCount: Math.max(1, Math.ceil(file.size / DEFAULT_PREVIEW_CHUNK_BYTES)),
       mimeType: file.mime_type || "application/octet-stream",
-      cacheMaxBytes
+      cacheMaxBytes,
+      prefetchConcurrency: normalizedPrefetchConcurrency
     };
   }
 
@@ -86,7 +93,8 @@ export function buildVideoPreviewUrl(file: FileItem, metadata: VideoPreviewMetad
   const params = new URLSearchParams({
     kind: metadata.kind,
     mime: metadata.mimeType,
-    cache_max: String(metadata.cacheMaxBytes)
+    cache_max: String(metadata.cacheMaxBytes),
+    prefetch_concurrency: String(metadata.prefetchConcurrency)
   });
 
   if (metadata.sourceUrl) params.set("source", metadata.sourceUrl);
@@ -111,6 +119,12 @@ export function stopVideoPreviewCacheSession(sessionId: string): boolean {
     type: "VIDEO_PREVIEW_CACHE_STOP",
     sessionId
   });
+}
+
+function normalizePreviewPrefetchConcurrency(value: number): number {
+  return Number.isSafeInteger(value) && value > 0
+    ? value
+    : DEFAULT_PREVIEW_PREFETCH_CONCURRENCY;
 }
 
 export function reportVideoPreviewPlaybackProgress(
