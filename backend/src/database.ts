@@ -1330,6 +1330,22 @@ export async function completeMultipartUploadRecord(
   await prepareCompleteMultipartUploadRecord(db, id, completedAt).run();
 }
 
+export async function updateMultipartUploadDirectory(params: {
+  db: AppDatabase;
+  id: string;
+  directoryId: string | null;
+  directoryPath: string;
+}): Promise<void> {
+  await params.db
+    .prepare(
+      `UPDATE multipart_uploads
+      SET directory_id = ?, directory_path = ?
+      WHERE id = ? AND completed_at IS NULL`
+    )
+    .bind(params.directoryId, params.directoryPath, params.id)
+    .run();
+}
+
 function prepareCompleteMultipartUploadRecord(
   db: AppDatabase,
   id: string,

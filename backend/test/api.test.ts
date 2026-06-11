@@ -734,6 +734,16 @@ class FakeDatabaseStatement {
       }
     }
 
+    if (normalizedSql.startsWith("UPDATE MULTIPART_UPLOADS SET DIRECTORY_ID")) {
+      const [directoryId, directoryPath, id] = this.bindings;
+      const upload = this.db.multipartUploads.find((item) => item.id === id && item.completed_at === null);
+      if (upload) {
+        upload.directory_id = directoryId === null ? null : String(directoryId);
+        upload.directory_path = String(directoryPath || "/");
+        changes = 1;
+      }
+    }
+
     if (normalizedSql.startsWith("DELETE FROM FILE_CHUNKS") && normalizedSql.includes("MULTIPART_UPLOADS.CREATED_AT < ?")) {
       const expiredBefore = String(this.bindings[0]);
       const staleUploadIds = new Set(

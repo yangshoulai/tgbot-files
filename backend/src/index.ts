@@ -81,6 +81,7 @@ import {
   updateApiKeyRecord,
   updateFileRecordMetadata,
   updateMagnetImportFileStatus,
+  updateMultipartUploadDirectory,
   updateTelegramChannelRecord,
   upsertFileChunkRecord,
   deleteTelegramChannelRecord,
@@ -1985,7 +1986,6 @@ async function initMagnetImportSelection(params: MagnetImportSelectionParams): P
     const targetFileName = fileOption?.fileName ?? file.file_name;
     const targetConflictAction = fileOption?.conflictAction ?? params.conflictAction;
     const targetDirectoryPath = targetDirectoryForMagnetFile(params.directoryPath, file);
-    const directory = await ensureWritableDirectory(params.db, targetDirectoryPath);
     const upload = await createMultipartUpload({
       db: params.db,
       sourceKind: "magnet",
@@ -1994,7 +1994,7 @@ async function initMagnetImportSelection(params: MagnetImportSelectionParams): P
       mimeType: file.mime_type,
       size: file.size,
       uploadedBy: params.uploadedBy,
-      directoryId: directory?.id ?? null,
+      directoryId: null,
       directoryPath: targetDirectoryPath,
       conflictAction: targetConflictAction,
       ...(params.remark ? { remark: params.remark } : {})
@@ -2198,6 +2198,7 @@ async function completeMagnetFileUpload(params: {
     env: params.env,
     db: params.db,
     upload,
+    ensureDirectoryOnComplete: true,
     ...(params.conflictAction ? { conflictAction: params.conflictAction } : {}),
     ...(params.thumbnail ? { thumbnail: params.thumbnail } : {})
   });
@@ -6382,6 +6383,7 @@ async function completeMultipartUpload(params: {
   upload: MultipartUploadRecord;
   conflictAction?: FileNameConflictAction;
   thumbnail?: ThumbnailInput;
+  ensureDirectoryOnComplete?: boolean;
 }): Promise<UploadResult> {
   const chunks = await listFileChunkRecords(params.db, params.upload.id);
   validateCompleteChunks(params.upload, chunks);
@@ -6420,50 +6422,66 @@ async function completeMultipartUpload(params: {
     originalFileName: params.upload.file_name,
     thumbnail: params.thumbnail
   });
+  let upload = params.upload;
+  if (params.ensureDirectoryOnComplete) {
+    const directoryPath = params.upload.directory_path ?? "/";
+    const directory = await ensureWritableDirectory(params.db, directoryPath);
+    await updateMultipartUploadDirectory({
+      db: params.db,
+      id: params.upload.id,
+      directoryId: directory?.id ?? null,
+      directoryPath
+    });
+    upload = {
+      ...params.upload,
+      directory_id: directory?.id ?? null,
+      directory_path: directoryPath
+    };
+  }
 
   await completeMultipartUploadWithFileRecord({
     db: params.db,
-    uploadId: params.upload.id,
+    uploadId: upload.id,
     completedAt: createdAt,
     conflictAction: params.conflictAction ?? "error",
     file: {
-      id: params.upload.id,
-      fileName: params.upload.file_name,
-      mimeType: params.upload.mime_type,
-      size: params.upload.size,
+      id: upload.id,
+      fileName: upload.file_name,
+      mimeType: upload.mime_type,
+      size: upload.size,
       md5,
-      telegramFileId: `multipart:${params.upload.id}`,
+      telegramFileId: `multipart:${upload.id}`,
       telegramChannelId: chunks[0]?.telegram_channel_id ?? "default",
       filePath,
       createdAt,
       storageBackend: "telegram_multipart",
-      chunkSize: params.upload.chunk_size,
-      chunkCount: params.upload.chunk_count,
-      directoryId: params.upload.directory_id ?? null,
-      directoryPath: params.upload.directory_path ?? "/",
+      chunkSize: upload.chunk_size,
+      chunkCount: upload.chunk_count,
+      directoryId: upload.directory_id ?? null,
+      directoryPath: upload.directory_path ?? "/",
       ...thumbnailFileRecordFields(thumbnail),
-      ...(params.upload.remark ? { remark: params.upload.remark } : {}),
-      ...(params.upload.uploaded_by ? { uploadedBy: params.upload.uploaded_by } : {})
+      ...(upload.remark ? { remark: upload.remark } : {}),
+      ...(upload.uploaded_by ? { uploadedBy: upload.uploaded_by } : {})
     }
   });
 
   return {
-    id: params.upload.id,
-    name: params.upload.file_name,
-    size: params.upload.size,
-    mimeType: params.upload.mime_type,
+    id: upload.id,
+    name: upload.file_name,
+    size: upload.size,
+    mimeType: upload.mime_type,
     md5,
     filePath,
     publicUrl,
-    telegramFileId: `multipart:${params.upload.id}`,
+    telegramFileId: `multipart:${upload.id}`,
     telegramChannelId: chunks[0]?.telegram_channel_id ?? "default",
-    ...(params.upload.remark ? { remark: params.upload.remark } : {}),
+    ...(upload.remark ? { remark: upload.remark } : {}),
     createdAt,
-    directoryId: params.upload.directory_id ?? null,
-    directoryPath: params.upload.directory_path ?? "/",
+    directoryId: upload.directory_id ?? null,
+    directoryPath: upload.directory_path ?? "/",
     storageBackend: "telegram_multipart",
-    chunkSize: params.upload.chunk_size,
-    chunkCount: params.upload.chunk_count,
+    chunkSize: upload.chunk_size,
+    chunkCount: upload.chunk_count,
     ...(thumbnail ? { thumbnail } : {})
   };
 }
