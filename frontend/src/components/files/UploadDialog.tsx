@@ -4,6 +4,7 @@ import {
   ApiError,
   cancelHlsUpload,
   cancelMagnetUpload,
+  cancelMagnetUploadKeepalive,
   completeHlsSegment,
   completeHlsUpload,
   completeMagnetMultipartUpload,
@@ -341,6 +342,20 @@ export function UploadDialog({
   useEffect(() => {
     urlUploadRef.current = urlUpload;
   }, [urlUpload]);
+
+  useEffect(() => {
+    const cancelActiveMagnetUpload = () => {
+      const importId = unfinishedMagnetImportId(urlUploadRef.current);
+      if (importId) {
+        cancelMagnetUploadKeepalive(importId);
+      }
+    };
+
+    window.addEventListener("pagehide", cancelActiveMagnetUpload);
+    return () => {
+      window.removeEventListener("pagehide", cancelActiveMagnetUpload);
+    };
+  }, []);
 
   useEffect(() => {
     if (!open) {
@@ -1157,8 +1172,12 @@ export function UploadDialog({
       return;
     }
 
+    const magnetImportId = task.kind === "url" ? unfinishedMagnetImportId(urlUploadRef.current) : undefined;
     task.cancelled = true;
     setStopRequested(true);
+    if (magnetImportId) {
+      cancelTemporaryMagnetUpload(magnetImportId);
+    }
     abortUploadTask(task);
 
     if (task.kind === "local" && task.itemId) {
@@ -1171,8 +1190,8 @@ export function UploadDialog({
       setUrlUpload((current) => ({
         ...current,
         progress: current.progress
-          ? { ...current.progress, label: "正在停止导入，保留已完成分片" }
-          : { completed: 0, total: 1, label: "正在停止导入" }
+          ? { ...current.progress, label: magnetImportId ? "正在停止导入并取消 aria2 下载" : "正在停止导入，保留已完成分片" }
+          : { completed: 0, total: 1, label: magnetImportId ? "正在停止导入并取消 aria2 下载" : "正在停止导入" }
       }));
     }
   }
@@ -4044,23 +4063,29 @@ function cleanupTemporaryHlsUpload(state: UrlUploadState): void {
 }
 
 function cleanupTemporaryMagnetUpload(state: UrlUploadState): void {
-  if (state.status === "done") {
-    return;
-  }
-
-  const importId = state.magnet?.import?.id;
+  const importId = unfinishedMagnetImportId(state);
   if (!importId) {
     return;
   }
 
-  void getMagnetUploadStatus(importId)
-    .then((response) => {
-      if (response.magnet.status === "done" || response.magnet.completed_at) {
-        return undefined;
-      }
-      return cancelMagnetUpload(importId);
-    })
-    .catch(() => undefined);
+  cancelTemporaryMagnetUpload(importId);
+}
+
+function cancelTemporaryMagnetUpload(importId: string): void {
+  void cancelMagnetUpload(importId).catch(() => undefined);
+}
+
+function unfinishedMagnetImportId(state: UrlUploadState): string | undefined {
+  if (state.status === "done") {
+    return undefined;
+  }
+
+  const magnet = state.magnet?.import;
+  if (!magnet || magnet.status === "done" || magnet.completed_at) {
+    return undefined;
+  }
+
+  return magnet.id;
 }
 
 function withoutHlsRetry(state: HlsUrlState): HlsUrlState {

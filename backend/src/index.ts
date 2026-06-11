@@ -1688,15 +1688,27 @@ async function handleAdminMagnetUploads(request: Request, env: AppEnv, username:
   const deleteMatch = /^\/api\/admin\/uploads\/magnet\/([^/]+)$/.exec(url.pathname);
   if (request.method === "DELETE" && deleteMatch?.[1]) {
     const importId = decodeURIComponent(deleteMatch[1]);
-    const record = await requireMagnetImport(db, importId);
-    const config = requireAria2Config(env);
-    await forgetAria2MagnetTask(config, record);
-    await cancelMagnetImportRecord(db, importId, new Date().toISOString());
-    const cleanup = await deleteMagnetImportDownloadDir(config, record);
+    const cleanup = await cancelMagnetImportUpload(env, db, importId);
     return jsonResponse({ ok: true, cleanup });
   }
 
   return errorResponse(new AppError(404, "NotFound", "Admin magnet upload route not found"));
+}
+
+async function cancelMagnetImportUpload(
+  env: AppEnv,
+  db: AppDatabase,
+  importId: string
+): Promise<{ deleted: boolean; path?: string; skipped?: string }> {
+  const record = await requireMagnetImport(db, importId);
+  const config = requireAria2Config(env);
+  await forgetAria2MagnetTask(config, record);
+
+  if (record.status !== "done" && !record.completed_at) {
+    await cancelMagnetImportRecord(db, importId, new Date().toISOString());
+  }
+
+  return deleteMagnetImportDownloadDir(config, record);
 }
 
 async function createMagnetImport(params: {

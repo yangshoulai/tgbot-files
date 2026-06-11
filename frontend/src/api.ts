@@ -870,6 +870,14 @@ export function cancelMagnetUpload(importId: string, signal?: AbortSignal) {
   );
 }
 
+export function cancelMagnetUploadKeepalive(importId: string) {
+  void fetch(`/api/admin/uploads/magnet/${encodeURIComponent(importId)}`, {
+    method: "DELETE",
+    credentials: "include",
+    keepalive: true
+  }).catch(() => undefined);
+}
+
 export function preflightUploads(entries: UploadPreflightRequestEntry[], signal?: AbortSignal) {
   return requestJson<UploadPreflightResponse>("/api/admin/uploads/preflight", {
     method: "POST",
