@@ -528,6 +528,10 @@ export function UploadDialog({
   const urlPendingCount = normalizedSourceUrl && urlUpload.status !== "uploading" && urlUpload.status !== "done" ? 1 : 0;
   const pendingCount = mode === "url" ? urlPendingCount : filePendingCount;
   const isMagnetSource = isLikelyMagnetUrl(normalizedSourceUrl);
+  const magnetValidFiles = isMagnetSource && urlUpload.magnet?.import
+    ? urlUpload.magnet.import.files.filter((file) => !file.file_name.startsWith("[METADATA]"))
+    : [];
+  const magnetHasNoValidFiles = isMagnetSource && urlUpload.magnet?.import && magnetValidFiles.length === 0;
   const hasUnresolvedMagnetConflict = isMagnetSource && Boolean(urlUpload.magnet?.selectedIndexes.some((fileIndex) =>
     Boolean(urlUpload.magnet?.fileDecisions?.[fileIndex]?.conflict)
   ));
@@ -3155,7 +3159,7 @@ export function UploadDialog({
               variant="primary"
               loading={uploadBusy}
               leadingIcon={mode === "url" ? <Link2 size={16} /> : <FilePlus2 size={16} />}
-              disabled={pendingCount === 0 || hasInvalidFileName || hasUnresolvedConflict}
+              disabled={pendingCount === 0 || hasInvalidFileName || hasUnresolvedConflict || magnetHasNoValidFiles}
             >
               {checkingConflicts
                 ? "检测重复项"
