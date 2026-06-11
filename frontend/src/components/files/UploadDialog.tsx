@@ -5578,6 +5578,9 @@ function UploadChunkList({ chunks, title = "分片明细" }: { chunks: UploadChu
   const completed = chunks.filter((chunk) => chunk.status === "completed").length;
   const failed = chunks.filter((chunk) => chunk.status === "failed").length;
   const uploading = chunks.filter((chunk) => chunk.status === "uploading").length;
+  const MAX_RENDERABLE_CHUNKS = 100;
+  const shouldLimitRender = chunks.length > MAX_RENDERABLE_CHUNKS;
+  const visibleChunks = shouldLimitRender ? chunks.filter((chunk) => chunk.status === "uploading" || chunk.status === "failed") : chunks;
 
   return (
     <div className="mt-2 border-t border-border pt-2">
@@ -5587,32 +5590,38 @@ function UploadChunkList({ chunks, title = "分片明细" }: { chunks: UploadChu
           {uploading > 0 ? ` · ${uploading} 上传中` : ""}
           {failed > 0 ? ` · ${failed} 失败` : ""}
         </span>
-        <span>每片状态实时更新</span>
+        {shouldLimitRender ? <span>仅显示上传中和失败的分片</span> : <span>每片状态实时更新</span>}
       </div>
-      <div className="grid max-h-40 gap-1 overflow-auto pr-1 scroll-thin sm:grid-cols-2">
-        {chunks.map((chunk) => (
-          <div
-            key={chunk.index}
-            className={cn(
-              "flex items-center gap-2 rounded-md border px-2 py-1.5 text-xs",
-              chunk.status === "completed" && "border-success/25 bg-success-soft text-success",
-              chunk.status === "failed" && "border-danger/25 bg-danger-soft text-danger",
-              chunk.status === "uploading" && "border-primary/25 bg-primary-soft text-primary-strong",
-              chunk.status === "queued" && "border-border bg-surface text-muted"
-            )}
-            title={chunk.errorMessage}
-          >
-            <ChunkStatusIcon status={chunk.status} />
-            <span className="shrink-0 font-medium">#{chunk.index + 1}</span>
-            <span className="min-w-0 flex-1 truncate">
-              {chunkStatusLabel(chunk.status)}
-              {chunk.attempts > 0 ? ` · 第 ${chunk.attempts} 次` : ""}
-              {chunk.errorMessage ? ` · ${chunk.errorMessage}` : ""}
-            </span>
-            {chunk.size > 0 ? <span className="shrink-0 opacity-70">{formatBytes(chunk.size)}</span> : null}
-          </div>
-        ))}
-      </div>
+      {shouldLimitRender && visibleChunks.length === 0 ? (
+        <div className="rounded-md border border-border bg-surface px-3 py-2 text-center text-xs text-muted">
+          分片过多（{chunks.length} 个），全部正常上传中
+        </div>
+      ) : (
+        <div className="grid max-h-40 gap-1 overflow-auto pr-1 scroll-thin sm:grid-cols-2">
+          {visibleChunks.map((chunk) => (
+            <div
+              key={chunk.index}
+              className={cn(
+                "flex items-center gap-2 rounded-md border px-2 py-1.5 text-xs",
+                chunk.status === "completed" && "border-success/25 bg-success-soft text-success",
+                chunk.status === "failed" && "border-danger/25 bg-danger-soft text-danger",
+                chunk.status === "uploading" && "border-primary/25 bg-primary-soft text-primary-strong",
+                chunk.status === "queued" && "border-border bg-surface text-muted"
+              )}
+              title={chunk.errorMessage}
+            >
+              <ChunkStatusIcon status={chunk.status} />
+              <span className="shrink-0 font-medium">#{chunk.index + 1}</span>
+              <span className="min-w-0 flex-1 truncate">
+                {chunkStatusLabel(chunk.status)}
+                {chunk.attempts > 0 ? ` · 第 ${chunk.attempts} 次` : ""}
+                {chunk.errorMessage ? ` · ${chunk.errorMessage}` : ""}
+              </span>
+              {chunk.size > 0 ? <span className="shrink-0 opacity-70">{formatBytes(chunk.size)}</span> : null}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
