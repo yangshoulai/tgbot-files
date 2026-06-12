@@ -356,13 +356,13 @@ export function FileTable({
               selectedDirectoryIds.has(directory.id) && "bg-primary-soft/20"
             )}
           >
-            <div className="flex items-start gap-3">
+            <div className="flex items-center gap-3">
               <input
                 type="checkbox"
                 aria-label={`选择目录 ${directory.name}`}
                 checked={selectedDirectoryIds.has(directory.id)}
                 onChange={(event) => onToggleDirectorySelected(directory, event.target.checked)}
-                className={`${checkboxClass} mt-3`}
+                className={checkboxClass}
               />
               <button
                 type="button"
@@ -389,7 +389,6 @@ export function FileTable({
                 variant="ghost"
                 label="更多操作"
                 onClick={(event) => openDirectoryActionsMenu(directory, event.currentTarget)}
-                className="mt-1 self-start"
               >
                 <MoreVertical size={16} />
               </IconButton>
@@ -420,13 +419,13 @@ export function FileTable({
                 selectedFileIds.has(file.id) && "bg-primary-soft/20"
               )}
             >
-              <div className="flex items-start gap-3">
+              <div className="flex items-center gap-3">
                 <input
                   type="checkbox"
                   aria-label={`选择 ${file.file_name}`}
                   checked={selectedFileIds.has(file.id)}
                   onChange={(event) => onToggleFileSelected(file, event.target.checked)}
-                  className={`${checkboxClass} mt-3`}
+                  className={checkboxClass}
                 />
                 <div className="flex min-w-0 flex-1 items-center gap-3">
                   <FileVisual
@@ -456,7 +455,6 @@ export function FileTable({
                   variant="ghost"
                   label="更多操作"
                   onClick={(event) => openFileActionsMenu(file, event.currentTarget)}
-                  className="mt-1 self-start"
                 >
                   <MoreVertical size={16} />
                 </IconButton>
