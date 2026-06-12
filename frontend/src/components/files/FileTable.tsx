@@ -12,7 +12,8 @@ import {
   Info,
   Pencil,
   MoreVertical,
-  Trash2
+  Trash2,
+  UploadCloud
 } from "lucide-react";
 import type { DirectoryItem, FileItem } from "../../api";
 import {
@@ -58,6 +59,7 @@ interface FileTableProps {
   onRenameDirectory: (directory: DirectoryItem) => void;
   onMoveDirectory: (directory: DirectoryItem) => void;
   onDeleteDirectory: (directory: DirectoryItem) => void;
+  onUploadToDirectory: (directory: DirectoryItem) => void;
   onToggleFileSelected: (file: FileItem, selected: boolean) => void;
   onToggleDirectorySelected: (directory: DirectoryItem, selected: boolean) => void;
   onTogglePage: (selected: boolean) => void;
@@ -130,6 +132,7 @@ export function FileTable({
   onRenameDirectory,
   onMoveDirectory,
   onDeleteDirectory,
+  onUploadToDirectory,
   onToggleFileSelected,
   onToggleDirectorySelected,
   onTogglePage,
@@ -249,6 +252,13 @@ export function FileTable({
           label: "打开",
           icon: <FolderOpen size={15} />,
           onSelect: () => runContextAction(() => onOpenDirectory(directory))
+        },
+        {
+          type: "item",
+          key: "upload",
+          label: "上传到此目录",
+          icon: <UploadCloud size={15} />,
+          onSelect: () => runContextAction(() => onUploadToDirectory(directory))
         },
         { type: "separator", key: "directory-main-separator" },
         {

@@ -45,6 +45,7 @@ function AppShell() {
 
   const [uploadOpen, setUploadOpen] = useState(false);
   const [uploadFiles, setUploadFiles] = useState<File[]>([]);
+  const [uploadDirectoryPath, setUploadDirectoryPath] = useState("/");
   const [uploadVersion, setUploadVersion] = useState(0);
   const [dashboardDirectoryPath, setDashboardDirectoryPath] = useState("/");
 
@@ -105,10 +106,11 @@ function AppShell() {
     void registerVideoPreviewServiceWorker();
   }, []);
 
-  const openUpload = useCallback((files: File[] = []) => {
+  const openUpload = useCallback((files: File[] = [], directoryPath = dashboardDirectoryPath) => {
+    setUploadDirectoryPath(directoryPath);
     setUploadFiles(files);
     setUploadOpen(true);
-  }, []);
+  }, [dashboardDirectoryPath]);
 
   const onLogout = useCallback(async () => {
     try {
@@ -161,6 +163,7 @@ function AppShell() {
             uploadVersion={uploadVersion}
             copyText={copyText}
             onDirectoryChange={setDashboardDirectoryPath}
+            onUploadToDirectory={(directoryPath) => openUpload([], directoryPath)}
           />
         )}
       </Shell>
@@ -172,7 +175,7 @@ function AppShell() {
         multipartChunkBytes={session.multipart_chunk_bytes}
         maxMultipartBytes={session.max_multipart_file_bytes}
         uploadConcurrency={session.upload_concurrency}
-        directoryPath={dashboardDirectoryPath}
+        directoryPath={uploadDirectoryPath}
         onClose={() => setUploadOpen(false)}
         onUploaded={(count) => {
           if (count > 0) {

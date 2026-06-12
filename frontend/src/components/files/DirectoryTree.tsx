@@ -13,7 +13,8 @@ import {
   ListFilter,
   Pencil,
   Search,
-  Trash2
+  Trash2,
+  UploadCloud
 } from "lucide-react";
 import type { DirectoryItem } from "../../api";
 import { cn } from "../../lib/cn";
@@ -34,6 +35,7 @@ interface DirectoryTreeProps {
   headerAction?: ReactNode;
   showExpandControls?: boolean;
   onCreateDirectory?: (parentPath: string) => void;
+  onUploadToDirectory?: (path: string) => void;
   onRenameDirectory?: (directory: DirectoryItem) => void;
   onMoveDirectory?: (directory: DirectoryItem) => void;
   onDeleteDirectory?: (directory: DirectoryItem) => void;
@@ -92,6 +94,7 @@ export function DirectoryTree({
   headerAction,
   showExpandControls = false,
   onCreateDirectory,
+  onUploadToDirectory,
   onRenameDirectory,
   onMoveDirectory,
   onDeleteDirectory,
@@ -110,7 +113,7 @@ export function DirectoryTree({
     [tree, normalizedQuery]
   );
   const sidebar = variant === "sidebar";
-  const showContextMenu = sidebar && Boolean(onCreateDirectory || onRenameDirectory || onMoveDirectory || onDeleteDirectory);
+  const showContextMenu = sidebar && Boolean(onCreateDirectory || onUploadToDirectory || onRenameDirectory || onMoveDirectory || onDeleteDirectory);
   const showHeader = Boolean(title || summary || headerAction || (sidebar && showExpandControls));
 
   useEffect(() => {
@@ -278,6 +281,7 @@ export function DirectoryTree({
           disabled={disabled}
           onClose={closeContextMenu}
           onCreateDirectory={onCreateDirectory}
+          onUploadToDirectory={onUploadToDirectory}
           onRenameDirectory={onRenameDirectory}
           onMoveDirectory={onMoveDirectory}
           onDeleteDirectory={onDeleteDirectory}
@@ -404,6 +408,7 @@ function DirectoryContextMenu({
   disabled,
   onClose,
   onCreateDirectory,
+  onUploadToDirectory,
   onRenameDirectory,
   onMoveDirectory,
   onDeleteDirectory,
@@ -414,6 +419,7 @@ function DirectoryContextMenu({
   disabled: boolean;
   onClose: () => void;
   onCreateDirectory?: (parentPath: string) => void;
+  onUploadToDirectory?: (path: string) => void;
   onRenameDirectory?: (directory: DirectoryItem) => void;
   onMoveDirectory?: (directory: DirectoryItem) => void;
   onDeleteDirectory?: (directory: DirectoryItem) => void;
@@ -447,6 +453,14 @@ function DirectoryContextMenu({
           label="新建文件夹"
           disabled={disabled}
           onClick={() => run(() => onCreateDirectory(node.path))}
+        />
+      ) : null}
+      {onUploadToDirectory ? (
+        <ContextMenuButton
+          icon={<UploadCloud size={15} />}
+          label="上传到此目录"
+          disabled={disabled}
+          onClick={() => run(() => onUploadToDirectory(node.path))}
         />
       ) : null}
       {onRenameDirectory && directory ? (

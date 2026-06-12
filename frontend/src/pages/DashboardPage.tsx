@@ -61,6 +61,7 @@ interface DashboardPageProps {
   uploadVersion: number;
   copyText: (value: string) => void;
   onDirectoryChange: (path: string) => void;
+  onUploadToDirectory: (path: string) => void;
 }
 
 function errorMessage(error: unknown): string {
@@ -197,7 +198,7 @@ function FileListBusyOverlay({ label }: { label: string }) {
   );
 }
 
-export function DashboardPage({ session, uploadVersion, copyText, onDirectoryChange }: DashboardPageProps) {
+export function DashboardPage({ session, uploadVersion, copyText, onDirectoryChange, onUploadToDirectory }: DashboardPageProps) {
   const toast = useToast();
   const confirm = useConfirm();
   const acceleratedDownloadTaskRef = useRef<AcceleratedDownloadTask | null>(null);
@@ -1198,6 +1199,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
             onRenameDirectory={openRenameDirectoryDialog}
             onMoveDirectory={openMoveDirectoryDialog}
             onDeleteDirectory={(directory) => void onDeleteDirectory(directory)}
+            onUploadToDirectory={onUploadToDirectory}
             className="xl:sticky xl:top-4"
             treeClassName="max-h-none overflow-visible"
             headerAction={(
@@ -1356,6 +1358,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
                 onRenameDirectory={openRenameDirectoryDialog}
                 onMoveDirectory={openMoveDirectoryDialog}
                 onDeleteDirectory={(directory) => void onDeleteDirectory(directory)}
+                onUploadToDirectory={(directory) => onUploadToDirectory(directory.path)}
                 onToggleFileSelected={toggleFileSelected}
                 onToggleDirectorySelected={toggleDirectorySelected}
                 onTogglePage={togglePage}
