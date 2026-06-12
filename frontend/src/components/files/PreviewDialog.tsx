@@ -114,15 +114,6 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
     return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
   }, []);
 
-  if (!file || !kind) {
-    return <Modal open={false} onClose={onClose}>{null}</Modal>;
-  }
-
-  const linkFile = hasFileLinkAccess(file) ? file : null;
-  const canAccelerateDownload = Boolean(onAcceleratedDownload);
-  const canCopyContent = (preview === "text" || preview === "markdown") && textState.status === "ready";
-  const isMediaPreview = preview === "video" || preview === "audio";
-  const toggleMaximized = () => setMaximized((value) => !value);
   const toggleNativeFullscreen = useCallback(() => {
     const target = fullscreenTargetRef.current;
     if (!target) return;
@@ -134,12 +125,23 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
 
     void target.requestFullscreen().catch(() => undefined);
   }, []);
+
   const closePreview = useCallback(() => {
     if (document.fullscreenElement === fullscreenTargetRef.current) {
       void document.exitFullscreen().catch(() => undefined);
     }
     onClose();
   }, [onClose]);
+
+  if (!file || !kind) {
+    return <Modal open={false} onClose={onClose}>{null}</Modal>;
+  }
+
+  const linkFile = hasFileLinkAccess(file) ? file : null;
+  const canAccelerateDownload = Boolean(onAcceleratedDownload);
+  const canCopyContent = (preview === "text" || preview === "markdown") && textState.status === "ready";
+  const isMediaPreview = preview === "video" || preview === "audio";
+  const toggleMaximized = () => setMaximized((value) => !value);
 
   return (
     <Modal

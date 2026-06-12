@@ -348,14 +348,6 @@ export function FileTable({
                 className="hidden w-28 px-4 py-3 text-left font-medium text-muted lg:table-cell"
               />
               <SortHeader
-                label="类型"
-                sortId="type"
-                activeSort={sortKey}
-                direction={sortDirection}
-                onSort={onSort}
-                className="hidden w-28 px-4 py-3 text-left font-medium text-muted md:table-cell"
-              />
-              <SortHeader
                 label="上传时间"
                 sortId="created_at"
                 activeSort={sortKey}
@@ -410,9 +402,6 @@ export function FileTable({
                     <span className="text-sm text-foreground">{formatBytes(directory.total_size)}</span>
                     <span className="text-xs text-muted">{directory.file_count} 个文件</span>
                   </div>
-                </td>
-                <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted md:table-cell">
-                  文件夹
                 </td>
                 <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted md:table-cell">
                   {formatDateTime(directory.created_at)}
@@ -502,9 +491,6 @@ export function FileTable({
                   </td>
                   <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-foreground lg:table-cell">
                     {formatBytes(file.size)}
-                  </td>
-                  <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted md:table-cell">
-                    {kind.label}
                   </td>
                   <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted md:table-cell">
                     {formatDateTime(file.created_at)}

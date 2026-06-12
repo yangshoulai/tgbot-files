@@ -238,12 +238,12 @@ function DirectoryTreeRow({
         aria-disabled={disabled || undefined}
         title={node.path}
         className={cn(
-          "group flex min-w-0 items-center gap-1 rounded-lg pr-2 text-sm transition-colors",
+          "group flex min-w-0 items-center gap-1 pr-2 text-sm transition-colors",
+          sidebar ? "my-px rounded-md" : "rounded-lg",
           selected ? "bg-primary-soft text-primary-strong" : "text-foreground hover:bg-background",
-          sidebar && "my-0.5",
           disabled && "opacity-60"
         )}
-        style={{ paddingLeft: sidebar ? Math.min(8 + node.depth * 16, 72) : 6 + node.depth * 18 }}
+        style={{ paddingLeft: sidebar ? Math.min(6 + node.depth * 14, 58) : 6 + node.depth * 18 }}
       >
         <button
           type="button"
@@ -253,7 +253,10 @@ function DirectoryTreeRow({
             event.stopPropagation();
             onToggle(node.path);
           }}
-          className="grid size-7 shrink-0 place-items-center rounded-md text-muted transition-colors hover:bg-primary-soft hover:text-primary-strong disabled:opacity-0"
+          className={cn(
+            "grid shrink-0 place-items-center rounded-md text-muted transition-colors hover:bg-primary-soft hover:text-primary-strong disabled:opacity-0",
+            sidebar ? "size-6" : "size-7"
+          )}
         >
           <ChevronRight size={14} className={cn("transition-transform", expanded && "rotate-90")} />
         </button>
@@ -262,14 +265,14 @@ function DirectoryTreeRow({
           disabled={disabled}
           onClick={() => onSelect(node.path)}
           className={cn(
-            "flex min-w-0 flex-1 items-center gap-2 py-2 text-left focus-visible:outline-none focus-visible:focus-ring disabled:cursor-not-allowed",
-            sidebar && "py-2.5"
+            "flex min-w-0 flex-1 items-center text-left focus-visible:outline-none focus-visible:focus-ring disabled:cursor-not-allowed",
+            sidebar ? "gap-1.5 py-1.5" : "gap-2 py-2"
           )}
         >
-          {expanded && hasChildren ? <FolderOpen size={16} className="shrink-0" /> : <Folder size={16} className="shrink-0" />}
-          <span className="min-w-0 flex-1">
-            <span className="block truncate font-medium">{node.name}</span>
-            {sidebar && node.path !== "/" ? <span className="block truncate text-[11px] leading-4 text-muted">{node.path}</span> : null}
+          {expanded && hasChildren ? <FolderOpen size={sidebar ? 15 : 16} className="shrink-0" /> : <Folder size={sidebar ? 15 : 16} className="shrink-0" />}
+          <span className={cn("min-w-0 flex-1", sidebar && "flex items-baseline gap-1.5")}>
+            <span className={cn("truncate font-medium", sidebar ? "text-[13px] leading-5" : "block")}>{node.name}</span>
+            {sidebar && node.path !== "/" ? <span className="min-w-0 truncate text-[11px] leading-4 text-muted">{node.path}</span> : null}
           </span>
           {!sidebar && node.path !== "/" ? <span className="hidden min-w-0 truncate text-xs text-muted sm:inline">{node.path}</span> : null}
         </button>
@@ -277,7 +280,7 @@ function DirectoryTreeRow({
       </div>
 
       {hasChildren && expanded ? (
-        <div role="group" className={cn(sidebar && node.depth > 0 ? "ml-3 border-l border-dashed border-border/80" : null)}>
+        <div role="group" className={cn(sidebar && node.depth > 0 ? "ml-2 border-l border-dashed border-border/80" : null)}>
           {node.children.map((child) => (
             <DirectoryTreeRow
               key={child.path}
