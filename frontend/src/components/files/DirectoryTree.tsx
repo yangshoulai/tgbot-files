@@ -428,10 +428,12 @@ function DirectoryContextMenu({
     action();
   }
 
+  const openSortSubmenuToLeft = typeof window !== "undefined" && state.x > window.innerWidth - 380;
+
   return (
     <div
       role="menu"
-      className="fixed z-[70] min-w-40 overflow-hidden rounded-xl border border-border bg-surface p-1 text-sm shadow-dialog"
+      className="fixed z-[70] min-w-40 overflow-visible rounded-xl border border-border bg-surface p-1 text-sm shadow-dialog"
       style={{ left: state.x, top: state.y }}
       onClick={(event) => event.stopPropagation()}
       onContextMenu={(event) => event.preventDefault()}
@@ -474,7 +476,10 @@ function DirectoryContextMenu({
         </button>
         <div
           role="menu"
-          className="invisible absolute left-[calc(100%-0.25rem)] top-0 z-[71] min-w-44 rounded-xl border border-border bg-surface p-1 text-sm opacity-0 shadow-dialog transition-[opacity,visibility] group-hover/sort:visible group-hover/sort:opacity-100 group-focus-within/sort:visible group-focus-within/sort:opacity-100"
+          className={cn(
+            "invisible absolute top-0 z-[71] min-w-44 rounded-xl border border-border bg-surface p-1 text-sm opacity-0 shadow-dialog transition-[opacity,visibility] group-hover/sort:visible group-hover/sort:opacity-100 group-focus-within/sort:visible group-focus-within/sort:opacity-100",
+            openSortSubmenuToLeft ? "right-[calc(100%-0.25rem)]" : "left-[calc(100%-0.25rem)]"
+          )}
         >
           {SORT_OPTIONS.map((option) => (
             <ContextMenuButton
