@@ -3374,7 +3374,7 @@ export function UploadDialog({
                 }}
               />
               <p className="text-xs leading-5 text-muted">
-                URL 导入要求远端支持 Range；磁力导入会先由 aria2 下载选中文件，再按 {formatBytes(multipartChunkBytes)} 分片转存到 Telegram。
+                URL 导入要求远端支持 Range；磁力导入会先由 aria2 下载选中文件，再分片转存到 Telegram。
               </p>
             </div>
 
