@@ -1191,6 +1191,14 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
             title="目录导航"
             summary={`${directoryOptions.length} 个目录 · 点击节点进入目标目录`}
             showExpandControls
+            showSortControl
+            onCreateDirectory={(parentPath) => {
+              setCreateDirParentPath(parentPath);
+              setCreateDirOpen(true);
+            }}
+            onRenameDirectory={openRenameDirectoryDialog}
+            onMoveDirectory={openMoveDirectoryDialog}
+            onDeleteDirectory={(directory) => void onDeleteDirectory(directory)}
             className="xl:sticky xl:top-4"
             treeClassName="max-h-none overflow-visible"
             headerAction={(

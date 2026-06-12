@@ -6,6 +6,7 @@ import {
   hasFileLinkAccess,
   TEXT_PREVIEW_MAX_BYTES
 } from "../../lib/file-access";
+import { cn } from "../../lib/cn";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
 import { Badge } from "../ui/Badge";
@@ -211,7 +212,11 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
           ) : null}
         </>
       }
-      bodyClassName={maximized ? "flex bg-background/40" : "bg-background/40"}
+      bodyClassName={cn(
+        "bg-background/40",
+        maximized && "flex",
+        (isMediaPreview || preview === "image") && "!overflow-hidden"
+      )}
     >
       <div ref={fullscreenTargetRef} className="relative flex min-h-0 w-full bg-background">
         {nativeFullscreen && !isMediaPreview ? (

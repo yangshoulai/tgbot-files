@@ -1,5 +1,17 @@
-import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
-import { Check, ChevronRight, ChevronsDownUp, ChevronsUpDown, Folder, FolderOpen, Search } from "lucide-react";
+import { useEffect, useId, useMemo, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
+import {
+  Check,
+  ChevronRight,
+  ChevronsDownUp,
+  ChevronsUpDown,
+  Folder,
+  FolderInput,
+  FolderOpen,
+  FolderPlus,
+  Pencil,
+  Search,
+  Trash2
+} from "lucide-react";
 import type { DirectoryItem } from "../../api";
 import { cn } from "../../lib/cn";
 
@@ -18,6 +30,11 @@ interface DirectoryTreeProps {
   summary?: string;
   headerAction?: ReactNode;
   showExpandControls?: boolean;
+  showSortControl?: boolean;
+  onCreateDirectory?: (parentPath: string) => void;
+  onRenameDirectory?: (directory: DirectoryItem) => void;
+  onMoveDirectory?: (directory: DirectoryItem) => void;
+  onDeleteDirectory?: (directory: DirectoryItem) => void;
   className?: string;
   treeClassName?: string;
 }
@@ -27,7 +44,16 @@ interface TreeNode {
   name: string;
   path: string;
   depth: number;
+  directory: DirectoryItem | null;
   children: TreeNode[];
+}
+
+type DirectoryTreeSortMode = "name-asc" | "name-desc" | "created-desc" | "created-asc";
+
+interface ContextMenuState {
+  node: TreeNode;
+  x: number;
+  y: number;
 }
 
 const ROOT_NODE: TreeNode = {
@@ -35,8 +61,16 @@ const ROOT_NODE: TreeNode = {
   name: "/ 根目录",
   path: "/",
   depth: 0,
+  directory: null,
   children: []
 };
+
+const SORT_OPTIONS: Array<{ value: DirectoryTreeSortMode; label: string }> = [
+  { value: "name-asc", label: "名称 A-Z" },
+  { value: "name-desc", label: "名称 Z-A" },
+  { value: "created-desc", label: "创建时间 新→旧" },
+  { value: "created-asc", label: "创建时间 旧→新" }
+];
 
 export function DirectoryTree({
   id,
@@ -53,20 +87,28 @@ export function DirectoryTree({
   summary,
   headerAction,
   showExpandControls = false,
+  showSortControl = false,
+  onCreateDirectory,
+  onRenameDirectory,
+  onMoveDirectory,
+  onDeleteDirectory,
   className,
   treeClassName
 }: DirectoryTreeProps) {
   const searchId = useId();
   const [query, setQuery] = useState("");
+  const [sortMode, setSortMode] = useState<DirectoryTreeSortMode>("name-asc");
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set(["/"]));
-  const tree = useMemo(() => buildDirectoryTree(directories), [directories]);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const tree = useMemo(() => buildDirectoryTree(directories, sortMode), [directories, sortMode]);
   const normalizedQuery = query.trim().toLowerCase();
   const visiblePaths = useMemo(
     () => visibleDirectoryPaths(tree, normalizedQuery),
     [tree, normalizedQuery]
   );
   const sidebar = variant === "sidebar";
-  const showHeader = Boolean(title || summary || headerAction || (sidebar && showExpandControls));
+  const showContextMenu = sidebar && Boolean(onCreateDirectory || onRenameDirectory || onMoveDirectory || onDeleteDirectory);
+  const showHeader = Boolean(title || summary || headerAction || (sidebar && (showExpandControls || showSortControl)));
 
   useEffect(() => {
     setExpandedPaths((current) => {
@@ -100,6 +142,35 @@ export function DirectoryTree({
   function collapseAll() {
     setExpandedPaths(new Set(["/", value, ...ancestorPaths(value)]));
   }
+
+  function openContextMenu(event: ReactMouseEvent, node: TreeNode) {
+    if (!showContextMenu) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu({ node, x: event.clientX, y: event.clientY });
+  }
+
+  function closeContextMenu() {
+    setContextMenu(null);
+  }
+
+  useEffect(() => {
+    if (!contextMenu) return;
+
+    const close = () => closeContextMenu();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeContextMenu();
+    };
+
+    window.addEventListener("click", close);
+    window.addEventListener("contextmenu", close);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("contextmenu", close);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [contextMenu]);
 
   return (
     <div
@@ -163,6 +234,25 @@ export function DirectoryTree({
             </div>
           ) : null}
 
+          {sidebar && showSortControl ? (
+            <label className="mt-2 flex items-center gap-2 text-[11px] font-medium text-muted">
+              <span className="shrink-0">排序</span>
+              <select
+                value={sortMode}
+                disabled={disabled}
+                onChange={(event) => setSortMode(event.currentTarget.value as DirectoryTreeSortMode)}
+                className="h-8 min-w-0 flex-1 rounded-full border border-border bg-background px-2.5 text-xs text-foreground outline-none transition-colors hover:border-primary/30 focus-visible:focus-ring disabled:cursor-not-allowed disabled:opacity-60"
+                aria-label="目录树排序"
+              >
+                {SORT_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+
           {sidebar && normalizedQuery ? (
             <p className="mt-2 rounded-lg bg-primary-soft px-2 py-1.5 text-[11px] leading-4 text-primary-strong">
               正在仅显示匹配目录及其上级路径
@@ -186,6 +276,7 @@ export function DirectoryTree({
           searching={Boolean(normalizedQuery)}
           disabled={disabled}
           sidebar={sidebar}
+          onContextMenu={openContextMenu}
           onToggle={togglePath}
           onSelect={onChange}
         />
@@ -196,6 +287,18 @@ export function DirectoryTree({
           <p className="px-3 py-2 text-xs text-muted">没有匹配的目录</p>
         ) : null}
       </div>
+
+      {contextMenu ? (
+        <DirectoryContextMenu
+          state={contextMenu}
+          disabled={disabled}
+          onClose={closeContextMenu}
+          onCreateDirectory={onCreateDirectory}
+          onRenameDirectory={onRenameDirectory}
+          onMoveDirectory={onMoveDirectory}
+          onDeleteDirectory={onDeleteDirectory}
+        />
+      ) : null}
     </div>
   );
 }
@@ -208,6 +311,7 @@ function DirectoryTreeRow({
   searching,
   disabled,
   sidebar,
+  onContextMenu,
   onToggle,
   onSelect
 }: {
@@ -218,6 +322,7 @@ function DirectoryTreeRow({
   searching: boolean;
   disabled: boolean;
   sidebar: boolean;
+  onContextMenu: (event: ReactMouseEvent, node: TreeNode) => void;
   onToggle: (path: string) => void;
   onSelect: (path: string) => void;
 }) {
@@ -237,6 +342,7 @@ function DirectoryTreeRow({
         aria-expanded={hasChildren ? expanded : undefined}
         aria-disabled={disabled || undefined}
         title={node.path}
+        onContextMenu={(event) => onContextMenu(event, node)}
         className={cn(
           "group flex min-w-0 items-center gap-1 pr-2 text-sm transition-colors",
           sidebar ? "my-px rounded-md" : "rounded-lg",
@@ -291,6 +397,7 @@ function DirectoryTreeRow({
               searching={searching}
               disabled={disabled}
               sidebar={sidebar}
+              onContextMenu={onContextMenu}
               onToggle={onToggle}
               onSelect={onSelect}
             />
@@ -301,7 +408,111 @@ function DirectoryTreeRow({
   );
 }
 
-function buildDirectoryTree(directories: DirectoryItem[]): TreeNode {
+function DirectoryContextMenu({
+  state,
+  disabled,
+  onClose,
+  onCreateDirectory,
+  onRenameDirectory,
+  onMoveDirectory,
+  onDeleteDirectory
+}: {
+  state: ContextMenuState;
+  disabled: boolean;
+  onClose: () => void;
+  onCreateDirectory?: (parentPath: string) => void;
+  onRenameDirectory?: (directory: DirectoryItem) => void;
+  onMoveDirectory?: (directory: DirectoryItem) => void;
+  onDeleteDirectory?: (directory: DirectoryItem) => void;
+}) {
+  const { node } = state;
+  const directory = node.directory;
+  const canMutateDirectory = Boolean(directory);
+
+  function run(action: () => void) {
+    onClose();
+    action();
+  }
+
+  return (
+    <div
+      role="menu"
+      className="fixed z-[70] min-w-40 overflow-hidden rounded-xl border border-border bg-surface p-1 text-sm shadow-dialog"
+      style={{ left: state.x, top: state.y }}
+      onClick={(event) => event.stopPropagation()}
+      onContextMenu={(event) => event.preventDefault()}
+    >
+      {onCreateDirectory ? (
+        <ContextMenuButton
+          icon={<FolderPlus size={15} />}
+          label="新建文件夹"
+          disabled={disabled}
+          onClick={() => run(() => onCreateDirectory(node.path))}
+        />
+      ) : null}
+      {onRenameDirectory && directory ? (
+        <ContextMenuButton
+          icon={<Pencil size={15} />}
+          label="重命名"
+          disabled={disabled || !canMutateDirectory}
+          onClick={() => run(() => onRenameDirectory(directory))}
+        />
+      ) : null}
+      {onMoveDirectory && directory ? (
+        <ContextMenuButton
+          icon={<FolderInput size={15} />}
+          label="移动"
+          disabled={disabled || !canMutateDirectory}
+          onClick={() => run(() => onMoveDirectory(directory))}
+        />
+      ) : null}
+      {onDeleteDirectory && directory ? (
+        <>
+          <div className="my-1 h-px bg-border" />
+          <ContextMenuButton
+            icon={<Trash2 size={15} />}
+            label="删除"
+            danger
+            disabled={disabled || !canMutateDirectory}
+            onClick={() => run(() => onDeleteDirectory(directory))}
+          />
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+function ContextMenuButton({
+  icon,
+  label,
+  danger = false,
+  disabled = false,
+  onClick
+}: {
+  icon: ReactNode;
+  label: string;
+  danger?: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      disabled={disabled}
+      onClick={onClick}
+      className={cn(
+        "flex h-9 w-full items-center gap-2 rounded-lg px-2.5 text-left transition-colors focus-visible:outline-none focus-visible:focus-ring disabled:pointer-events-none disabled:opacity-50",
+        danger ? "text-danger hover:bg-danger-soft" : "text-foreground hover:bg-primary-soft hover:text-primary-strong"
+      )}
+    >
+      {icon}
+      <span className="flex-1">{label}</span>
+    </button>
+  );
+}
+
+function buildDirectoryTree(directories: DirectoryItem[], sortMode: DirectoryTreeSortMode): TreeNode {
   const childrenByParent = new Map<string | null, DirectoryItem[]>();
   const byId = new Map(directories.map((directory) => [directory.id, directory]));
 
@@ -313,7 +524,7 @@ function buildDirectoryTree(directories: DirectoryItem[]): TreeNode {
   }
 
   for (const children of childrenByParent.values()) {
-    children.sort((left, right) => left.name.localeCompare(right.name, "zh-CN"));
+    children.sort((left, right) => compareDirectories(left, right, sortMode));
   }
 
   function build(parentId: string | null, depth: number): TreeNode[] {
@@ -322,6 +533,7 @@ function buildDirectoryTree(directories: DirectoryItem[]): TreeNode {
       name: directory.name,
       path: directory.path,
       depth,
+      directory,
       children: build(directory.id, depth + 1)
     }));
   }
@@ -330,6 +542,27 @@ function buildDirectoryTree(directories: DirectoryItem[]): TreeNode {
     ...ROOT_NODE,
     children: build(null, 1)
   };
+}
+
+function compareDirectories(left: DirectoryItem, right: DirectoryItem, sortMode: DirectoryTreeSortMode): number {
+  switch (sortMode) {
+    case "name-desc":
+      return right.name.localeCompare(left.name, "zh-CN", { numeric: true, sensitivity: "base" });
+    case "created-desc":
+      return dateValue(right.created_at) - dateValue(left.created_at) ||
+        left.name.localeCompare(right.name, "zh-CN", { numeric: true, sensitivity: "base" });
+    case "created-asc":
+      return dateValue(left.created_at) - dateValue(right.created_at) ||
+        left.name.localeCompare(right.name, "zh-CN", { numeric: true, sensitivity: "base" });
+    case "name-asc":
+    default:
+      return left.name.localeCompare(right.name, "zh-CN", { numeric: true, sensitivity: "base" });
+  }
+}
+
+function dateValue(value: string | null | undefined): number {
+  const timestamp = value ? Date.parse(value) : 0;
+  return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
 function visibleDirectoryPaths(root: TreeNode, normalizedQuery: string): Set<string> {

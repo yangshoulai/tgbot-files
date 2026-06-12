@@ -16,7 +16,7 @@ export function PreviewFrame({ fullscreen, tone = "surface", children, className
       className={cn(
         fullscreen
           ? "flex min-h-0 w-full flex-1 overflow-hidden rounded-xl border"
-          : "grid min-h-72 overflow-hidden rounded-xl border",
+          : "grid min-h-72 w-full overflow-hidden rounded-xl border",
         tone === "dark" ? "border-foreground/20 bg-[#07110f]" : "border-border bg-surface",
         tone === "code" && "bg-white",
         className

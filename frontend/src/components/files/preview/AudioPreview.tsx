@@ -152,8 +152,8 @@ export function AudioPreview({ file, fullscreen, onToggleMaximized, nativeFullsc
   return (
     <div
       className={cn(
-        "relative isolate flex w-full items-center justify-center overflow-hidden bg-[linear-gradient(180deg,rgba(255,255,255,0.98),rgba(239,251,246,0.92))] p-4 text-foreground sm:p-6",
-        fullscreen ? "h-full" : "min-h-72"
+        "relative isolate flex min-h-0 w-full items-center justify-center overflow-hidden bg-[linear-gradient(180deg,rgba(255,255,255,0.98),rgba(239,251,246,0.92))] p-3 text-foreground sm:p-4",
+        fullscreen ? "h-full" : "h-[min(64dvh,650px)] min-h-[28rem]"
       )}
     >
       <div aria-hidden className="pointer-events-none absolute inset-0 overflow-hidden">
@@ -162,9 +162,9 @@ export function AudioPreview({ file, fullscreen, onToggleMaximized, nativeFullsc
         <span className="absolute inset-x-0 bottom-0 h-28 bg-[linear-gradient(180deg,transparent,rgba(16,185,129,0.08))]" />
       </div>
 
-      <div className={cn("relative flex w-full flex-col gap-4", showLyricsPanel ? "max-w-5xl" : "max-w-3xl")}>
-        <div className="flex min-w-0 items-center gap-4 rounded-[1.35rem] border border-white/80 bg-white/[0.68] p-3 shadow-[0_18px_44px_rgba(15,23,42,0.1)] ring-1 ring-border/70 backdrop-blur-md sm:p-4">
-          <div className="size-20 shrink-0 overflow-hidden rounded-2xl border border-white/80 bg-background shadow-[0_18px_42px_rgba(15,23,42,0.16)] ring-1 ring-border/70 sm:size-24">
+      <div className="relative flex h-full min-h-0 w-full max-w-5xl flex-col justify-center gap-3">
+        <div className="flex min-w-0 shrink-0 items-center gap-3 rounded-[1.2rem] border border-white/80 bg-white/[0.72] p-3 shadow-[0_18px_44px_rgba(15,23,42,0.1)] ring-1 ring-border/70 backdrop-blur-md">
+          <div className="size-16 shrink-0 overflow-hidden rounded-2xl border border-white/80 bg-background shadow-[0_18px_42px_rgba(15,23,42,0.16)] ring-1 ring-border/70 sm:size-20">
             {coverUrl ? (
               <img
                 src={coverUrl}
@@ -174,7 +174,7 @@ export function AudioPreview({ file, fullscreen, onToggleMaximized, nativeFullsc
               />
             ) : (
               <span className="grid h-full w-full place-items-center bg-primary-soft text-primary-strong">
-                <Music2 size={34} />
+                <Music2 size={30} />
               </span>
             )}
           </div>
@@ -243,7 +243,7 @@ export function AudioPreview({ file, fullscreen, onToggleMaximized, nativeFullsc
           />
         ) : null}
 
-        <div className="w-full">
+        <div className="w-full shrink-0">
           <MediaControls
             mediaRef={audioRef}
             maximized={fullscreen}
@@ -297,8 +297,8 @@ function LyricsPanel({
           : "歌词";
 
   return (
-    <section className="flex min-h-0 flex-col rounded-[1.35rem] border border-white/80 bg-white/[0.72] p-3 shadow-[0_18px_44px_rgba(15,23,42,0.12)] ring-1 ring-border/70 backdrop-blur-md sm:p-4">
-      <div className="mb-3 flex min-w-0 items-center justify-between gap-3">
+    <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-[1.2rem] border border-white/80 bg-white/[0.72] p-3 shadow-[0_18px_44px_rgba(15,23,42,0.12)] ring-1 ring-border/70 backdrop-blur-md">
+      <div className="mb-2 flex min-w-0 shrink-0 items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2">
           <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-primary-soft text-primary-strong ring-1 ring-primary/15">
             <FileText size={18} />
@@ -331,8 +331,8 @@ function LyricsPanel({
 
       <div
         className={cn(
-          "min-h-40 overflow-y-auto rounded-2xl border border-border/70 bg-[linear-gradient(180deg,rgba(248,250,252,0.92),rgba(236,253,245,0.66))] px-4 py-4",
-          fullscreen ? "max-h-[min(54dvh,36rem)]" : "max-h-72",
+          "min-h-0 flex-1 overflow-y-auto rounded-2xl border border-border/70 bg-[linear-gradient(180deg,rgba(248,250,252,0.92),rgba(236,253,245,0.66))] px-4 py-4",
+          fullscreen ? "max-h-none" : "max-h-none",
           selectedTrack?.kind === "timed" && "[mask-image:linear-gradient(to_bottom,transparent,black_10%,black_90%,transparent)]"
         )}
       >
@@ -390,7 +390,7 @@ function LyricsPanel({
       </div>
 
       {selectedTrack ? (
-        <p className="mt-2 truncate text-xs text-muted" title={selectedTrack.sourceFileName}>
+        <p className="mt-2 shrink-0 truncate text-xs text-muted" title={selectedTrack.sourceFileName}>
           来源：{selectedTrack.sourceFileName}
         </p>
       ) : null}
