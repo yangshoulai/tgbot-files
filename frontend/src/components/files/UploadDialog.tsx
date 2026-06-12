@@ -63,7 +63,6 @@ interface UploadDialogProps {
   open: boolean;
   initialFiles: File[];
   maxBytes: number;
-  multipartChunkBytes: number;
   maxMultipartBytes: number;
   uploadConcurrency: number;
   directoryPath: string;
@@ -295,7 +294,6 @@ export function UploadDialog({
   open,
   initialFiles,
   maxBytes,
-  multipartChunkBytes,
   maxMultipartBytes,
   uploadConcurrency,
   directoryPath,
@@ -3148,7 +3146,7 @@ export function UploadDialog({
         open={open}
         onClose={onClose}
         title="上传文件"
-        description={`上传到 ${uploadDirectoryPath}；所有文件统一按 ${formatBytes(multipartChunkBytes)} 分片上传，单文件上限 ${formatBytes(maxMultipartBytes)}，最多 ${effectiveUploadConcurrency} 分片并发`}
+        description={`上传到 ${uploadDirectoryPath}；按文件类型和系统配置自动选择分片大小，单文件上限 ${formatBytes(maxMultipartBytes)}，最多 ${effectiveUploadConcurrency} 分片并发`}
         size="wide"
         closeOnBackdrop={false}
         closeOnEscape={!uploadBusy && !curlImportOpen}
@@ -3263,7 +3261,7 @@ export function UploadDialog({
               </span>
               <p className="text-sm font-medium text-foreground">点击选择文件，或拖拽文件/文件夹到这里</p>
               <p className="text-xs text-muted">
-                统一按 {formatBytes(multipartChunkBytes)} 分片，最多 {effectiveUploadConcurrency} 并发，每片最多 {MULTIPART_UPLOAD_MAX_ATTEMPTS} 次
+                按文件类型自动选择分片大小，最多 {effectiveUploadConcurrency} 并发，每片最多 {MULTIPART_UPLOAD_MAX_ATTEMPTS} 次
               </p>
               <input
                 ref={fileInput}

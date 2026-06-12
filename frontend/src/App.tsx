@@ -172,7 +172,6 @@ function AppShell() {
         open={uploadOpen}
         initialFiles={uploadFiles}
         maxBytes={session.max_file_bytes}
-        multipartChunkBytes={session.multipart_chunk_bytes}
         maxMultipartBytes={session.max_multipart_file_bytes}
         uploadConcurrency={session.upload_concurrency}
         directoryPath={uploadDirectoryPath}
