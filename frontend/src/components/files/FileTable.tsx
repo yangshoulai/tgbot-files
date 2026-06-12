@@ -11,6 +11,7 @@ import {
   FolderOpen,
   Info,
   Pencil,
+  MoreVertical,
   Trash2
 } from "lucide-react";
 import type { DirectoryItem, FileItem } from "../../api";
@@ -20,6 +21,7 @@ import {
 } from "../../lib/file-access";
 import { cn } from "../../lib/cn";
 import { fileKind, formatBytes, formatDateTime } from "../../utils";
+import { IconButton } from "../ui/IconButton";
 import { FileVisual } from "../ui/FileVisual";
 import { EmptyState } from "../ui/EmptyState";
 
@@ -212,6 +214,26 @@ export function FileTable({
     setContextMenu({ kind: "file", file, x: event.clientX, y: event.clientY });
   }
 
+  function openDirectoryActionsMenu(directory: DirectoryItem, anchor: HTMLElement) {
+    const rect = anchor.getBoundingClientRect();
+    setContextMenu({
+      kind: "directory",
+      directory,
+      x: rect.right,
+      y: rect.bottom + 8
+    });
+  }
+
+  function openFileActionsMenu(file: FileItem, anchor: HTMLElement) {
+    const rect = anchor.getBoundingClientRect();
+    setContextMenu({
+      kind: "file",
+      file,
+      x: rect.right,
+      y: rect.bottom + 8
+    });
+  }
+
   function runContextAction(action: () => void) {
     setContextMenu(null);
     action();
@@ -362,6 +384,15 @@ export function FileTable({
                   </span>
                 </span>
               </button>
+              <IconButton
+                size="sm"
+                variant="ghost"
+                label="更多操作"
+                onClick={(event) => openDirectoryActionsMenu(directory, event.currentTarget)}
+                className="mt-1 self-start"
+              >
+                <MoreVertical size={16} />
+              </IconButton>
             </div>
           </div>
         ))}
@@ -420,6 +451,15 @@ export function FileTable({
                     </p>
                   </div>
                 </div>
+                <IconButton
+                  size="sm"
+                  variant="ghost"
+                  label="更多操作"
+                  onClick={(event) => openFileActionsMenu(file, event.currentTarget)}
+                  className="mt-1 self-start"
+                >
+                  <MoreVertical size={16} />
+                </IconButton>
               </div>
             </div>
           );
