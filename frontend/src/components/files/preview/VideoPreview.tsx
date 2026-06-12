@@ -309,7 +309,7 @@ export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscr
 
       try {
         const nextState = await requestVideoPreviewCacheState(previewMetadata);
-        if (!disposed) {
+        if (!disposed && nextState) {
           setCacheState(nextState);
         }
       } finally {
