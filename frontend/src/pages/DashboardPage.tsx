@@ -1191,7 +1191,6 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
             title="目录导航"
             summary={`${directoryOptions.length} 个目录 · 点击节点进入目标目录`}
             showExpandControls
-            showSortControl
             onCreateDirectory={(parentPath) => {
               setCreateDirParentPath(parentPath);
               setCreateDirOpen(true);

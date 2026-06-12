@@ -4,10 +4,12 @@ import {
   ChevronRight,
   ChevronsDownUp,
   ChevronsUpDown,
+  Clock,
   Folder,
   FolderInput,
   FolderOpen,
   FolderPlus,
+  ListFilter,
   Pencil,
   Search,
   Trash2
@@ -30,7 +32,6 @@ interface DirectoryTreeProps {
   summary?: string;
   headerAction?: ReactNode;
   showExpandControls?: boolean;
-  showSortControl?: boolean;
   onCreateDirectory?: (parentPath: string) => void;
   onRenameDirectory?: (directory: DirectoryItem) => void;
   onMoveDirectory?: (directory: DirectoryItem) => void;
@@ -66,11 +67,13 @@ const ROOT_NODE: TreeNode = {
 };
 
 const SORT_OPTIONS: Array<{ value: DirectoryTreeSortMode; label: string }> = [
-  { value: "name-asc", label: "名称 A-Z" },
-  { value: "name-desc", label: "名称 Z-A" },
   { value: "created-desc", label: "创建时间 新→旧" },
-  { value: "created-asc", label: "创建时间 旧→新" }
+  { value: "created-asc", label: "创建时间 旧→新" },
+  { value: "name-asc", label: "名称 A-Z" },
+  { value: "name-desc", label: "名称 Z-A" }
 ];
+
+const DEFAULT_SORT_MODE: DirectoryTreeSortMode = "created-desc";
 
 export function DirectoryTree({
   id,
@@ -87,7 +90,6 @@ export function DirectoryTree({
   summary,
   headerAction,
   showExpandControls = false,
-  showSortControl = false,
   onCreateDirectory,
   onRenameDirectory,
   onMoveDirectory,
@@ -97,10 +99,10 @@ export function DirectoryTree({
 }: DirectoryTreeProps) {
   const searchId = useId();
   const [query, setQuery] = useState("");
-  const [sortMode, setSortMode] = useState<DirectoryTreeSortMode>("name-asc");
+  const [sortModesByPath, setSortModesByPath] = useState<Record<string, DirectoryTreeSortMode>>({});
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set(["/"]));
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
-  const tree = useMemo(() => buildDirectoryTree(directories, sortMode), [directories, sortMode]);
+  const tree = useMemo(() => buildDirectoryTree(directories, sortModesByPath), [directories, sortModesByPath]);
   const normalizedQuery = query.trim().toLowerCase();
   const visiblePaths = useMemo(
     () => visibleDirectoryPaths(tree, normalizedQuery),
@@ -108,7 +110,7 @@ export function DirectoryTree({
   );
   const sidebar = variant === "sidebar";
   const showContextMenu = sidebar && Boolean(onCreateDirectory || onRenameDirectory || onMoveDirectory || onDeleteDirectory);
-  const showHeader = Boolean(title || summary || headerAction || (sidebar && (showExpandControls || showSortControl)));
+  const showHeader = Boolean(title || summary || headerAction || (sidebar && showExpandControls));
 
   useEffect(() => {
     setExpandedPaths((current) => {
@@ -234,25 +236,6 @@ export function DirectoryTree({
             </div>
           ) : null}
 
-          {sidebar && showSortControl ? (
-            <label className="mt-2 flex items-center gap-2 text-[11px] font-medium text-muted">
-              <span className="shrink-0">排序</span>
-              <select
-                value={sortMode}
-                disabled={disabled}
-                onChange={(event) => setSortMode(event.currentTarget.value as DirectoryTreeSortMode)}
-                className="h-8 min-w-0 flex-1 rounded-full border border-border bg-background px-2.5 text-xs text-foreground outline-none transition-colors hover:border-primary/30 focus-visible:focus-ring disabled:cursor-not-allowed disabled:opacity-60"
-                aria-label="目录树排序"
-              >
-                {SORT_OPTIONS.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-          ) : null}
-
           {sidebar && normalizedQuery ? (
             <p className="mt-2 rounded-lg bg-primary-soft px-2 py-1.5 text-[11px] leading-4 text-primary-strong">
               正在仅显示匹配目录及其上级路径
@@ -297,6 +280,13 @@ export function DirectoryTree({
           onRenameDirectory={onRenameDirectory}
           onMoveDirectory={onMoveDirectory}
           onDeleteDirectory={onDeleteDirectory}
+          sortMode={sortModesByPath[contextMenu.node.path] ?? DEFAULT_SORT_MODE}
+          onSortChange={(sortMode) => {
+            setSortModesByPath((current) => ({
+              ...current,
+              [contextMenu.node.path]: sortMode
+            }));
+          }}
         />
       ) : null}
     </div>
@@ -415,7 +405,9 @@ function DirectoryContextMenu({
   onCreateDirectory,
   onRenameDirectory,
   onMoveDirectory,
-  onDeleteDirectory
+  onDeleteDirectory,
+  sortMode,
+  onSortChange
 }: {
   state: ContextMenuState;
   disabled: boolean;
@@ -424,6 +416,8 @@ function DirectoryContextMenu({
   onRenameDirectory?: (directory: DirectoryItem) => void;
   onMoveDirectory?: (directory: DirectoryItem) => void;
   onDeleteDirectory?: (directory: DirectoryItem) => void;
+  sortMode: DirectoryTreeSortMode;
+  onSortChange: (sortMode: DirectoryTreeSortMode) => void;
 }) {
   const { node } = state;
   const directory = node.directory;
@@ -466,6 +460,34 @@ function DirectoryContextMenu({
           onClick={() => run(() => onMoveDirectory(directory))}
         />
       ) : null}
+      <div className="my-1 h-px bg-border" />
+      <div className="group/sort relative">
+        <button
+          type="button"
+          role="menuitem"
+          disabled={disabled}
+          className="flex h-9 w-full items-center gap-2 rounded-lg px-2.5 text-left text-foreground transition-colors hover:bg-primary-soft hover:text-primary-strong focus-visible:outline-none focus-visible:focus-ring disabled:pointer-events-none disabled:opacity-50"
+        >
+          <ListFilter size={15} />
+          <span className="flex-1">选择排序方式</span>
+          <ChevronRight size={14} className="text-muted" />
+        </button>
+        <div
+          role="menu"
+          className="invisible absolute left-[calc(100%-0.25rem)] top-0 z-[71] min-w-44 rounded-xl border border-border bg-surface p-1 text-sm opacity-0 shadow-dialog transition-[opacity,visibility] group-hover/sort:visible group-hover/sort:opacity-100 group-focus-within/sort:visible group-focus-within/sort:opacity-100"
+        >
+          {SORT_OPTIONS.map((option) => (
+            <ContextMenuButton
+              key={option.value}
+              icon={option.value === sortMode ? <Check size={15} /> : <Clock size={15} />}
+              label={option.label}
+              disabled={disabled}
+              checked={option.value === sortMode}
+              onClick={() => run(() => onSortChange(option.value))}
+            />
+          ))}
+        </div>
+      </div>
       {onDeleteDirectory && directory ? (
         <>
           <div className="my-1 h-px bg-border" />
@@ -485,12 +507,14 @@ function DirectoryContextMenu({
 function ContextMenuButton({
   icon,
   label,
+  checked = false,
   danger = false,
   disabled = false,
   onClick
 }: {
   icon: ReactNode;
   label: string;
+  checked?: boolean;
   danger?: boolean;
   disabled?: boolean;
   onClick: () => void;
@@ -503,7 +527,8 @@ function ContextMenuButton({
       onClick={onClick}
       className={cn(
         "flex h-9 w-full items-center gap-2 rounded-lg px-2.5 text-left transition-colors focus-visible:outline-none focus-visible:focus-ring disabled:pointer-events-none disabled:opacity-50",
-        danger ? "text-danger hover:bg-danger-soft" : "text-foreground hover:bg-primary-soft hover:text-primary-strong"
+        danger ? "text-danger hover:bg-danger-soft" : "text-foreground hover:bg-primary-soft hover:text-primary-strong",
+        checked && !danger && "bg-primary-soft text-primary-strong"
       )}
     >
       {icon}
@@ -512,7 +537,7 @@ function ContextMenuButton({
   );
 }
 
-function buildDirectoryTree(directories: DirectoryItem[], sortMode: DirectoryTreeSortMode): TreeNode {
+function buildDirectoryTree(directories: DirectoryItem[], sortModesByPath: Record<string, DirectoryTreeSortMode>): TreeNode {
   const childrenByParent = new Map<string | null, DirectoryItem[]>();
   const byId = new Map(directories.map((directory) => [directory.id, directory]));
 
@@ -523,24 +548,23 @@ function buildDirectoryTree(directories: DirectoryItem[], sortMode: DirectoryTre
     childrenByParent.set(parentId, children);
   }
 
-  for (const children of childrenByParent.values()) {
-    children.sort((left, right) => compareDirectories(left, right, sortMode));
-  }
-
-  function build(parentId: string | null, depth: number): TreeNode[] {
-    return (childrenByParent.get(parentId) ?? []).map((directory) => ({
+  function build(parentId: string | null, parentPath: string, depth: number): TreeNode[] {
+    const sortMode = sortModesByPath[parentPath] ?? DEFAULT_SORT_MODE;
+    return [...(childrenByParent.get(parentId) ?? [])]
+      .sort((left, right) => compareDirectories(left, right, sortMode))
+      .map((directory) => ({
       id: directory.id,
       name: directory.name,
       path: directory.path,
       depth,
       directory,
-      children: build(directory.id, depth + 1)
+      children: build(directory.id, directory.path, depth + 1)
     }));
   }
 
   return {
     ...ROOT_NODE,
-    children: build(null, 1)
+    children: build(null, "/", 1)
   };
 }
 
