@@ -415,10 +415,12 @@ export const MIN_VIDEO_PREVIEW_CACHE_BYTES = 256 * 1024 * 1024;
 export const MAX_VIDEO_PREVIEW_CACHE_BYTES = 20 * 1024 * 1024 * 1024;
 export const TELEGRAM_CHUNK_SIZE_BYTES_SETTING_KEY = "telegram_chunk_size_bytes";
 export const TELEGRAM_VIDEO_CHUNK_SIZE_BYTES_SETTING_KEY = "telegram_video_chunk_size_bytes";
+export const TELEGRAM_AUDIO_CHUNK_SIZE_BYTES_SETTING_KEY = "telegram_audio_chunk_size_bytes";
 export const TELEGRAM_TEXT_CHUNK_SIZE_BYTES_SETTING_KEY = "telegram_text_chunk_size_bytes";
 export const TELEGRAM_IMAGE_CHUNK_SIZE_BYTES_SETTING_KEY = "telegram_image_chunk_size_bytes";
 export const DEFAULT_TELEGRAM_CHUNK_SIZE_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_TELEGRAM_VIDEO_CHUNK_SIZE_BYTES = 2 * 1024 * 1024;
+export const DEFAULT_TELEGRAM_AUDIO_CHUNK_SIZE_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_TELEGRAM_TEXT_CHUNK_SIZE_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_TELEGRAM_IMAGE_CHUNK_SIZE_BYTES = 4 * 1024 * 1024;
 export const MIN_TELEGRAM_CHUNK_SIZE_BYTES = 1 * 1024 * 1024;
@@ -3107,6 +3109,14 @@ export async function getTelegramVideoChunkSizeBytesSetting(db: AppDatabase): Pr
 
 export async function setTelegramVideoChunkSizeBytesSetting(db: AppDatabase, value: number, updatedAt: string): Promise<number> {
   return setTelegramChunkSizeSettingValue(db, TELEGRAM_VIDEO_CHUNK_SIZE_BYTES_SETTING_KEY, value, updatedAt);
+}
+
+export async function getTelegramAudioChunkSizeBytesSetting(db: AppDatabase): Promise<number> {
+  return getTelegramChunkSizeSettingValue(db, TELEGRAM_AUDIO_CHUNK_SIZE_BYTES_SETTING_KEY, DEFAULT_TELEGRAM_AUDIO_CHUNK_SIZE_BYTES);
+}
+
+export async function setTelegramAudioChunkSizeBytesSetting(db: AppDatabase, value: number, updatedAt: string): Promise<number> {
+  return setTelegramChunkSizeSettingValue(db, TELEGRAM_AUDIO_CHUNK_SIZE_BYTES_SETTING_KEY, value, updatedAt);
 }
 
 export async function getTelegramTextChunkSizeBytesSetting(db: AppDatabase): Promise<number> {

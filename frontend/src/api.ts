@@ -14,6 +14,7 @@ export interface SessionResponse {
   video_preview_cache_bytes_max: number;
   telegram_chunk_size_bytes: number;
   telegram_video_chunk_size_bytes: number;
+  telegram_audio_chunk_size_bytes: number;
   telegram_text_chunk_size_bytes: number;
   telegram_image_chunk_size_bytes: number;
   telegram_chunk_size_bytes_min: number;
@@ -102,6 +103,7 @@ export interface SettingsUpdateResponse {
     video_preview_cache_bytes_max: number;
     telegram_chunk_size_bytes: number;
     telegram_video_chunk_size_bytes: number;
+    telegram_audio_chunk_size_bytes: number;
     telegram_text_chunk_size_bytes: number;
     telegram_image_chunk_size_bytes: number;
     telegram_chunk_size_bytes_min: number;
@@ -618,6 +620,7 @@ export function updateSettings(body: {
   video_preview_cache_bytes?: number;
   telegram_chunk_size_bytes?: number;
   telegram_video_chunk_size_bytes?: number;
+  telegram_audio_chunk_size_bytes?: number;
   telegram_text_chunk_size_bytes?: number;
   telegram_image_chunk_size_bytes?: number;
 }) {

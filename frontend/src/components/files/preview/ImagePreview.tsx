@@ -34,7 +34,7 @@ export function ImagePreview({ file, fullscreen }: PreviewComponentProps) {
   }
 
   return (
-    <div className={cn("relative grid min-w-0 w-full place-items-center overflow-hidden bg-[radial-gradient(circle_at_top,var(--color-primary-soft),transparent_28%),linear-gradient(45deg,#f8fafc_25%,transparent_25%),linear-gradient(-45deg,#f8fafc_25%,transparent_25%),linear-gradient(45deg,transparent_75%,#f8fafc_75%),linear-gradient(-45deg,transparent_75%,#f8fafc_75%)] bg-[length:auto,24px_24px,24px_24px,24px_24px,24px_24px] bg-[position:center,0_0,0_12px,12px_-12px,-12px_0] p-4", fullscreen ? "h-full" : "h-[min(62dvh,720px)] max-h-[calc(92dvh-13rem)] min-h-72") }>
+    <div className={cn("relative grid min-w-0 w-full place-items-center overflow-hidden bg-[radial-gradient(circle_at_top,var(--color-primary-soft),transparent_28%),linear-gradient(45deg,#f8fafc_25%,transparent_25%),linear-gradient(-45deg,#f8fafc_25%,transparent_25%),linear-gradient(45deg,transparent_75%,#f8fafc_75%),linear-gradient(-45deg,transparent_75%,#f8fafc_75%)] bg-[length:auto,24px_24px,24px_24px,24px_24px,24px_24px] bg-[position:center,0_0,0_12px,12px_-12px,-12px_0] p-4", fullscreen ? "h-full" : "h-[min(70dvh,760px)] max-h-[calc(92dvh-12rem)] min-h-72") }>
       {!loaded ? (
         <div className="absolute inset-0 z-10">
           <PreviewLoading label="加载图片预览…" />
@@ -46,7 +46,7 @@ export function ImagePreview({ file, fullscreen }: PreviewComponentProps) {
         className={cn(
           "transition-opacity duration-200",
           loaded ? "opacity-100" : "opacity-0",
-          "block h-auto max-h-full w-auto max-w-full rounded-xl object-contain shadow-dialog"
+          "block h-full max-h-full w-full max-w-full rounded-xl object-contain shadow-dialog"
         )}
         loading="lazy"
         onLoad={() => {

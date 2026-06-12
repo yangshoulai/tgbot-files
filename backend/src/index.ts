@@ -78,6 +78,7 @@ import {
   DEFAULT_UPLOAD_CONCURRENCY,
   DEFAULT_TELEGRAM_CHUNK_SIZE_BYTES,
   DEFAULT_TELEGRAM_VIDEO_CHUNK_SIZE_BYTES,
+  DEFAULT_TELEGRAM_AUDIO_CHUNK_SIZE_BYTES,
   DEFAULT_TELEGRAM_TEXT_CHUNK_SIZE_BYTES,
   DEFAULT_TELEGRAM_IMAGE_CHUNK_SIZE_BYTES,
   touchApiKeyRecord,
@@ -92,12 +93,14 @@ import {
   getVideoPreviewCacheBytesSetting,
   getTelegramChunkSizeBytesSetting,
   getTelegramVideoChunkSizeBytesSetting,
+  getTelegramAudioChunkSizeBytesSetting,
   getTelegramTextChunkSizeBytesSetting,
   getTelegramImageChunkSizeBytesSetting,
   setUploadConcurrencySetting,
   setVideoPreviewCacheBytesSetting,
   setTelegramChunkSizeBytesSetting,
   setTelegramVideoChunkSizeBytesSetting,
+  setTelegramAudioChunkSizeBytesSetting,
   setTelegramTextChunkSizeBytesSetting,
   setTelegramImageChunkSizeBytesSetting,
   selectMagnetImportFiles,
@@ -312,6 +315,8 @@ async function resolveTelegramChunkSizeBytes(params: {
   switch (kind) {
     case "video":
       return getTelegramVideoChunkSizeBytesSetting(params.db);
+    case "audio":
+      return getTelegramAudioChunkSizeBytesSetting(params.db);
     case "text":
       return getTelegramTextChunkSizeBytesSetting(params.db);
     case "image":
@@ -321,11 +326,12 @@ async function resolveTelegramChunkSizeBytes(params: {
   }
 }
 
-type TelegramChunkSizeKind = "default" | "video" | "text" | "image";
+type TelegramChunkSizeKind = "default" | "video" | "audio" | "text" | "image";
 
 function telegramChunkSizeKind(mimeType: string, fileName: string): TelegramChunkSizeKind {
   const normalizedMimeType = mimeType.toLowerCase().split(";")[0]?.trim() || "";
   if (normalizedMimeType.startsWith("video/")) return "video";
+  if (normalizedMimeType.startsWith("audio/") || isAudioLikeFileName(fileName)) return "audio";
   if (normalizedMimeType.startsWith("image/")) return "image";
   if (isTextLikeMimeType(normalizedMimeType) || isTextLikeFileName(fileName)) return "text";
   return "default";
@@ -350,6 +356,15 @@ function isTextLikeMimeType(mimeType: string): boolean {
 function isTextLikeFileName(fileName: string): boolean {
   return TEXT_LIKE_EXTENSIONS.has(fileExtension(fileName));
 }
+
+function isAudioLikeFileName(fileName: string): boolean {
+  return AUDIO_LIKE_EXTENSIONS.has(fileExtension(fileName));
+}
+
+const AUDIO_LIKE_EXTENSIONS = new Set([
+  "mp3", "m4a", "aac", "flac", "wav", "ogg", "oga", "opus",
+  "wma", "alac", "aiff", "aif", "ape", "amr", "mid", "midi"
+]);
 
 const TEXT_LIKE_EXTENSIONS = new Set([
   "txt", "md", "markdown", "json", "jsonl", "ndjson", "csv", "tsv", "log",
@@ -819,6 +834,9 @@ async function handleAdminSession(request: Request, env: AppEnv, username: strin
   const telegramVideoChunkSizeBytes = env.DATABASE
     ? await getTelegramVideoChunkSizeBytesSetting(env.DATABASE)
     : DEFAULT_TELEGRAM_VIDEO_CHUNK_SIZE_BYTES;
+  const telegramAudioChunkSizeBytes = env.DATABASE
+    ? await getTelegramAudioChunkSizeBytesSetting(env.DATABASE)
+    : DEFAULT_TELEGRAM_AUDIO_CHUNK_SIZE_BYTES;
   const telegramTextChunkSizeBytes = env.DATABASE
     ? await getTelegramTextChunkSizeBytesSetting(env.DATABASE)
     : DEFAULT_TELEGRAM_TEXT_CHUNK_SIZE_BYTES;
@@ -842,6 +860,7 @@ async function handleAdminSession(request: Request, env: AppEnv, username: strin
     video_preview_cache_bytes_max: MAX_VIDEO_PREVIEW_CACHE_BYTES,
     telegram_chunk_size_bytes: telegramChunkSizeBytes,
     telegram_video_chunk_size_bytes: telegramVideoChunkSizeBytes,
+    telegram_audio_chunk_size_bytes: telegramAudioChunkSizeBytes,
     telegram_text_chunk_size_bytes: telegramTextChunkSizeBytes,
     telegram_image_chunk_size_bytes: telegramImageChunkSizeBytes,
     telegram_chunk_size_bytes_min: MIN_TELEGRAM_CHUNK_SIZE_BYTES,
@@ -888,6 +907,7 @@ async function handleAdminSettings(request: Request, env: AppEnv): Promise<Respo
     const currentVideoPreviewCacheBytes = await getVideoPreviewCacheBytesSetting(db);
     const currentTelegramChunkSizeBytes = await getTelegramChunkSizeBytesSetting(db);
     const currentTelegramVideoChunkSizeBytes = await getTelegramVideoChunkSizeBytesSetting(db);
+    const currentTelegramAudioChunkSizeBytes = await getTelegramAudioChunkSizeBytesSetting(db);
     const currentTelegramTextChunkSizeBytes = await getTelegramTextChunkSizeBytesSetting(db);
     const currentTelegramImageChunkSizeBytes = await getTelegramImageChunkSizeBytesSetting(db);
     const uploadConcurrency = body.upload_concurrency === undefined
@@ -902,6 +922,9 @@ async function handleAdminSettings(request: Request, env: AppEnv): Promise<Respo
     const telegramVideoChunkSizeBytes = body.telegram_video_chunk_size_bytes === undefined
       ? currentTelegramVideoChunkSizeBytes
       : positiveIntegerField(body.telegram_video_chunk_size_bytes, "telegram_video_chunk_size_bytes");
+    const telegramAudioChunkSizeBytes = body.telegram_audio_chunk_size_bytes === undefined
+      ? currentTelegramAudioChunkSizeBytes
+      : positiveIntegerField(body.telegram_audio_chunk_size_bytes, "telegram_audio_chunk_size_bytes");
     const telegramTextChunkSizeBytes = body.telegram_text_chunk_size_bytes === undefined
       ? currentTelegramTextChunkSizeBytes
       : positiveIntegerField(body.telegram_text_chunk_size_bytes, "telegram_text_chunk_size_bytes");
@@ -913,6 +936,7 @@ async function handleAdminSettings(request: Request, env: AppEnv): Promise<Respo
     const savedVideoPreviewCacheBytes = await setVideoPreviewCacheBytesSetting(db, videoPreviewCacheBytes, updatedAt);
     const savedTelegramChunkSizeBytes = await setTelegramChunkSizeBytesSetting(db, telegramChunkSizeBytes, updatedAt);
     const savedTelegramVideoChunkSizeBytes = await setTelegramVideoChunkSizeBytesSetting(db, telegramVideoChunkSizeBytes, updatedAt);
+    const savedTelegramAudioChunkSizeBytes = await setTelegramAudioChunkSizeBytesSetting(db, telegramAudioChunkSizeBytes, updatedAt);
     const savedTelegramTextChunkSizeBytes = await setTelegramTextChunkSizeBytesSetting(db, telegramTextChunkSizeBytes, updatedAt);
     const savedTelegramImageChunkSizeBytes = await setTelegramImageChunkSizeBytesSetting(db, telegramImageChunkSizeBytes, updatedAt);
     return jsonResponse({
@@ -926,6 +950,7 @@ async function handleAdminSettings(request: Request, env: AppEnv): Promise<Respo
         video_preview_cache_bytes_max: MAX_VIDEO_PREVIEW_CACHE_BYTES,
         telegram_chunk_size_bytes: savedTelegramChunkSizeBytes,
         telegram_video_chunk_size_bytes: savedTelegramVideoChunkSizeBytes,
+        telegram_audio_chunk_size_bytes: savedTelegramAudioChunkSizeBytes,
         telegram_text_chunk_size_bytes: savedTelegramTextChunkSizeBytes,
         telegram_image_chunk_size_bytes: savedTelegramImageChunkSizeBytes,
         telegram_chunk_size_bytes_min: MIN_TELEGRAM_CHUNK_SIZE_BYTES,

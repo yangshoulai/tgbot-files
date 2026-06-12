@@ -19,7 +19,7 @@ export function SettingsPage({ session, onSessionChange, copyText }: SettingsPag
         <p className="mt-1 text-sm text-muted">管理 API key、TG 存储渠道、传输并发、预览缓存，并查看运行配置项的就绪情况。</p>
       </div>
 
-      <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-[1.4fr_1fr]">
+      <div className="grid grid-cols-1 items-start gap-4">
         <TelegramChannelsPanel />
         <ApiKeysPanel copyText={copyText} />
         <UploadSettingsPanel session={session} onSessionChange={onSessionChange} />

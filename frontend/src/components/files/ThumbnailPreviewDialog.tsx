@@ -74,7 +74,7 @@ export function ThumbnailPreviewDialog({ file, onClose }: ThumbnailPreviewDialog
             src={thumbnailUrl}
             alt={`${file.file_name} 缩略图`}
             className={cn(
-              "block h-auto max-h-full w-auto max-w-full rounded-xl object-contain shadow-dialog transition-opacity duration-200",
+              "block h-full max-h-full w-full max-w-full rounded-xl object-contain shadow-dialog transition-opacity duration-200",
               loaded ? "opacity-100" : "opacity-0"
             )}
             onLoad={() => {

@@ -3205,6 +3205,7 @@ describe("admin file manager", () => {
     const cookie = await loginAndGetCookie(adminEnv);
     const defaultChunkSize = 8 * 1024 * 1024;
     const videoChunkSize = 1 * 1024 * 1024;
+    const audioChunkSize = 10 * 1024 * 1024;
     const textChunkSize = 12 * 1024 * 1024;
     const imageChunkSize = 3 * 1024 * 1024;
 
@@ -3218,6 +3219,7 @@ describe("admin file manager", () => {
         body: JSON.stringify({
           telegram_chunk_size_bytes: defaultChunkSize,
           telegram_video_chunk_size_bytes: videoChunkSize,
+          telegram_audio_chunk_size_bytes: audioChunkSize,
           telegram_text_chunk_size_bytes: textChunkSize,
           telegram_image_chunk_size_bytes: imageChunkSize
         })
@@ -3228,6 +3230,7 @@ describe("admin file manager", () => {
       settings: {
         telegram_chunk_size_bytes: number;
         telegram_video_chunk_size_bytes: number;
+        telegram_audio_chunk_size_bytes: number;
         telegram_text_chunk_size_bytes: number;
         telegram_image_chunk_size_bytes: number;
       };
@@ -3237,6 +3240,7 @@ describe("admin file manager", () => {
     expect(updateBody.settings).toMatchObject({
       telegram_chunk_size_bytes: defaultChunkSize,
       telegram_video_chunk_size_bytes: videoChunkSize,
+      telegram_audio_chunk_size_bytes: audioChunkSize,
       telegram_text_chunk_size_bytes: textChunkSize,
       telegram_image_chunk_size_bytes: imageChunkSize
     });
@@ -3250,6 +3254,11 @@ describe("admin file manager", () => {
       file_name: "notes.md",
       mime_type: "application/octet-stream",
       size: 10 * 1024 * 1024
+    });
+    const audioInit = await initAdminMultipartForTest(adminEnv, cookie, {
+      file_name: "song.mp3",
+      mime_type: "application/octet-stream",
+      size: 11 * 1024 * 1024
     });
     const imageInit = await initAdminMultipartForTest(adminEnv, cookie, {
       file_name: "photo.webp",
@@ -3266,6 +3275,8 @@ describe("admin file manager", () => {
     expect(videoInit.upload.chunk_count).toBe(5);
     expect(textInit.upload.chunk_size).toBe(textChunkSize);
     expect(textInit.upload.chunk_count).toBe(1);
+    expect(audioInit.upload.chunk_size).toBe(audioChunkSize);
+    expect(audioInit.upload.chunk_count).toBe(2);
     expect(imageInit.upload.chunk_size).toBe(imageChunkSize);
     expect(imageInit.upload.chunk_count).toBe(3);
     expect(defaultInit.upload.chunk_size).toBe(defaultChunkSize);

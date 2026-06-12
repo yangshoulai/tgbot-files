@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState, type MouseEvent, type ReactNode, type RefObject } from "react";
 import {
   ArrowDown,
   ArrowUp,
@@ -17,13 +18,30 @@ import {
   canPreviewThroughAvailableAccess,
   hasFileLinkAccess
 } from "../../lib/file-access";
+import { cn } from "../../lib/cn";
 import { fileKind, formatBytes, formatDateTime } from "../../utils";
 import { FileVisual } from "../ui/FileVisual";
-import { IconButton } from "../ui/IconButton";
 import { EmptyState } from "../ui/EmptyState";
 
 type FileSortKey = "name" | "size" | "created_at" | "type";
 type SortDirection = "asc" | "desc";
+
+type ContextMenuState =
+  | { kind: "directory"; directory: DirectoryItem; x: number; y: number }
+  | { kind: "file"; file: FileItem; x: number; y: number }
+  | null;
+
+type ContextMenuEntry =
+  | { type: "separator"; key: string }
+  | {
+      type: "item";
+      key: string;
+      label: string;
+      icon: ReactNode;
+      tone?: "default" | "danger";
+      disabled?: boolean;
+      onSelect: () => void;
+    };
 
 interface FileTableProps {
   directories: DirectoryItem[];
@@ -53,9 +71,14 @@ interface FileTableProps {
 
 const checkboxClass =
   "block size-4 rounded border-border text-primary accent-primary focus-visible:outline-none focus-visible:focus-ring";
+const CONTEXT_MENU_MARGIN = 8;
 
 function isInteractiveTarget(target: EventTarget | null): boolean {
   return target instanceof Element && Boolean(target.closest("button, a, input, select, textarea, [role='button']"));
+}
+
+function isSelectionTarget(target: EventTarget | null): boolean {
+  return target instanceof Element && Boolean(target.closest("input, select, textarea"));
 }
 
 function SortHeader({
@@ -92,25 +115,6 @@ function SortHeader({
   );
 }
 
-function DownloadIconAction({
-  file,
-  onAcceleratedDownload
-}: {
-  file: FileItem;
-  onAcceleratedDownload: (file: FileItem) => void;
-}) {
-  return (
-    <IconButton
-      variant="ghost"
-      size="sm"
-      label="加速下载"
-      onClick={() => onAcceleratedDownload(file)}
-    >
-      <Download size={16} />
-    </IconButton>
-  );
-}
-
 export function FileTable({
   directories,
   files,
@@ -136,6 +140,184 @@ export function FileTable({
   onAcceleratedDownload,
   onDelete
 }: FileTableProps) {
+  const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+
+    function onPointerDown(event: PointerEvent) {
+      const menu = contextMenuRef.current;
+      if (menu && event.target instanceof Node && menu.contains(event.target)) return;
+      setContextMenu(null);
+    }
+
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setContextMenu(null);
+      }
+    }
+
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("resize", closeContextMenu);
+    window.addEventListener("scroll", closeContextMenu, true);
+
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("resize", closeContextMenu);
+      window.removeEventListener("scroll", closeContextMenu, true);
+    };
+  }, [contextMenu]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+
+    const frame = window.requestAnimationFrame(() => {
+      const menu = contextMenuRef.current;
+      if (!menu) return;
+      const rect = menu.getBoundingClientRect();
+      const nextX = Math.max(
+        CONTEXT_MENU_MARGIN,
+        Math.min(contextMenu.x, window.innerWidth - rect.width - CONTEXT_MENU_MARGIN)
+      );
+      const nextY = Math.max(
+        CONTEXT_MENU_MARGIN,
+        Math.min(contextMenu.y, window.innerHeight - rect.height - CONTEXT_MENU_MARGIN)
+      );
+
+      if (nextX !== contextMenu.x || nextY !== contextMenu.y) {
+        setContextMenu((current) => current ? { ...current, x: nextX, y: nextY } : current);
+      }
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [contextMenu]);
+
+  function closeContextMenu() {
+    setContextMenu(null);
+  }
+
+  function openDirectoryContextMenu(event: MouseEvent, directory: DirectoryItem) {
+    if (isSelectionTarget(event.target)) return;
+    event.preventDefault();
+    setContextMenu({ kind: "directory", directory, x: event.clientX, y: event.clientY });
+  }
+
+  function openFileContextMenu(event: MouseEvent, file: FileItem) {
+    if (isSelectionTarget(event.target)) return;
+    event.preventDefault();
+    setContextMenu({ kind: "file", file, x: event.clientX, y: event.clientY });
+  }
+
+  function runContextAction(action: () => void) {
+    setContextMenu(null);
+    action();
+  }
+
+  function contextMenuEntries(state: Exclude<ContextMenuState, null>): ContextMenuEntry[] {
+    if (state.kind === "directory") {
+      const { directory } = state;
+      return [
+        {
+          type: "item",
+          key: "open",
+          label: "打开",
+          icon: <FolderOpen size={15} />,
+          onSelect: () => runContextAction(() => onOpenDirectory(directory))
+        },
+        { type: "separator", key: "directory-main-separator" },
+        {
+          type: "item",
+          key: "rename",
+          label: "重命名",
+          icon: <Pencil size={15} />,
+          onSelect: () => runContextAction(() => onRenameDirectory(directory))
+        },
+        {
+          type: "item",
+          key: "move",
+          label: "移动到…",
+          icon: <FolderInput size={15} />,
+          onSelect: () => runContextAction(() => onMoveDirectory(directory))
+        },
+        { type: "separator", key: "directory-danger-separator" },
+        {
+          type: "item",
+          key: "delete",
+          label: "删除目录",
+          icon: <Trash2 size={15} />,
+          tone: "danger",
+          onSelect: () => runContextAction(() => onDeleteDirectory(directory))
+        }
+      ];
+    }
+
+    const { file } = state;
+    const linkFile = hasFileLinkAccess(file) ? file : null;
+    const canPreviewFile = canPreviewThroughAvailableAccess(file);
+
+    return [
+      {
+        type: "item",
+        key: "preview",
+        label: "预览",
+        icon: <Eye size={15} />,
+        disabled: !canPreviewFile,
+        onSelect: () => runContextAction(() => onPreview(file))
+      },
+      {
+        type: "item",
+        key: "detail",
+        label: "属性 / 详情",
+        icon: <Info size={15} />,
+        onSelect: () => runContextAction(() => onDetail(file))
+      },
+      { type: "separator", key: "file-main-separator" },
+      {
+        type: "item",
+        key: "edit",
+        label: "重命名 / 编辑信息",
+        icon: <Pencil size={15} />,
+        onSelect: () => runContextAction(() => onEdit(file))
+      },
+      {
+        type: "item",
+        key: "move",
+        label: "移动到…",
+        icon: <FolderInput size={15} />,
+        onSelect: () => runContextAction(() => onMoveFile(file))
+      },
+      { type: "separator", key: "file-link-separator" },
+      {
+        type: "item",
+        key: "copy",
+        label: "复制链接",
+        icon: <Copy size={15} />,
+        disabled: !linkFile,
+        onSelect: () => runContextAction(() => onCopy(file))
+      },
+      {
+        type: "item",
+        key: "download",
+        label: "加速下载",
+        icon: <Download size={15} />,
+        onSelect: () => runContextAction(() => onAcceleratedDownload(file))
+      },
+      { type: "separator", key: "file-danger-separator" },
+      {
+        type: "item",
+        key: "delete",
+        label: "删除索引",
+        icon: <Trash2 size={15} />,
+        tone: "danger",
+        onSelect: () => runContextAction(() => onDelete(file))
+      }
+    ];
+  }
+
   if (files.length === 0 && directories.length === 0) {
     return <EmptyState title="没有文件或子目录" description="试试调整搜索条件，或新建目录、上传文件。" />;
   }
@@ -144,7 +326,14 @@ export function FileTable({
     <div className="overflow-hidden rounded-2xl border border-border bg-surface shadow-card">
       <div className="divide-y divide-border sm:hidden">
         {directories.map((directory) => (
-          <div key={directory.id} className="p-3">
+          <div
+            key={directory.id}
+            onContextMenu={(event) => openDirectoryContextMenu(event, directory)}
+            className={cn(
+              "p-3 transition-colors duration-150",
+              selectedDirectoryIds.has(directory.id) && "bg-primary-soft/20"
+            )}
+          >
             <div className="flex items-start gap-3">
               <input
                 type="checkbox"
@@ -174,51 +363,32 @@ export function FileTable({
                 </span>
               </button>
             </div>
-            <div className="mt-3 flex flex-wrap justify-end gap-1.5">
-              <IconButton
-                variant="ghost"
-                size="sm"
-                label="进入目录"
-                onClick={() => onOpenDirectory(directory)}
-              >
-                <FolderOpen size={16} />
-              </IconButton>
-              <IconButton
-                variant="ghost"
-                size="sm"
-                label="重命名目录"
-                onClick={() => onRenameDirectory(directory)}
-              >
-                <Pencil size={16} />
-              </IconButton>
-              <IconButton
-                variant="ghost"
-                size="sm"
-                label="移动目录"
-                onClick={() => onMoveDirectory(directory)}
-              >
-                <FolderInput size={16} />
-              </IconButton>
-              <IconButton
-                variant="danger"
-                size="sm"
-                label="删除目录"
-                onClick={() => onDeleteDirectory(directory)}
-              >
-                <Trash2 size={16} />
-              </IconButton>
-            </div>
           </div>
         ))}
         {files.map((file) => {
           const linkFile = hasFileLinkAccess(file) ? file : null;
-          const canPreviewFile = canPreviewThroughAvailableAccess(file);
           const kind = fileKind(file);
           const mimeLabel = file.mime_type || "未知 MIME";
           const previewFromThumbnail = file.thumbnail_url ? () => onThumbnailPreview(file) : undefined;
+          const canPreviewFile = canPreviewThroughAvailableAccess(file);
 
           return (
-            <div key={file.id} className="p-3">
+            <div
+              key={file.id}
+              onContextMenu={(event) => openFileContextMenu(event, file)}
+              onDoubleClick={(event) => {
+                if (isInteractiveTarget(event.target)) return;
+                if (canPreviewFile) {
+                  onPreview(file);
+                } else {
+                  onDetail(file);
+                }
+              }}
+              className={cn(
+                "p-3 transition-colors duration-150",
+                selectedFileIds.has(file.id) && "bg-primary-soft/20"
+              )}
+            >
               <div className="flex items-start gap-3">
                 <input
                   type="checkbox"
@@ -250,66 +420,6 @@ export function FileTable({
                     </p>
                   </div>
                 </div>
-              </div>
-              <div className="mt-3 flex flex-wrap justify-end gap-1.5">
-                <IconButton
-                  variant="ghost"
-                  size="sm"
-                  label="详情"
-                  onClick={() => onDetail(file)}
-                >
-                  <Info size={16} />
-                </IconButton>
-                <IconButton
-                  variant="ghost"
-                  size="sm"
-                  label="编辑文件信息"
-                  onClick={() => onEdit(file)}
-                >
-                  <Pencil size={16} />
-                </IconButton>
-                <IconButton
-                  variant="ghost"
-                  size="sm"
-                  label="移动文件"
-                  onClick={() => onMoveFile(file)}
-                >
-                  <FolderInput size={16} />
-                </IconButton>
-                {canPreviewFile ? (
-                  <IconButton
-                    variant="ghost"
-                    size="sm"
-                    label="预览"
-                    onClick={() => onPreview(file)}
-                  >
-                    <Eye size={16} />
-                  </IconButton>
-                ) : null}
-                {linkFile ? (
-                  <>
-                    <IconButton
-                      variant="ghost"
-                      size="sm"
-                      label="复制链接"
-                      onClick={() => onCopy(file)}
-                    >
-                      <Copy size={16} />
-                    </IconButton>
-                  </>
-                ) : null}
-                <DownloadIconAction
-                  file={file}
-                  onAcceleratedDownload={onAcceleratedDownload}
-                />
-                <IconButton
-                  variant="danger"
-                  size="sm"
-                  label="删除索引"
-                  onClick={() => onDelete(file)}
-                >
-                  <Trash2 size={16} />
-                </IconButton>
               </div>
             </div>
           );
@@ -345,7 +455,7 @@ export function FileTable({
                 activeSort={sortKey}
                 direction={sortDirection}
                 onSort={onSort}
-                className="hidden w-28 px-4 py-3 text-left font-medium text-muted lg:table-cell"
+                className="hidden w-32 px-4 py-3 text-left font-medium text-muted lg:table-cell"
               />
               <SortHeader
                 label="上传时间"
@@ -353,20 +463,23 @@ export function FileTable({
                 activeSort={sortKey}
                 direction={sortDirection}
                 onSort={onSort}
-                className="hidden w-40 px-4 py-3 text-left font-medium text-muted md:table-cell"
+                className="hidden w-44 px-4 py-3 text-left font-medium text-muted md:table-cell"
               />
-              <th className="w-44 px-4 py-3 text-right font-medium text-muted md:w-56 lg:w-72">操作</th>
             </tr>
           </thead>
           <tbody>
             {directories.map((directory) => (
               <tr
                 key={directory.id}
+                onContextMenu={(event) => openDirectoryContextMenu(event, directory)}
                 onDoubleClick={(event) => {
                   if (isInteractiveTarget(event.target)) return;
                   onOpenDirectory(directory);
                 }}
-                className="cursor-pointer border-b border-border last:border-b-0 transition-colors duration-150 hover:bg-primary-soft/25"
+                className={cn(
+                  "cursor-pointer border-b border-border last:border-b-0 transition-colors duration-150 hover:bg-primary-soft/25",
+                  selectedDirectoryIds.has(directory.id) && "bg-primary-soft/20"
+                )}
               >
                 <td className="px-4 py-3 align-middle">
                   <input
@@ -406,42 +519,6 @@ export function FileTable({
                 <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted md:table-cell">
                   {formatDateTime(directory.created_at)}
                 </td>
-                <td className="px-4 py-3 align-middle">
-                  <div className="flex flex-nowrap items-center justify-end gap-1">
-                    <IconButton
-                      variant="ghost"
-                      size="sm"
-                      label="进入目录"
-                      onClick={() => onOpenDirectory(directory)}
-                    >
-                      <FolderOpen size={16} />
-                    </IconButton>
-                    <IconButton
-                      variant="ghost"
-                      size="sm"
-                      label="重命名目录"
-                      onClick={() => onRenameDirectory(directory)}
-                    >
-                      <Pencil size={16} />
-                    </IconButton>
-                    <IconButton
-                      variant="ghost"
-                      size="sm"
-                      label="移动目录"
-                      onClick={() => onMoveDirectory(directory)}
-                    >
-                      <FolderInput size={16} />
-                    </IconButton>
-                    <IconButton
-                      variant="danger"
-                      size="sm"
-                      label="删除目录"
-                      onClick={() => onDeleteDirectory(directory)}
-                    >
-                      <Trash2 size={16} />
-                    </IconButton>
-                  </div>
-                </td>
               </tr>
             ))}
             {files.map((file) => {
@@ -454,7 +531,19 @@ export function FileTable({
               return (
                 <tr
                   key={file.id}
-                  className="border-b border-border last:border-b-0 transition-colors duration-150 hover:bg-primary-soft/25"
+                  onContextMenu={(event) => openFileContextMenu(event, file)}
+                  onDoubleClick={(event) => {
+                    if (isInteractiveTarget(event.target)) return;
+                    if (canPreviewFile) {
+                      onPreview(file);
+                    } else {
+                      onDetail(file);
+                    }
+                  }}
+                  className={cn(
+                    "cursor-default border-b border-border last:border-b-0 transition-colors duration-150 hover:bg-primary-soft/25",
+                    selectedFileIds.has(file.id) && "bg-primary-soft/20"
+                  )}
                 >
                   <td className="px-4 py-3 align-middle">
                     <input
@@ -495,74 +584,66 @@ export function FileTable({
                   <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted md:table-cell">
                     {formatDateTime(file.created_at)}
                   </td>
-                  <td className="px-4 py-3 align-middle">
-                    <div className="flex flex-nowrap items-center justify-end gap-1">
-                      <IconButton
-                        variant="ghost"
-                        size="sm"
-                        label="详情"
-                        onClick={() => onDetail(file)}
-                      >
-                        <Info size={16} />
-                      </IconButton>
-                      <IconButton
-                        variant="ghost"
-                        size="sm"
-                        label="编辑文件信息"
-                        onClick={() => onEdit(file)}
-                      >
-                        <Pencil size={16} />
-                      </IconButton>
-                      <IconButton
-                        variant="ghost"
-                        size="sm"
-                        label="移动文件"
-                        onClick={() => onMoveFile(file)}
-                      >
-                        <FolderInput size={16} />
-                      </IconButton>
-                      {canPreviewFile ? (
-                        <IconButton
-                          variant="ghost"
-                          size="sm"
-                          label="预览"
-                          onClick={() => onPreview(file)}
-                        >
-                          <Eye size={16} />
-                        </IconButton>
-                      ) : null}
-                      {linkFile ? (
-                        <>
-                          <IconButton
-                            variant="ghost"
-                            size="sm"
-                            label="复制链接"
-                            onClick={() => onCopy(file)}
-                          >
-                            <Copy size={16} />
-                          </IconButton>
-                        </>
-                      ) : null}
-                      <DownloadIconAction
-                        file={file}
-                        onAcceleratedDownload={onAcceleratedDownload}
-                      />
-                      <IconButton
-                        variant="danger"
-                        size="sm"
-                        label="删除索引"
-                        onClick={() => onDelete(file)}
-                      >
-                        <Trash2 size={16} />
-                      </IconButton>
-                    </div>
-                  </td>
                 </tr>
               );
             })}
           </tbody>
         </table>
       </div>
+      {contextMenu ? (
+        <ContextMenuSurface
+          refNode={contextMenuRef}
+          x={contextMenu.x}
+          y={contextMenu.y}
+          entries={contextMenuEntries(contextMenu)}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function ContextMenuSurface({
+  refNode,
+  x,
+  y,
+  entries
+}: {
+  refNode: RefObject<HTMLDivElement>;
+  x: number;
+  y: number;
+  entries: ContextMenuEntry[];
+}) {
+  return (
+    <div
+      ref={refNode}
+      role="menu"
+      style={{ left: x, top: y }}
+      className="fixed z-[70] w-56 overflow-hidden rounded-xl border border-border bg-surface/98 p-1.5 text-sm shadow-[0_18px_55px_rgba(15,23,42,0.22)] backdrop-blur-md animate-fade-in"
+    >
+      {entries.map((entry) => {
+        if (entry.type === "separator") {
+          return <div key={entry.key} className="my-1 h-px bg-border" role="separator" />;
+        }
+
+        return (
+          <button
+            key={entry.key}
+            type="button"
+            role="menuitem"
+            disabled={entry.disabled}
+            onClick={entry.onSelect}
+            className={cn(
+              "flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left text-[13px] transition-colors focus-visible:outline-none focus-visible:focus-ring disabled:pointer-events-none disabled:opacity-45",
+              entry.tone === "danger"
+                ? "text-danger hover:bg-danger-soft"
+                : "text-foreground hover:bg-primary-soft hover:text-primary-strong"
+            )}
+          >
+            <span className="grid size-5 shrink-0 place-items-center text-current/80">{entry.icon}</span>
+            <span className="min-w-0 flex-1 truncate">{entry.label}</span>
+          </button>
+        );
+      })}
     </div>
   );
 }

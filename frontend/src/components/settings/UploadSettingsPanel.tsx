@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState, type ReactNode } from "react";
-import { FileText, Gauge, HardDrive, Image as ImageIcon, Package, Save, Video } from "lucide-react";
+import { FileText, Gauge, HardDrive, Image as ImageIcon, Music2, Package, Save, Video } from "lucide-react";
 import { ApiError, type SessionResponse, updateSettings } from "../../api";
 import { useToast } from "../../lib/toast";
 import { formatBytes } from "../../utils";
@@ -28,6 +28,7 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
   const [cacheDraft, setCacheDraft] = useState(cacheBytesToGiBInput(session.video_preview_cache_bytes));
   const [chunkDraft, setChunkDraft] = useState(bytesToMBInput(session.telegram_chunk_size_bytes));
   const [videoChunkDraft, setVideoChunkDraft] = useState(bytesToMBInput(session.telegram_video_chunk_size_bytes));
+  const [audioChunkDraft, setAudioChunkDraft] = useState(bytesToMBInput(session.telegram_audio_chunk_size_bytes));
   const [textChunkDraft, setTextChunkDraft] = useState(bytesToMBInput(session.telegram_text_chunk_size_bytes));
   const [imageChunkDraft, setImageChunkDraft] = useState(bytesToMBInput(session.telegram_image_chunk_size_bytes));
   const [saving, setSaving] = useState(false);
@@ -47,6 +48,10 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
   useEffect(() => {
     setVideoChunkDraft(bytesToMBInput(session.telegram_video_chunk_size_bytes));
   }, [session.telegram_video_chunk_size_bytes]);
+
+  useEffect(() => {
+    setAudioChunkDraft(bytesToMBInput(session.telegram_audio_chunk_size_bytes));
+  }, [session.telegram_audio_chunk_size_bytes]);
 
   useEffect(() => {
     setTextChunkDraft(bytesToMBInput(session.telegram_text_chunk_size_bytes));
@@ -69,17 +74,21 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
   const parsedVideoChunkMB = useMemo(() => Number(videoChunkDraft), [videoChunkDraft]);
   const parsedVideoChunkBytes = useMemo(() => Math.round(parsedVideoChunkMB * MB_BYTES), [parsedVideoChunkMB]);
   const videoChunkInvalid = isChunkDraftInvalid(parsedVideoChunkMB, parsedVideoChunkBytes, session);
+  const parsedAudioChunkMB = useMemo(() => Number(audioChunkDraft), [audioChunkDraft]);
+  const parsedAudioChunkBytes = useMemo(() => Math.round(parsedAudioChunkMB * MB_BYTES), [parsedAudioChunkMB]);
+  const audioChunkInvalid = isChunkDraftInvalid(parsedAudioChunkMB, parsedAudioChunkBytes, session);
   const parsedTextChunkMB = useMemo(() => Number(textChunkDraft), [textChunkDraft]);
   const parsedTextChunkBytes = useMemo(() => Math.round(parsedTextChunkMB * MB_BYTES), [parsedTextChunkMB]);
   const textChunkInvalid = isChunkDraftInvalid(parsedTextChunkMB, parsedTextChunkBytes, session);
   const parsedImageChunkMB = useMemo(() => Number(imageChunkDraft), [imageChunkDraft]);
   const parsedImageChunkBytes = useMemo(() => Math.round(parsedImageChunkMB * MB_BYTES), [parsedImageChunkMB]);
   const imageChunkInvalid = isChunkDraftInvalid(parsedImageChunkMB, parsedImageChunkBytes, session);
-  const anyChunkInvalid = chunkInvalid || videoChunkInvalid || textChunkInvalid || imageChunkInvalid;
+  const anyChunkInvalid = chunkInvalid || videoChunkInvalid || audioChunkInvalid || textChunkInvalid || imageChunkInvalid;
   const dirty = (!invalid && parsedDraft !== session.upload_concurrency) ||
     (!cacheInvalid && parsedCacheBytes !== session.video_preview_cache_bytes) ||
     (!chunkInvalid && parsedChunkBytes !== session.telegram_chunk_size_bytes) ||
     (!videoChunkInvalid && parsedVideoChunkBytes !== session.telegram_video_chunk_size_bytes) ||
+    (!audioChunkInvalid && parsedAudioChunkBytes !== session.telegram_audio_chunk_size_bytes) ||
     (!textChunkInvalid && parsedTextChunkBytes !== session.telegram_text_chunk_size_bytes) ||
     (!imageChunkInvalid && parsedImageChunkBytes !== session.telegram_image_chunk_size_bytes);
 
@@ -105,6 +114,7 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
         video_preview_cache_bytes: parsedCacheBytes,
         telegram_chunk_size_bytes: parsedChunkBytes,
         telegram_video_chunk_size_bytes: parsedVideoChunkBytes,
+        telegram_audio_chunk_size_bytes: parsedAudioChunkBytes,
         telegram_text_chunk_size_bytes: parsedTextChunkBytes,
         telegram_image_chunk_size_bytes: parsedImageChunkBytes
       });
@@ -118,6 +128,7 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
         video_preview_cache_bytes_max: response.settings.video_preview_cache_bytes_max,
         telegram_chunk_size_bytes: response.settings.telegram_chunk_size_bytes,
         telegram_video_chunk_size_bytes: response.settings.telegram_video_chunk_size_bytes,
+        telegram_audio_chunk_size_bytes: response.settings.telegram_audio_chunk_size_bytes,
         telegram_text_chunk_size_bytes: response.settings.telegram_text_chunk_size_bytes,
         telegram_image_chunk_size_bytes: response.settings.telegram_image_chunk_size_bytes,
         telegram_chunk_size_bytes_min: response.settings.telegram_chunk_size_bytes_min,
@@ -127,6 +138,7 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
       setCacheDraft(cacheBytesToGiBInput(response.settings.video_preview_cache_bytes));
       setChunkDraft(bytesToMBInput(response.settings.telegram_chunk_size_bytes));
       setVideoChunkDraft(bytesToMBInput(response.settings.telegram_video_chunk_size_bytes));
+      setAudioChunkDraft(bytesToMBInput(response.settings.telegram_audio_chunk_size_bytes));
       setTextChunkDraft(bytesToMBInput(response.settings.telegram_text_chunk_size_bytes));
       setImageChunkDraft(bytesToMBInput(response.settings.telegram_image_chunk_size_bytes));
       toast.success("传输与预览设置已保存");
@@ -154,6 +166,9 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
           </Badge>
           <Badge tone="primary" icon={<Video size={12} />}>
             视频 {formatBytes(session.telegram_video_chunk_size_bytes)}
+          </Badge>
+          <Badge tone="info" icon={<Music2 size={12} />}>
+            音频 {formatBytes(session.telegram_audio_chunk_size_bytes)}
           </Badge>
           <Badge tone="neutral" icon={<HardDrive size={12} />}>
             {formatBytes(session.video_preview_cache_bytes)}
@@ -219,6 +234,18 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
             onChange={setVideoChunkDraft}
           />
           <ChunkSizeField
+            label="音频分片"
+            description="默认 10MB，适合音频预览"
+            icon={<Music2 size={14} />}
+            value={audioChunkDraft}
+            parsedMB={parsedAudioChunkMB}
+            currentBytes={session.telegram_audio_chunk_size_bytes}
+            invalid={audioChunkInvalid}
+            saving={saving}
+            session={session}
+            onChange={setAudioChunkDraft}
+          />
+          <ChunkSizeField
             label="文本分片"
             description="可设大一些，减少切片"
             icon={<FileText size={14} />}
@@ -277,7 +304,7 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
 
         <div className="flex flex-wrap items-center justify-between gap-3">
           <p className="text-xs text-muted">
-            并发 {min}-{max}；四类分片均限制 {formatBytes(session.telegram_chunk_size_bytes_min)}-{formatBytes(session.telegram_chunk_size_bytes_max)}；缓存 {formatBytes(session.video_preview_cache_bytes_min)}-{formatBytes(session.video_preview_cache_bytes_max)}。
+            并发 {min}-{max}；五类分片均限制 {formatBytes(session.telegram_chunk_size_bytes_min)}-{formatBytes(session.telegram_chunk_size_bytes_max)}；缓存 {formatBytes(session.video_preview_cache_bytes_min)}-{formatBytes(session.video_preview_cache_bytes_max)}。
           </p>
           <Button
             type="submit"
