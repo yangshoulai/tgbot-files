@@ -54,7 +54,7 @@ export function ThumbnailPreviewDialog({ file, onClose }: ThumbnailPreviewDialog
       }
       bodyClassName="bg-background/40"
     >
-      <div className="relative grid h-[min(70dvh,760px)] min-h-72 w-full place-items-center overflow-hidden rounded-xl border border-border bg-[linear-gradient(45deg,#f8fafc_25%,transparent_25%),linear-gradient(-45deg,#f8fafc_25%,transparent_25%),linear-gradient(45deg,transparent_75%,#f8fafc_75%),linear-gradient(-45deg,transparent_75%,#f8fafc_75%)] bg-[length:24px_24px] bg-[position:0_0,0_12px,12px_-12px,-12px_0] p-4">
+      <div className="relative h-[min(72dvh,780px)] min-h-72 w-full overflow-hidden rounded-xl border border-border bg-background">
         {!loaded && !failed ? (
           <div className="absolute inset-0 z-10 flex items-center justify-center gap-2 text-sm text-muted">
             <Spinner size={18} />
@@ -70,19 +70,22 @@ export function ThumbnailPreviewDialog({ file, onClose }: ThumbnailPreviewDialog
             <p className="mt-2 text-xs leading-5 text-muted">浏览器无法读取该缩略图资源。</p>
           </div>
         ) : (
-          <img
-            src={thumbnailUrl}
-            alt={`${file.file_name} 缩略图`}
-            className={cn(
-              "block h-full max-h-full w-full max-w-full rounded-xl object-contain shadow-dialog transition-opacity duration-200",
-              loaded ? "opacity-100" : "opacity-0"
-            )}
-            onLoad={() => {
-              setLoaded(true);
-              setFailed(false);
-            }}
-            onError={() => setFailed(true)}
-          />
+          <div className="absolute inset-4 flex min-h-0 min-w-0 items-center justify-center">
+            <img
+              src={thumbnailUrl}
+              alt={`${file.file_name} 缩略图`}
+              className={cn(
+                "block max-h-full max-w-full rounded-xl object-contain shadow-dialog transition-opacity duration-200",
+                loaded ? "opacity-100" : "opacity-0"
+              )}
+              style={{ width: "auto", height: "auto" }}
+              onLoad={() => {
+                setLoaded(true);
+                setFailed(false);
+              }}
+              onError={() => setFailed(true)}
+            />
+          </div>
         )}
       </div>
     </Modal>
