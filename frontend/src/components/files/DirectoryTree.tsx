@@ -1,4 +1,5 @@
 import { useEffect, useId, useMemo, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import {
   Check,
   ChevronRight,
@@ -430,10 +431,12 @@ function DirectoryContextMenu({
 
   const openSortSubmenuToLeft = typeof window !== "undefined" && state.x > window.innerWidth - 380;
 
-  return (
+  if (typeof document === "undefined") return null;
+
+  return createPortal(
     <div
       role="menu"
-      className="fixed z-[70] min-w-40 overflow-visible rounded-xl border border-border bg-surface p-1 text-sm shadow-dialog"
+      className="fixed z-[1000] min-w-40 overflow-visible rounded-xl border border-border bg-surface p-1 text-sm shadow-dialog"
       style={{ left: state.x, top: state.y }}
       onClick={(event) => event.stopPropagation()}
       onContextMenu={(event) => event.preventDefault()}
@@ -477,7 +480,7 @@ function DirectoryContextMenu({
         <div
           role="menu"
           className={cn(
-            "invisible absolute top-0 z-[71] min-w-44 rounded-xl border border-border bg-surface p-1 text-sm opacity-0 shadow-dialog transition-[opacity,visibility] group-hover/sort:visible group-hover/sort:opacity-100 group-focus-within/sort:visible group-focus-within/sort:opacity-100",
+            "invisible absolute top-0 z-[1001] min-w-44 rounded-xl border border-border bg-surface p-1 text-sm opacity-0 shadow-dialog transition-[opacity,visibility] group-hover/sort:visible group-hover/sort:opacity-100 group-focus-within/sort:visible group-focus-within/sort:opacity-100",
             openSortSubmenuToLeft ? "right-[calc(100%-0.25rem)]" : "left-[calc(100%-0.25rem)]"
           )}
         >
@@ -505,7 +508,8 @@ function DirectoryContextMenu({
           />
         </>
       ) : null}
-    </div>
+    </div>,
+    document.body
   );
 }
 
