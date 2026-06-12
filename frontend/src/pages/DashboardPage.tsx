@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, ChevronRight, FolderInput, FolderPlus, Pencil, RefreshCw, Search, Trash2 } from "lucide-react";
+import { ArrowUp, ChevronRight, FolderInput, FolderPlus, PanelLeftClose, PanelLeftOpen, Pencil, RefreshCw, Search, Trash2 } from "lucide-react";
 import {
   ApiError,
   DirectoryItem,
@@ -32,7 +32,6 @@ import { FileTable } from "../components/files/FileTable";
 import { PreviewDialog } from "../components/files/PreviewDialog";
 import { ThumbnailPreviewDialog } from "../components/files/ThumbnailPreviewDialog";
 import { FileDetailDialog } from "../components/files/FileDetailDialog";
-import { DirectoryTreeSelect } from "../components/files/DirectoryTreeSelect";
 import { DirectoryTree } from "../components/files/DirectoryTree";
 import {
   AcceleratedDownloadDialog,
@@ -241,6 +240,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   const [renamingDirectory, setRenamingDirectory] = useState<DirectoryItem | null>(null);
   const [directoryRenameName, setDirectoryRenameName] = useState("");
   const [renamingDirectorySaving, setRenamingDirectorySaving] = useState(false);
+  const [directoryPanelVisible, setDirectoryPanelVisible] = useState(true);
   const [acceleratedDownload, setAcceleratedDownload] = useState<AcceleratedDownloadState | null>(null);
   const listBusyLabel = operationLabel ?? (loading ? "正在加载目录内容..." : undefined);
   const isListBusy = Boolean(listBusyLabel);
@@ -1179,157 +1179,191 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
 
       <MetricsRow metrics={metrics} />
 
-      <div className="flex flex-col gap-3 rounded-2xl border border-border bg-surface p-3 shadow-card sm:p-4">
-        <div className="flex items-center gap-2 rounded-xl border border-border bg-background/60 px-3 py-2">
-          <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto scroll-thin">
-            {directoryBreadcrumbs(currentDirPath).map((item, index, array) => (
-              <div key={item.path} className="flex shrink-0 items-center gap-1">
-                <button
-                  type="button"
-                  disabled={isListBusy}
-                  onClick={() => goToDirectory(item.path)}
-                  className="rounded-md px-2 py-1 text-sm font-medium text-foreground transition-colors hover:bg-primary-soft hover:text-primary-strong focus-visible:outline-none focus-visible:focus-ring disabled:pointer-events-none disabled:opacity-50"
-                >
-                  {item.label}
-                </button>
-                {index < array.length - 1 ? <ChevronRight size={14} className="text-subtle" /> : null}
-              </div>
-            ))}
-            {query.trim() ? (
-              <span className="shrink-0 rounded-full bg-primary-soft px-2 py-1 text-xs font-medium text-primary-strong">
-                当前目录内搜索
-              </span>
-            ) : null}
-          </div>
-          <div className="flex shrink-0 items-center gap-2">
-            <Button
-              variant="secondary"
-              leadingIcon={<ArrowUp size={16} />}
-              disabled={currentDirPath === "/" || isListBusy}
-              onClick={() => goToDirectory(parentDirectoryPath(currentDirPath))}
-            >
-              返回上级
-            </Button>
-            <Button
-              variant="primary"
-              leadingIcon={<FolderPlus size={16} />}
-              disabled={isListBusy}
-              onClick={() => {
-                setCreateDirParentPath(currentDirPath);
-                setCreateDirOpen(true);
-              }}
-            >
-              新建目录
-            </Button>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 gap-2 lg:grid-cols-[220px_minmax(240px,1fr)_145px_auto] lg:items-center">
-          <DirectoryTreeSelect
-            ariaLabel="目录过滤"
+      <div className={directoryPanelVisible ? "grid items-start gap-4 xl:grid-cols-[minmax(260px,320px)_minmax(0,1fr)]" : "grid items-start gap-4"}>
+        {directoryPanelVisible ? (
+          <DirectoryTree
+            ariaLabel="目录导航"
             value={currentDirPath}
             directories={directoryOptions}
             disabled={isListBusy}
             onChange={goToDirectory}
+            variant="sidebar"
+            title="目录导航"
+            summary={`${directoryOptions.length} 个目录 · 点击节点进入目标目录`}
+            showExpandControls
+            className="xl:sticky xl:top-4"
+            treeClassName="max-h-none overflow-visible"
+            headerAction={(
+              <Button
+                variant="ghost"
+                size="sm"
+                leadingIcon={<PanelLeftClose size={15} />}
+                onClick={() => setDirectoryPanelVisible(false)}
+                className="h-8 px-2.5"
+              >
+                隐藏
+              </Button>
+            )}
           />
-          <Input
-            placeholder="搜索文件名、备注"
-            leadingIcon={<Search size={15} />}
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-          />
-          <select
-            aria-label="文件类型过滤"
-            value={typeFilter}
-            onChange={(event) => setTypeFilter(event.target.value as FileTypeFilter)}
-            className="h-11 rounded-lg border border-border bg-surface px-3 text-sm text-foreground shadow-card outline-none transition-colors hover:border-border-strong focus:border-primary focus:shadow-[0_0_0_4px_var(--color-primary-ring)]"
-          >
-            {FILE_TYPE_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-          <div className="flex items-center justify-end">
-            <IconButton
-              variant="default"
-              label="刷新"
-              disabled={isListBusy}
-              onClick={() => void loadFiles()}
-            >
-              {isListBusy ? <Spinner size={16} /> : <RefreshCw size={16} />}
-            </IconButton>
-          </div>
-        </div>
+        ) : null}
 
-        {selectedCount > 0 ? (
-          <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-danger/20 bg-danger-soft px-3 py-2">
-            <p className="text-sm font-medium text-danger">
-              已选 {selectedCount} 项
-              <span className="ml-2 text-xs font-normal text-muted">
-                {selectedDirectoryCount} 个目录 · {selectedFileCount} 个文件
-              </span>
-            </p>
-            <div className="flex flex-wrap items-center gap-2">
+        <div className="flex min-w-0 flex-col gap-3 rounded-2xl border border-border bg-surface p-3 shadow-card sm:p-4">
+          <div className="flex flex-col gap-3 rounded-xl border border-border bg-background/60 px-3 py-2 lg:flex-row lg:items-center lg:justify-between">
+            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1">
+              {!directoryPanelVisible ? (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  leadingIcon={<PanelLeftOpen size={15} />}
+                  onClick={() => setDirectoryPanelVisible(true)}
+                  className="mr-1"
+                >
+                  显示目录树
+                </Button>
+              ) : null}
+              {directoryBreadcrumbs(currentDirPath).map((item, index, array) => (
+                <div key={item.path} className="flex min-w-0 items-center gap-1">
+                  <button
+                    type="button"
+                    disabled={isListBusy}
+                    onClick={() => goToDirectory(item.path)}
+                    title={item.path}
+                    className="max-w-[13rem] truncate rounded-md px-2 py-1 text-sm font-medium text-foreground transition-colors hover:bg-primary-soft hover:text-primary-strong focus-visible:outline-none focus-visible:focus-ring disabled:pointer-events-none disabled:opacity-50"
+                  >
+                    {item.label}
+                  </button>
+                  {index < array.length - 1 ? <ChevronRight size={14} className="shrink-0 text-subtle" /> : null}
+                </div>
+              ))}
+              {query.trim() ? (
+                <span className="shrink-0 rounded-full bg-primary-soft px-2 py-1 text-xs font-medium text-primary-strong">
+                  当前目录内搜索
+                </span>
+              ) : null}
+            </div>
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
               <Button
                 variant="secondary"
-                size="sm"
-                disabled={isListBusy}
-                loading={operationLabel === "正在移动项目..."}
-                leadingIcon={<FolderInput size={15} />}
-                onClick={() => openMoveDialog()}
+                leadingIcon={<ArrowUp size={16} />}
+                disabled={currentDirPath === "/" || isListBusy}
+                onClick={() => goToDirectory(parentDirectoryPath(currentDirPath))}
               >
-                移动
+                返回上级
               </Button>
               <Button
-                variant="danger"
-                size="sm"
+                variant="primary"
+                leadingIcon={<FolderPlus size={16} />}
                 disabled={isListBusy}
-                loading={operationLabel === "正在批量删除..."}
-                leadingIcon={<Trash2 size={15} />}
-                onClick={() => void onBulkDelete()}
+                onClick={() => {
+                  setCreateDirParentPath(currentDirPath);
+                  setCreateDirOpen(true);
+                }}
               >
-                批量删除
+                新建目录
               </Button>
             </div>
           </div>
-        ) : null}
 
-        <div className="relative min-h-52" aria-busy={isListBusy}>
-          <div
-            className={
-              isListBusy
-                ? "pointer-events-none flex select-none flex-col gap-3 opacity-45 transition-opacity duration-200"
-                : "flex flex-col gap-3 transition-opacity duration-200"
-            }
-          >
-            <FileTable
-              directories={sortedDirectories}
-              files={sortedFiles}
-              selectedFileIds={selectedFileIds}
-              selectedDirectoryIds={selectedDirectoryIds}
-              allPageSelected={allPageSelected}
-              sortKey={sortKey}
-              sortDirection={sortDirection}
-              onSort={changeSort}
-              onOpenDirectory={(directory) => goToDirectory(directory.path)}
-              onRenameDirectory={openRenameDirectoryDialog}
-              onMoveDirectory={openMoveDirectoryDialog}
-              onDeleteDirectory={(directory) => void onDeleteDirectory(directory)}
-              onToggleFileSelected={toggleFileSelected}
-              onToggleDirectorySelected={toggleDirectorySelected}
-              onTogglePage={togglePage}
-              onDetail={setDetailFile}
-              onEdit={openEditDialog}
-              onMoveFile={openMoveDialog}
-              onPreview={setPreviewFile}
-              onThumbnailPreview={setThumbnailPreviewFile}
-              onCopy={onCopy}
-              onAcceleratedDownload={(file) => void onAcceleratedDownload(file)}
-              onDelete={onDelete}
+          <div className="grid grid-cols-1 gap-2 lg:grid-cols-[minmax(240px,1fr)_145px_auto] lg:items-center">
+            <Input
+              placeholder="搜索文件名、备注"
+              leadingIcon={<Search size={15} />}
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
             />
+            <select
+              aria-label="文件类型过滤"
+              value={typeFilter}
+              onChange={(event) => setTypeFilter(event.target.value as FileTypeFilter)}
+              className="h-11 rounded-lg border border-border bg-surface px-3 text-sm text-foreground shadow-card outline-none transition-colors hover:border-border-strong focus:border-primary focus:shadow-[0_0_0_4px_var(--color-primary-ring)]"
+            >
+              {FILE_TYPE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <div className="flex items-center justify-end">
+              <IconButton
+                variant="default"
+                label="刷新"
+                disabled={isListBusy}
+                onClick={() => void loadFiles()}
+              >
+                {isListBusy ? <Spinner size={16} /> : <RefreshCw size={16} />}
+              </IconButton>
+            </div>
           </div>
-          {listBusyLabel ? <FileListBusyOverlay label={listBusyLabel} /> : null}
+
+          {selectedCount > 0 ? (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-danger/20 bg-danger-soft px-3 py-2">
+              <p className="text-sm font-medium text-danger">
+                已选 {selectedCount} 项
+                <span className="ml-2 text-xs font-normal text-muted">
+                  {selectedDirectoryCount} 个目录 · {selectedFileCount} 个文件
+                </span>
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={isListBusy}
+                  loading={operationLabel === "正在移动项目..."}
+                  leadingIcon={<FolderInput size={15} />}
+                  onClick={() => openMoveDialog()}
+                >
+                  移动
+                </Button>
+                <Button
+                  variant="danger"
+                  size="sm"
+                  disabled={isListBusy}
+                  loading={operationLabel === "正在批量删除..."}
+                  leadingIcon={<Trash2 size={15} />}
+                  onClick={() => void onBulkDelete()}
+                >
+                  批量删除
+                </Button>
+              </div>
+            </div>
+          ) : null}
+
+          <div className="relative min-h-52 overflow-visible" aria-busy={isListBusy}>
+            <div
+              className={
+                isListBusy
+                  ? "pointer-events-none flex select-none flex-col gap-3 overflow-visible opacity-45 transition-opacity duration-200"
+                  : "flex flex-col gap-3 overflow-visible transition-opacity duration-200"
+              }
+            >
+              <FileTable
+                directories={sortedDirectories}
+                files={sortedFiles}
+                selectedFileIds={selectedFileIds}
+                selectedDirectoryIds={selectedDirectoryIds}
+                allPageSelected={allPageSelected}
+                sortKey={sortKey}
+                sortDirection={sortDirection}
+                onSort={changeSort}
+                onOpenDirectory={(directory) => goToDirectory(directory.path)}
+                onRenameDirectory={openRenameDirectoryDialog}
+                onMoveDirectory={openMoveDirectoryDialog}
+                onDeleteDirectory={(directory) => void onDeleteDirectory(directory)}
+                onToggleFileSelected={toggleFileSelected}
+                onToggleDirectorySelected={toggleDirectorySelected}
+                onTogglePage={togglePage}
+                onDetail={setDetailFile}
+                onEdit={openEditDialog}
+                onMoveFile={openMoveDialog}
+                onPreview={setPreviewFile}
+                onThumbnailPreview={setThumbnailPreviewFile}
+                onCopy={onCopy}
+                onAcceleratedDownload={(file) => void onAcceleratedDownload(file)}
+                onDelete={onDelete}
+              />
+            </div>
+            {listBusyLabel ? <FileListBusyOverlay label={listBusyLabel} /> : null}
+          </div>
         </div>
       </div>
 

@@ -1,5 +1,5 @@
-import { useEffect, useId, useMemo, useState } from "react";
-import { Check, ChevronRight, Folder, FolderOpen, Search } from "lucide-react";
+import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
+import { Check, ChevronRight, ChevronsDownUp, ChevronsUpDown, Folder, FolderOpen, Search } from "lucide-react";
 import type { DirectoryItem } from "../../api";
 import { cn } from "../../lib/cn";
 
@@ -13,6 +13,11 @@ interface DirectoryTreeProps {
   emptyText?: string;
   searchable?: boolean;
   searchPlaceholder?: string;
+  variant?: "default" | "sidebar";
+  title?: string;
+  summary?: string;
+  headerAction?: ReactNode;
+  showExpandControls?: boolean;
   className?: string;
   treeClassName?: string;
 }
@@ -43,6 +48,11 @@ export function DirectoryTree({
   emptyText = "没有可选子目录",
   searchable = true,
   searchPlaceholder = "搜索目录路径",
+  variant = "default",
+  title,
+  summary,
+  headerAction,
+  showExpandControls = false,
   className,
   treeClassName
 }: DirectoryTreeProps) {
@@ -55,6 +65,8 @@ export function DirectoryTree({
     () => visibleDirectoryPaths(tree, normalizedQuery),
     [tree, normalizedQuery]
   );
+  const sidebar = variant === "sidebar";
+  const showHeader = Boolean(title || summary || headerAction || (sidebar && showExpandControls));
 
   useEffect(() => {
     setExpandedPaths((current) => {
@@ -81,24 +93,81 @@ export function DirectoryTree({
     });
   }
 
+  function expandAll() {
+    setExpandedPaths(collectPaths(tree));
+  }
+
+  function collapseAll() {
+    setExpandedPaths(new Set(["/", value, ...ancestorPaths(value)]));
+  }
+
   return (
-    <div className={cn("overflow-hidden rounded-2xl border border-border bg-surface shadow-card", className)}>
-      {searchable ? (
-        <div className="border-b border-border p-2">
-          <label htmlFor={searchId} className="sr-only">
-            搜索目录
-          </label>
-          <div className="flex h-9 items-center gap-2 rounded-lg border border-border bg-background px-2 text-sm text-muted focus-within:border-primary focus-within:shadow-[0_0_0_4px_var(--color-primary-ring)]">
-            <Search size={14} className="shrink-0" />
-            <input
-              id={searchId}
-              value={query}
-              placeholder={searchPlaceholder}
-              disabled={disabled}
-              onChange={(event) => setQuery(event.target.value)}
-              className="min-w-0 flex-1 bg-transparent text-sm text-foreground outline-none placeholder:text-muted disabled:cursor-not-allowed disabled:opacity-60"
-            />
-          </div>
+    <div
+      className={cn(
+        "rounded-2xl border border-border bg-surface shadow-card",
+        sidebar ? "overflow-visible bg-gradient-to-b from-surface to-background/80" : "overflow-hidden",
+        className
+      )}
+    >
+      {showHeader || searchable ? (
+        <div className={cn("border-b border-border", sidebar ? "p-3" : "p-2")}>
+          {showHeader ? (
+            <div className="mb-3 flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                {title ? <p className="text-sm font-semibold text-foreground">{title}</p> : null}
+                {summary ? <p className="mt-0.5 text-xs text-muted">{summary}</p> : null}
+              </div>
+              {headerAction ? <div className="shrink-0">{headerAction}</div> : null}
+            </div>
+          ) : null}
+
+          {searchable ? (
+            <>
+              <label htmlFor={searchId} className="sr-only">
+                搜索目录
+              </label>
+              <div className="flex h-9 items-center gap-2 rounded-lg border border-border bg-background px-2 text-sm text-muted focus-within:border-primary focus-within:shadow-[0_0_0_4px_var(--color-primary-ring)]">
+                <Search size={14} className="shrink-0" />
+                <input
+                  id={searchId}
+                  value={query}
+                  placeholder={searchPlaceholder}
+                  disabled={disabled}
+                  onChange={(event) => setQuery(event.target.value)}
+                  className="min-w-0 flex-1 bg-transparent text-sm text-foreground outline-none placeholder:text-muted disabled:cursor-not-allowed disabled:opacity-60"
+                />
+              </div>
+            </>
+          ) : null}
+
+          {sidebar && showExpandControls ? (
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={disabled}
+                onClick={expandAll}
+                className="inline-flex h-7 items-center gap-1.5 rounded-full border border-border bg-background px-2.5 text-[11px] font-medium text-muted transition-colors hover:border-primary/30 hover:bg-primary-soft hover:text-primary-strong focus-visible:outline-none focus-visible:focus-ring disabled:pointer-events-none disabled:opacity-50"
+              >
+                <ChevronsUpDown size={13} />
+                全部展开
+              </button>
+              <button
+                type="button"
+                disabled={disabled}
+                onClick={collapseAll}
+                className="inline-flex h-7 items-center gap-1.5 rounded-full border border-border bg-background px-2.5 text-[11px] font-medium text-muted transition-colors hover:border-primary/30 hover:bg-primary-soft hover:text-primary-strong focus-visible:outline-none focus-visible:focus-ring disabled:pointer-events-none disabled:opacity-50"
+              >
+                <ChevronsDownUp size={13} />
+                全部收起
+              </button>
+            </div>
+          ) : null}
+
+          {sidebar && normalizedQuery ? (
+            <p className="mt-2 rounded-lg bg-primary-soft px-2 py-1.5 text-[11px] leading-4 text-primary-strong">
+              正在仅显示匹配目录及其上级路径
+            </p>
+          ) : null}
         </div>
       ) : null}
 
@@ -107,7 +176,7 @@ export function DirectoryTree({
         role="tree"
         aria-label={ariaLabel}
         aria-disabled={disabled || undefined}
-        className={cn("max-h-[min(30rem,64dvh)] overflow-auto p-1.5 scroll-thin", treeClassName)}
+        className={cn(sidebar ? "overflow-visible p-2" : "max-h-[min(30rem,64dvh)] overflow-auto p-1.5 scroll-thin", treeClassName)}
       >
         <DirectoryTreeRow
           node={tree}
@@ -116,6 +185,7 @@ export function DirectoryTree({
           visiblePaths={visiblePaths}
           searching={Boolean(normalizedQuery)}
           disabled={disabled}
+          sidebar={sidebar}
           onToggle={togglePath}
           onSelect={onChange}
         />
@@ -137,6 +207,7 @@ function DirectoryTreeRow({
   visiblePaths,
   searching,
   disabled,
+  sidebar,
   onToggle,
   onSelect
 }: {
@@ -146,6 +217,7 @@ function DirectoryTreeRow({
   visiblePaths: Set<string>;
   searching: boolean;
   disabled: boolean;
+  sidebar: boolean;
   onToggle: (path: string) => void;
   onSelect: (path: string) => void;
 }) {
@@ -164,12 +236,14 @@ function DirectoryTreeRow({
         aria-selected={selected}
         aria-expanded={hasChildren ? expanded : undefined}
         aria-disabled={disabled || undefined}
+        title={node.path}
         className={cn(
-          "group flex items-center gap-1 rounded-lg pr-2 text-sm transition-colors",
+          "group flex min-w-0 items-center gap-1 rounded-lg pr-2 text-sm transition-colors",
           selected ? "bg-primary-soft text-primary-strong" : "text-foreground hover:bg-background",
+          sidebar && "my-0.5",
           disabled && "opacity-60"
         )}
-        style={{ paddingLeft: 6 + node.depth * 18 }}
+        style={{ paddingLeft: sidebar ? Math.min(8 + node.depth * 16, 72) : 6 + node.depth * 18 }}
       >
         <button
           type="button"
@@ -187,17 +261,23 @@ function DirectoryTreeRow({
           type="button"
           disabled={disabled}
           onClick={() => onSelect(node.path)}
-          className="flex min-w-0 flex-1 items-center gap-2 py-2 text-left focus-visible:outline-none focus-visible:focus-ring disabled:cursor-not-allowed"
+          className={cn(
+            "flex min-w-0 flex-1 items-center gap-2 py-2 text-left focus-visible:outline-none focus-visible:focus-ring disabled:cursor-not-allowed",
+            sidebar && "py-2.5"
+          )}
         >
           {expanded && hasChildren ? <FolderOpen size={16} className="shrink-0" /> : <Folder size={16} className="shrink-0" />}
-          <span className="truncate font-medium">{node.name}</span>
-          {node.path !== "/" ? <span className="hidden truncate text-xs text-muted sm:inline">{node.path}</span> : null}
+          <span className="min-w-0 flex-1">
+            <span className="block truncate font-medium">{node.name}</span>
+            {sidebar && node.path !== "/" ? <span className="block truncate text-[11px] leading-4 text-muted">{node.path}</span> : null}
+          </span>
+          {!sidebar && node.path !== "/" ? <span className="hidden min-w-0 truncate text-xs text-muted sm:inline">{node.path}</span> : null}
         </button>
         {selected ? <Check size={15} className="shrink-0" /> : null}
       </div>
 
       {hasChildren && expanded ? (
-        <div role="group">
+        <div role="group" className={cn(sidebar && node.depth > 0 ? "ml-3 border-l border-dashed border-border/80" : null)}>
           {node.children.map((child) => (
             <DirectoryTreeRow
               key={child.path}
@@ -207,6 +287,7 @@ function DirectoryTreeRow({
               visiblePaths={visiblePaths}
               searching={searching}
               disabled={disabled}
+              sidebar={sidebar}
               onToggle={onToggle}
               onSelect={onSelect}
             />
