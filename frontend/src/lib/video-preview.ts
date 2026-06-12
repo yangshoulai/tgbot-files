@@ -34,6 +34,7 @@ export interface VideoPreviewCacheState {
   kind: VideoPreviewKind;
   chunkCount: number;
   cachedChunks: number[];
+  durations?: number[];
 }
 
 export function buildVideoPreviewMetadata(file: FileItem, cacheMaxBytes: number, prefetchConcurrency: number): VideoPreviewMetadata | null {
@@ -249,6 +250,18 @@ function normalizeVideoPreviewCacheState(value: unknown, metadata: VideoPreviewM
     fileId: metadata.fileId,
     kind: metadata.kind,
     chunkCount,
-    cachedChunks
+    cachedChunks,
+    ...normalizedVideoPreviewCacheDurations(state.durations, chunkCount)
   };
+}
+
+function normalizedVideoPreviewCacheDurations(value: unknown, chunkCount: number): Pick<VideoPreviewCacheState, "durations"> | Record<string, never> {
+  if (!Array.isArray(value) || value.length !== chunkCount) {
+    return {};
+  }
+
+  const durations = value.map((duration) => Number(duration));
+  return durations.every((duration) => Number.isFinite(duration) && duration > 0)
+    ? { durations }
+    : {};
 }

@@ -1,5 +1,5 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
-import { Gauge, HardDrive, Package, Save } from "lucide-react";
+import { FormEvent, useEffect, useMemo, useState, type ReactNode } from "react";
+import { FileText, Gauge, HardDrive, Image as ImageIcon, Package, Save, Video } from "lucide-react";
 import { ApiError, type SessionResponse, updateSettings } from "../../api";
 import { useToast } from "../../lib/toast";
 import { formatBytes } from "../../utils";
@@ -27,6 +27,9 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
   const [draft, setDraft] = useState(String(session.upload_concurrency));
   const [cacheDraft, setCacheDraft] = useState(cacheBytesToGiBInput(session.video_preview_cache_bytes));
   const [chunkDraft, setChunkDraft] = useState(bytesToMBInput(session.telegram_chunk_size_bytes));
+  const [videoChunkDraft, setVideoChunkDraft] = useState(bytesToMBInput(session.telegram_video_chunk_size_bytes));
+  const [textChunkDraft, setTextChunkDraft] = useState(bytesToMBInput(session.telegram_text_chunk_size_bytes));
+  const [imageChunkDraft, setImageChunkDraft] = useState(bytesToMBInput(session.telegram_image_chunk_size_bytes));
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -41,6 +44,18 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
     setChunkDraft(bytesToMBInput(session.telegram_chunk_size_bytes));
   }, [session.telegram_chunk_size_bytes]);
 
+  useEffect(() => {
+    setVideoChunkDraft(bytesToMBInput(session.telegram_video_chunk_size_bytes));
+  }, [session.telegram_video_chunk_size_bytes]);
+
+  useEffect(() => {
+    setTextChunkDraft(bytesToMBInput(session.telegram_text_chunk_size_bytes));
+  }, [session.telegram_text_chunk_size_bytes]);
+
+  useEffect(() => {
+    setImageChunkDraft(bytesToMBInput(session.telegram_image_chunk_size_bytes));
+  }, [session.telegram_image_chunk_size_bytes]);
+
   const parsedDraft = useMemo(() => Number(draft), [draft]);
   const invalid = !Number.isSafeInteger(parsedDraft) || parsedDraft < min || parsedDraft > max;
   const parsedCacheGiB = useMemo(() => Number(cacheDraft), [cacheDraft]);
@@ -50,12 +65,23 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
     parsedCacheBytes > session.video_preview_cache_bytes_max;
   const parsedChunkMB = useMemo(() => Number(chunkDraft), [chunkDraft]);
   const parsedChunkBytes = useMemo(() => Math.round(parsedChunkMB * MB_BYTES), [parsedChunkMB]);
-  const chunkInvalid = !Number.isFinite(parsedChunkMB) ||
-    parsedChunkBytes < session.telegram_chunk_size_bytes_min ||
-    parsedChunkBytes > session.telegram_chunk_size_bytes_max;
+  const chunkInvalid = isChunkDraftInvalid(parsedChunkMB, parsedChunkBytes, session);
+  const parsedVideoChunkMB = useMemo(() => Number(videoChunkDraft), [videoChunkDraft]);
+  const parsedVideoChunkBytes = useMemo(() => Math.round(parsedVideoChunkMB * MB_BYTES), [parsedVideoChunkMB]);
+  const videoChunkInvalid = isChunkDraftInvalid(parsedVideoChunkMB, parsedVideoChunkBytes, session);
+  const parsedTextChunkMB = useMemo(() => Number(textChunkDraft), [textChunkDraft]);
+  const parsedTextChunkBytes = useMemo(() => Math.round(parsedTextChunkMB * MB_BYTES), [parsedTextChunkMB]);
+  const textChunkInvalid = isChunkDraftInvalid(parsedTextChunkMB, parsedTextChunkBytes, session);
+  const parsedImageChunkMB = useMemo(() => Number(imageChunkDraft), [imageChunkDraft]);
+  const parsedImageChunkBytes = useMemo(() => Math.round(parsedImageChunkMB * MB_BYTES), [parsedImageChunkMB]);
+  const imageChunkInvalid = isChunkDraftInvalid(parsedImageChunkMB, parsedImageChunkBytes, session);
+  const anyChunkInvalid = chunkInvalid || videoChunkInvalid || textChunkInvalid || imageChunkInvalid;
   const dirty = (!invalid && parsedDraft !== session.upload_concurrency) ||
     (!cacheInvalid && parsedCacheBytes !== session.video_preview_cache_bytes) ||
-    (!chunkInvalid && parsedChunkBytes !== session.telegram_chunk_size_bytes);
+    (!chunkInvalid && parsedChunkBytes !== session.telegram_chunk_size_bytes) ||
+    (!videoChunkInvalid && parsedVideoChunkBytes !== session.telegram_video_chunk_size_bytes) ||
+    (!textChunkInvalid && parsedTextChunkBytes !== session.telegram_text_chunk_size_bytes) ||
+    (!imageChunkInvalid && parsedImageChunkBytes !== session.telegram_image_chunk_size_bytes);
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -67,7 +93,7 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
       toast.danger(`视频预览缓存需要在 ${formatBytes(session.video_preview_cache_bytes_min)}-${formatBytes(session.video_preview_cache_bytes_max)} 之间`);
       return;
     }
-    if (chunkInvalid) {
+    if (anyChunkInvalid) {
       toast.danger(`分片大小需要在 ${formatBytes(session.telegram_chunk_size_bytes_min)}-${formatBytes(session.telegram_chunk_size_bytes_max)} 之间`);
       return;
     }
@@ -77,7 +103,10 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
       const response = await updateSettings({
         upload_concurrency: parsedDraft,
         video_preview_cache_bytes: parsedCacheBytes,
-        telegram_chunk_size_bytes: parsedChunkBytes
+        telegram_chunk_size_bytes: parsedChunkBytes,
+        telegram_video_chunk_size_bytes: parsedVideoChunkBytes,
+        telegram_text_chunk_size_bytes: parsedTextChunkBytes,
+        telegram_image_chunk_size_bytes: parsedImageChunkBytes
       });
       onSessionChange({
         ...session,
@@ -88,12 +117,18 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
         video_preview_cache_bytes_min: response.settings.video_preview_cache_bytes_min,
         video_preview_cache_bytes_max: response.settings.video_preview_cache_bytes_max,
         telegram_chunk_size_bytes: response.settings.telegram_chunk_size_bytes,
+        telegram_video_chunk_size_bytes: response.settings.telegram_video_chunk_size_bytes,
+        telegram_text_chunk_size_bytes: response.settings.telegram_text_chunk_size_bytes,
+        telegram_image_chunk_size_bytes: response.settings.telegram_image_chunk_size_bytes,
         telegram_chunk_size_bytes_min: response.settings.telegram_chunk_size_bytes_min,
         telegram_chunk_size_bytes_max: response.settings.telegram_chunk_size_bytes_max
       });
       setDraft(String(response.settings.upload_concurrency));
       setCacheDraft(cacheBytesToGiBInput(response.settings.video_preview_cache_bytes));
       setChunkDraft(bytesToMBInput(response.settings.telegram_chunk_size_bytes));
+      setVideoChunkDraft(bytesToMBInput(response.settings.telegram_video_chunk_size_bytes));
+      setTextChunkDraft(bytesToMBInput(response.settings.telegram_text_chunk_size_bytes));
+      setImageChunkDraft(bytesToMBInput(response.settings.telegram_image_chunk_size_bytes));
       toast.success("传输与预览设置已保存");
     } catch (error) {
       toast.danger(errorMessage(error));
@@ -115,7 +150,10 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
             {session.upload_concurrency} 并发
           </Badge>
           <Badge tone="info" icon={<Package size={12} />}>
-            {formatBytes(session.telegram_chunk_size_bytes)}
+            默认 {formatBytes(session.telegram_chunk_size_bytes)}
+          </Badge>
+          <Badge tone="primary" icon={<Video size={12} />}>
+            视频 {formatBytes(session.telegram_video_chunk_size_bytes)}
           </Badge>
           <Badge tone="neutral" icon={<HardDrive size={12} />}>
             {formatBytes(session.video_preview_cache_bytes)}
@@ -155,35 +193,55 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
           </label>
         </div>
 
-        <div className="grid gap-3 sm:grid-cols-[1fr_9rem] sm:items-end">
-          <label className="flex flex-col gap-2">
-            <span className="text-xs font-medium text-muted">分片大小</span>
-            <input
-              type="range"
-              min={bytesToMB(session.telegram_chunk_size_bytes_min)}
-              max={bytesToMB(session.telegram_chunk_size_bytes_max)}
-              step={1}
-              value={chunkInvalid ? bytesToMB(session.telegram_chunk_size_bytes) : parsedChunkMB}
-              disabled={saving}
-              onChange={(event) => setChunkDraft(event.currentTarget.value)}
-              className="h-11 w-full accent-primary"
-            />
-          </label>
-
-          <label className="flex flex-col gap-2">
-            <span className="text-xs font-medium text-muted">大小</span>
-            <Input
-              type="number"
-              min={bytesToMB(session.telegram_chunk_size_bytes_min)}
-              max={bytesToMB(session.telegram_chunk_size_bytes_max)}
-              step={1}
-              value={chunkDraft}
-              disabled={saving}
-              invalid={chunkInvalid}
-              onChange={(event) => setChunkDraft(event.currentTarget.value)}
-              trailingNode={<span className="text-xs text-muted">MB</span>}
-            />
-          </label>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <ChunkSizeField
+            label="默认分片"
+            description="其他文件类型使用"
+            icon={<Package size={14} />}
+            value={chunkDraft}
+            parsedMB={parsedChunkMB}
+            currentBytes={session.telegram_chunk_size_bytes}
+            invalid={chunkInvalid}
+            saving={saving}
+            session={session}
+            onChange={setChunkDraft}
+          />
+          <ChunkSizeField
+            label="视频分片"
+            description="建议 1-2MB，预览更快"
+            icon={<Video size={14} />}
+            value={videoChunkDraft}
+            parsedMB={parsedVideoChunkMB}
+            currentBytes={session.telegram_video_chunk_size_bytes}
+            invalid={videoChunkInvalid}
+            saving={saving}
+            session={session}
+            onChange={setVideoChunkDraft}
+          />
+          <ChunkSizeField
+            label="文本分片"
+            description="可设大一些，减少切片"
+            icon={<FileText size={14} />}
+            value={textChunkDraft}
+            parsedMB={parsedTextChunkMB}
+            currentBytes={session.telegram_text_chunk_size_bytes}
+            invalid={textChunkInvalid}
+            saving={saving}
+            session={session}
+            onChange={setTextChunkDraft}
+          />
+          <ChunkSizeField
+            label="图片分片"
+            description="图片预览与原图下载"
+            icon={<ImageIcon size={14} />}
+            value={imageChunkDraft}
+            parsedMB={parsedImageChunkMB}
+            currentBytes={session.telegram_image_chunk_size_bytes}
+            invalid={imageChunkInvalid}
+            saving={saving}
+            session={session}
+            onChange={setImageChunkDraft}
+          />
         </div>
 
         <div className="grid gap-3 sm:grid-cols-[1fr_9rem] sm:items-end">
@@ -219,14 +277,14 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
 
         <div className="flex flex-wrap items-center justify-between gap-3">
           <p className="text-xs text-muted">
-            并发 {min}-{max}；分片 {formatBytes(session.telegram_chunk_size_bytes_min)}-{formatBytes(session.telegram_chunk_size_bytes_max)}；缓存 {formatBytes(session.video_preview_cache_bytes_min)}-{formatBytes(session.video_preview_cache_bytes_max)}。
+            并发 {min}-{max}；四类分片均限制 {formatBytes(session.telegram_chunk_size_bytes_min)}-{formatBytes(session.telegram_chunk_size_bytes_max)}；缓存 {formatBytes(session.video_preview_cache_bytes_min)}-{formatBytes(session.video_preview_cache_bytes_max)}。
           </p>
           <Button
             type="submit"
             size="sm"
             variant="primary"
             loading={saving}
-            disabled={!dirty || invalid || chunkInvalid}
+            disabled={!dirty || invalid || cacheInvalid || anyChunkInvalid}
             leadingIcon={<Save size={15} />}
           >
             保存设置
@@ -234,6 +292,76 @@ export function UploadSettingsPanel({ session, onSessionChange }: UploadSettings
         </div>
       </form>
     </section>
+  );
+}
+
+function isChunkDraftInvalid(parsedMB: number, parsedBytes: number, session: SessionResponse): boolean {
+  return !Number.isFinite(parsedMB) ||
+    parsedBytes < session.telegram_chunk_size_bytes_min ||
+    parsedBytes > session.telegram_chunk_size_bytes_max;
+}
+
+function ChunkSizeField({
+  label,
+  description,
+  icon,
+  value,
+  parsedMB,
+  currentBytes,
+  invalid,
+  saving,
+  session,
+  onChange
+}: {
+  label: string;
+  description: string;
+  icon: ReactNode;
+  value: string;
+  parsedMB: number;
+  currentBytes: number;
+  invalid: boolean;
+  saving: boolean;
+  session: SessionResponse;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div className="rounded-xl border border-border bg-background/60 p-3">
+      <div className="mb-2 flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
+            <span className="text-primary">{icon}</span>
+            <span>{label}</span>
+          </div>
+          <p className="mt-0.5 text-[11px] text-muted">{description}</p>
+        </div>
+        <span className="shrink-0 rounded-full bg-primary-soft px-2 py-0.5 text-[11px] font-medium text-primary-strong">
+          {formatBytes(currentBytes)}
+        </span>
+      </div>
+      <div className="grid gap-2 sm:grid-cols-[1fr_5.75rem] sm:items-center">
+        <input
+          type="range"
+          min={bytesToMB(session.telegram_chunk_size_bytes_min)}
+          max={bytesToMB(session.telegram_chunk_size_bytes_max)}
+          step={1}
+          value={invalid ? bytesToMB(currentBytes) : parsedMB}
+          disabled={saving}
+          onChange={(event) => onChange(event.currentTarget.value)}
+          className="h-9 w-full accent-primary"
+        />
+        <Input
+          type="number"
+          min={bytesToMB(session.telegram_chunk_size_bytes_min)}
+          max={bytesToMB(session.telegram_chunk_size_bytes_max)}
+          step={1}
+          value={value}
+          disabled={saving}
+          invalid={invalid}
+          onChange={(event) => onChange(event.currentTarget.value)}
+          trailingNode={<span className="text-xs text-muted">MB</span>}
+        />
+      </div>
+    </div>
   );
 }
 

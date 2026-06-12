@@ -414,7 +414,13 @@ export const DEFAULT_VIDEO_PREVIEW_CACHE_BYTES = 2 * 1024 * 1024 * 1024;
 export const MIN_VIDEO_PREVIEW_CACHE_BYTES = 256 * 1024 * 1024;
 export const MAX_VIDEO_PREVIEW_CACHE_BYTES = 20 * 1024 * 1024 * 1024;
 export const TELEGRAM_CHUNK_SIZE_BYTES_SETTING_KEY = "telegram_chunk_size_bytes";
+export const TELEGRAM_VIDEO_CHUNK_SIZE_BYTES_SETTING_KEY = "telegram_video_chunk_size_bytes";
+export const TELEGRAM_TEXT_CHUNK_SIZE_BYTES_SETTING_KEY = "telegram_text_chunk_size_bytes";
+export const TELEGRAM_IMAGE_CHUNK_SIZE_BYTES_SETTING_KEY = "telegram_image_chunk_size_bytes";
 export const DEFAULT_TELEGRAM_CHUNK_SIZE_BYTES = 10 * 1024 * 1024;
+export const DEFAULT_TELEGRAM_VIDEO_CHUNK_SIZE_BYTES = 2 * 1024 * 1024;
+export const DEFAULT_TELEGRAM_TEXT_CHUNK_SIZE_BYTES = 10 * 1024 * 1024;
+export const DEFAULT_TELEGRAM_IMAGE_CHUNK_SIZE_BYTES = 4 * 1024 * 1024;
 export const MIN_TELEGRAM_CHUNK_SIZE_BYTES = 1 * 1024 * 1024;
 export const MAX_TELEGRAM_CHUNK_SIZE_BYTES = 18 * 1024 * 1024;
 
@@ -3088,25 +3094,57 @@ function clampVideoPreviewCacheBytes(value: number): number {
 }
 
 export async function getTelegramChunkSizeBytesSetting(db: AppDatabase): Promise<number> {
+  return getTelegramChunkSizeSettingValue(db, TELEGRAM_CHUNK_SIZE_BYTES_SETTING_KEY, DEFAULT_TELEGRAM_CHUNK_SIZE_BYTES);
+}
+
+export async function setTelegramChunkSizeBytesSetting(db: AppDatabase, value: number, updatedAt: string): Promise<number> {
+  return setTelegramChunkSizeSettingValue(db, TELEGRAM_CHUNK_SIZE_BYTES_SETTING_KEY, value, updatedAt);
+}
+
+export async function getTelegramVideoChunkSizeBytesSetting(db: AppDatabase): Promise<number> {
+  return getTelegramChunkSizeSettingValue(db, TELEGRAM_VIDEO_CHUNK_SIZE_BYTES_SETTING_KEY, DEFAULT_TELEGRAM_VIDEO_CHUNK_SIZE_BYTES);
+}
+
+export async function setTelegramVideoChunkSizeBytesSetting(db: AppDatabase, value: number, updatedAt: string): Promise<number> {
+  return setTelegramChunkSizeSettingValue(db, TELEGRAM_VIDEO_CHUNK_SIZE_BYTES_SETTING_KEY, value, updatedAt);
+}
+
+export async function getTelegramTextChunkSizeBytesSetting(db: AppDatabase): Promise<number> {
+  return getTelegramChunkSizeSettingValue(db, TELEGRAM_TEXT_CHUNK_SIZE_BYTES_SETTING_KEY, DEFAULT_TELEGRAM_TEXT_CHUNK_SIZE_BYTES);
+}
+
+export async function setTelegramTextChunkSizeBytesSetting(db: AppDatabase, value: number, updatedAt: string): Promise<number> {
+  return setTelegramChunkSizeSettingValue(db, TELEGRAM_TEXT_CHUNK_SIZE_BYTES_SETTING_KEY, value, updatedAt);
+}
+
+export async function getTelegramImageChunkSizeBytesSetting(db: AppDatabase): Promise<number> {
+  return getTelegramChunkSizeSettingValue(db, TELEGRAM_IMAGE_CHUNK_SIZE_BYTES_SETTING_KEY, DEFAULT_TELEGRAM_IMAGE_CHUNK_SIZE_BYTES);
+}
+
+export async function setTelegramImageChunkSizeBytesSetting(db: AppDatabase, value: number, updatedAt: string): Promise<number> {
+  return setTelegramChunkSizeSettingValue(db, TELEGRAM_IMAGE_CHUNK_SIZE_BYTES_SETTING_KEY, value, updatedAt);
+}
+
+async function getTelegramChunkSizeSettingValue(db: AppDatabase, key: string, fallback: number): Promise<number> {
   let row: { value: string } | null = null;
   try {
     row = await db
       .prepare("SELECT value FROM app_settings WHERE key = ?")
-      .bind(TELEGRAM_CHUNK_SIZE_BYTES_SETTING_KEY)
+      .bind(key)
       .first<{ value: string }>();
   } catch {
-    return DEFAULT_TELEGRAM_CHUNK_SIZE_BYTES;
+    return fallback;
   }
-  const parsed = row ? Number(row.value) : DEFAULT_TELEGRAM_CHUNK_SIZE_BYTES;
+  const parsed = row ? Number(row.value) : fallback;
 
   if (!Number.isSafeInteger(parsed)) {
-    return DEFAULT_TELEGRAM_CHUNK_SIZE_BYTES;
+    return fallback;
   }
 
   return clampTelegramChunkSizeBytes(parsed);
 }
 
-export async function setTelegramChunkSizeBytesSetting(db: AppDatabase, value: number, updatedAt: string): Promise<number> {
+async function setTelegramChunkSizeSettingValue(db: AppDatabase, key: string, value: number, updatedAt: string): Promise<number> {
   const normalized = clampTelegramChunkSizeBytes(value);
   await db
     .prepare(
@@ -3114,7 +3152,7 @@ export async function setTelegramChunkSizeBytesSetting(db: AppDatabase, value: n
       VALUES (?, ?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
     )
-    .bind(TELEGRAM_CHUNK_SIZE_BYTES_SETTING_KEY, String(normalized), updatedAt)
+    .bind(key, String(normalized), updatedAt)
     .run();
 
   return normalized;

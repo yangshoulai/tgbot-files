@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode, type RefObject } from "react";
-import { Captions, FastForward, Maximize2, Minimize2, Pause, Play, Rewind, Square, Volume2, VolumeX } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject } from "react";
+import { Captions, FastForward, Maximize, Maximize2, Minimize, Minimize2, Pause, Play, Rewind, Square, Volume2, VolumeX } from "lucide-react";
 import { cn } from "../../../lib/cn";
 
 export interface MediaSubtitleOption {
@@ -10,12 +10,17 @@ export interface MediaSubtitleOption {
 export interface MediaCacheState {
   chunkCount: number;
   cachedChunks: number[];
+  durations?: number[];
+  size?: number;
+  chunkSize?: number;
 }
 
 interface MediaControlsProps {
   mediaRef: RefObject<HTMLMediaElement>;
-  fullscreen: boolean;
-  onToggleFullscreen: () => void;
+  maximized: boolean;
+  onToggleMaximized: () => void;
+  nativeFullscreen?: boolean;
+  onToggleNativeFullscreen?: () => void;
   cacheState?: MediaCacheState | null;
   subtitles?: MediaSubtitleOption[];
   selectedSubtitleId?: string | null;
@@ -41,8 +46,10 @@ const playbackRates = [0.5, 0.75, 1, 1.25, 1.5, 2];
 
 export function MediaControls({
   mediaRef,
-  fullscreen,
-  onToggleFullscreen,
+  maximized,
+  onToggleMaximized,
+  nativeFullscreen = false,
+  onToggleNativeFullscreen,
   cacheState = null,
   subtitles = [],
   selectedSubtitleId = null,
@@ -55,10 +62,12 @@ export function MediaControls({
 }: MediaControlsProps) {
   const floating = variant === "floating";
   const inline = variant === "inline";
-  const dense = compact || fullscreen || floating;
+  const dense = compact || maximized || floating;
   const narrow = density === "narrow" || density === "tiny";
   const tiny = density === "tiny";
   const controlTabIndex = interactive ? undefined : -1;
+  const progressTrackRef = useRef<HTMLDivElement>(null);
+  const seekingPointerIdRef = useRef<number | null>(null);
   const [state, setState] = useState<MediaState>({
     playing: false,
     currentTime: 0,
@@ -137,12 +146,55 @@ export function MediaControls({
     syncState();
   };
 
-  const seekTo = (value: string) => {
+  const seekToTime = useCallback((value: number) => {
     const media = mediaRef.current;
     if (!media) return;
-    media.currentTime = Number(value);
+    const duration = Number.isFinite(media.duration) && media.duration > 0 ? media.duration : 0;
+    if (duration <= 0 || !Number.isFinite(value)) return;
+    media.currentTime = Math.min(Math.max(value, 0), duration);
     syncState();
+  }, [mediaRef, syncState]);
+
+  const seekTo = (value: string) => {
+    seekToTime(Number(value));
   };
+
+  const seekToPointerPosition = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!interactive) return;
+
+    const track = progressTrackRef.current;
+    const media = mediaRef.current;
+    if (!track || !media) return;
+
+    const duration = Number.isFinite(media.duration) && media.duration > 0 ? media.duration : 0;
+    if (duration <= 0) return;
+
+    const rect = track.getBoundingClientRect();
+    if (!Number.isFinite(rect.width) || rect.width <= 0) return;
+
+    const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+    seekToTime(ratio * duration);
+  }, [interactive, mediaRef, seekToTime]);
+
+  const handleProgressPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!interactive || event.button !== 0) return;
+    event.preventDefault();
+    seekingPointerIdRef.current = event.pointerId;
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    seekToPointerPosition(event);
+  }, [interactive, seekToPointerPosition]);
+
+  const handleProgressPointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (seekingPointerIdRef.current !== event.pointerId) return;
+    event.preventDefault();
+    seekToPointerPosition(event);
+  }, [seekToPointerPosition]);
+
+  const stopProgressPointerSeek = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (seekingPointerIdRef.current !== event.pointerId) return;
+    seekingPointerIdRef.current = null;
+    event.currentTarget.releasePointerCapture?.(event.pointerId);
+  }, []);
 
   const setVolume = (value: string) => {
     const media = mediaRef.current;
@@ -194,8 +246,13 @@ export function MediaControls({
       aria-hidden={interactive ? undefined : true}
     >
       <div
+        ref={progressTrackRef}
+        onPointerDown={handleProgressPointerDown}
+        onPointerMove={handleProgressPointerMove}
+        onPointerUp={stopProgressPointerSeek}
+        onPointerCancel={stopProgressPointerSeek}
         className={cn(
-          "relative rounded-full",
+          "relative cursor-pointer touch-none rounded-full",
           floating ? "mb-2.5 h-1.5 bg-white/18 sm:h-2" : inline ? "mb-3 h-2 bg-border" : dense ? "mb-2 h-2.5 bg-white/15" : "mb-3 h-3 bg-white/15",
           tiny && "mb-1.5 h-1.5"
         )}
@@ -232,7 +289,7 @@ export function MediaControls({
           onChange={(event) => seekTo(event.target.value)}
           aria-label="播放进度"
           tabIndex={controlTabIndex}
-          className={cn("absolute inset-x-0 -inset-y-2 h-5 w-full cursor-pointer opacity-0", floating && "sm:-inset-y-2.5 sm:h-6")}
+          className={cn("pointer-events-none absolute inset-x-0 -inset-y-2 h-5 w-full opacity-0", floating && "sm:-inset-y-2.5 sm:h-6")}
         />
       </div>
 
@@ -376,9 +433,14 @@ export function MediaControls({
               </select>
             </label>
           ) : null}
-          <MediaButton label={fullscreen ? "退出全屏" : "全屏"} onClick={onToggleFullscreen} dense={dense} floating={floating} inline={inline} tabIndex={controlTabIndex}>
-            {fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+          <MediaButton label={maximized ? "还原" : "最大化"} onClick={onToggleMaximized} dense={dense} floating={floating} inline={inline} tabIndex={controlTabIndex}>
+            {maximized ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
           </MediaButton>
+          {onToggleNativeFullscreen ? (
+            <MediaButton label={nativeFullscreen ? "退出全屏" : "进入全屏"} onClick={onToggleNativeFullscreen} dense={dense} floating={floating} inline={inline} tabIndex={controlTabIndex}>
+              {nativeFullscreen ? <Minimize size={15} /> : <Maximize size={15} />}
+            </MediaButton>
+          ) : null}
         </div>
       </div>
     </div>
@@ -416,20 +478,58 @@ function cachedChunkRanges(cacheState: MediaCacheState | null): Array<{ left: nu
       continue;
     }
 
-    ranges.push(chunkRangeToPercent(start, end, chunkCount));
+    ranges.push(chunkRangeToPercent(start, end, chunkCount, cacheState));
     start = chunkIndex;
     end = chunkIndex;
   }
 
-  ranges.push(chunkRangeToPercent(start, end, chunkCount));
+  ranges.push(chunkRangeToPercent(start, end, chunkCount, cacheState));
   return ranges;
 }
 
-function chunkRangeToPercent(start: number, end: number, chunkCount: number): { left: number; width: number } {
+function chunkRangeToPercent(start: number, end: number, chunkCount: number, cacheState?: MediaCacheState | null): { left: number; width: number } {
+  const durations = normalizedCacheDurations(cacheState, chunkCount);
+  if (durations) {
+    const totalDuration = durations.reduce((total, duration) => total + duration, 0);
+    const rangeStart = durations.slice(0, start).reduce((total, duration) => total + duration, 0);
+    const rangeEnd = durations.slice(0, end + 1).reduce((total, duration) => total + duration, 0);
+    return {
+      left: (rangeStart / totalDuration) * 100,
+      width: ((rangeEnd - rangeStart) / totalDuration) * 100
+    };
+  }
+
+  const size = Number(cacheState?.size);
+  const chunkSize = Number(cacheState?.chunkSize);
+  if (
+    Number.isFinite(size) &&
+    size > 0 &&
+    Number.isFinite(chunkSize) &&
+    chunkSize > 0
+  ) {
+    const byteStart = Math.min(size, Math.max(0, start * chunkSize));
+    const byteEndExclusive = Math.min(size, Math.max(byteStart, (end + 1) * chunkSize));
+    return {
+      left: (byteStart / size) * 100,
+      width: ((byteEndExclusive - byteStart) / size) * 100
+    };
+  }
+
   return {
     left: (start / chunkCount) * 100,
     width: ((end - start + 1) / chunkCount) * 100
   };
+}
+
+function normalizedCacheDurations(cacheState: MediaCacheState | null | undefined, chunkCount: number): number[] | null {
+  if (!Array.isArray(cacheState?.durations) || cacheState.durations.length !== chunkCount) {
+    return null;
+  }
+
+  const durations = cacheState.durations.map((duration) => Number(duration));
+  return durations.every((duration) => Number.isFinite(duration) && duration > 0)
+    ? durations
+    : null;
 }
 
 function MediaButton({ label, onClick, children, emphasis = false, dense = false, floating = false, inline = false, tabIndex, className }: {

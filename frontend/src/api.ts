@@ -13,6 +13,9 @@ export interface SessionResponse {
   video_preview_cache_bytes_min: number;
   video_preview_cache_bytes_max: number;
   telegram_chunk_size_bytes: number;
+  telegram_video_chunk_size_bytes: number;
+  telegram_text_chunk_size_bytes: number;
+  telegram_image_chunk_size_bytes: number;
   telegram_chunk_size_bytes_min: number;
   telegram_chunk_size_bytes_max: number;
   base_url: string;
@@ -98,6 +101,9 @@ export interface SettingsUpdateResponse {
     video_preview_cache_bytes_min: number;
     video_preview_cache_bytes_max: number;
     telegram_chunk_size_bytes: number;
+    telegram_video_chunk_size_bytes: number;
+    telegram_text_chunk_size_bytes: number;
+    telegram_image_chunk_size_bytes: number;
     telegram_chunk_size_bytes_min: number;
     telegram_chunk_size_bytes_max: number;
   };
@@ -607,7 +613,14 @@ export function logout() {
   });
 }
 
-export function updateSettings(body: { upload_concurrency?: number; video_preview_cache_bytes?: number; telegram_chunk_size_bytes?: number }) {
+export function updateSettings(body: {
+  upload_concurrency?: number;
+  video_preview_cache_bytes?: number;
+  telegram_chunk_size_bytes?: number;
+  telegram_video_chunk_size_bytes?: number;
+  telegram_text_chunk_size_bytes?: number;
+  telegram_image_chunk_size_bytes?: number;
+}) {
   return requestJson<SettingsUpdateResponse>("/api/admin/settings", {
     method: "PATCH",
     headers: {

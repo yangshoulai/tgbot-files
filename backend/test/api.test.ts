@@ -3194,6 +3194,84 @@ describe("admin file manager", () => {
     expect(listBody.direct_access_max_chunks).toBe(Math.ceil(maxMultipartFileBytes / configuredChunkSize));
   });
 
+  it("uses file-type specific Telegram chunk sizes for new multipart upload sessions", async () => {
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const cookie = await loginAndGetCookie(adminEnv);
+    const defaultChunkSize = 8 * 1024 * 1024;
+    const videoChunkSize = 1 * 1024 * 1024;
+    const textChunkSize = 12 * 1024 * 1024;
+    const imageChunkSize = 3 * 1024 * 1024;
+
+    const updateResponse = await handleRequest(
+      new Request("https://files.example.com/api/admin/settings", {
+        method: "PATCH",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          telegram_chunk_size_bytes: defaultChunkSize,
+          telegram_video_chunk_size_bytes: videoChunkSize,
+          telegram_text_chunk_size_bytes: textChunkSize,
+          telegram_image_chunk_size_bytes: imageChunkSize
+        })
+      }),
+      adminEnv
+    );
+    const updateBody = await updateResponse.json() as {
+      settings: {
+        telegram_chunk_size_bytes: number;
+        telegram_video_chunk_size_bytes: number;
+        telegram_text_chunk_size_bytes: number;
+        telegram_image_chunk_size_bytes: number;
+      };
+    };
+
+    expect(updateResponse.status).toBe(200);
+    expect(updateBody.settings).toMatchObject({
+      telegram_chunk_size_bytes: defaultChunkSize,
+      telegram_video_chunk_size_bytes: videoChunkSize,
+      telegram_text_chunk_size_bytes: textChunkSize,
+      telegram_image_chunk_size_bytes: imageChunkSize
+    });
+
+    const videoInit = await initAdminMultipartForTest(adminEnv, cookie, {
+      file_name: "clip.mp4",
+      mime_type: "video/mp4",
+      size: 5 * 1024 * 1024
+    });
+    const textInit = await initAdminMultipartForTest(adminEnv, cookie, {
+      file_name: "notes.md",
+      mime_type: "application/octet-stream",
+      size: 10 * 1024 * 1024
+    });
+    const imageInit = await initAdminMultipartForTest(adminEnv, cookie, {
+      file_name: "photo.webp",
+      mime_type: "image/webp",
+      size: 7 * 1024 * 1024
+    });
+    const defaultInit = await initAdminMultipartForTest(adminEnv, cookie, {
+      file_name: "archive.bin",
+      mime_type: "application/octet-stream",
+      size: 17 * 1024 * 1024
+    });
+
+    expect(videoInit.upload.chunk_size).toBe(videoChunkSize);
+    expect(videoInit.upload.chunk_count).toBe(5);
+    expect(textInit.upload.chunk_size).toBe(textChunkSize);
+    expect(textInit.upload.chunk_count).toBe(1);
+    expect(imageInit.upload.chunk_size).toBe(imageChunkSize);
+    expect(imageInit.upload.chunk_count).toBe(3);
+    expect(defaultInit.upload.chunk_size).toBe(defaultChunkSize);
+    expect(defaultInit.upload.chunk_count).toBe(3);
+  });
+
   it("creates, lists, reveals, disables, and deletes upload API keys", async () => {
     const db = new FakeDatabase();
     const adminEnv: AppEnv = {
@@ -3649,7 +3727,7 @@ describe("admin file manager", () => {
     expect(body.mode).toBe("multipart");
     expect(body.upload.file_name).toBe("big-video.mp4");
     expect(body.upload.size).toBe(fileSize);
-    expect(body.upload.chunk_count).toBe(3);
+    expect(body.upload.chunk_count).toBe(13);
     expect(db.multipartUploads[0]?.source_url).toBe(sourceUrl);
     expect(db.multipartUploads[0]?.remark).toBe("大文件 URL");
   });
@@ -4664,6 +4742,18 @@ video.mp4
       })
     );
     const cookie = await loginAndGetCookie(adminEnv);
+    const settingsResponse = await handleRequest(
+      new Request("https://files.example.com/api/admin/settings", {
+        method: "PATCH",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ telegram_video_chunk_size_bytes: telegramChunkSizeBytes })
+      }),
+      adminEnv
+    );
+    expect(settingsResponse.status).toBe(200);
 
     const initResponse = await handleRequest(
       new Request("https://files.example.com/api/admin/uploads/hls/hls-large/segments/0/import", {
@@ -6464,4 +6554,25 @@ async function loginAndGetCookie(envWithAdmin: AppEnv): Promise<string> {
   }
 
   return cookie;
+}
+
+async function initAdminMultipartForTest(
+  envWithAdmin: AppEnv,
+  cookie: string,
+  body: { file_name: string; mime_type: string; size: number }
+): Promise<{ upload: { chunk_size: number; chunk_count: number } }> {
+  const response = await handleRequest(
+    new Request("https://files.example.com/api/admin/uploads/init", {
+      method: "POST",
+      headers: {
+        Cookie: cookie,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    }),
+    envWithAdmin
+  );
+
+  expect(response.status).toBe(201);
+  return response.json() as Promise<{ upload: { chunk_size: number; chunk_count: number } }>;
 }

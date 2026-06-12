@@ -25,25 +25,27 @@ import { MediaControls, type MediaCacheState, type MediaSubtitleOption } from ".
 
 interface VideoPreviewProps {
   file: FileItem;
-  fullscreen: boolean;
-  onToggleFullscreen: () => void;
+  maximized: boolean;
+  onToggleMaximized: () => void;
+  nativeFullscreen: boolean;
+  onToggleNativeFullscreen: () => void;
   videoPreviewCacheBytes: number;
   videoPreviewConcurrency: number;
 }
 
-const VIDEO_PREVIEW_TIMEOUT_MS = 30_000;
 const VIDEO_CONTROLS_HIDE_DELAY_MS = 1_800;
 const VIDEO_LOADING_INDICATOR_DELAY_MS = 360;
 const VIDEO_PREVIEW_PROGRESS_REPORT_MIN_INTERVAL_MS = 900;
 const VIDEO_PREVIEW_CACHE_STATE_POLL_MS = 1_200;
 const SUBTITLE_PREVIEW_TIMEOUT_MS = 20_000;
 
-export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPreviewCacheBytes, videoPreviewConcurrency }: VideoPreviewProps) {
+export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscreen, onToggleNativeFullscreen, videoPreviewCacheBytes, videoPreviewConcurrency }: VideoPreviewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const frameRef = useRef<HTMLDivElement>(null);
   const loadingTimerRef = useRef<number | null>(null);
   const previewCacheSessionIdRef = useRef(`video-preview-${file.id}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   const playbackProgressReportRef = useRef({ sentAt: 0, marker: -1, currentTime: -1 });
+  const initialPlaybackAttemptRef = useRef<"pending" | "playing" | "blocked">("pending");
   const [ratio, setRatio] = useState(() => initialAspectRatio(file));
   const [controlsDensity, setControlsDensity] = useState<MediaControlsDensity>("regular");
   const [serviceWorkerState, setServiceWorkerState] = useState<VideoPreviewServiceWorkerState>(initialVideoPreviewServiceWorkerState);
@@ -52,7 +54,7 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
   const [cacheState, setCacheState] = useState<VideoPreviewCacheState | null>(null);
   const [subtitleTracks, setSubtitleTracks] = useState<LoadedSubtitleTrack[]>([]);
   const [selectedSubtitleId, setSelectedSubtitleId] = useState<string | null>(null);
-  const videoHeightLimit = fullscreen ? "calc(100dvh - 13.5rem)" : "min(62dvh, 700px)";
+  const videoHeightLimit = maximized ? "calc(100dvh - 13.5rem)" : "min(62dvh, 700px)";
   const isHlsPackage = file.storage_backend === "hls_package";
   const serviceWorkerReady = serviceWorkerState.status === "controlled";
   const previewCandidate = useMemo(
@@ -69,8 +71,16 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
   );
   const cachedChunkSet = useMemo(() => new Set(cacheState?.cachedChunks ?? []), [cacheState]);
   const displayedCacheState = useMemo<MediaCacheState | null>(() => {
+    const sharedCacheState = {
+      size: previewMetadata?.kind !== "hls" ? previewMetadata?.size : undefined,
+      chunkSize: previewMetadata?.kind !== "hls" ? previewMetadata?.chunkSize : undefined
+    };
+
     if (cacheState) {
-      return cacheState;
+      return {
+        ...cacheState,
+        ...sharedCacheState
+      };
     }
 
     const chunkCount = previewMetadata?.chunkCount ?? 0;
@@ -78,13 +88,13 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
       return null;
     }
 
-    return { chunkCount, cachedChunks: [] };
-  }, [cacheState, previewMetadata?.chunkCount]);
+    return { chunkCount, cachedChunks: [], ...sharedCacheState };
+  }, [cacheState, previewMetadata?.chunkCount, previewMetadata?.chunkSize, previewMetadata?.kind, previewMetadata?.size]);
 
   const isCurrentPlaybackPositionCached = useCallback((video: HTMLVideoElement) => {
-    const chunkIndex = playbackChunkIndexForVideo(video, previewMetadata, cacheState?.chunkCount ?? 0);
+    const chunkIndex = playbackChunkIndexForVideo(video, previewMetadata, cacheState);
     return chunkIndex !== null && cachedChunkSet.has(chunkIndex);
-  }, [cacheState?.chunkCount, cachedChunkSet, previewMetadata]);
+  }, [cacheState, cachedChunkSet, previewMetadata]);
 
   const reportPlaybackProgress = useCallback((video: HTMLVideoElement, immediate = false) => {
     if (!previewMetadata) return;
@@ -187,6 +197,28 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
     showLoading(immediate);
   }, [hideLoading, isCurrentPlaybackPositionCached, showLoading]);
 
+  const attemptInitialPlayback = useCallback((video: HTMLVideoElement) => {
+    if (initialPlaybackAttemptRef.current !== "pending" || failed) {
+      return;
+    }
+
+    const playPromise = video.play();
+    if (playPromise === undefined) {
+      initialPlaybackAttemptRef.current = "playing";
+      return;
+    }
+
+    void playPromise
+      .then(() => {
+        initialPlaybackAttemptRef.current = "playing";
+      })
+      .catch((error: unknown) => {
+        initialPlaybackAttemptRef.current = error instanceof DOMException && error.name === "NotAllowedError"
+          ? "blocked"
+          : "pending";
+      });
+  }, [failed]);
+
   useEffect(() => {
     if (videoSrc) {
       showLoading(true);
@@ -194,6 +226,7 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
       hideLoading();
     }
     setFailed(false);
+    initialPlaybackAttemptRef.current = "pending";
   }, [file.id, hideLoading, showLoading, videoSrc]);
 
   useEffect(() => {
@@ -218,17 +251,6 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
 
     return () => observer.disconnect();
   }, [ratio.value]);
-
-  useEffect(() => {
-    if (!loading || failed || !videoSrc) return;
-
-    const timeout = window.setTimeout(() => {
-      setLoading(false);
-      setFailed(true);
-    }, VIDEO_PREVIEW_TIMEOUT_MS);
-
-    return () => window.clearTimeout(timeout);
-  }, [failed, loading, videoSrc]);
 
   useEffect(() => {
     if (!previewCandidate || serviceWorkerReady) return;
@@ -447,7 +469,7 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
     <div
       className={cn(
         "relative flex w-full items-center justify-center overflow-hidden bg-[radial-gradient(circle_at_16%_0%,rgba(16,185,129,0.2),transparent_32%),linear-gradient(135deg,#07110f_0%,#101827_58%,#030712_100%)] px-2 py-3 sm:px-5 sm:py-5",
-        fullscreen ? "h-full min-h-0" : "min-h-56"
+        maximized ? "h-full min-h-0" : "min-h-56"
       )}
     >
       <div
@@ -465,6 +487,7 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
             ref={videoRef}
             src={isHlsPackage ? undefined : videoSrc ?? undefined}
             poster={poster}
+            autoPlay
             playsInline
             preload="auto"
             className="h-full w-full bg-[#020403] object-contain"
@@ -475,17 +498,20 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
               maybeShowLoading(event.currentTarget);
             }}
             onTimeUpdate={(event) => reportPlaybackProgress(event.currentTarget)}
-            onLoadedData={() => {
+            onLoadedData={(event) => {
               hideLoading();
               setFailed(false);
+              attemptInitialPlayback(event.currentTarget);
             }}
-            onCanPlay={() => {
+            onCanPlay={(event) => {
               hideLoading();
               setFailed(false);
+              attemptInitialPlayback(event.currentTarget);
             }}
             onPlaying={(event) => {
               hideLoading();
               setFailed(false);
+              initialPlaybackAttemptRef.current = "playing";
               reportPlaybackProgress(event.currentTarget, true);
             }}
             onSeeked={(event) => {
@@ -541,8 +567,10 @@ export function VideoPreview({ file, fullscreen, onToggleFullscreen, videoPrevie
         <div className="w-full bg-[#050a09]/95 p-2 sm:p-3">
           <MediaControls
             mediaRef={videoRef}
-            fullscreen={fullscreen}
-            onToggleFullscreen={onToggleFullscreen}
+            maximized={maximized}
+            onToggleMaximized={onToggleMaximized}
+            nativeFullscreen={nativeFullscreen}
+            onToggleNativeFullscreen={onToggleNativeFullscreen}
             cacheState={displayedCacheState}
             variant="floating"
             density={controlsDensity}
@@ -765,7 +793,7 @@ function initialAspectRatio(file: FileItem): { label: string; value: number } {
 function playbackChunkIndexForVideo(
   video: HTMLVideoElement,
   metadata: VideoPreviewMetadata | null,
-  fallbackChunkCount: number
+  cacheState: VideoPreviewCacheState | null
 ): number | null {
   const currentTime = Number.isFinite(video.currentTime) && video.currentTime >= 0
     ? video.currentTime
@@ -776,12 +804,30 @@ function playbackChunkIndexForVideo(
   if (duration <= 0) return null;
 
   const ratio = Math.min(1, Math.max(0, currentTime / duration));
+  if (metadata?.kind === "hls" && Array.isArray(cacheState?.durations) && cacheState.durations.length > 0) {
+    let elapsed = 0;
+    for (let index = 0; index < cacheState.durations.length; index += 1) {
+      const segmentDuration = Number(cacheState.durations[index]);
+      if (!Number.isFinite(segmentDuration) || segmentDuration <= 0) {
+        return null;
+      }
+
+      if (currentTime < elapsed + segmentDuration) {
+        return index;
+      }
+
+      elapsed += segmentDuration;
+    }
+
+    return cacheState.durations.length - 1;
+  }
+
   if (metadata?.kind !== "hls" && metadata?.size && metadata.size > 0 && metadata.chunkSize && metadata.chunkSize > 0) {
     const byteOffset = Math.min(metadata.size - 1, Math.max(0, Math.floor(ratio * metadata.size)));
     return Math.floor(byteOffset / metadata.chunkSize);
   }
 
-  const chunkCount = fallbackChunkCount || metadata?.chunkCount || 0;
+  const chunkCount = cacheState?.chunkCount || metadata?.chunkCount || 0;
   if (!Number.isSafeInteger(chunkCount) || chunkCount <= 0) return null;
 
   return Math.min(chunkCount - 1, Math.max(0, Math.floor(ratio * chunkCount)));

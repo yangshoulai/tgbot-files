@@ -7,6 +7,7 @@ const RESPONSE_WINDOW_BYTES = 2 * 1024 * 1024;
 const DEFAULT_PREVIEW_PREFETCH_CONCURRENCY = 5;
 const MAX_PREVIEW_PREFETCH_CONCURRENCY = 32;
 const CONTINUOUS_PREFETCH_SESSION_TTL_MS = 12_000;
+const CONTINUOUS_PREFETCH_RETRY_DELAY_MS = 3_000;
 const HOT_CHUNK_CACHE_MAX_BYTES = 160 * 1024 * 1024;
 const fullChunkLoads = new Map();
 const hlsPartLoads = new Map();
@@ -376,11 +377,10 @@ async function prefetchHlsSegments(fileId, startIndex, count, cacheMaxBytes) {
 async function runConcurrentPrefetchWorkers(session, generation, sessions, loadNext) {
   const concurrency = normalizePreviewPrefetchConcurrency(session.metadata?.prefetchConcurrency);
   const workerCount = Math.min(concurrency, Math.max(1, session.queue.length));
-  let failed = false;
+  const failedItems = [];
 
   async function runWorker() {
     while (
-      !failed &&
       isContinuousPrefetchSessionActive(session, sessions) &&
       generation === session.generation &&
       session.queue.length > 0
@@ -393,12 +393,20 @@ async function runConcurrentPrefetchWorkers(session, generation, sessions, loadN
       try {
         await loadNext(item);
       } catch {
-        failed = true;
+        failedItems.push(item);
       }
     }
   }
 
   await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+
+  if (
+    failedItems.length > 0 &&
+    isContinuousPrefetchSessionActive(session, sessions) &&
+    generation === session.generation
+  ) {
+    session.queue.push(...failedItems);
+  }
 }
 
 function hlsChunkIndex(partKind, partIndex) {
@@ -433,7 +441,8 @@ function startHlsPreviewCacheSession(sessionId, metadata) {
     priorityStart: 0,
     queue: [],
     generation: 0,
-    task: null
+    task: null,
+    retryTimer: null
   };
   hlsPreviewCacheSessions.set(sessionId, session);
 
@@ -447,6 +456,7 @@ function stopHlsPreviewCacheSession(sessionId) {
   }
 
   session.active = false;
+  clearContinuousPrefetchRetry(session);
   hlsPreviewCacheSessions.delete(sessionId);
 }
 
@@ -488,6 +498,7 @@ function setHlsPreviewCachePriority(session, startIndex) {
     session.queue = createHlsPriorityQueue(sources, priorityStart);
     session.completed = false;
     session.generation += 1;
+    clearContinuousPrefetchRetry(session);
   } else if (session.queue.length === 0 && !session.task) {
     session.queue = createHlsPriorityQueue(sources, priorityStart);
   }
@@ -537,6 +548,8 @@ function scheduleHlsPreviewCacheSession(session) {
       if (session.active && completed) {
         session.completed = true;
         scheduleContinuousPrefetchExpiry(session, hlsPreviewCacheSessions);
+      } else if (session.active && !completed) {
+        scheduleContinuousPrefetchRetry(session, hlsPreviewCacheSessions, scheduleHlsPreviewCacheSession);
       } else if (!session.active) {
         hlsPreviewCacheSessions.delete(session.sessionId);
       }
@@ -798,11 +811,14 @@ async function readPreviewCacheState(metadata) {
 
   cachedChunks.sort((left, right) => left - right);
 
+  const durations = previewCacheStateDurations(metadata, chunkCount);
+
   return {
     fileId: metadata.fileId,
     kind: metadata.kind,
     chunkCount,
-    cachedChunks
+    cachedChunks,
+    ...(durations ? { durations } : {})
   };
 }
 
@@ -817,6 +833,22 @@ function previewCacheStateChunkCount(metadata) {
   }
 
   return Number.isSafeInteger(metadata.chunkCount) && metadata.chunkCount > 0 ? metadata.chunkCount : 0;
+}
+
+function previewCacheStateDurations(metadata, chunkCount) {
+  if (metadata.kind !== "hls" || !Number.isSafeInteger(chunkCount) || chunkCount <= 0) {
+    return null;
+  }
+
+  const sources = hlsPreviewSources.get(metadata.fileId);
+  if (!Array.isArray(sources?.durations) || sources.durations.length !== chunkCount) {
+    return null;
+  }
+
+  const durations = sources.durations.map((duration) => Number(duration));
+  return durations.every((duration) => Number.isFinite(duration) && duration > 0)
+    ? durations
+    : null;
 }
 
 function normalizePlaybackProgress(value) {
@@ -1453,7 +1485,8 @@ function startContinuousPreviewCache(sessionId, metadata) {
     priorityStart: 0,
     queue: createPriorityChunkQueue(metadata.chunkCount, 0),
     generation: 0,
-    task: null
+    task: null,
+    retryTimer: null
   };
   continuousPrefetchSessions.set(sessionId, session);
 
@@ -1480,6 +1513,7 @@ function setContinuousPrefetchPriority(session, startIndex) {
     session.queue = createPriorityChunkQueue(session.metadata.chunkCount, priorityStart);
     session.completed = false;
     session.generation += 1;
+    clearContinuousPrefetchRetry(session);
   } else if (session.queue.length === 0 && !session.task) {
     session.queue = createPriorityChunkQueue(session.metadata.chunkCount, priorityStart);
   }
@@ -1524,6 +1558,8 @@ function scheduleContinuousPrefetchSession(session) {
       if (session.active && completed) {
         session.completed = true;
         scheduleContinuousPrefetchExpiry(session, continuousPrefetchSessions);
+      } else if (session.active && !completed) {
+        scheduleContinuousPrefetchRetry(session, continuousPrefetchSessions, scheduleContinuousPrefetchSession);
       } else if (!session.active) {
         continuousPrefetchSessions.delete(session.sessionId);
       }
@@ -1540,6 +1576,7 @@ function stopContinuousPreviewCache(sessionId) {
   }
 
   session.active = false;
+  clearContinuousPrefetchRetry(session);
   continuousPrefetchSessions.delete(sessionId);
 }
 
@@ -1601,6 +1638,36 @@ function scheduleContinuousPrefetchExpiry(session, sessions) {
       sessions.delete(session.sessionId);
     }
   }, CONTINUOUS_PREFETCH_SESSION_TTL_MS + 1_000);
+}
+
+function scheduleContinuousPrefetchRetry(session, sessions, schedule) {
+  if (session.retryTimer) {
+    return;
+  }
+
+  const generation = session.generation;
+  session.retryTimer = setTimeout(() => {
+    session.retryTimer = null;
+    if (
+      sessions.get(session.sessionId) !== session ||
+      !session.active ||
+      generation !== session.generation ||
+      Date.now() - session.lastHeartbeat > CONTINUOUS_PREFETCH_SESSION_TTL_MS
+    ) {
+      return;
+    }
+
+    void schedule(session);
+  }, CONTINUOUS_PREFETCH_RETRY_DELAY_MS);
+}
+
+function clearContinuousPrefetchRetry(session) {
+  if (!session.retryTimer) {
+    return;
+  }
+
+  clearTimeout(session.retryTimer);
+  session.retryTimer = null;
 }
 
 function getHotChunkBytes(metadata, chunkIndex) {

@@ -10,7 +10,9 @@ import { PreviewError } from "./PreviewFrame";
 import { Spinner } from "../../ui/Spinner";
 
 interface AudioPreviewProps extends PreviewComponentProps {
-  onToggleFullscreen: () => void;
+  onToggleMaximized: () => void;
+  nativeFullscreen: boolean;
+  onToggleNativeFullscreen: () => void;
 }
 
 interface LoadedLyricsTrack {
@@ -30,7 +32,7 @@ interface LyricsLine {
 const AUDIO_PREVIEW_TIMEOUT_MS = 30_000;
 const LYRICS_PREVIEW_TIMEOUT_MS = 20_000;
 
-export function AudioPreview({ file, fullscreen, onToggleFullscreen }: AudioPreviewProps) {
+export function AudioPreview({ file, fullscreen, onToggleMaximized, nativeFullscreen, onToggleNativeFullscreen }: AudioPreviewProps) {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
@@ -242,7 +244,16 @@ export function AudioPreview({ file, fullscreen, onToggleFullscreen }: AudioPrev
         ) : null}
 
         <div className="w-full">
-          <MediaControls mediaRef={audioRef} fullscreen={fullscreen} onToggleFullscreen={onToggleFullscreen} compact variant="inline" className="w-full" />
+          <MediaControls
+            mediaRef={audioRef}
+            maximized={fullscreen}
+            onToggleMaximized={onToggleMaximized}
+            nativeFullscreen={nativeFullscreen}
+            onToggleNativeFullscreen={onToggleNativeFullscreen}
+            compact
+            variant="inline"
+            className="w-full"
+          />
         </div>
       </div>
     </div>

@@ -77,6 +77,9 @@ import {
   DEFAULT_VIDEO_PREVIEW_CACHE_BYTES,
   DEFAULT_UPLOAD_CONCURRENCY,
   DEFAULT_TELEGRAM_CHUNK_SIZE_BYTES,
+  DEFAULT_TELEGRAM_VIDEO_CHUNK_SIZE_BYTES,
+  DEFAULT_TELEGRAM_TEXT_CHUNK_SIZE_BYTES,
+  DEFAULT_TELEGRAM_IMAGE_CHUNK_SIZE_BYTES,
   touchApiKeyRecord,
   updateApiKeyRecord,
   updateFileRecordMetadata,
@@ -88,9 +91,15 @@ import {
   getUploadConcurrencySetting,
   getVideoPreviewCacheBytesSetting,
   getTelegramChunkSizeBytesSetting,
+  getTelegramVideoChunkSizeBytesSetting,
+  getTelegramTextChunkSizeBytesSetting,
+  getTelegramImageChunkSizeBytesSetting,
   setUploadConcurrencySetting,
   setVideoPreviewCacheBytesSetting,
   setTelegramChunkSizeBytesSetting,
+  setTelegramVideoChunkSizeBytesSetting,
+  setTelegramTextChunkSizeBytesSetting,
+  setTelegramImageChunkSizeBytesSetting,
   selectMagnetImportFiles,
   MIN_UPLOAD_CONCURRENCY,
   MAX_UPLOAD_CONCURRENCY,
@@ -292,6 +301,70 @@ const ARIA2_CACHE_DIRECTORY_NAME_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-
 
 function maxTelegramMultipartChunks(chunkSizeBytes: number): number {
   return Math.ceil(MAX_TELEGRAM_MULTIPART_BYTES / chunkSizeBytes);
+}
+
+async function resolveTelegramChunkSizeBytes(params: {
+  db: AppDatabase;
+  mimeType: string;
+  fileName: string;
+}): Promise<number> {
+  const kind = telegramChunkSizeKind(params.mimeType, params.fileName);
+  switch (kind) {
+    case "video":
+      return getTelegramVideoChunkSizeBytesSetting(params.db);
+    case "text":
+      return getTelegramTextChunkSizeBytesSetting(params.db);
+    case "image":
+      return getTelegramImageChunkSizeBytesSetting(params.db);
+    default:
+      return getTelegramChunkSizeBytesSetting(params.db);
+  }
+}
+
+type TelegramChunkSizeKind = "default" | "video" | "text" | "image";
+
+function telegramChunkSizeKind(mimeType: string, fileName: string): TelegramChunkSizeKind {
+  const normalizedMimeType = mimeType.toLowerCase().split(";")[0]?.trim() || "";
+  if (normalizedMimeType.startsWith("video/")) return "video";
+  if (normalizedMimeType.startsWith("image/")) return "image";
+  if (isTextLikeMimeType(normalizedMimeType) || isTextLikeFileName(fileName)) return "text";
+  return "default";
+}
+
+function isTextLikeMimeType(mimeType: string): boolean {
+  return mimeType.startsWith("text/") ||
+    mimeType === "application/json" ||
+    mimeType === "application/ld+json" ||
+    mimeType === "application/xml" ||
+    mimeType === "application/yaml" ||
+    mimeType === "application/x-yaml" ||
+    mimeType === "application/javascript" ||
+    mimeType === "application/x-javascript" ||
+    mimeType === "application/typescript" ||
+    mimeType === "application/x-typescript" ||
+    mimeType === "application/x-sh" ||
+    mimeType.endsWith("+json") ||
+    mimeType.endsWith("+xml");
+}
+
+function isTextLikeFileName(fileName: string): boolean {
+  return TEXT_LIKE_EXTENSIONS.has(fileExtension(fileName));
+}
+
+const TEXT_LIKE_EXTENSIONS = new Set([
+  "txt", "md", "markdown", "json", "jsonl", "ndjson", "csv", "tsv", "log",
+  "xml", "yaml", "yml", "toml", "ini", "conf", "cfg", "env",
+  "js", "jsx", "ts", "tsx", "css", "scss", "less", "html", "htm",
+  "svg", "sh", "bash", "zsh", "fish", "sql", "py", "go", "rs", "java",
+  "kt", "c", "h", "cpp", "hpp", "cs", "php", "rb", "lua", "vue", "svelte"
+]);
+
+function fileExtension(fileName: string): string {
+  const trimmed = fileName.trim().toLowerCase();
+  const slashIndex = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  const baseName = slashIndex >= 0 ? trimmed.slice(slashIndex + 1) : trimmed;
+  const dotIndex = baseName.lastIndexOf(".");
+  return dotIndex > 0 && dotIndex < baseName.length - 1 ? baseName.slice(dotIndex + 1) : "";
 }
 
 type TelegramRateLimitScope = "sendDocument" | "getFile";
@@ -743,6 +816,15 @@ async function handleAdminSession(request: Request, env: AppEnv, username: strin
   const telegramChunkSizeBytes = env.DATABASE
     ? await getTelegramChunkSizeBytesSetting(env.DATABASE)
     : DEFAULT_TELEGRAM_CHUNK_SIZE_BYTES;
+  const telegramVideoChunkSizeBytes = env.DATABASE
+    ? await getTelegramVideoChunkSizeBytesSetting(env.DATABASE)
+    : DEFAULT_TELEGRAM_VIDEO_CHUNK_SIZE_BYTES;
+  const telegramTextChunkSizeBytes = env.DATABASE
+    ? await getTelegramTextChunkSizeBytesSetting(env.DATABASE)
+    : DEFAULT_TELEGRAM_TEXT_CHUNK_SIZE_BYTES;
+  const telegramImageChunkSizeBytes = env.DATABASE
+    ? await getTelegramImageChunkSizeBytesSetting(env.DATABASE)
+    : DEFAULT_TELEGRAM_IMAGE_CHUNK_SIZE_BYTES;
 
   return jsonResponse({
     ok: true,
@@ -759,6 +841,9 @@ async function handleAdminSession(request: Request, env: AppEnv, username: strin
     video_preview_cache_bytes_min: MIN_VIDEO_PREVIEW_CACHE_BYTES,
     video_preview_cache_bytes_max: MAX_VIDEO_PREVIEW_CACHE_BYTES,
     telegram_chunk_size_bytes: telegramChunkSizeBytes,
+    telegram_video_chunk_size_bytes: telegramVideoChunkSizeBytes,
+    telegram_text_chunk_size_bytes: telegramTextChunkSizeBytes,
+    telegram_image_chunk_size_bytes: telegramImageChunkSizeBytes,
     telegram_chunk_size_bytes_min: MIN_TELEGRAM_CHUNK_SIZE_BYTES,
     telegram_chunk_size_bytes_max: MAX_TELEGRAM_CHUNK_SIZE_BYTES,
     base_url: baseUrl,
@@ -802,6 +887,9 @@ async function handleAdminSettings(request: Request, env: AppEnv): Promise<Respo
     const currentUploadConcurrency = await getUploadConcurrencySetting(db);
     const currentVideoPreviewCacheBytes = await getVideoPreviewCacheBytesSetting(db);
     const currentTelegramChunkSizeBytes = await getTelegramChunkSizeBytesSetting(db);
+    const currentTelegramVideoChunkSizeBytes = await getTelegramVideoChunkSizeBytesSetting(db);
+    const currentTelegramTextChunkSizeBytes = await getTelegramTextChunkSizeBytesSetting(db);
+    const currentTelegramImageChunkSizeBytes = await getTelegramImageChunkSizeBytesSetting(db);
     const uploadConcurrency = body.upload_concurrency === undefined
       ? currentUploadConcurrency
       : positiveIntegerField(body.upload_concurrency, "upload_concurrency");
@@ -811,10 +899,22 @@ async function handleAdminSettings(request: Request, env: AppEnv): Promise<Respo
     const telegramChunkSizeBytes = body.telegram_chunk_size_bytes === undefined
       ? currentTelegramChunkSizeBytes
       : positiveIntegerField(body.telegram_chunk_size_bytes, "telegram_chunk_size_bytes");
+    const telegramVideoChunkSizeBytes = body.telegram_video_chunk_size_bytes === undefined
+      ? currentTelegramVideoChunkSizeBytes
+      : positiveIntegerField(body.telegram_video_chunk_size_bytes, "telegram_video_chunk_size_bytes");
+    const telegramTextChunkSizeBytes = body.telegram_text_chunk_size_bytes === undefined
+      ? currentTelegramTextChunkSizeBytes
+      : positiveIntegerField(body.telegram_text_chunk_size_bytes, "telegram_text_chunk_size_bytes");
+    const telegramImageChunkSizeBytes = body.telegram_image_chunk_size_bytes === undefined
+      ? currentTelegramImageChunkSizeBytes
+      : positiveIntegerField(body.telegram_image_chunk_size_bytes, "telegram_image_chunk_size_bytes");
     const updatedAt = new Date().toISOString();
     const savedUploadConcurrency = await setUploadConcurrencySetting(db, uploadConcurrency, updatedAt);
     const savedVideoPreviewCacheBytes = await setVideoPreviewCacheBytesSetting(db, videoPreviewCacheBytes, updatedAt);
     const savedTelegramChunkSizeBytes = await setTelegramChunkSizeBytesSetting(db, telegramChunkSizeBytes, updatedAt);
+    const savedTelegramVideoChunkSizeBytes = await setTelegramVideoChunkSizeBytesSetting(db, telegramVideoChunkSizeBytes, updatedAt);
+    const savedTelegramTextChunkSizeBytes = await setTelegramTextChunkSizeBytesSetting(db, telegramTextChunkSizeBytes, updatedAt);
+    const savedTelegramImageChunkSizeBytes = await setTelegramImageChunkSizeBytesSetting(db, telegramImageChunkSizeBytes, updatedAt);
     return jsonResponse({
       ok: true,
       settings: {
@@ -825,6 +925,9 @@ async function handleAdminSettings(request: Request, env: AppEnv): Promise<Respo
         video_preview_cache_bytes_min: MIN_VIDEO_PREVIEW_CACHE_BYTES,
         video_preview_cache_bytes_max: MAX_VIDEO_PREVIEW_CACHE_BYTES,
         telegram_chunk_size_bytes: savedTelegramChunkSizeBytes,
+        telegram_video_chunk_size_bytes: savedTelegramVideoChunkSizeBytes,
+        telegram_text_chunk_size_bytes: savedTelegramTextChunkSizeBytes,
+        telegram_image_chunk_size_bytes: savedTelegramImageChunkSizeBytes,
         telegram_chunk_size_bytes_min: MIN_TELEGRAM_CHUNK_SIZE_BYTES,
         telegram_chunk_size_bytes_max: MAX_TELEGRAM_CHUNK_SIZE_BYTES
       }
@@ -1883,23 +1986,29 @@ async function refreshMagnetMetadataFromStatus(
     const torrentFiles = await loadMagnetFilesFromSavedTorrent(importRecord.download_dir);
     if (torrentFiles && torrentFiles.length > 0) {
       const now = new Date().toISOString();
-      const telegramChunkSizeBytes = await getTelegramChunkSizeBytesSetting(db);
       await replaceMagnetImportFiles(
         db,
         importRecord.id,
-        torrentFiles.map((file) => ({
-          id: crypto.randomUUID(),
-          importId: importRecord.id,
-          fileIndex: file.fileIndex,
-          path: file.relativePath,
-          fileName: file.fileName,
-          relativeDirectoryPath: file.relativeDirectoryPath,
-          size: file.size,
-          mimeType: file.mimeType,
-          chunkSize: telegramChunkSizeBytes,
-          chunkCount: Math.ceil(file.size / telegramChunkSizeBytes),
-          createdAt: now,
-          updatedAt: now
+        await Promise.all(torrentFiles.map(async (file) => {
+          const chunkSizeBytes = await resolveTelegramChunkSizeBytes({
+            db,
+            mimeType: file.mimeType,
+            fileName: file.fileName
+          });
+          return {
+            id: crypto.randomUUID(),
+            importId: importRecord.id,
+            fileIndex: file.fileIndex,
+            path: file.relativePath,
+            fileName: file.fileName,
+            relativeDirectoryPath: file.relativeDirectoryPath,
+            size: file.size,
+            mimeType: file.mimeType,
+            chunkSize: chunkSizeBytes,
+            chunkCount: Math.ceil(file.size / chunkSizeBytes),
+            createdAt: now,
+            updatedAt: now
+          };
         })),
         {
           infoHash: magnetInfoHash(importRecord.magnet_uri),
@@ -1916,23 +2025,29 @@ async function refreshMagnetMetadataFromStatus(
   }
 
   const now = new Date().toISOString();
-  const telegramChunkSizeBytes = await getTelegramChunkSizeBytesSetting(db);
   await replaceMagnetImportFiles(
     db,
     importRecord.id,
-    files.map((file) => ({
-      id: crypto.randomUUID(),
-      importId: importRecord.id,
-      fileIndex: file.fileIndex,
-      path: file.relativePath,
-      fileName: file.fileName,
-      relativeDirectoryPath: file.relativeDirectoryPath,
-      size: file.size,
-      mimeType: file.mimeType,
-      chunkSize: telegramChunkSizeBytes,
-      chunkCount: Math.ceil(file.size / telegramChunkSizeBytes),
-      createdAt: now,
-      updatedAt: now
+    await Promise.all(files.map(async (file) => {
+      const chunkSizeBytes = await resolveTelegramChunkSizeBytes({
+        db,
+        mimeType: file.mimeType,
+        fileName: file.fileName
+      });
+      return {
+        id: crypto.randomUUID(),
+        importId: importRecord.id,
+        fileIndex: file.fileIndex,
+        path: file.relativePath,
+        fileName: file.fileName,
+        relativeDirectoryPath: file.relativeDirectoryPath,
+        size: file.size,
+        mimeType: file.mimeType,
+        chunkSize: chunkSizeBytes,
+        chunkCount: Math.ceil(file.size / chunkSizeBytes),
+        createdAt: now,
+        updatedAt: now
+      };
     })),
     {
       infoHash: magnetInfoHash(importRecord.magnet_uri),
@@ -1987,11 +2102,15 @@ async function initMagnetImportSelection(params: MagnetImportSelectionParams): P
 
   const uploadByFileIndex = new Map<number, string>();
   const uploads: Array<{ file_index: number; upload: Record<string, unknown>; target_directory_path: string }> = [];
-  const telegramChunkSizeBytes = await getTelegramChunkSizeBytesSetting(params.db);
   for (const file of files) {
-    validateMultipartFileSize(file.size, telegramChunkSizeBytes);
     const fileOption = params.fileOptions.get(file.file_index);
     const targetFileName = fileOption?.fileName ?? file.file_name;
+    const chunkSizeBytes = await resolveTelegramChunkSizeBytes({
+      db: params.db,
+      mimeType: file.mime_type,
+      fileName: targetFileName
+    });
+    validateMultipartFileSize(file.size, chunkSizeBytes);
     const targetConflictAction = fileOption?.conflictAction ?? params.conflictAction;
     const targetDirectoryPath = targetDirectoryForMagnetFile(params.directoryPath, file);
     const upload = await createMultipartUpload({
@@ -2001,7 +2120,7 @@ async function initMagnetImportSelection(params: MagnetImportSelectionParams): P
       fileName: targetFileName,
       mimeType: file.mime_type,
       size: file.size,
-      chunkSizeBytes: telegramChunkSizeBytes,
+      chunkSizeBytes,
       uploadedBy: params.uploadedBy,
       directoryId: null,
       directoryPath: targetDirectoryPath,
@@ -3282,6 +3401,12 @@ async function importHlsSegment(params: {
     const encryption = hlsSegmentEncryptionForAsset(asset, params.segmentIndex);
     const probe = await probeHlsSegmentSource(sourceUrl, sourceHeaders, byteRange);
     const mimeType = hlsMimeTypeForSegment(sourceUrl, probe.contentType);
+    const fileName = hlsSegmentFileName(sourceUrl, segment.segment_index);
+    const hlsVideoChunkSizeBytes = await resolveTelegramChunkSizeBytes({
+      db: params.db,
+      mimeType,
+      fileName
+    });
 
     if (probe.size !== undefined && probe.size > MAX_TELEGRAM_MULTIPART_BYTES) {
       throw fileTooLargeError(MAX_TELEGRAM_MULTIPART_BYTES, probe.size);
@@ -3312,7 +3437,6 @@ async function importHlsSegment(params: {
         );
       }
 
-      const fileName = hlsSegmentFileName(sourceUrl, segment.segment_index);
       const { telegramDocument, channel } = await uploadTelegramDocumentWithChannel({
         env: params.env,
         db: params.db,
@@ -3336,7 +3460,7 @@ async function importHlsSegment(params: {
       return hlsSegmentImportResult(params.db, await requireHlsSegment(params.db, params.asset.id, params.segmentIndex));
     }
 
-    if (probe.size !== undefined && probe.size > TELEGRAM_CHUNK_SIZE_BYTES) {
+    if (probe.size !== undefined && probe.size > hlsVideoChunkSizeBytes) {
       if (!probe.supportsRange) {
         throw new AppError(400, "RangeNotSupported", "较大的 HLS segment 必须支持 Range 请求");
       }
@@ -3358,8 +3482,7 @@ async function importHlsSegment(params: {
       };
     }
 
-    const blob = await downloadHlsSegmentBlob(sourceUrl, TELEGRAM_CHUNK_SIZE_BYTES, probe.size, sourceHeaders, byteRange);
-    const fileName = hlsSegmentFileName(sourceUrl, segment.segment_index);
+    const blob = await downloadHlsSegmentBlob(sourceUrl, hlsVideoChunkSizeBytes, probe.size, sourceHeaders, byteRange);
     const { telegramDocument, channel } = await uploadTelegramDocumentWithChannel({
       env: params.env,
       db: params.db,
@@ -4016,10 +4139,16 @@ async function ensureHlsSegmentMultipartUpload(params: {
     }
   }
 
-  validateMultipartFileSize(params.size);
-  const chunkCount = Math.ceil(params.size / TELEGRAM_CHUNK_SIZE_BYTES);
   const now = new Date().toISOString();
   const sourceUrl = new URL(params.segment.source_url);
+  const fileName = hlsSegmentFileName(sourceUrl, params.segment.segment_index);
+  const chunkSizeBytes = await resolveTelegramChunkSizeBytes({
+    db: params.db,
+    mimeType: params.mimeType,
+    fileName
+  });
+  validateMultipartFileSize(params.size, chunkSizeBytes);
+  const chunkCount = Math.ceil(params.size / chunkSizeBytes);
   const byteRange = hlsSegmentByteRange(params.segment);
   const upload = await insertMultipartUploadRecord(params.db, {
     id: crypto.randomUUID(),
@@ -4027,10 +4156,10 @@ async function ensureHlsSegmentMultipartUpload(params: {
     sourceUrl: params.segment.source_url,
     ...(params.asset.source_headers_json ? { sourceHeadersJson: params.asset.source_headers_json } : {}),
     ...(byteRange ? { sourceRangeStart: byteRange.offset } : {}),
-    fileName: hlsSegmentFileName(sourceUrl, params.segment.segment_index),
+    fileName,
     mimeType: params.mimeType,
     size: params.size,
-    chunkSize: TELEGRAM_CHUNK_SIZE_BYTES,
+    chunkSize: chunkSizeBytes,
     chunkCount,
     directoryId: params.asset.directory_id ?? null,
     directoryPath: params.asset.directory_path ?? "/",
@@ -4044,7 +4173,7 @@ async function ensureHlsSegmentMultipartUpload(params: {
     multipartUploadId: upload.id,
     mimeType: params.mimeType,
     size: params.size,
-    chunkSize: TELEGRAM_CHUNK_SIZE_BYTES,
+    chunkSize: chunkSizeBytes,
     chunkCount,
     updatedAt: now
   });
@@ -5637,7 +5766,11 @@ async function createMultipartUpload(params: {
   directoryPath: string;
   conflictAction?: FileNameConflictAction;
 }): Promise<MultipartInitResult> {
-  const chunkSizeBytes = params.chunkSizeBytes ?? await getTelegramChunkSizeBytesSetting(params.db);
+  const chunkSizeBytes = params.chunkSizeBytes ?? await resolveTelegramChunkSizeBytes({
+    db: params.db,
+    mimeType: params.mimeType,
+    fileName: params.fileName
+  });
   validateMultipartFileSize(params.size, chunkSizeBytes);
   await requireFileNameWritable({
     db: params.db,

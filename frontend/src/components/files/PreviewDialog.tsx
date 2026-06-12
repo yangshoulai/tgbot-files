@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Copy, Download, Maximize2, Minimize2 } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Copy, Download, Maximize, Maximize2, Minimize, Minimize2 } from "lucide-react";
 import type { FileItem } from "../../api";
 import { fileKind, formatBytes, previewKind } from "../../utils";
 import {
@@ -33,7 +33,9 @@ interface PreviewDialogProps {
 export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, videoPreviewCacheBytes, videoPreviewConcurrency }: PreviewDialogProps) {
   const preview = file ? previewKind(file) : null;
   const kind = file ? fileKind(file) : null;
-  const [fullscreen, setFullscreen] = useState(false);
+  const fullscreenTargetRef = useRef<HTMLDivElement>(null);
+  const [maximized, setMaximized] = useState(false);
+  const [nativeFullscreen, setNativeFullscreen] = useState(false);
   const [textState, setTextState] = useState<TextPreviewState>({ status: "idle", content: "" });
 
   useEffect(() => {
@@ -97,8 +99,20 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
   }, [file, preview]);
 
   useEffect(() => {
-    setFullscreen(false);
+    setMaximized(false);
+    setNativeFullscreen(false);
   }, [file?.id]);
+
+  useEffect(() => {
+    const onFullscreenChange = () => {
+      setNativeFullscreen(document.fullscreenElement === fullscreenTargetRef.current);
+    };
+
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    onFullscreenChange();
+
+    return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
+  }, []);
 
   if (!file || !kind) {
     return <Modal open={false} onClose={onClose}>{null}</Modal>;
@@ -108,13 +122,30 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
   const canAccelerateDownload = Boolean(onAcceleratedDownload);
   const canCopyContent = (preview === "text" || preview === "markdown") && textState.status === "ready";
   const isMediaPreview = preview === "video" || preview === "audio";
-  const toggleFullscreen = () => setFullscreen((value) => !value);
+  const toggleMaximized = () => setMaximized((value) => !value);
+  const toggleNativeFullscreen = useCallback(() => {
+    const target = fullscreenTargetRef.current;
+    if (!target) return;
+
+    if (document.fullscreenElement === target) {
+      void document.exitFullscreen().catch(() => undefined);
+      return;
+    }
+
+    void target.requestFullscreen().catch(() => undefined);
+  }, []);
+  const closePreview = useCallback(() => {
+    if (document.fullscreenElement === fullscreenTargetRef.current) {
+      void document.exitFullscreen().catch(() => undefined);
+    }
+    onClose();
+  }, [onClose]);
 
   return (
     <Modal
       open
-      onClose={onClose}
-      size={fullscreen ? "full" : "xl"}
+      onClose={closePreview}
+      size={maximized ? "full" : "xl"}
       title={
         <span className="flex min-w-0 items-center gap-3">
           <FileVisual
@@ -152,10 +183,19 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
           {!isMediaPreview ? (
             <Button
               variant="secondary"
-              leadingIcon={fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
-              onClick={toggleFullscreen}
+              leadingIcon={maximized ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+              onClick={toggleMaximized}
             >
-              {fullscreen ? "退出全屏" : "全屏"}
+              {maximized ? "还原" : "最大化"}
+            </Button>
+          ) : null}
+          {!isMediaPreview ? (
+            <Button
+              variant="secondary"
+              leadingIcon={nativeFullscreen ? <Minimize size={15} /> : <Maximize size={15} />}
+              onClick={toggleNativeFullscreen}
+            >
+              {nativeFullscreen ? "退出全屏" : "进入全屏"}
             </Button>
           ) : null}
           {canAccelerateDownload ? (
@@ -169,29 +209,50 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
           ) : null}
         </>
       }
-      bodyClassName={fullscreen ? "flex bg-background/40" : "bg-background/40"}
+      bodyClassName={maximized ? "flex bg-background/40" : "bg-background/40"}
     >
-      <PreviewFrame fullscreen={fullscreen} tone={previewTone(preview)}>
-        {preview === "image" ? (
-          <ImagePreview file={file} fullscreen={fullscreen} />
-        ) : preview === "video" ? (
-          <VideoPreview
-            file={file}
-            fullscreen={fullscreen}
-            onToggleFullscreen={toggleFullscreen}
-            videoPreviewCacheBytes={videoPreviewCacheBytes}
-            videoPreviewConcurrency={videoPreviewConcurrency}
-          />
-        ) : preview === "audio" ? (
-          <AudioPreview file={file} fullscreen={fullscreen} onToggleFullscreen={toggleFullscreen} />
-        ) : preview === "text" ? (
-          <TextPreview file={file} state={textState} fullscreen={fullscreen} />
-        ) : preview === "markdown" ? (
-          <MarkdownPreview state={textState} fullscreen={fullscreen} />
-        ) : (
-          <UnsupportedPreview file={file} />
-        )}
-      </PreviewFrame>
+      <div ref={fullscreenTargetRef} className="relative flex min-h-0 w-full bg-background">
+        {nativeFullscreen && !isMediaPreview ? (
+          <button
+            type="button"
+            onClick={toggleNativeFullscreen}
+            className="absolute right-4 top-4 z-30 inline-flex h-9 items-center gap-1.5 rounded-full border border-white/15 bg-black/55 px-3 text-xs font-medium text-white shadow-[0_12px_32px_rgba(0,0,0,0.35)] backdrop-blur-md transition-colors hover:bg-black/70 focus-visible:outline-none focus-visible:focus-ring"
+            aria-label="退出全屏"
+          >
+            <Minimize size={14} />
+            退出全屏
+          </button>
+        ) : null}
+        <PreviewFrame fullscreen={maximized || nativeFullscreen} tone={previewTone(preview)} className={nativeFullscreen ? "h-screen rounded-none border-0" : undefined}>
+          {preview === "image" ? (
+            <ImagePreview file={file} fullscreen={maximized || nativeFullscreen} />
+          ) : preview === "video" ? (
+            <VideoPreview
+              file={file}
+              maximized={maximized || nativeFullscreen}
+              onToggleMaximized={toggleMaximized}
+              nativeFullscreen={nativeFullscreen}
+              onToggleNativeFullscreen={toggleNativeFullscreen}
+              videoPreviewCacheBytes={videoPreviewCacheBytes}
+              videoPreviewConcurrency={videoPreviewConcurrency}
+            />
+          ) : preview === "audio" ? (
+            <AudioPreview
+              file={file}
+              fullscreen={maximized || nativeFullscreen}
+              onToggleMaximized={toggleMaximized}
+              nativeFullscreen={nativeFullscreen}
+              onToggleNativeFullscreen={toggleNativeFullscreen}
+            />
+          ) : preview === "text" ? (
+            <TextPreview file={file} state={textState} fullscreen={maximized || nativeFullscreen} />
+          ) : preview === "markdown" ? (
+            <MarkdownPreview state={textState} fullscreen={maximized || nativeFullscreen} />
+          ) : (
+            <UnsupportedPreview file={file} />
+          )}
+        </PreviewFrame>
+      </div>
     </Modal>
   );
 }
