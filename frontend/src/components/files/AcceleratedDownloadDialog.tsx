@@ -2,7 +2,6 @@ import { memo } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
-  Clock3,
   Download,
   Loader2,
   RotateCcw,
@@ -112,15 +111,21 @@ export function AcceleratedDownloadDialog({
           </span>
         </div>
 
-        <div className="flex flex-col gap-2">
-          <div className="h-2 overflow-hidden rounded-full bg-border">
+        <div className="rounded-2xl border border-border bg-surface p-3 shadow-card">
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <p className="text-xs font-semibold text-foreground">整体下载进度</p>
+            <p className="text-xs font-medium text-muted">
+              {formatBytes(stats.outputBytes)} / {formatBytes(state.totalBytes)}
+            </p>
+          </div>
+          <div className="h-3 overflow-hidden rounded-full bg-border">
             <div
-              className="h-full rounded-full bg-primary transition-[width] duration-300"
+              className="h-full rounded-full bg-primary shadow-[0_0_18px_rgba(16,185,129,0.28)] transition-[width] duration-300"
               style={{ width: `${stats.progress}%` }}
             />
           </div>
-          <div className="grid grid-cols-2 gap-2 text-xs text-muted lg:grid-cols-4">
-            <ProgressStat label="整体进度" value={`${formatBytes(stats.outputBytes)} / ${formatBytes(state.totalBytes)}`} />
+          <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-muted lg:grid-cols-4">
+            <ProgressStat label="整体进度" value={`${stats.progress}%`} />
             <ProgressStat label="分片完成" value={`${stats.completedChunks} / ${state.chunks.length}`} />
             <ProgressStat label="当前并发" value={`${stats.activeChunks} / ${state.concurrency}`} />
             <ProgressStat label="失败分片" value={`${stats.failedChunks}`} tone={stats.failedChunks > 0 ? "danger" : "default"} />
@@ -133,25 +138,24 @@ export function AcceleratedDownloadDialog({
           </p>
         ) : null}
 
-        <div className="rounded-2xl border border-border bg-surface">
-          <div className="flex items-center justify-between gap-3 border-b border-border px-3 py-2">
-            <p className="text-xs font-semibold text-foreground">分片明细</p>
-            <p className="text-xs text-muted">
-              每个请求对应一个 Telegram 分片
-            </p>
-          </div>
-          <div className="max-h-[38vh] overflow-auto scroll-thin p-2">
-            <div className="grid grid-cols-1 gap-2">
-              {state.chunks.map((chunk) => (
-                <MemoizedChunkRow
-                  key={chunk.index}
-                  chunk={chunk}
-                  totalChunks={state.chunks.length}
-                  onRetry={() => onRetryChunk(chunk.index)}
-                />
-              ))}
+        <div className="rounded-2xl border border-border bg-surface p-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-xs font-semibold text-foreground">分片状态</p>
+              <p className="mt-0.5 text-xs text-muted">每个小方块代表一个 Telegram 分片</p>
             </div>
+            <ChunkStatusLegend />
           </div>
+          <ChunkStatusGrid
+            chunks={state.chunks}
+            totalChunks={state.chunks.length}
+            onRetryChunk={onRetryChunk}
+          />
+          {stats.failedChunks > 0 ? (
+            <p className="mt-3 rounded-xl border border-danger/25 bg-danger-soft px-3 py-2 text-xs leading-5 text-danger">
+              红色分片下载异常，可点击红色小方块单独重试，或使用底部按钮批量重试失败分片。
+            </p>
+          ) : null}
         </div>
 
         <p className="rounded-xl border border-info/20 bg-info-soft px-3 py-2 text-xs leading-5 text-info">
@@ -162,12 +166,37 @@ export function AcceleratedDownloadDialog({
   );
 }
 
-const MemoizedChunkRow = memo(
-  ChunkRow,
+const MemoizedChunkTile = memo(
+  ChunkTile,
   (previous, next) => previous.chunk === next.chunk && previous.totalChunks === next.totalChunks
 );
 
-function ChunkRow({
+function ChunkStatusGrid({
+  chunks,
+  totalChunks,
+  onRetryChunk
+}: {
+  chunks: AcceleratedChunkState[];
+  totalChunks: number;
+  onRetryChunk: (chunkIndex: number) => void;
+}) {
+  return (
+    <div className="mt-3 rounded-xl border border-border bg-background/70 p-3">
+      <div className="flex flex-wrap gap-1.5">
+        {chunks.map((chunk) => (
+          <MemoizedChunkTile
+            key={chunk.index}
+            chunk={chunk}
+            totalChunks={totalChunks}
+            onRetry={() => onRetryChunk(chunk.index)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ChunkTile({
   chunk,
   totalChunks,
   onRetry
@@ -176,62 +205,78 @@ function ChunkRow({
   totalChunks: number;
   onRetry: () => void;
 }) {
-  const progress = chunk.size > 0
-    ? Math.min(100, Math.round((Math.min(chunk.downloadedBytes, chunk.size) / chunk.size) * 100))
-    : 0;
   const canRetry = chunk.status === "failed";
+  const label = `分片 ${chunk.index + 1} / ${totalChunks}：${chunkStatusText(chunk.status)}，${formatBytes(chunk.downloadedBytes)} / ${formatBytes(chunk.size)}${chunk.attempts > 0 ? `，第 ${chunk.attempts} 次` : ""}${chunk.errorMessage ? `，错误：${chunk.errorMessage}` : ""}`;
+
+  if (canRetry) {
+    return (
+      <button
+        type="button"
+        aria-label={`${label}，点击重试`}
+        title={`${label}，点击重试`}
+        onClick={onRetry}
+        className={chunkTileClass(chunk.status)}
+      />
+    );
+  }
 
   return (
-    <div className="rounded-xl border border-border bg-background/70 px-3 py-2">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="min-w-0">
-          <p className="text-sm font-semibold text-foreground">
-            分片 {chunk.index + 1} / {totalChunks}
-          </p>
-          <p className="mt-0.5 text-xs text-muted">
-            {formatBytes(chunk.downloadedBytes)} / {formatBytes(chunk.size)}
-            {chunk.attempts > 0 ? ` · 第 ${chunk.attempts} 次` : ""}
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <ChunkStatusBadge status={chunk.status} />
-          {canRetry ? (
-            <Button size="sm" variant="secondary" leadingIcon={<RotateCcw size={14} />} onClick={onRetry}>
-              重试
-            </Button>
-          ) : null}
-        </div>
-      </div>
-      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-border">
-        <div
-          className={chunk.status === "failed" ? "h-full rounded-full bg-danger" : "h-full rounded-full bg-primary"}
-          style={{ width: `${progress}%` }}
-        />
-      </div>
-      {chunk.errorMessage ? (
-        <p className="mt-2 overflow-anywhere text-xs leading-5 text-danger">
-          {chunk.errorMessage}
-        </p>
-      ) : null}
+    <span
+      aria-label={label}
+      title={label}
+      className={chunkTileClass(chunk.status)}
+      role="img"
+    />
+  );
+}
+
+function ChunkStatusLegend() {
+  return (
+    <div className="flex flex-wrap items-center justify-end gap-2 text-[11px] text-muted">
+      <LegendItem className="bg-border" label="等待" />
+      <LegendItem className="bg-warning" label="下载中" />
+      <LegendItem className="bg-primary" label="已完成" />
+      <LegendItem className="bg-danger" label="异常" />
     </div>
   );
 }
 
-function ChunkStatusBadge({ status }: { status: AcceleratedChunkStatus }) {
-  const config = {
-    queued: { label: "等待", className: "bg-border text-muted", icon: Clock3 },
-    downloading: { label: "下载中", className: "bg-info-soft text-info", icon: Loader2 },
-    completed: { label: "完成", className: "bg-success-soft text-success", icon: CheckCircle2 },
-    failed: { label: "失败", className: "bg-danger-soft text-danger", icon: AlertTriangle }
-  }[status];
-  const Icon = config.icon;
-
+function LegendItem({ className, label }: { className: string; label: string }) {
   return (
-    <span className={`inline-flex h-7 items-center gap-1.5 rounded-full px-2.5 text-xs font-semibold ${config.className}`}>
-      <Icon size={13} className={status === "downloading" ? "animate-spin" : undefined} />
-      {config.label}
+    <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+      <span className={`size-2.5 rounded-[3px] ${className}`} />
+      {label}
     </span>
   );
+}
+
+function chunkTileClass(status: AcceleratedChunkStatus): string {
+  const base = "size-3.5 rounded-[4px] border transition-[background-color,border-color,box-shadow,transform] duration-200 focus-visible:outline-none focus-visible:focus-ring";
+  switch (status) {
+    case "completed":
+      return `${base} border-primary/60 bg-primary shadow-[0_0_0_1px_rgba(16,185,129,0.08)]`;
+    case "downloading":
+      return `${base} animate-pulse border-warning/70 bg-warning shadow-[0_0_0_3px_rgba(245,158,11,0.12)]`;
+    case "failed":
+      return `${base} border-danger/70 bg-danger hover:scale-110 hover:shadow-[0_0_0_4px_rgba(239,68,68,0.14)]`;
+    case "queued":
+    default:
+      return `${base} border-border-strong bg-border`;
+  }
+}
+
+function chunkStatusText(status: AcceleratedChunkStatus): string {
+  switch (status) {
+    case "completed":
+      return "已完成";
+    case "downloading":
+      return "正在下载";
+    case "failed":
+      return "异常";
+    case "queued":
+    default:
+      return "等待";
+  }
 }
 
 function StatusIcon({ status }: { status: AcceleratedDownloadStatus }) {
