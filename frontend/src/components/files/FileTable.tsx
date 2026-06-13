@@ -788,7 +788,7 @@ function FileGridView({
           {directories.length} 个目录 · {files.length} 个文件 · 双击可打开或预览
         </p>
       </div>
-      <div className="grid gap-3 p-3 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 min-[1680px]:grid-cols-5">
+      <div className="grid gap-2.5 p-3 [grid-template-columns:repeat(auto-fill,minmax(13.75rem,1fr))]">
         {directories.map((directory) => {
           const selected = selectedDirectoryIds.has(directory.id);
 
@@ -801,44 +801,46 @@ function FileGridView({
                 onOpenDirectory(directory);
               }}
               className={cn(
-                "group relative flex min-h-44 flex-col rounded-2xl border bg-surface p-3 shadow-card transition-[border-color,box-shadow,transform,background-color] duration-150 hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-card-hover",
+                "group flex min-w-0 items-start gap-3 rounded-xl border bg-surface p-3 shadow-card transition-[border-color,box-shadow,transform,background-color] duration-150 hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-card-hover",
                 selected ? "border-primary/35 bg-primary-soft/25 ring-1 ring-primary/15" : "border-border"
               )}
             >
-              <div className="flex items-center justify-between gap-2">
-                <input
-                  type="checkbox"
-                  aria-label={`选择目录 ${directory.name}`}
-                  checked={selected}
-                  onChange={(event) => onToggleDirectorySelected(directory, event.target.checked)}
-                  className={checkboxClass}
-                />
-                <IconButton
-                  size="sm"
-                  variant="ghost"
-                  label="更多操作"
-                  onClick={(event) => openDirectoryActionsMenu(directory, event.currentTarget)}
-                >
-                  <MoreVertical size={16} />
-                </IconButton>
-              </div>
+              <input
+                type="checkbox"
+                aria-label={`选择目录 ${directory.name}`}
+                checked={selected}
+                onChange={(event) => onToggleDirectorySelected(directory, event.target.checked)}
+                className={cn(checkboxClass, "mt-1")}
+              />
 
               <button
                 type="button"
                 onClick={() => onOpenDirectory(directory)}
-                className="mt-3 flex min-h-0 flex-1 flex-col items-start rounded-xl text-left focus-visible:outline-none focus-visible:focus-ring"
+                className="flex min-w-0 flex-1 items-start gap-3 rounded-xl text-left focus-visible:outline-none focus-visible:focus-ring"
               >
-                <span className="grid size-14 place-items-center rounded-2xl bg-primary-soft text-primary-strong ring-1 ring-primary/15">
-                  <Folder size={28} />
+                <span className="grid size-12 shrink-0 place-items-center rounded-xl bg-primary-soft text-primary-strong ring-1 ring-primary/15">
+                  <Folder size={24} />
                 </span>
-                <span className="mt-4 overflow-hidden break-all text-sm font-semibold leading-5 text-foreground [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2]" title={directory.name}>
-                  {directory.name}
+                <span className="min-w-0 flex-1">
+                  <span className="overflow-hidden break-all text-sm font-semibold leading-5 text-foreground [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2]" title={directory.name}>
+                    {directory.name}
+                  </span>
+                  <span className="mt-1 block truncate text-xs text-muted">
+                    {directory.file_count} 个文件 · {formatBytes(directory.total_size)}
+                  </span>
+                  <span className="mt-0.5 block truncate text-xs text-subtle">{formatDateTime(directory.created_at)}</span>
                 </span>
-                <span className="mt-2 text-xs text-muted">
-                  {directory.file_count} 个文件 · {formatBytes(directory.total_size)}
-                </span>
-                <span className="mt-1 text-xs text-subtle">{formatDateTime(directory.created_at)}</span>
               </button>
+
+              <IconButton
+                size="sm"
+                variant="ghost"
+                label="更多操作"
+                onClick={(event) => openDirectoryActionsMenu(directory, event.currentTarget)}
+                className="-mr-1 -mt-1 shrink-0"
+              >
+                <MoreVertical size={16} />
+              </IconButton>
             </article>
           );
         })}
@@ -847,7 +849,6 @@ function FileGridView({
           const selected = selectedFileIds.has(file.id);
           const linkFile = hasFileLinkAccess(file) ? file : null;
           const kind = fileKind(file);
-          const mimeLabel = file.mime_type || "未知 MIME";
           const previewFromThumbnail = file.thumbnail_url ? () => onThumbnailPreview(file) : undefined;
           const canPreviewFile = canPreviewThroughAvailableAccess(file);
 
@@ -864,56 +865,53 @@ function FileGridView({
                 }
               }}
               className={cn(
-                "group flex min-h-56 flex-col rounded-2xl border bg-surface p-3 shadow-card transition-[border-color,box-shadow,transform,background-color] duration-150 hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-card-hover",
+                "group flex min-w-0 items-start gap-3 rounded-xl border bg-surface p-3 shadow-card transition-[border-color,box-shadow,transform,background-color] duration-150 hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-card-hover",
                 selected ? "border-primary/35 bg-primary-soft/25 ring-1 ring-primary/15" : "border-border"
               )}
             >
-              <div className="mb-3 flex items-center justify-between gap-2">
-                <input
-                  type="checkbox"
-                  aria-label={`选择 ${file.file_name}`}
-                  checked={selected}
-                  onChange={(event) => onToggleFileSelected(file, event.target.checked)}
-                  className={checkboxClass}
-                />
-                <IconButton
-                  size="sm"
-                  variant="ghost"
-                  label="更多操作"
-                  onClick={(event) => openFileActionsMenu(file, event.currentTarget)}
-                >
-                  <MoreVertical size={16} />
-                </IconButton>
-              </div>
+              <input
+                type="checkbox"
+                aria-label={`选择 ${file.file_name}`}
+                checked={selected}
+                onChange={(event) => onToggleFileSelected(file, event.target.checked)}
+                className={cn(checkboxClass, "mt-1")}
+              />
 
-              <div className="flex flex-1 flex-col">
+              <div className="flex min-w-0 flex-1 items-start gap-3">
                 <FileVisual
                   mimeType={file.mime_type}
                   fileName={file.file_name}
                   url={linkFile ? file.file_path : undefined}
                   thumbnailUrl={file.thumbnail_url}
-                  size="lg"
-                  className="mx-auto rounded-2xl"
+                  size="md"
+                  className="size-12 rounded-xl"
                   onClick={previewFromThumbnail}
                   actionLabel={`预览缩略图 ${file.file_name}`}
                 />
                 <button
                   type="button"
                   onClick={() => (canPreviewFile ? onPreview(file) : onDetail(file))}
-                  className="mt-4 min-w-0 rounded-xl text-left focus-visible:outline-none focus-visible:focus-ring"
+                  className="min-w-0 flex-1 rounded-xl text-left focus-visible:outline-none focus-visible:focus-ring"
                 >
                   <span className="overflow-hidden break-all text-sm font-semibold leading-5 text-foreground [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2]" title={file.file_name}>
                     {file.file_name}
                   </span>
-                  <span className="mt-2 block truncate text-xs text-muted">
-                    {kind.label} · {mimeLabel}
+                  <span className="mt-1 block truncate text-xs text-muted">
+                    {kind.label} · {formatBytes(file.size)}
                   </span>
-                  <span className="mt-1 block text-xs text-muted">
-                    {formatBytes(file.size)}
-                  </span>
+                  <span className="mt-0.5 block truncate text-xs text-subtle">{formatDateTime(file.created_at)}</span>
                 </button>
-                <div className="mt-auto pt-3 text-xs text-subtle">{formatDateTime(file.created_at)}</div>
               </div>
+
+              <IconButton
+                size="sm"
+                variant="ghost"
+                label="更多操作"
+                onClick={(event) => openFileActionsMenu(file, event.currentTarget)}
+                className="-mr-1 -mt-1 shrink-0"
+              >
+                <MoreVertical size={16} />
+              </IconButton>
             </article>
           );
         })}
