@@ -42,20 +42,20 @@ export function LoginPage({ onLoggedIn }: LoginPageProps) {
     <main className="relative grid min-h-dvh place-items-center overflow-hidden bg-background px-4 py-10">
       <div
         aria-hidden
-        className="pointer-events-none absolute inset-x-0 -top-32 h-96 bg-[radial-gradient(circle_at_50%_0%,var(--color-primary-soft),transparent_70%)]"
+        className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_-10%,rgba(16,185,129,0.2),transparent_34%),radial-gradient(circle_at_86%_14%,rgba(56,189,248,0.13),transparent_26%),linear-gradient(180deg,rgba(236,253,245,0.78),rgba(255,255,255,0)_26rem)]"
       />
-      <div className="relative w-full max-w-sm">
+      <div className="relative w-full max-w-md">
         <div className="mb-6 flex flex-col items-center gap-2 text-center">
-          <span className="grid size-12 place-items-center rounded-2xl bg-primary text-white shadow-dialog">
+          <span className="grid size-14 place-items-center rounded-3xl bg-primary text-white shadow-[0_22px_54px_rgba(16,185,129,0.28)]">
             <ShieldCheck size={22} />
           </span>
-          <h1 className="text-xl font-semibold text-foreground">文件仓库</h1>
-          <p className="text-sm text-muted">管理员入口 · 基于 Telegram 的轻量个人文件存储</p>
+          <h1 className="text-2xl font-semibold tracking-tight text-foreground">飞梭云盘</h1>
+          <p className="text-sm text-muted">管理员入口 · 轻量、私有、可分发的文件存储</p>
         </div>
 
         <form
           onSubmit={onSubmit}
-          className="flex flex-col gap-4 rounded-3xl border border-border bg-surface p-6 shadow-dialog"
+          className="flex flex-col gap-4 rounded-3xl border border-border bg-surface/92 p-6 shadow-dialog backdrop-blur-xl"
         >
           <div className="flex flex-col gap-1.5">
             <label htmlFor="login-username" className="text-xs font-medium text-muted">

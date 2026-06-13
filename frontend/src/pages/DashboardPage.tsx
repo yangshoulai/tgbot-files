@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, ChevronRight, FolderInput, FolderPlus, PanelLeftClose, PanelLeftOpen, Pencil, RefreshCw, Search, Trash2 } from "lucide-react";
+import { ArrowUp, ChevronRight, FolderInput, FolderPlus, LayoutGrid, List, PanelLeftClose, PanelLeftOpen, Pencil, RefreshCw, Search, Trash2, UploadCloud } from "lucide-react";
 import {
   ApiError,
   DirectoryItem,
@@ -27,6 +27,7 @@ import { Button } from "../components/ui/Button";
 import { Modal } from "../components/ui/Modal";
 import { Textarea } from "../components/ui/Textarea";
 import { Spinner } from "../components/ui/Spinner";
+import { Segmented } from "../components/ui/Segmented";
 import { MetricsRow, Metric } from "../components/files/MetricsRow";
 import { FileTable } from "../components/files/FileTable";
 import { PreviewDialog } from "../components/files/PreviewDialog";
@@ -55,6 +56,9 @@ import { canUseHlsAcceleratedDownload, hasFileLinkAccess, type LinkAccessibleFil
 type FileTypeFilter = "all" | "image" | "video" | "text" | "pdf" | "archive" | "other";
 type FileSortKey = "name" | "size" | "created_at" | "type";
 type SortDirection = "asc" | "desc";
+type FileLayoutMode = "list" | "grid";
+
+const FILE_LAYOUT_STORAGE_KEY = "tgbot-files-layout-mode";
 
 interface DashboardPageProps {
   session: SessionResponse;
@@ -78,6 +82,18 @@ const FILE_TYPE_OPTIONS: Array<{ value: FileTypeFilter; label: string }> = [
   { value: "archive", label: "压缩包" },
   { value: "other", label: "其他" }
 ];
+
+function initialFileLayoutMode(): FileLayoutMode {
+  if (typeof window === "undefined") {
+    return "list";
+  }
+
+  try {
+    return window.localStorage.getItem(FILE_LAYOUT_STORAGE_KEY) === "grid" ? "grid" : "list";
+  } catch {
+    return "list";
+  }
+}
 
 const collator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
 
@@ -212,6 +228,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   const [typeFilter, setTypeFilter] = useState<FileTypeFilter>("all");
   const [sortKey, setSortKey] = useState<FileSortKey>("created_at");
   const [sortDirection, setSortDirection] = useState<SortDirection>("desc");
+  const [fileLayoutMode, setFileLayoutMode] = useState<FileLayoutMode>(initialFileLayoutMode);
   const [loading, setLoading] = useState(false);
   const [operationLabel, setOperationLabel] = useState<string | null>(null);
   const [previewFile, setPreviewFile] = useState<FileItem | null>(null);
@@ -245,6 +262,15 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   const [acceleratedDownload, setAcceleratedDownload] = useState<AcceleratedDownloadState | null>(null);
   const listBusyLabel = operationLabel ?? (loading ? "正在加载目录内容..." : undefined);
   const isListBusy = Boolean(listBusyLabel);
+
+  const changeFileLayoutMode = useCallback((mode: FileLayoutMode) => {
+    setFileLayoutMode(mode);
+    try {
+      window.localStorage.setItem(FILE_LAYOUT_STORAGE_KEY, mode);
+    } catch {
+      // Ignore storage failures; the current in-memory selection still applies.
+    }
+  }, []);
 
   const loadFiles = useCallback(
     async () => {
@@ -1172,11 +1198,55 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
 
   return (
     <div className="flex flex-col gap-5">
-      <div>
-        <p className="text-xs font-medium uppercase tracking-wide text-muted">控制台</p>
-        <h1 className="mt-1 text-2xl font-semibold text-foreground sm:text-3xl">文件管理</h1>
-        <p className="mt-1 text-sm text-muted">上传、检索、预览与分发存储在 Telegram 中的文件。</p>
-      </div>
+      <section className="overflow-hidden rounded-3xl border border-border bg-surface shadow-card">
+        <div className="relative px-5 py-6 sm:px-7 lg:px-8">
+          <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_8%_0%,rgba(16,185,129,0.18),transparent_34%),radial-gradient(circle_at_88%_12%,rgba(56,189,248,0.12),transparent_30%),linear-gradient(135deg,rgba(236,253,245,0.82),rgba(255,255,255,0)_48%)]" />
+          <div className="relative flex flex-col gap-5 xl:flex-row xl:items-end xl:justify-between">
+            <div className="max-w-4xl">
+              <p className="inline-flex items-center rounded-full border border-primary/20 bg-primary-soft px-3 py-1 text-xs font-medium uppercase tracking-wide text-primary-strong">
+                控制台
+              </p>
+              <h1 className="mt-4 text-3xl font-semibold tracking-tight text-foreground sm:text-4xl">文件管理</h1>
+              <p className="mt-2 max-w-2xl text-sm leading-6 text-muted">
+                上传、检索、预览与分发存储在 Telegram 中的文件。当前目录{" "}
+                <span className="font-mono text-foreground">{currentDirPath}</span>
+              </p>
+              <div className="mt-4 flex flex-wrap gap-2 text-xs font-medium">
+                <span className="rounded-full border border-border bg-surface/80 px-3 py-1 text-muted">
+                  全站 {globalStats.file_count} 个文件
+                </span>
+                <span className="rounded-full border border-border bg-surface/80 px-3 py-1 text-muted">
+                  总容量 {formatBytes(globalStats.total_size)}
+                </span>
+                <span className="rounded-full border border-primary/20 bg-primary-soft px-3 py-1 text-primary-strong">
+                  {directoryOptions.length} 个目录
+                </span>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                variant="secondary"
+                leadingIcon={<FolderPlus size={16} />}
+                disabled={isListBusy}
+                onClick={() => {
+                  setCreateDirParentPath(currentDirPath);
+                  setCreateDirOpen(true);
+                }}
+              >
+                新建目录
+              </Button>
+              <Button
+                variant="primary"
+                leadingIcon={<UploadCloud size={16} />}
+                disabled={isListBusy}
+                onClick={() => onUploadToDirectory(currentDirPath)}
+              >
+                上传到当前目录
+              </Button>
+            </div>
+          </div>
+        </div>
+      </section>
 
       <MetricsRow metrics={metrics} />
 
@@ -1273,7 +1343,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
             </div>
           </div>
 
-          <div className="grid grid-cols-1 gap-2 lg:grid-cols-[minmax(240px,1fr)_145px_auto] lg:items-center">
+          <div className="grid grid-cols-1 gap-2 lg:grid-cols-[minmax(240px,1fr)_145px_auto] lg:items-center xl:grid-cols-[minmax(280px,1fr)_145px_auto]">
             <Input
               placeholder="搜索文件名、备注"
               leadingIcon={<Search size={15} />}
@@ -1292,7 +1362,17 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
                 </option>
               ))}
             </select>
-            <div className="flex items-center justify-end">
+            <div className="flex items-center justify-end gap-2">
+              <Segmented<FileLayoutMode>
+                value={fileLayoutMode}
+                onChange={changeFileLayoutMode}
+                ariaLabel="文件布局"
+                className="h-10"
+                options={[
+                  { value: "list", label: "列表", icon: <List size={15} /> },
+                  { value: "grid", label: "网格", icon: <LayoutGrid size={15} /> }
+                ]}
+              />
               <IconButton
                 variant="default"
                 label="刷新"
@@ -1370,6 +1450,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
                 onCopy={onCopy}
                 onAcceleratedDownload={(file) => void onAcceleratedDownload(file)}
                 onDelete={onDelete}
+                layout={fileLayoutMode}
               />
             </div>
             {listBusyLabel ? <FileListBusyOverlay label={listBusyLabel} /> : null}

@@ -49,6 +49,7 @@ type ContextMenuEntry =
 interface FileTableProps {
   directories: DirectoryItem[];
   files: FileItem[];
+  layout?: "list" | "grid";
   selectedFileIds: Set<string>;
   selectedDirectoryIds: Set<string>;
   allPageSelected: boolean;
@@ -122,6 +123,7 @@ function SortHeader({
 export function FileTable({
   directories,
   files,
+  layout = "list",
   selectedFileIds,
   selectedDirectoryIds,
   allPageSelected,
@@ -354,9 +356,50 @@ export function FileTable({
     return <EmptyState title="没有文件或子目录" description="试试调整搜索条件，或新建目录、上传文件。" />;
   }
 
+  const desktopLayout = layout === "grid" ? (
+    <FileGridView
+      directories={directories}
+      files={files}
+      allPageSelected={allPageSelected}
+      selectedFileIds={selectedFileIds}
+      selectedDirectoryIds={selectedDirectoryIds}
+      onOpenDirectory={onOpenDirectory}
+      onToggleFileSelected={onToggleFileSelected}
+      onToggleDirectorySelected={onToggleDirectorySelected}
+      onTogglePage={onTogglePage}
+      onDetail={onDetail}
+      onPreview={onPreview}
+      onThumbnailPreview={onThumbnailPreview}
+      openDirectoryContextMenu={openDirectoryContextMenu}
+      openFileContextMenu={openFileContextMenu}
+      openDirectoryActionsMenu={openDirectoryActionsMenu}
+      openFileActionsMenu={openFileActionsMenu}
+    />
+  ) : (
+    <FileListTableView
+      directories={directories}
+      files={files}
+      selectedFileIds={selectedFileIds}
+      selectedDirectoryIds={selectedDirectoryIds}
+      allPageSelected={allPageSelected}
+      sortKey={sortKey}
+      sortDirection={sortDirection}
+      onSort={onSort}
+      onOpenDirectory={onOpenDirectory}
+      onToggleFileSelected={onToggleFileSelected}
+      onToggleDirectorySelected={onToggleDirectorySelected}
+      onTogglePage={onTogglePage}
+      onDetail={onDetail}
+      onPreview={onPreview}
+      onThumbnailPreview={onThumbnailPreview}
+      openDirectoryContextMenu={openDirectoryContextMenu}
+      openFileContextMenu={openFileContextMenu}
+    />
+  );
+
   return (
     <div className="overflow-hidden rounded-2xl border border-border bg-surface shadow-card">
-      <div className="divide-y divide-border sm:hidden">
+      <div className={cn("divide-y divide-border sm:hidden", layout === "grid" && "hidden")}>
         {directories.map((directory) => (
           <div
             key={directory.id}
@@ -473,171 +516,7 @@ export function FileTable({
           );
         })}
       </div>
-      <div className="hidden overflow-x-hidden sm:block">
-        <table className="w-full table-fixed border-collapse text-sm">
-          <thead>
-            <tr className="border-b border-border bg-background/60">
-              <th className="w-10 px-4 py-3 align-middle font-medium text-muted">
-                <div className="flex h-full items-center">
-                  <input
-                    type="checkbox"
-                    aria-label="选择当前页内容"
-                    checked={allPageSelected}
-                    disabled={files.length === 0 && directories.length === 0}
-                    onChange={(event) => onTogglePage(event.target.checked)}
-                    className={checkboxClass}
-                  />
-                </div>
-              </th>
-              <SortHeader
-                label="文件"
-                sortId="name"
-                activeSort={sortKey}
-                direction={sortDirection}
-                onSort={onSort}
-                className="px-4 py-3 text-left font-medium text-muted"
-              />
-              <SortHeader
-                label="大小"
-                sortId="size"
-                activeSort={sortKey}
-                direction={sortDirection}
-                onSort={onSort}
-                className="hidden w-32 px-4 py-3 text-left font-medium text-muted lg:table-cell"
-              />
-              <SortHeader
-                label="上传时间"
-                sortId="created_at"
-                activeSort={sortKey}
-                direction={sortDirection}
-                onSort={onSort}
-                className="hidden w-44 px-4 py-3 text-left font-medium text-muted md:table-cell"
-              />
-            </tr>
-          </thead>
-          <tbody>
-            {directories.map((directory) => (
-              <tr
-                key={directory.id}
-                onContextMenu={(event) => openDirectoryContextMenu(event, directory)}
-                onDoubleClick={(event) => {
-                  if (isInteractiveTarget(event.target)) return;
-                  onOpenDirectory(directory);
-                }}
-                className={cn(
-                  "cursor-pointer border-b border-border last:border-b-0 transition-colors duration-150 hover:bg-primary-soft/25",
-                  selectedDirectoryIds.has(directory.id) && "bg-primary-soft/20"
-                )}
-              >
-                <td className="px-4 py-3 align-middle">
-                  <input
-                    type="checkbox"
-                    aria-label={`选择目录 ${directory.name}`}
-                    checked={selectedDirectoryIds.has(directory.id)}
-                    onChange={(event) => onToggleDirectorySelected(directory, event.target.checked)}
-                    className={checkboxClass}
-                  />
-                </td>
-                <td className="max-w-0 px-4 py-3 align-middle">
-                  <button
-                    type="button"
-                    onClick={() => onOpenDirectory(directory)}
-                    className="flex w-full min-w-0 items-center gap-3 text-left focus-visible:outline-none focus-visible:focus-ring"
-                  >
-                    <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-primary-soft text-primary-strong">
-                      <Folder size={20} />
-                    </span>
-                    <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                      <span className="truncate text-sm font-semibold text-foreground" title={directory.name}>
-                        {directory.name}
-                      </span>
-                      <span className="truncate text-xs text-muted">文件夹</span>
-                      <span className="truncate text-xs text-muted lg:hidden">
-                        {directory.file_count} 个文件 · {formatBytes(directory.total_size)}
-                      </span>
-                    </div>
-                  </button>
-                </td>
-                <td className="hidden whitespace-nowrap px-4 py-3 align-middle lg:table-cell">
-                  <div className="flex flex-col gap-0.5">
-                    <span className="text-sm text-foreground">{formatBytes(directory.total_size)}</span>
-                    <span className="text-xs text-muted">{directory.file_count} 个文件</span>
-                  </div>
-                </td>
-                <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted md:table-cell">
-                  {formatDateTime(directory.created_at)}
-                </td>
-              </tr>
-            ))}
-            {files.map((file) => {
-              const linkFile = hasFileLinkAccess(file) ? file : null;
-              const canPreviewFile = canPreviewThroughAvailableAccess(file);
-              const kind = fileKind(file);
-              const mimeLabel = file.mime_type || "未知 MIME";
-              const previewFromThumbnail = file.thumbnail_url ? () => onThumbnailPreview(file) : undefined;
-
-              return (
-                <tr
-                  key={file.id}
-                  onContextMenu={(event) => openFileContextMenu(event, file)}
-                  onDoubleClick={(event) => {
-                    if (isInteractiveTarget(event.target)) return;
-                    if (canPreviewFile) {
-                      onPreview(file);
-                    } else {
-                      onDetail(file);
-                    }
-                  }}
-                  className={cn(
-                    "cursor-default border-b border-border last:border-b-0 transition-colors duration-150 hover:bg-primary-soft/25",
-                    selectedFileIds.has(file.id) && "bg-primary-soft/20"
-                  )}
-                >
-                  <td className="px-4 py-3 align-middle">
-                    <input
-                      type="checkbox"
-                      aria-label={`选择 ${file.file_name}`}
-                      checked={selectedFileIds.has(file.id)}
-                      onChange={(event) => onToggleFileSelected(file, event.target.checked)}
-                      className={checkboxClass}
-                    />
-                  </td>
-                  <td className="max-w-0 px-4 py-3 align-middle">
-                    <div className="flex w-full min-w-0 items-center gap-3">
-                      <FileVisual
-                        mimeType={file.mime_type}
-                        fileName={file.file_name}
-                        url={linkFile ? file.file_path : undefined}
-                        thumbnailUrl={file.thumbnail_url}
-                        size="sm"
-                        onClick={previewFromThumbnail}
-                        actionLabel={`预览缩略图 ${file.file_name}`}
-                      />
-                      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                        <span className="truncate text-sm font-medium text-foreground" title={file.file_name}>
-                          {file.file_name}
-                        </span>
-                        <span className="truncate text-xs text-muted lg:hidden">
-                          {kind.label} · {mimeLabel} · {formatBytes(file.size)}
-                        </span>
-                        <span className="hidden truncate text-xs text-muted lg:inline">
-                          {kind.label} · {mimeLabel}
-                        </span>
-                      </div>
-                    </div>
-                  </td>
-                  <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-foreground lg:table-cell">
-                    {formatBytes(file.size)}
-                  </td>
-                  <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted md:table-cell">
-                    {formatDateTime(file.created_at)}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
+      {desktopLayout}
       {contextMenu ? (
         <ContextMenuSurface
           refNode={contextMenuRef}
@@ -646,6 +525,399 @@ export function FileTable({
           entries={contextMenuEntries(contextMenu)}
         />
       ) : null}
+    </div>
+  );
+}
+
+function FileListTableView({
+  directories,
+  files,
+  selectedFileIds,
+  selectedDirectoryIds,
+  allPageSelected,
+  sortKey,
+  sortDirection,
+  onSort,
+  onOpenDirectory,
+  onToggleFileSelected,
+  onToggleDirectorySelected,
+  onTogglePage,
+  onDetail,
+  onPreview,
+  onThumbnailPreview,
+  openDirectoryContextMenu,
+  openFileContextMenu
+}: {
+  directories: DirectoryItem[];
+  files: FileItem[];
+  selectedFileIds: Set<string>;
+  selectedDirectoryIds: Set<string>;
+  allPageSelected: boolean;
+  sortKey: FileSortKey;
+  sortDirection: SortDirection;
+  onSort: (key: FileSortKey) => void;
+  onOpenDirectory: (directory: DirectoryItem) => void;
+  onToggleFileSelected: (file: FileItem, selected: boolean) => void;
+  onToggleDirectorySelected: (directory: DirectoryItem, selected: boolean) => void;
+  onTogglePage: (selected: boolean) => void;
+  onDetail: (file: FileItem) => void;
+  onPreview: (file: FileItem) => void;
+  onThumbnailPreview: (file: FileItem) => void;
+  openDirectoryContextMenu: (event: MouseEvent, directory: DirectoryItem) => void;
+  openFileContextMenu: (event: MouseEvent, file: FileItem) => void;
+}) {
+  return (
+    <div className="hidden overflow-x-hidden sm:block">
+      <table className="w-full table-fixed border-collapse text-sm">
+        <thead>
+          <tr className="border-b border-border bg-background/70">
+            <th className="w-10 px-4 py-3 align-middle font-medium text-muted">
+              <div className="flex h-full items-center">
+                <input
+                  type="checkbox"
+                  aria-label="选择当前页内容"
+                  checked={allPageSelected}
+                  disabled={files.length === 0 && directories.length === 0}
+                  onChange={(event) => onTogglePage(event.target.checked)}
+                  className={checkboxClass}
+                />
+              </div>
+            </th>
+            <SortHeader
+              label="文件"
+              sortId="name"
+              activeSort={sortKey}
+              direction={sortDirection}
+              onSort={onSort}
+              className="px-4 py-3 text-left font-medium text-muted"
+            />
+            <SortHeader
+              label="大小"
+              sortId="size"
+              activeSort={sortKey}
+              direction={sortDirection}
+              onSort={onSort}
+              className="hidden w-32 px-4 py-3 text-left font-medium text-muted lg:table-cell"
+            />
+            <SortHeader
+              label="上传时间"
+              sortId="created_at"
+              activeSort={sortKey}
+              direction={sortDirection}
+              onSort={onSort}
+              className="hidden w-44 px-4 py-3 text-left font-medium text-muted md:table-cell"
+            />
+          </tr>
+        </thead>
+        <tbody>
+          {directories.map((directory) => (
+            <tr
+              key={directory.id}
+              onContextMenu={(event) => openDirectoryContextMenu(event, directory)}
+              onDoubleClick={(event) => {
+                if (isInteractiveTarget(event.target)) return;
+                onOpenDirectory(directory);
+              }}
+              className={cn(
+                "cursor-pointer border-b border-border last:border-b-0 transition-colors duration-150 hover:bg-primary-soft/25",
+                selectedDirectoryIds.has(directory.id) && "bg-primary-soft/20"
+              )}
+            >
+              <td className="px-4 py-3 align-middle">
+                <input
+                  type="checkbox"
+                  aria-label={`选择目录 ${directory.name}`}
+                  checked={selectedDirectoryIds.has(directory.id)}
+                  onChange={(event) => onToggleDirectorySelected(directory, event.target.checked)}
+                  className={checkboxClass}
+                />
+              </td>
+              <td className="max-w-0 px-4 py-3 align-middle">
+                <button
+                  type="button"
+                  onClick={() => onOpenDirectory(directory)}
+                  className="flex w-full min-w-0 items-center gap-3 text-left focus-visible:outline-none focus-visible:focus-ring"
+                >
+                  <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-primary-soft text-primary-strong">
+                    <Folder size={20} />
+                  </span>
+                  <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                    <span className="truncate text-sm font-semibold text-foreground" title={directory.name}>
+                      {directory.name}
+                    </span>
+                    <span className="truncate text-xs text-muted">文件夹</span>
+                    <span className="truncate text-xs text-muted lg:hidden">
+                      {directory.file_count} 个文件 · {formatBytes(directory.total_size)}
+                    </span>
+                  </div>
+                </button>
+              </td>
+              <td className="hidden whitespace-nowrap px-4 py-3 align-middle lg:table-cell">
+                <div className="flex flex-col gap-0.5">
+                  <span className="text-sm text-foreground">{formatBytes(directory.total_size)}</span>
+                  <span className="text-xs text-muted">{directory.file_count} 个文件</span>
+                </div>
+              </td>
+              <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted md:table-cell">
+                {formatDateTime(directory.created_at)}
+              </td>
+            </tr>
+          ))}
+          {files.map((file) => {
+            const linkFile = hasFileLinkAccess(file) ? file : null;
+            const canPreviewFile = canPreviewThroughAvailableAccess(file);
+            const kind = fileKind(file);
+            const mimeLabel = file.mime_type || "未知 MIME";
+            const previewFromThumbnail = file.thumbnail_url ? () => onThumbnailPreview(file) : undefined;
+
+            return (
+              <tr
+                key={file.id}
+                onContextMenu={(event) => openFileContextMenu(event, file)}
+                onDoubleClick={(event) => {
+                  if (isInteractiveTarget(event.target)) return;
+                  if (canPreviewFile) {
+                    onPreview(file);
+                  } else {
+                    onDetail(file);
+                  }
+                }}
+                className={cn(
+                  "cursor-default border-b border-border last:border-b-0 transition-colors duration-150 hover:bg-primary-soft/25",
+                  selectedFileIds.has(file.id) && "bg-primary-soft/20"
+                )}
+              >
+                <td className="px-4 py-3 align-middle">
+                  <input
+                    type="checkbox"
+                    aria-label={`选择 ${file.file_name}`}
+                    checked={selectedFileIds.has(file.id)}
+                    onChange={(event) => onToggleFileSelected(file, event.target.checked)}
+                    className={checkboxClass}
+                  />
+                </td>
+                <td className="max-w-0 px-4 py-3 align-middle">
+                  <div className="flex w-full min-w-0 items-center gap-3">
+                    <FileVisual
+                      mimeType={file.mime_type}
+                      fileName={file.file_name}
+                      url={linkFile ? file.file_path : undefined}
+                      thumbnailUrl={file.thumbnail_url}
+                      size="sm"
+                      onClick={previewFromThumbnail}
+                      actionLabel={`预览缩略图 ${file.file_name}`}
+                    />
+                    <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                      <span className="truncate text-sm font-medium text-foreground" title={file.file_name}>
+                        {file.file_name}
+                      </span>
+                      <span className="truncate text-xs text-muted lg:hidden">
+                        {kind.label} · {mimeLabel} · {formatBytes(file.size)}
+                      </span>
+                      <span className="hidden truncate text-xs text-muted lg:inline">
+                        {kind.label} · {mimeLabel}
+                      </span>
+                    </div>
+                  </div>
+                </td>
+                <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-foreground lg:table-cell">
+                  {formatBytes(file.size)}
+                </td>
+                <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted md:table-cell">
+                  {formatDateTime(file.created_at)}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function FileGridView({
+  directories,
+  files,
+  selectedFileIds,
+  selectedDirectoryIds,
+  allPageSelected,
+  onOpenDirectory,
+  onToggleFileSelected,
+  onToggleDirectorySelected,
+  onTogglePage,
+  onDetail,
+  onPreview,
+  onThumbnailPreview,
+  openDirectoryContextMenu,
+  openFileContextMenu,
+  openDirectoryActionsMenu,
+  openFileActionsMenu
+}: {
+  directories: DirectoryItem[];
+  files: FileItem[];
+  selectedFileIds: Set<string>;
+  selectedDirectoryIds: Set<string>;
+  allPageSelected: boolean;
+  onOpenDirectory: (directory: DirectoryItem) => void;
+  onToggleFileSelected: (file: FileItem, selected: boolean) => void;
+  onToggleDirectorySelected: (directory: DirectoryItem, selected: boolean) => void;
+  onTogglePage: (selected: boolean) => void;
+  onDetail: (file: FileItem) => void;
+  onPreview: (file: FileItem) => void;
+  onThumbnailPreview: (file: FileItem) => void;
+  openDirectoryContextMenu: (event: MouseEvent, directory: DirectoryItem) => void;
+  openFileContextMenu: (event: MouseEvent, file: FileItem) => void;
+  openDirectoryActionsMenu: (directory: DirectoryItem, anchor: HTMLElement) => void;
+  openFileActionsMenu: (file: FileItem, anchor: HTMLElement) => void;
+}) {
+  return (
+    <div className="bg-background/45">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-surface px-4 py-3">
+        <label className="inline-flex items-center gap-2 text-sm font-medium text-foreground">
+          <input
+            type="checkbox"
+            aria-label="选择当前页内容"
+            checked={allPageSelected}
+            disabled={files.length === 0 && directories.length === 0}
+            onChange={(event) => onTogglePage(event.target.checked)}
+            className={checkboxClass}
+          />
+          选择当前页
+        </label>
+        <p className="text-xs text-muted">
+          {directories.length} 个目录 · {files.length} 个文件 · 双击可打开或预览
+        </p>
+      </div>
+      <div className="grid gap-3 p-3 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 min-[1680px]:grid-cols-5">
+        {directories.map((directory) => {
+          const selected = selectedDirectoryIds.has(directory.id);
+
+          return (
+            <article
+              key={directory.id}
+              onContextMenu={(event) => openDirectoryContextMenu(event, directory)}
+              onDoubleClick={(event) => {
+                if (isInteractiveTarget(event.target)) return;
+                onOpenDirectory(directory);
+              }}
+              className={cn(
+                "group relative flex min-h-44 flex-col rounded-2xl border bg-surface p-3 shadow-card transition-[border-color,box-shadow,transform,background-color] duration-150 hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-card-hover",
+                selected ? "border-primary/35 bg-primary-soft/25 ring-1 ring-primary/15" : "border-border"
+              )}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <input
+                  type="checkbox"
+                  aria-label={`选择目录 ${directory.name}`}
+                  checked={selected}
+                  onChange={(event) => onToggleDirectorySelected(directory, event.target.checked)}
+                  className={checkboxClass}
+                />
+                <IconButton
+                  size="sm"
+                  variant="ghost"
+                  label="更多操作"
+                  onClick={(event) => openDirectoryActionsMenu(directory, event.currentTarget)}
+                >
+                  <MoreVertical size={16} />
+                </IconButton>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => onOpenDirectory(directory)}
+                className="mt-3 flex min-h-0 flex-1 flex-col items-start rounded-xl text-left focus-visible:outline-none focus-visible:focus-ring"
+              >
+                <span className="grid size-14 place-items-center rounded-2xl bg-primary-soft text-primary-strong ring-1 ring-primary/15">
+                  <Folder size={28} />
+                </span>
+                <span className="mt-4 overflow-hidden break-all text-sm font-semibold leading-5 text-foreground [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2]" title={directory.name}>
+                  {directory.name}
+                </span>
+                <span className="mt-2 text-xs text-muted">
+                  {directory.file_count} 个文件 · {formatBytes(directory.total_size)}
+                </span>
+                <span className="mt-1 text-xs text-subtle">{formatDateTime(directory.created_at)}</span>
+              </button>
+            </article>
+          );
+        })}
+
+        {files.map((file) => {
+          const selected = selectedFileIds.has(file.id);
+          const linkFile = hasFileLinkAccess(file) ? file : null;
+          const kind = fileKind(file);
+          const mimeLabel = file.mime_type || "未知 MIME";
+          const previewFromThumbnail = file.thumbnail_url ? () => onThumbnailPreview(file) : undefined;
+          const canPreviewFile = canPreviewThroughAvailableAccess(file);
+
+          return (
+            <article
+              key={file.id}
+              onContextMenu={(event) => openFileContextMenu(event, file)}
+              onDoubleClick={(event) => {
+                if (isInteractiveTarget(event.target)) return;
+                if (canPreviewFile) {
+                  onPreview(file);
+                } else {
+                  onDetail(file);
+                }
+              }}
+              className={cn(
+                "group flex min-h-56 flex-col rounded-2xl border bg-surface p-3 shadow-card transition-[border-color,box-shadow,transform,background-color] duration-150 hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-card-hover",
+                selected ? "border-primary/35 bg-primary-soft/25 ring-1 ring-primary/15" : "border-border"
+              )}
+            >
+              <div className="mb-3 flex items-center justify-between gap-2">
+                <input
+                  type="checkbox"
+                  aria-label={`选择 ${file.file_name}`}
+                  checked={selected}
+                  onChange={(event) => onToggleFileSelected(file, event.target.checked)}
+                  className={checkboxClass}
+                />
+                <IconButton
+                  size="sm"
+                  variant="ghost"
+                  label="更多操作"
+                  onClick={(event) => openFileActionsMenu(file, event.currentTarget)}
+                >
+                  <MoreVertical size={16} />
+                </IconButton>
+              </div>
+
+              <div className="flex flex-1 flex-col">
+                <FileVisual
+                  mimeType={file.mime_type}
+                  fileName={file.file_name}
+                  url={linkFile ? file.file_path : undefined}
+                  thumbnailUrl={file.thumbnail_url}
+                  size="lg"
+                  className="mx-auto rounded-2xl"
+                  onClick={previewFromThumbnail}
+                  actionLabel={`预览缩略图 ${file.file_name}`}
+                />
+                <button
+                  type="button"
+                  onClick={() => (canPreviewFile ? onPreview(file) : onDetail(file))}
+                  className="mt-4 min-w-0 rounded-xl text-left focus-visible:outline-none focus-visible:focus-ring"
+                >
+                  <span className="overflow-hidden break-all text-sm font-semibold leading-5 text-foreground [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2]" title={file.file_name}>
+                    {file.file_name}
+                  </span>
+                  <span className="mt-2 block truncate text-xs text-muted">
+                    {kind.label} · {mimeLabel}
+                  </span>
+                  <span className="mt-1 block text-xs text-muted">
+                    {formatBytes(file.size)}
+                  </span>
+                </button>
+                <div className="mt-auto pt-3 text-xs text-subtle">{formatDateTime(file.created_at)}</div>
+              </div>
+            </article>
+          );
+        })}
+      </div>
     </div>
   );
 }

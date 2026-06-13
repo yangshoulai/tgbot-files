@@ -26,18 +26,22 @@ export function Shell({ active, session, onNavigate, onLogout, onUpload, childre
   const [menuOpen, setMenuOpen] = useState(false);
 
   return (
-    <div className="flex min-h-dvh flex-col bg-background">
-      <header className="sticky top-0 z-30 border-b border-border bg-surface/80 backdrop-blur-md">
-        <div className="mx-auto flex h-14 max-w-7xl items-center gap-3 px-4 sm:h-16 sm:px-6 lg:px-8">
+    <div className="relative isolate flex min-h-dvh flex-col overflow-x-hidden bg-background">
+      <div
+        aria-hidden
+        className="pointer-events-none fixed inset-0 -z-10 bg-[radial-gradient(circle_at_12%_-8%,rgba(16,185,129,0.16),transparent_32%),radial-gradient(circle_at_88%_0%,rgba(56,189,248,0.12),transparent_30%),linear-gradient(180deg,rgba(236,253,245,0.72),rgba(255,255,255,0)_22rem)]"
+      />
+      <header className="sticky top-0 z-30 border-b border-border/80 bg-surface/85 shadow-[0_1px_0_rgba(15,23,42,0.03)] backdrop-blur-xl">
+        <div className="mx-auto flex h-14 max-w-[104rem] items-center gap-3 px-4 sm:h-16 sm:px-6 lg:px-8 xl:px-10">
           <button
             type="button"
             onClick={() => onNavigate("admin")}
             className="flex items-center gap-2 rounded-lg px-1.5 py-1 focus-visible:outline-none focus-visible:focus-ring"
           >
-            <span className="grid size-7 place-items-center rounded-lg bg-primary text-white shadow-card">
+            <span className="grid size-8 place-items-center rounded-xl bg-primary text-white shadow-[0_10px_24px_rgba(16,185,129,0.28)]">
               <Logo />
             </span>
-            <span className="text-base font-semibold text-foreground">TGBot Files</span>
+            <span className="text-base font-semibold tracking-tight text-foreground">飞梭云盘</span>
           </button>
 
           <nav className="ml-2 hidden items-center gap-1 sm:flex" aria-label="主导航">
@@ -163,7 +167,7 @@ export function Shell({ active, session, onNavigate, onLogout, onUpload, childre
         </nav>
       </header>
 
-      <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-6 sm:px-6 lg:px-8 lg:py-8">{children}</main>
+      <main className="mx-auto w-full max-w-[104rem] flex-1 px-4 py-6 sm:px-6 lg:px-8 lg:py-8 xl:px-10">{children}</main>
     </div>
   );
 }

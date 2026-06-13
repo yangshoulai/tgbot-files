@@ -69,7 +69,7 @@ export function ApiDocsPage({ session }: ApiDocsPageProps) {
 
   function exportMarkdown() {
     const markdown = [
-      "# TGBot Files API 文档",
+      "# 飞梭云盘 API 文档",
       "",
       `服务地址：${session.base_url}`,
       "",
@@ -81,7 +81,7 @@ export function ApiDocsPage({ session }: ApiDocsPageProps) {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = "tgbot-files-api-docs.md";
+    link.download = "feisuo-cloud-disk-api-docs.md";
     document.body.appendChild(link);
     link.click();
     link.remove();
