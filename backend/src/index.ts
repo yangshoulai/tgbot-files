@@ -84,6 +84,7 @@ import {
   touchApiKeyRecord,
   updateApiKeyRecord,
   updateFileRecordMetadata,
+  updateFileRecordThumbnail,
   updateMagnetImportFileStatus,
   updateMultipartUploadDirectory,
   updateTelegramChannelRecord,
@@ -235,7 +236,9 @@ interface ThumbnailSourceInfo {
 }
 
 interface ThumbnailInput {
-  file: File;
+  file?: File;
+  sourceUrl?: URL;
+  sourceHeaders?: RemoteRequestHeaders;
   width?: number;
   height?: number;
 }
@@ -702,7 +705,7 @@ async function handleApiFiles(request: Request, env: AppEnv): Promise<Response> 
   const url = new URL(request.url);
 
   if (request.method === "POST" && url.pathname === "/api/v1/files") {
-    const { file, directoryPath, conflictAction } = await readUploadInput(request, env);
+    const { file, directoryPath, conflictAction, thumbnail } = await readUploadInput(request, env);
     const directory = await ensureWritableDirectory(db, directoryPath);
     await requireFileNameWritable({
       db,
@@ -717,7 +720,8 @@ async function handleApiFiles(request: Request, env: AppEnv): Promise<Response> 
       db,
       directoryPath,
       directoryId: directory?.id ?? null,
-      conflictAction
+      conflictAction,
+      ...(thumbnail ? { thumbnail } : {})
     });
 
     return jsonResponse({
@@ -1032,8 +1036,60 @@ async function handleAdminFiles(request: Request, env: AppEnv, username: string)
     });
   }
 
+  const thumbnailMatch = /^\/api\/admin\/files\/([^/]+)\/thumbnail$/.exec(url.pathname);
+  if ((request.method === "PUT" || request.method === "PATCH" || request.method === "POST") && thumbnailMatch?.[1]) {
+    const id = decodeURIComponent(thumbnailMatch[1]);
+    const file = await requireFileRecord(db, id);
+    const thumbnail = await readThumbnailRequestInput(request);
+
+    if (!thumbnail) {
+      throw new AppError(400, "MissingThumbnail", "Thumbnail file or thumbnail_url is required");
+    }
+
+    const uploaded = await uploadThumbnailToTelegram({
+      request,
+      env,
+      db,
+      originalFileName: file.file_name,
+      thumbnail
+    });
+    const updated = await updateFileRecordThumbnail({
+      db,
+      id,
+      thumbnail: thumbnailRecordUpdateFields(uploaded)
+    });
+
+    if (!updated) {
+      throw new AppError(404, "NotFound", "File record not found");
+    }
+
+    return jsonResponse({
+      ok: true,
+      file: await serializeFileRecord(updated, getPublicBaseUrl(request, env), db)
+    });
+  }
+
+  if (request.method === "DELETE" && thumbnailMatch?.[1]) {
+    const id = decodeURIComponent(thumbnailMatch[1]);
+    await requireFileRecord(db, id);
+    const updated = await updateFileRecordThumbnail({
+      db,
+      id,
+      thumbnail: emptyThumbnailRecordUpdateFields()
+    });
+
+    if (!updated) {
+      throw new AppError(404, "NotFound", "File record not found");
+    }
+
+    return jsonResponse({
+      ok: true,
+      file: await serializeFileRecord(updated, getPublicBaseUrl(request, env), db)
+    });
+  }
+
   if (request.method === "POST" && url.pathname === "/api/admin/files") {
-    const { file: formFile, remark, directoryPath, conflictAction } = await readUploadInput(request, env);
+    const { file: formFile, remark, directoryPath, conflictAction, thumbnail } = await readUploadInput(request, env);
     const directory = await ensureWritableDirectory(db, directoryPath);
     await requireFileNameWritable({
       db,
@@ -1050,6 +1106,7 @@ async function handleAdminFiles(request: Request, env: AppEnv, username: string)
       directoryPath,
       directoryId: directory?.id ?? null,
       conflictAction,
+      ...(thumbnail ? { thumbnail } : {}),
       ...(remark ? { remark } : {})
     });
 
@@ -4720,6 +4777,7 @@ async function readUploadInput(request: Request, env: AppEnv): Promise<{
   remark?: string;
   directoryPath: string;
   conflictAction: FileNameConflictAction;
+  thumbnail?: ThumbnailInput;
 }> {
   const contentType = request.headers.get("Content-Type") || "";
   const normalizedContentType = contentType.toLowerCase();
@@ -4744,6 +4802,7 @@ async function readUploadInput(request: Request, env: AppEnv): Promise<{
   const remark = normalizeRemark(formData.get("remark"));
   const directoryPath = normalizeDirectoryPath(formData.get("directory_path") ?? formData.get("dir") ?? "/");
   const conflictAction = normalizeFileNameConflictAction(formData.get("on_conflict"));
+  const thumbnail = readThumbnailInputFromFormData(formData);
 
   if (formFile instanceof File) {
     validateUploadFileSize(formFile, maxFileBytes);
@@ -4753,6 +4812,7 @@ async function readUploadInput(request: Request, env: AppEnv): Promise<{
       file,
       directoryPath,
       conflictAction,
+      ...(thumbnail ? { thumbnail } : {}),
       ...(remark ? { remark } : {})
     };
   }
@@ -4771,6 +4831,7 @@ async function readUploadInput(request: Request, env: AppEnv): Promise<{
       file,
       directoryPath,
       conflictAction,
+      ...(thumbnail ? { thumbnail } : {}),
       ...(remark ? { remark } : {})
     };
   }
@@ -4783,6 +4844,7 @@ async function readUrlUploadJson(request: Request, env: AppEnv): Promise<{
   remark?: string;
   directoryPath: string;
   conflictAction: FileNameConflictAction;
+  thumbnail?: ThumbnailInput;
 }> {
   const maxFileBytes = parseMaxFileBytes(env.MAX_FILE_BYTES);
   const body = await readJsonObject(request);
@@ -4790,6 +4852,7 @@ async function readUrlUploadJson(request: Request, env: AppEnv): Promise<{
   const sourceHeaders = normalizeRemoteRequestHeaders(body.headers ?? body.source_headers ?? body.request_headers);
   const fileNameOverride = normalizeOptionalFileName(body.file_name);
   const conflictAction = normalizeFileNameConflictAction(body.on_conflict);
+  const thumbnail = readThumbnailInputFromRecord(body);
 
   if (!sourceUrl) {
     throw new AppError(400, "MissingUrl", "JSON field 'url' is required");
@@ -4809,6 +4872,7 @@ async function readUrlUploadJson(request: Request, env: AppEnv): Promise<{
     file,
     directoryPath,
     conflictAction,
+    ...(thumbnail ? { thumbnail } : {}),
     ...(remark ? { remark } : {})
   };
 }
@@ -4828,7 +4892,11 @@ async function readCompleteUploadInput(
   if (normalizedContentType.includes("application/json")) {
     const body = await request.json() as unknown;
     const bodyConflictAction = isPlainRecord(body) ? body.on_conflict : undefined;
-    return { conflictAction: normalizeFileNameConflictAction(bodyConflictAction ?? queryConflictAction) };
+    const thumbnail = isPlainRecord(body) ? readThumbnailInputFromRecord(body) : undefined;
+    return {
+      conflictAction: normalizeFileNameConflictAction(bodyConflictAction ?? queryConflictAction),
+      ...(thumbnail ? { thumbnail } : {})
+    };
   }
 
   if (!normalizedContentType.includes("multipart/form-data")) {
@@ -4837,18 +4905,11 @@ async function readCompleteUploadInput(
 
   const formData = await request.formData();
   const conflictAction = normalizeFileNameConflictAction(formData.get("on_conflict") ?? queryConflictAction);
-  const thumbnail = formData.get("thumbnail");
-
-  if (!(thumbnail instanceof File)) {
-    return { conflictAction };
-  }
+  const thumbnail = readThumbnailInputFromFormData(formData);
 
   return {
     conflictAction,
-    thumbnail: {
-      file: thumbnail,
-      ...optionalThumbnailDimensions(formData)
-    }
+    ...(thumbnail ? { thumbnail } : {})
   };
 }
 
@@ -4862,8 +4923,91 @@ function optionalThumbnailDimensions(formData: FormData): Pick<ThumbnailInput, "
   };
 }
 
+async function readThumbnailRequestInput(request: Request): Promise<ThumbnailInput | undefined> {
+  const contentType = request.headers.get("Content-Type") || "";
+  const normalizedContentType = contentType.toLowerCase();
+
+  if (normalizedContentType.includes("application/json")) {
+    return readThumbnailInputFromRecord(await readJsonObject(request));
+  }
+
+  if (!normalizedContentType.includes("multipart/form-data")) {
+    throw new AppError(400, "InvalidContentType", "Thumbnail update must use multipart/form-data or application/json");
+  }
+
+  return readThumbnailInputFromFormData(await request.formData());
+}
+
+function readThumbnailInputFromFormData(formData: FormData): ThumbnailInput | undefined {
+  const thumbnail = formData.get("thumbnail");
+  const dimensions = optionalThumbnailDimensions(formData);
+
+  if (thumbnail instanceof File) {
+    return {
+      file: thumbnail,
+      ...dimensions
+    };
+  }
+
+  const sourceUrl = normalizeSourceUrl(formData.get("thumbnail_url") ?? formData.get("thumbnail_source_url"));
+  if (!sourceUrl) {
+    return undefined;
+  }
+
+  const sourceHeaders = normalizeRemoteRequestHeaders(
+    formData.get("thumbnail_headers") ??
+    formData.get("thumbnail_source_headers") ??
+    formData.get("thumbnail_request_headers")
+  );
+
+  return {
+    sourceUrl,
+    ...(sourceHeaders ? { sourceHeaders } : {}),
+    ...dimensions
+  };
+}
+
+function readThumbnailInputFromRecord(body: Record<string, unknown>): ThumbnailInput | undefined {
+  const nested = isPlainRecord(body.thumbnail) ? body.thumbnail : undefined;
+  const sourceUrl = normalizeSourceUrl(
+    nested?.url ??
+    nested?.thumbnail_url ??
+    body.thumbnail_url ??
+    body.thumbnail_source_url
+  );
+
+  if (!sourceUrl) {
+    return undefined;
+  }
+
+  const sourceHeaders = normalizeRemoteRequestHeaders(
+    nested?.headers ??
+    nested?.thumbnail_headers ??
+    body.thumbnail_headers ??
+    body.thumbnail_source_headers ??
+    body.thumbnail_request_headers
+  );
+  const width = optionalBoundedIntegerValue(nested?.width ?? body.thumbnail_width, 1, 8192);
+  const height = optionalBoundedIntegerValue(nested?.height ?? body.thumbnail_height, 1, 8192);
+
+  return {
+    sourceUrl,
+    ...(sourceHeaders ? { sourceHeaders } : {}),
+    ...(width ? { width } : {}),
+    ...(height ? { height } : {})
+  };
+}
+
 function optionalBoundedInteger(value: FormDataEntryValue | null, min: number, max: number): number | undefined {
-  if (typeof value !== "string" || value.trim() === "") {
+  return optionalBoundedIntegerValue(value, min, max);
+}
+
+function optionalBoundedIntegerValue(value: unknown, min: number, max: number): number | undefined {
+  if (typeof value !== "string" && typeof value !== "number") {
+    return undefined;
+  }
+
+  if (typeof value === "string" && value.trim() === "") {
     return undefined;
   }
 
@@ -6686,32 +6830,22 @@ async function uploadThumbnailToTelegram(params: {
   thumbnail: ThumbnailInput;
 }): Promise<UploadedThumbnailResult> {
   const signingSecret = requireEnv(params.env, "LINK_SIGNING_SECRET");
-  const thumbnailBytes = await params.thumbnail.file.arrayBuffer();
-
-  validateThumbnailBytes(thumbnailBytes, params.thumbnail.file.type);
-
-  const mimeType = resolveStoredMimeType({
-    bytes: thumbnailBytes,
-    fileType: params.thumbnail.file.type
-  });
-  validateThumbnailMimeType(mimeType);
-
-  const thumbnailFileName = thumbnailFileNameFor(params.originalFileName, mimeType);
-  const thumbnailFile = new File([thumbnailBytes], thumbnailFileName, { type: mimeType });
+  const materialized = await materializeThumbnailFile(params);
+  const thumbnailFileName = materialized.file.name;
   const { telegramDocument, channel } = await uploadTelegramDocumentWithChannel({
     env: params.env,
     db: params.db,
-    file: thumbnailFile,
+    file: materialized.file,
     fileName: thumbnailFileName
   });
-  const thumbnailSize = telegramDocument.file_size ?? thumbnailFile.size;
+  const thumbnailSize = telegramDocument.file_size ?? materialized.file.size;
   const token = await createSignedToken(
     {
       v: 3,
       channel_id: channel.id,
       file_id: telegramDocument.file_id,
       name: thumbnailFileName,
-      mime_type: mimeType,
+      mime_type: materialized.mimeType,
       size: thumbnailSize,
       iat: Math.floor(Date.now() / 1000)
     },
@@ -6725,10 +6859,141 @@ async function uploadThumbnailToTelegram(params: {
     telegramChannelId: channel.id,
     ...(telegramDocument.file_unique_id ? { fileUniqueId: telegramDocument.file_unique_id } : {}),
     filePath,
-    mimeType,
+    mimeType: materialized.mimeType,
     size: thumbnailSize,
     ...(params.thumbnail.width ? { width: params.thumbnail.width } : {}),
     ...(params.thumbnail.height ? { height: params.thumbnail.height } : {})
+  };
+}
+
+async function materializeThumbnailFile(params: {
+  originalFileName: string;
+  thumbnail: ThumbnailInput;
+}): Promise<{ file: File; mimeType: string }> {
+  if (params.thumbnail.file) {
+    const thumbnailBytes = await params.thumbnail.file.arrayBuffer();
+    return thumbnailFileFromBytes({
+      bytes: thumbnailBytes,
+      fileType: params.thumbnail.file.type,
+      originalFileName: params.originalFileName
+    });
+  }
+
+  if (params.thumbnail.sourceUrl) {
+    return downloadThumbnailFileFromUrl({
+      sourceUrl: params.thumbnail.sourceUrl,
+      originalFileName: params.originalFileName,
+      ...(params.thumbnail.sourceHeaders ? { sourceHeaders: params.thumbnail.sourceHeaders } : {})
+    });
+  }
+
+  throw new AppError(400, "MissingThumbnail", "Thumbnail file or thumbnail_url is required");
+}
+
+async function downloadThumbnailFileFromUrl(params: {
+  sourceUrl: URL;
+  sourceHeaders?: RemoteRequestHeaders;
+  originalFileName: string;
+}): Promise<{ file: File; mimeType: string }> {
+  let response: Response;
+
+  try {
+    response = await fetch(params.sourceUrl.toString(), {
+      redirect: "follow",
+      headers: remoteFetchHeaders(params.sourceHeaders, { Accept: "image/jpeg,image/png,image/webp,image/*,*/*" })
+    });
+  } catch {
+    throw new AppError(502, "ThumbnailFetchFailed", "Failed to fetch thumbnail URL");
+  }
+
+  if (!response.ok) {
+    throw new AppError(
+      response.status >= 500 ? 502 : 400,
+      "ThumbnailFetchFailed",
+      `Thumbnail URL returned ${response.status}`,
+      { source_status: response.status }
+    );
+  }
+
+  const contentLength = parseContentLength(response.headers.get("Content-Length"));
+  if (contentLength !== undefined && contentLength > MAX_THUMBNAIL_BYTES) {
+    throw new AppError(400, "ThumbnailTooLarge", `Thumbnail must not exceed ${formatHumanFileSize(MAX_THUMBNAIL_BYTES)}`);
+  }
+
+  const bytes = await readResponseArrayBufferLimited(response, MAX_THUMBNAIL_BYTES);
+  const remoteName = inferRemoteFileName(params.sourceUrl, response.headers);
+  const fileType = pickRemoteMimeHint(response.headers.get("Content-Type"), remoteName);
+
+  return thumbnailFileFromBytes({
+    bytes,
+    fileType,
+    originalFileName: params.originalFileName
+  });
+}
+
+async function readResponseArrayBufferLimited(response: Response, maxBytes: number): Promise<ArrayBuffer> {
+  if (!response.body) {
+    const bytes = await response.arrayBuffer();
+    validateThumbnailBytes(bytes, response.headers.get("Content-Type") || "");
+    return bytes;
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      if (!value) {
+        continue;
+      }
+
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new AppError(400, "ThumbnailTooLarge", `Thumbnail must not exceed ${formatHumanFileSize(maxBytes)}`);
+      }
+      chunks.push(value);
+    }
+  } catch (error) {
+    if (error instanceof AppError) {
+      throw error;
+    }
+    throw new AppError(502, "ThumbnailFetchFailed", "Failed to read thumbnail URL response");
+  }
+
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  return output.buffer;
+}
+
+function thumbnailFileFromBytes(params: {
+  bytes: ArrayBuffer;
+  fileType: string | undefined;
+  originalFileName: string;
+}): { file: File; mimeType: string } {
+  validateThumbnailBytes(params.bytes, params.fileType ?? "");
+
+  const mimeType = resolveStoredMimeType({
+    bytes: params.bytes,
+    fileType: params.fileType
+  });
+  validateThumbnailMimeType(mimeType);
+
+  const thumbnailFileName = thumbnailFileNameFor(params.originalFileName, mimeType);
+  return {
+    file: new File([params.bytes], thumbnailFileName, { type: mimeType }),
+    mimeType
   };
 }
 
@@ -6777,6 +7042,32 @@ function thumbnailFileRecordFields(thumbnail: UploadedThumbnailResult | undefine
   };
 }
 
+function thumbnailRecordUpdateFields(thumbnail: UploadedThumbnailResult) {
+  return {
+    thumbnailFileId: thumbnail.fileId ?? null,
+    thumbnailFileUniqueId: thumbnail.fileUniqueId ?? null,
+    thumbnailFilePath: thumbnail.filePath ?? null,
+    thumbnailMimeType: thumbnail.mimeType ?? null,
+    thumbnailSize: thumbnail.size ?? null,
+    thumbnailWidth: thumbnail.width ?? null,
+    thumbnailHeight: thumbnail.height ?? null,
+    thumbnailStatus: thumbnail.status
+  };
+}
+
+function emptyThumbnailRecordUpdateFields() {
+  return {
+    thumbnailFileId: null,
+    thumbnailFileUniqueId: null,
+    thumbnailFilePath: null,
+    thumbnailMimeType: null,
+    thumbnailSize: null,
+    thumbnailWidth: null,
+    thumbnailHeight: null,
+    thumbnailStatus: "none" as const
+  };
+}
+
 function validateCompleteChunks(upload: MultipartUploadRecord, chunks: FileChunkRecord[]): void {
   if (chunks.length !== upload.chunk_count) {
     throw new AppError(409, "UploadIncomplete", "Not all chunks have been uploaded", {
@@ -6812,6 +7103,7 @@ async function uploadAndRecordFile(params: {
   directoryId?: string | null;
   directoryPath?: string;
   conflictAction?: FileNameConflictAction;
+  thumbnail?: ThumbnailInput;
 }): Promise<UploadResult> {
   const signingSecret = requireEnv(params.env, "LINK_SIGNING_SECRET");
   const id = crypto.randomUUID();
@@ -6857,6 +7149,15 @@ async function uploadAndRecordFile(params: {
   const publicName = encodeURIComponent(storedName);
   const filePath = `/f/${token}/${publicName}`;
   const publicUrl = `${baseUrl}${filePath}`;
+  const thumbnail = params.db
+    ? await uploadOptionalThumbnail({
+        request: params.request,
+        env: params.env,
+        db: params.db,
+        originalFileName: storedName,
+        thumbnail: params.thumbnail
+      })
+    : undefined;
 
   if (params.db) {
     const conflictAction = params.conflictAction ?? "error";
@@ -6881,6 +7182,7 @@ async function uploadAndRecordFile(params: {
         createdAt,
         directoryId: params.directoryId ?? null,
         directoryPath: params.directoryPath ?? "/",
+        ...thumbnailFileRecordFields(thumbnail),
         ...(params.remark ? { remark: params.remark } : {}),
         ...(telegramDocument.file_unique_id ? { telegramFileUniqueId: telegramDocument.file_unique_id } : {}),
         ...(params.uploadedBy ? { uploadedBy: params.uploadedBy } : {})
@@ -6905,7 +7207,8 @@ async function uploadAndRecordFile(params: {
     directoryPath: params.directoryPath ?? "/",
     storageBackend: "telegram_single",
     chunkSize: null,
-    chunkCount: null
+    chunkCount: null,
+    ...(thumbnail ? { thumbnail } : {})
   };
 }
 

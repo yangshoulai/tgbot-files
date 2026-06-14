@@ -446,6 +446,32 @@ class FakeDatabaseStatement {
       }
     }
 
+    if (normalizedSql.startsWith("UPDATE FILES") && normalizedSql.includes("SET") && normalizedSql.includes("THUMBNAIL_FILE_ID")) {
+      const [
+        thumbnailFileId,
+        thumbnailFileUniqueId,
+        thumbnailFilePath,
+        thumbnailMimeType,
+        thumbnailSize,
+        thumbnailWidth,
+        thumbnailHeight,
+        thumbnailStatus,
+        id
+      ] = this.bindings;
+      const file = this.db.files.find((item) => item.id === id && item.deleted_at === null);
+      if (file) {
+        file.thumbnail_file_id = thumbnailFileId === null ? null : String(thumbnailFileId);
+        file.thumbnail_file_unique_id = thumbnailFileUniqueId === null ? null : String(thumbnailFileUniqueId);
+        file.thumbnail_file_path = thumbnailFilePath === null ? null : String(thumbnailFilePath);
+        file.thumbnail_mime_type = thumbnailMimeType === null ? null : String(thumbnailMimeType);
+        file.thumbnail_size = thumbnailSize === null ? null : Number(thumbnailSize);
+        file.thumbnail_width = thumbnailWidth === null ? null : Number(thumbnailWidth);
+        file.thumbnail_height = thumbnailHeight === null ? null : Number(thumbnailHeight);
+        file.thumbnail_status = thumbnailStatus === "ready" || thumbnailStatus === "failed" ? thumbnailStatus : "none";
+        changes = 1;
+      }
+    }
+
     if (normalizedSql.startsWith("UPDATE FILES") && normalizedSql.includes("DIRECTORY_PATH = ? || SUBSTR")) {
       const [nextPath, , oldPath, likePattern] = this.bindings;
       const prefix = String(likePattern).replace(/\/%$/, "/");
@@ -5894,6 +5920,255 @@ video.mp4
       file_name: "new name.txt",
       remark: null,
       file_path: renameBody.file.file_path
+    });
+  });
+
+  it("updates an existing file thumbnail from multipart upload", async () => {
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      PUBLIC_BASE_URL: "https://cdn.example.com",
+      DATABASE: db as unknown as AppDatabase,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    db.files.push(fileRecord({
+      id: "file-thumb",
+      file_name: "movie.mp4",
+      mime_type: "video/mp4",
+      size: 1024,
+      telegram_file_id: "tg-movie"
+    }));
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const inputUrl = String(input);
+      if (inputUrl.endsWith("/sendDocument")) {
+        return jsonResponse({
+          ok: true,
+          result: {
+            document: {
+              file_id: "tg-thumbnail",
+              file_unique_id: "unique-thumbnail",
+              file_name: "movie.thumbnail.jpg",
+              mime_type: "image/jpeg",
+              file_size: 4
+            }
+          }
+        });
+      }
+
+      throw new Error(`Unexpected fetch ${inputUrl}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const cookie = await loginAndGetCookie(adminEnv);
+    const form = new FormData();
+    form.set("thumbnail", new File([new Uint8Array([0xff, 0xd8, 0xff, 0xd9])], "cover.jpg", { type: "image/jpeg" }));
+    form.set("thumbnail_width", "320");
+    form.set("thumbnail_height", "180");
+
+    const response = await handleRequest(
+      new Request("https://files.example.com/api/admin/files/file-thumb/thumbnail", {
+        method: "PUT",
+        headers: { Cookie: cookie },
+        body: form
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      ok: boolean;
+      file: {
+        thumbnail_status: string;
+        thumbnail_url: string | null;
+        thumbnail_file_id: string | null;
+        thumbnail_file_path: string | null;
+        thumbnail_width: number | null;
+        thumbnail_height: number | null;
+      };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.file.thumbnail_status).toBe("ready");
+    expect(body.file.thumbnail_file_id).toBe("tg-thumbnail");
+    expect(body.file.thumbnail_url).toMatch(/^https:\/\/cdn\.example\.com\/f\//);
+    expect(body.file.thumbnail_width).toBe(320);
+    expect(body.file.thumbnail_height).toBe(180);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(db.files[0]).toMatchObject({
+      thumbnail_file_id: "tg-thumbnail",
+      thumbnail_file_unique_id: "unique-thumbnail",
+      thumbnail_file_path: body.file.thumbnail_file_path,
+      thumbnail_mime_type: "image/jpeg",
+      thumbnail_size: 4,
+      thumbnail_width: 320,
+      thumbnail_height: 180,
+      thumbnail_status: "ready"
+    });
+  });
+
+  it("updates an existing file thumbnail from a remote URL with custom headers", async () => {
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      PUBLIC_BASE_URL: "https://cdn.example.com",
+      DATABASE: db as unknown as AppDatabase,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    db.files.push(fileRecord({
+      id: "file-thumb-url",
+      file_name: "remote-video.mp4",
+      mime_type: "video/mp4",
+      size: 2048,
+      telegram_file_id: "tg-remote-video"
+    }));
+    const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const sourceHeadersSeen: Array<{
+      accept: string | null;
+      authorization: string | null;
+      referer: string | null;
+    }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const inputUrl = String(input);
+      if (inputUrl === "https://images.example.com/cover.png") {
+        const headers = new Headers(init?.headers);
+        sourceHeadersSeen.push({
+          accept: headers.get("Accept"),
+          authorization: headers.get("Authorization"),
+          referer: headers.get("Referer")
+        });
+        return new Response(pngBytes, {
+          headers: {
+            "Content-Type": "image/png",
+            "Content-Length": String(pngBytes.byteLength)
+          }
+        });
+      }
+
+      if (inputUrl.endsWith("/sendDocument")) {
+        return jsonResponse({
+          ok: true,
+          result: {
+            document: {
+              file_id: "tg-thumbnail-url",
+              file_unique_id: "unique-thumbnail-url",
+              file_name: "remote-video.thumbnail.png",
+              mime_type: "image/png",
+              file_size: pngBytes.byteLength
+            }
+          }
+        });
+      }
+
+      throw new Error(`Unexpected fetch ${inputUrl}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const response = await handleRequest(
+      new Request("https://files.example.com/api/admin/files/file-thumb-url/thumbnail", {
+        method: "PUT",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          thumbnail_url: "https://images.example.com/cover.png",
+          thumbnail_headers: {
+            Authorization: "Bearer cover-token",
+            Referer: "https://images.example.com/gallery"
+          },
+          thumbnail_width: 640,
+          thumbnail_height: 360
+        })
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      file: {
+        thumbnail_status: string;
+        thumbnail_url: string | null;
+        thumbnail_file_id: string | null;
+        thumbnail_mime_type: string | null;
+        thumbnail_width: number | null;
+        thumbnail_height: number | null;
+      };
+    };
+
+    expect(response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(sourceHeadersSeen[0]).toMatchObject({
+      authorization: "Bearer cover-token",
+      referer: "https://images.example.com/gallery"
+    });
+    expect(sourceHeadersSeen[0]?.accept).toContain("image/png");
+    expect(body.file).toMatchObject({
+      thumbnail_status: "ready",
+      thumbnail_file_id: "tg-thumbnail-url",
+      thumbnail_mime_type: "image/png",
+      thumbnail_width: 640,
+      thumbnail_height: 360
+    });
+    expect(body.file.thumbnail_url).toMatch(/^https:\/\/cdn\.example\.com\/f\//);
+    expect(db.files[0]).toMatchObject({
+      thumbnail_file_id: "tg-thumbnail-url",
+      thumbnail_file_unique_id: "unique-thumbnail-url",
+      thumbnail_mime_type: "image/png",
+      thumbnail_size: pngBytes.byteLength,
+      thumbnail_status: "ready"
+    });
+  });
+
+  it("clears an existing file thumbnail", async () => {
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    db.files.push(fileRecord({
+      id: "file-thumb-clear",
+      thumbnail_file_id: "tg-thumbnail",
+      thumbnail_file_unique_id: "unique-thumbnail",
+      thumbnail_file_path: "/f/thumb-token/movie.thumbnail.jpg",
+      thumbnail_mime_type: "image/jpeg",
+      thumbnail_size: 4,
+      thumbnail_width: 320,
+      thumbnail_height: 180,
+      thumbnail_status: "ready"
+    }));
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    const response = await handleRequest(
+      new Request("https://files.example.com/api/admin/files/file-thumb-clear/thumbnail", {
+        method: "DELETE",
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      ok: boolean;
+      file: {
+        thumbnail_status: string;
+        thumbnail_url: string | null;
+        thumbnail_file_id: string | null;
+        thumbnail_file_path: string | null;
+      };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.file.thumbnail_status).toBe("none");
+    expect(body.file.thumbnail_url).toBeNull();
+    expect(body.file.thumbnail_file_id).toBeNull();
+    expect(body.file.thumbnail_file_path).toBeNull();
+    expect(db.files[0]).toMatchObject({
+      thumbnail_file_id: null,
+      thumbnail_file_unique_id: null,
+      thumbnail_file_path: null,
+      thumbnail_mime_type: null,
+      thumbnail_size: null,
+      thumbnail_width: null,
+      thumbnail_height: null,
+      thumbnail_status: "none"
     });
   });
 

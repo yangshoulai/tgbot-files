@@ -4,6 +4,8 @@ import Hls, { Events, type ErrorData } from "hls.js";
 export type ThumbnailKind = "image" | "video" | "audio";
 
 export interface GeneratedThumbnail extends ThumbnailUploadPayload {
+  blob: Blob;
+  fileName: string;
   objectUrl: string;
   source: "auto" | "manual";
 }

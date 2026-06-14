@@ -77,6 +77,17 @@ export interface NewFileRecord {
   thumbnailStatus?: ThumbnailStatus;
 }
 
+export interface UpdateFileThumbnailRecord {
+  thumbnailFileId: string | null;
+  thumbnailFileUniqueId: string | null;
+  thumbnailFilePath: string | null;
+  thumbnailMimeType: string | null;
+  thumbnailSize: number | null;
+  thumbnailWidth: number | null;
+  thumbnailHeight: number | null;
+  thumbnailStatus: ThumbnailStatus;
+}
+
 export interface FileListResult {
   files: FileRecord[];
   total: number;
@@ -760,6 +771,57 @@ export async function updateFileRecordMetadata(params: {
     file_name: params.fileName,
     remark: params.remark,
     file_path: params.filePath
+  };
+}
+
+export async function updateFileRecordThumbnail(params: {
+  db: AppDatabase;
+  id: string;
+  thumbnail: UpdateFileThumbnailRecord;
+}): Promise<FileRecord | null> {
+  const existing = await getFileRecord(params.db, params.id);
+
+  if (!existing) {
+    return null;
+  }
+
+  await params.db
+    .prepare(
+      `UPDATE files
+      SET
+        thumbnail_file_id = ?,
+        thumbnail_file_unique_id = ?,
+        thumbnail_file_path = ?,
+        thumbnail_mime_type = ?,
+        thumbnail_size = ?,
+        thumbnail_width = ?,
+        thumbnail_height = ?,
+        thumbnail_status = ?
+      WHERE id = ? AND deleted_at IS NULL`
+    )
+    .bind(
+      params.thumbnail.thumbnailFileId,
+      params.thumbnail.thumbnailFileUniqueId,
+      params.thumbnail.thumbnailFilePath,
+      params.thumbnail.thumbnailMimeType,
+      params.thumbnail.thumbnailSize,
+      params.thumbnail.thumbnailWidth,
+      params.thumbnail.thumbnailHeight,
+      params.thumbnail.thumbnailStatus,
+      params.id
+    )
+    .run();
+
+  return {
+    ...existing,
+    thumbnail_file_id: params.thumbnail.thumbnailFileId,
+    thumbnail_file_unique_id: params.thumbnail.thumbnailFileUniqueId,
+    thumbnail_file_path: params.thumbnail.thumbnailFilePath,
+    thumbnail_mime_type: params.thumbnail.thumbnailMimeType,
+    thumbnail_size: params.thumbnail.thumbnailSize,
+    thumbnail_width: params.thumbnail.thumbnailWidth,
+    thumbnail_height: params.thumbnail.thumbnailHeight,
+    thumbnail_status: params.thumbnail.thumbnailStatus
   };
 }
 

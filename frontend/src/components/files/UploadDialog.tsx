@@ -199,8 +199,18 @@ type UploadThumbnailStatus = "idle" | "generating" | "ready" | "failed" | "remov
 interface UploadThumbnailState {
   status: UploadThumbnailStatus;
   generated?: GeneratedThumbnail;
+  remote?: RemoteThumbnailInput;
   message?: string;
 }
+
+interface RemoteThumbnailInput {
+  url: string;
+  headers?: SourceRequestHeaders;
+}
+
+type ThumbnailUrlPickerTarget =
+  | { kind: "item"; id: string }
+  | { kind: "url" };
 
 interface ChunkQueueResult {
   completedChunks: number[];
@@ -308,6 +318,9 @@ export function UploadDialog({
   const [curlImportOpen, setCurlImportOpen] = useState(false);
   const [curlImportText, setCurlImportText] = useState("");
   const [curlImportError, setCurlImportError] = useState<string>();
+  const [thumbnailUrlPicker, setThumbnailUrlPicker] = useState<ThumbnailUrlPickerTarget | null>(null);
+  const [thumbnailUrlText, setThumbnailUrlText] = useState("");
+  const [thumbnailUrlError, setThumbnailUrlError] = useState<string>();
   const [urlUpload, setUrlUpload] = useState<UrlUploadState>({ status: "pending" });
   const [remark, setRemark] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -380,6 +393,9 @@ export function UploadDialog({
       setCurlImportOpen(false);
       setCurlImportText("");
       setCurlImportError(undefined);
+      setThumbnailUrlPicker(null);
+      setThumbnailUrlText("");
+      setThumbnailUrlError(undefined);
       setRemark("");
       setSubmitting(false);
       setCheckingConflicts(false);
@@ -398,6 +414,9 @@ export function UploadDialog({
     setCurlImportOpen(false);
     setCurlImportText("");
     setCurlImportError(undefined);
+    setThumbnailUrlPicker(null);
+    setThumbnailUrlText("");
+    setThumbnailUrlError(undefined);
     setUrlUpload((current) => {
       cleanupTemporaryHlsUpload(current);
       cleanupTemporaryMagnetUpload(current);
@@ -530,6 +549,47 @@ export function UploadDialog({
   const removeUrlThumbnail = () => {
     updateUrlThumbnail({ status: "removed", message: "已移除缩略图" });
   };
+
+  function openThumbnailUrlPicker(target: ThumbnailUrlPickerTarget) {
+    const existing = target.kind === "item"
+      ? items.find((item) => item.id === target.id)?.thumbnail?.remote
+      : urlUpload.thumbnail?.remote;
+    setThumbnailUrlPicker(target);
+    setThumbnailUrlText(existing?.url ?? "");
+    setThumbnailUrlError(undefined);
+  }
+
+  function closeThumbnailUrlPicker() {
+    setThumbnailUrlPicker(null);
+    setThumbnailUrlText("");
+    setThumbnailUrlError(undefined);
+  }
+
+  function applyThumbnailUrlPicker() {
+    if (!thumbnailUrlPicker) return;
+
+    try {
+      const parsed = parseRemoteThumbnailInput(thumbnailUrlText);
+      const thumbnail: UploadThumbnailState = {
+        status: "ready",
+        remote: {
+          url: parsed.url,
+          ...(parsed.headers ? { headers: parsed.headers } : {})
+        },
+        message: parsed.summary
+      };
+
+      if (thumbnailUrlPicker.kind === "item") {
+        updateItemThumbnail(thumbnailUrlPicker.id, thumbnail);
+      } else {
+        updateUrlThumbnail(thumbnail);
+      }
+
+      closeThumbnailUrlPicker();
+    } catch (error) {
+      setThumbnailUrlError(errorMessage(error));
+    }
+  }
 
   const uploadBusy = submitting || checkingConflicts;
   const filePendingCount = items.filter(isUploadableLocalItem).length;
@@ -1544,8 +1604,8 @@ export function UploadDialog({
   }
 
   async function resolveLocalThumbnailForUpload(target: QueueItem): Promise<ThumbnailUploadPayload | undefined> {
-    if (target.thumbnail?.status === "ready" && target.thumbnail.generated) {
-      return thumbnailPayload(target.thumbnail.generated);
+    if (target.thumbnail?.status === "ready") {
+      return thumbnailStatePayload(target.thumbnail);
     }
 
     if (target.thumbnail?.status === "removed" || !canAutoGenerateThumbnail(target.file)) {
@@ -1556,7 +1616,7 @@ export function UploadDialog({
       updateItemThumbnail(target.id, { status: "generating", message: "正在生成缩略图" });
       const generated = await generateThumbnailFromFile(target.file);
       updateItemThumbnail(target.id, { status: "ready", generated });
-      return thumbnailPayload(generated);
+      return generatedThumbnailPayload(generated);
     } catch (error) {
       updateItemThumbnail(target.id, {
         status: "failed",
@@ -1567,8 +1627,8 @@ export function UploadDialog({
   }
 
   async function resolveUrlThumbnailForUpload(source: MultipartUpload["thumbnail_source"] | undefined): Promise<ThumbnailUploadPayload | undefined> {
-    if (urlUpload.thumbnail?.status === "ready" && urlUpload.thumbnail.generated) {
-      return thumbnailPayload(urlUpload.thumbnail.generated);
+    if (urlUpload.thumbnail?.status === "ready") {
+      return thumbnailStatePayload(urlUpload.thumbnail);
     }
 
     if (urlUpload.thumbnail?.status === "removed" || !source?.available) {
@@ -1583,7 +1643,7 @@ export function UploadDialog({
         mime_type: source.mime_type
       }, remoteFileLabel(normalizedSourceUrl));
       updateUrlThumbnail({ status: "ready", generated });
-      return thumbnailPayload(generated);
+      return generatedThumbnailPayload(generated);
     } catch (error) {
       updateUrlThumbnail({
         status: "failed",
@@ -1616,7 +1676,7 @@ export function UploadDialog({
         url: magnetThumbnailSourceUrl(importId, fileIndex),
         mime_type: upload.mime_type
       }, upload.file_name);
-      return thumbnailPayload(generated);
+      return generatedThumbnailPayload(generated);
     } catch {
       return undefined;
     } finally {
@@ -2866,8 +2926,8 @@ export function UploadDialog({
   async function resolveHlsThumbnailForUpload(previewPlaylistUrl: string, fileName: string): Promise<ThumbnailUploadPayload | undefined> {
     const latest = urlUploadRef.current.thumbnail;
 
-    if (latest?.status === "ready" && latest.generated) {
-      return thumbnailPayload(latest.generated);
+    if (latest?.status === "ready") {
+      return thumbnailStatePayload(latest);
     }
 
     if (latest?.status === "removed") {
@@ -2880,7 +2940,7 @@ export function UploadDialog({
         return undefined;
       }
       if (generated) {
-        return thumbnailPayload(generated);
+        return generatedThumbnailPayload(generated);
       }
     }
 
@@ -2888,7 +2948,7 @@ export function UploadDialog({
     if (urlUploadRef.current.thumbnail?.status === "removed") {
       return undefined;
     }
-    return generated ? thumbnailPayload(generated) : undefined;
+    return generated ? generatedThumbnailPayload(generated) : undefined;
   }
 
   function startHlsThumbnailGeneration(
@@ -3019,8 +3079,8 @@ export function UploadDialog({
           label: syncedRetry.directAccess === false ? "正在生成文件索引" : "正在生成访问链接"
         }
       }));
-      const thumbnail = urlUpload.thumbnail?.status === "ready" && urlUpload.thumbnail.generated
-        ? thumbnailPayload(urlUpload.thumbnail.generated)
+      const thumbnail = urlUpload.thumbnail?.status === "ready"
+        ? thumbnailStatePayload(urlUpload.thumbnail)
         : undefined;
       await completeUploadOrRetryLater({
         ...syncedRetry,
@@ -3149,8 +3209,8 @@ export function UploadDialog({
         description={`上传到 ${uploadDirectoryPath}；按文件类型和系统配置自动选择分片大小，单文件上限 ${formatBytes(maxMultipartBytes)}，最多 ${effectiveUploadConcurrency} 分片并发`}
         size="wide"
         closeOnBackdrop={false}
-        closeOnEscape={!uploadBusy && !curlImportOpen}
-        trapFocus={!curlImportOpen}
+        closeOnEscape={!uploadBusy && !curlImportOpen && !thumbnailUrlPicker}
+        trapFocus={!curlImportOpen && !thumbnailUrlPicker}
         footer={
           <>
             {activeUploadKind ? (
@@ -3326,6 +3386,7 @@ export function UploadDialog({
                     onOverwriteConflict={item.conflict ? () => resolveItemConflict(item.id, "overwrite") : undefined}
                     onSkipConflict={item.conflict ? () => skipItemConflict(item.id) : undefined}
                     onThumbnailChange={(file) => void handleManualItemThumbnail(item.id, file)}
+                    onThumbnailUrl={() => openThumbnailUrlPicker({ kind: "item", id: item.id })}
                     onThumbnailRemove={() => removeItemThumbnail(item.id)}
                     onToggleChunks={() => toggleItemChunks(item.id)}
                     disabled={uploadBusy}
@@ -3490,6 +3551,7 @@ export function UploadDialog({
                 onOverwriteConflict={urlUpload.conflict ? () => resolveUrlConflict("overwrite") : undefined}
                 thumbnail={urlUpload.thumbnail}
                 onThumbnailChange={(file) => void handleManualUrlThumbnail(file)}
+                onThumbnailUrl={() => openThumbnailUrlPicker({ kind: "url" })}
                 onThumbnailRemove={removeUrlThumbnail}
                 disabled={uploadBusy}
               />
@@ -3571,6 +3633,65 @@ export function UploadDialog({
             支持 <span className="font-mono">-H/--header</span>、<span className="font-mono">-A/--user-agent</span>、
             <span className="font-mono">-e/--referer</span>、<span className="font-mono">-b/--cookie</span>、
             <span className="font-mono">-u/--user</span>。解析结果会覆盖当前 URL 和请求头；POST/body 参数不会转发，URL 上传仍要求源站支持 GET/HEAD/Range。
+          </div>
+        </div>
+      </Modal>
+
+      <Modal
+        open={Boolean(thumbnailUrlPicker)}
+        onClose={closeThumbnailUrlPicker}
+        title="从 URL 选择缩略图"
+        description="可粘贴图片 URL，或粘贴带 Referer/Cookie/Authorization 的 cURL。缩略图会由服务端拉取并转存。"
+        size="lg"
+        footer={
+          <>
+            <Button variant="secondary" onClick={closeThumbnailUrlPicker}>
+              取消
+            </Button>
+            <Button
+              variant="primary"
+              leadingIcon={<Check size={15} />}
+              disabled={!thumbnailUrlText.trim()}
+              onClick={applyThumbnailUrlPicker}
+            >
+              使用此缩略图
+            </Button>
+          </>
+        }
+      >
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="upload-thumbnail-url" className="text-xs font-medium text-muted">
+              缩略图 URL 或 cURL
+            </label>
+            <Textarea
+              id="upload-thumbnail-url"
+              rows={7}
+              placeholder={"https://example.com/cover.jpg\n\n或：\ncurl 'https://example.com/cover.jpg' \\\n  -H 'Referer: https://example.com/' \\\n  -H 'Cookie: session=...'"}
+              value={thumbnailUrlText}
+              invalid={Boolean(thumbnailUrlError)}
+              className="font-mono !text-[13px] !leading-6 !text-muted"
+              onChange={(event) => {
+                setThumbnailUrlText(event.target.value);
+                setThumbnailUrlError(undefined);
+              }}
+              onKeyDown={(event) => {
+                if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && thumbnailUrlText.trim()) {
+                  event.preventDefault();
+                  applyThumbnailUrlPicker();
+                }
+              }}
+            />
+          </div>
+
+          {thumbnailUrlError ? (
+            <div className="rounded-xl border border-danger/30 bg-danger-soft px-3 py-2 text-sm leading-6 text-danger">
+              {thumbnailUrlError}
+            </div>
+          ) : null}
+
+          <div className="rounded-xl border border-border bg-background px-3 py-2.5 text-xs leading-5 text-muted">
+            服务端会校验缩略图类型，仅接受 JPEG、PNG、WebP，大小不超过 512 KB。cURL 中的请求体不会转发。
           </div>
         </div>
       </Modal>
@@ -3684,6 +3805,45 @@ function curlImportSummary(headerCount: number, warnings: string[]): string {
     : "";
 
   return `${base}${warningText}${overflowText}`;
+}
+
+function parseRemoteThumbnailInput(input: string): { url: string; headers?: SourceRequestHeaders; summary: string } {
+  const text = input.trim();
+  if (!text) {
+    throw new Error("请输入缩略图 URL 或 cURL 命令");
+  }
+
+  if (/^(?:[$>]\s*)?curl(?:\.exe)?\b/i.test(text)) {
+    const parsed = parseCurlCommand(text);
+    const headerResult = sourceHeaderRowsFromCurlHeaders(parsed.headers);
+    const headers = parseSourceHeaderRows(headerResult.rows);
+    const warnings = [...parsed.warnings];
+    if (headerResult.skippedHeaders.length > 0) {
+      warnings.push(`已忽略 ${headerResult.skippedHeaders.length} 个不支持的请求头`);
+    }
+
+    return {
+      url: parsed.url,
+      ...(headers ? { headers } : {}),
+      summary: curlImportSummary(headerResult.headerCount, warnings).replace("URL", "缩略图 URL")
+    };
+  }
+
+  let url: URL;
+  try {
+    url = new URL(text);
+  } catch {
+    throw new Error("缩略图 URL 必须是完整的 http/https 地址");
+  }
+
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("缩略图 URL 必须使用 http 或 https");
+  }
+
+  return {
+    url: url.toString(),
+    summary: "URL 缩略图"
+  };
 }
 
 function parseSourceHeaderRows(rows: SourceHeaderRow[]): SourceRequestHeaders | undefined {
@@ -3977,13 +4137,32 @@ function normalizedFileNameOverride(value: string | undefined): string | undefin
   return normalized || undefined;
 }
 
-function thumbnailPayload(thumbnail: GeneratedThumbnail): ThumbnailUploadPayload {
+function generatedThumbnailPayload(thumbnail: GeneratedThumbnail): ThumbnailUploadPayload {
   return {
     blob: thumbnail.blob,
     fileName: thumbnail.fileName,
     ...(thumbnail.width ? { width: thumbnail.width } : {}),
     ...(thumbnail.height ? { height: thumbnail.height } : {})
   };
+}
+
+function thumbnailStatePayload(thumbnail: UploadThumbnailState | undefined): ThumbnailUploadPayload | undefined {
+  if (thumbnail?.status !== "ready") {
+    return undefined;
+  }
+
+  if (thumbnail.generated) {
+    return generatedThumbnailPayload(thumbnail.generated);
+  }
+
+  if (thumbnail.remote) {
+    return {
+      sourceUrl: thumbnail.remote.url,
+      ...(thumbnail.remote.headers ? { sourceHeaders: thumbnail.remote.headers } : {})
+    };
+  }
+
+  return undefined;
 }
 
 function isVideoUploadCandidate(upload: Pick<MultipartUpload, "mime_type" | "file_name">): boolean {
@@ -4608,6 +4787,7 @@ interface QueueRowProps {
   onOverwriteConflict?: () => void;
   onSkipConflict?: () => void;
   onThumbnailChange: (file: File) => void;
+  onThumbnailUrl: () => void;
   onThumbnailRemove: () => void;
   onToggleChunks: () => void;
   disabled: boolean;
@@ -4626,6 +4806,7 @@ function QueueRow({
   onOverwriteConflict,
   onSkipConflict,
   onThumbnailChange,
+  onThumbnailUrl,
   onThumbnailRemove,
   onToggleChunks,
   disabled
@@ -4677,6 +4858,7 @@ function QueueRow({
           <ThumbnailPicker
             disabled={disabled || status === "uploading"}
             onChange={onThumbnailChange}
+            onUrl={onThumbnailUrl}
             onRemove={onThumbnailRemove}
             hasThumbnail={item.thumbnail?.status === "ready"}
           />
@@ -4750,6 +4932,7 @@ interface UrlUploadRowProps {
   onRenameConflict?: () => void;
   onOverwriteConflict?: () => void;
   onThumbnailChange: (file: File) => void;
+  onThumbnailUrl: () => void;
   onThumbnailRemove: () => void;
   disabled: boolean;
 }
@@ -4786,6 +4969,7 @@ function UrlUploadRow({
   onRenameConflict,
   onOverwriteConflict,
   onThumbnailChange,
+  onThumbnailUrl,
   onThumbnailRemove,
   disabled
 }: UrlUploadRowProps) {
@@ -4859,6 +5043,7 @@ function UrlUploadRow({
             <ThumbnailPicker
               disabled={disabled || status === "uploading"}
               onChange={onThumbnailChange}
+              onUrl={onThumbnailUrl}
               onRemove={onThumbnailRemove}
               hasThumbnail={thumbnail?.status === "ready"}
             />
@@ -5329,6 +5514,14 @@ function UploadThumbnailVisual({
     );
   }
 
+  if (thumbnail?.status === "ready" && thumbnail.remote) {
+    return (
+      <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-primary-soft text-primary-strong ring-1 ring-primary/15">
+        <Link2 size={16} />
+      </span>
+    );
+  }
+
   if (thumbnail?.status === "generating") {
     return (
       <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-primary-soft text-primary-strong ring-1 ring-primary/15">
@@ -5343,16 +5536,18 @@ function UploadThumbnailVisual({
 function ThumbnailPicker({
   disabled,
   onChange,
+  onUrl,
   onRemove,
   hasThumbnail
 }: {
   disabled: boolean;
   onChange: (file: File) => void;
+  onUrl: () => void;
   onRemove: () => void;
   hasThumbnail: boolean;
 }) {
   return (
-    <span className="hidden shrink-0 items-center gap-0.5 sm:inline-flex">
+    <span className="inline-flex shrink-0 items-center gap-0.5">
       <label
         className={cn(
           "grid size-6 cursor-pointer place-items-center rounded-md text-subtle transition-colors hover:bg-primary-soft hover:text-primary-strong",
@@ -5373,6 +5568,15 @@ function ThumbnailPicker({
           }}
         />
       </label>
+      <button
+        type="button"
+        className="grid size-6 place-items-center rounded-md text-subtle transition-colors hover:bg-primary-soft hover:text-primary-strong disabled:pointer-events-none disabled:opacity-40"
+        disabled={disabled}
+        title={hasThumbnail ? "从 URL 更换缩略图" : "从 URL 选择缩略图"}
+        onClick={onUrl}
+      >
+        <Link2 size={13} />
+      </button>
       {hasThumbnail ? (
         <button
           type="button"
@@ -5395,6 +5599,7 @@ function thumbnailHint(thumbnail: UploadThumbnailState | undefined): string | un
     case "generating":
       return thumbnail.message || "正在生成缩略图";
     case "ready":
+      if (thumbnail.remote) return "URL 缩略图";
       return thumbnail.generated?.source === "manual" ? "手动缩略图" : "已生成缩略图";
     case "failed":
       return thumbnail.message || "缩略图失败";

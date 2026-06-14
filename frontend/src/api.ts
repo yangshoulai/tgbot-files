@@ -868,9 +868,7 @@ export function completeMagnetMultipartUpload(
   if (conflictAction && conflictAction !== "error") {
     form.set("on_conflict", conflictAction);
   }
-  form.set("thumbnail", thumbnail.blob, thumbnail.fileName);
-  if (thumbnail.width) form.set("thumbnail_width", String(thumbnail.width));
-  if (thumbnail.height) form.set("thumbnail_height", String(thumbnail.height));
+  appendThumbnailToForm(form, thumbnail);
 
   return requestJson<AdminUploadResponse>(path, {
     method: "POST",
@@ -980,10 +978,26 @@ export function cancelHlsUpload(assetId: string, signal?: AbortSignal) {
 }
 
 export interface ThumbnailUploadPayload {
-  blob: Blob;
-  fileName: string;
+  blob?: Blob;
+  fileName?: string;
+  sourceUrl?: string;
+  sourceHeaders?: SourceRequestHeaders;
   width?: number;
   height?: number;
+}
+
+function appendThumbnailToForm(form: FormData, thumbnail: ThumbnailUploadPayload) {
+  if (thumbnail.blob) {
+    form.set("thumbnail", thumbnail.blob, thumbnail.fileName || "thumbnail.jpg");
+  } else if (thumbnail.sourceUrl) {
+    form.set("thumbnail_url", thumbnail.sourceUrl);
+    if (thumbnail.sourceHeaders && Object.keys(thumbnail.sourceHeaders).length > 0) {
+      form.set("thumbnail_headers", JSON.stringify(thumbnail.sourceHeaders));
+    }
+  }
+
+  if (thumbnail.width) form.set("thumbnail_width", String(thumbnail.width));
+  if (thumbnail.height) form.set("thumbnail_height", String(thumbnail.height));
 }
 
 export function completeMultipartUpload(
@@ -1013,9 +1027,7 @@ export function completeMultipartUpload(
   if (conflictAction && conflictAction !== "error") {
     form.set("on_conflict", conflictAction);
   }
-  form.set("thumbnail", thumbnail.blob, thumbnail.fileName);
-  if (thumbnail.width) form.set("thumbnail_width", String(thumbnail.width));
-  if (thumbnail.height) form.set("thumbnail_height", String(thumbnail.height));
+  appendThumbnailToForm(form, thumbnail);
 
   return requestJson<AdminUploadResponse>(path, {
     method: "POST",
@@ -1051,14 +1063,28 @@ export function completeHlsUpload(
   if (conflictAction && conflictAction !== "error") {
     form.set("on_conflict", conflictAction);
   }
-  form.set("thumbnail", thumbnail.blob, thumbnail.fileName);
-  if (thumbnail.width) form.set("thumbnail_width", String(thumbnail.width));
-  if (thumbnail.height) form.set("thumbnail_height", String(thumbnail.height));
+  appendThumbnailToForm(form, thumbnail);
 
   return requestJson<AdminUploadResponse>(path, {
     method: "POST",
     signal,
     body: form
+  });
+}
+
+export function updateFileThumbnail(id: string, thumbnail: ThumbnailUploadPayload) {
+  const form = new FormData();
+  appendThumbnailToForm(form, thumbnail);
+
+  return requestJson<FileUpdateResponse>(`/api/admin/files/${encodeURIComponent(id)}/thumbnail`, {
+    method: "PUT",
+    body: form
+  });
+}
+
+export function clearFileThumbnail(id: string) {
+  return requestJson<FileUpdateResponse>(`/api/admin/files/${encodeURIComponent(id)}/thumbnail`, {
+    method: "DELETE"
   });
 }
 

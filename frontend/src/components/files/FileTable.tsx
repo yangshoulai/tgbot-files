@@ -10,6 +10,7 @@ import {
   FolderInput,
   FolderOpen,
   Info,
+  ImagePlus,
   Pencil,
   MoreVertical,
   Trash2,
@@ -66,6 +67,7 @@ interface FileTableProps {
   onTogglePage: (selected: boolean) => void;
   onDetail: (file: FileItem) => void;
   onEdit: (file: FileItem) => void;
+  onEditThumbnail: (file: FileItem) => void;
   onMoveFile: (file: FileItem) => void;
   onPreview: (file: FileItem) => void;
   onThumbnailPreview: (file: FileItem) => void;
@@ -140,6 +142,7 @@ export function FileTable({
   onTogglePage,
   onDetail,
   onEdit,
+  onEditThumbnail,
   onMoveFile,
   onPreview,
   onThumbnailPreview,
@@ -316,6 +319,13 @@ export function FileTable({
         label: "重命名 / 编辑信息",
         icon: <Pencil size={15} />,
         onSelect: () => runContextAction(() => onEdit(file))
+      },
+      {
+        type: "item",
+        key: "thumbnail",
+        label: "修改缩略图",
+        icon: <ImagePlus size={15} />,
+        onSelect: () => runContextAction(() => onEditThumbnail(file))
       },
       {
         type: "item",
@@ -788,7 +798,7 @@ function FileGridView({
           {directories.length} 个目录 · {files.length} 个文件 · 双击可打开或预览
         </p>
       </div>
-      <div className="grid gap-3 p-3 [grid-template-columns:repeat(auto-fill,minmax(min(17rem,100%),1fr))]">
+      <div className="grid gap-4 p-4 [grid-template-columns:repeat(auto-fill,minmax(min(20rem,100%),1fr))]">
         {directories.map((directory) => {
           const selected = selectedDirectoryIds.has(directory.id);
 
@@ -801,48 +811,59 @@ function FileGridView({
                 onOpenDirectory(directory);
               }}
               className={cn(
-                "group flex min-h-[8.5rem] min-w-0 flex-col rounded-xl border bg-surface p-3.5 shadow-card transition-[border-color,box-shadow,transform,background-color] duration-150 hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-card-hover",
+                "group flex min-h-[17rem] min-w-0 flex-col overflow-hidden rounded-2xl border bg-surface p-3 shadow-card transition-[border-color,box-shadow,transform,background-color] duration-150 hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-card-hover",
                 selected ? "border-primary/35 bg-primary-soft/25 ring-1 ring-primary/15" : "border-border"
               )}
             >
-              <div className="flex items-center justify-between gap-2">
-                <input
-                  type="checkbox"
-                  aria-label={`选择目录 ${directory.name}`}
-                  checked={selected}
-                  onChange={(event) => onToggleDirectorySelected(directory, event.target.checked)}
-                  className={checkboxClass}
-                />
+              <div className="relative overflow-hidden rounded-2xl border border-primary/10 bg-gradient-to-br from-primary-soft via-background to-surface">
+                <div className="absolute left-3 top-3 z-10 grid size-7 place-items-center rounded-lg border border-border bg-surface/90 shadow-card backdrop-blur">
+                  <input
+                    type="checkbox"
+                    aria-label={`选择目录 ${directory.name}`}
+                    checked={selected}
+                    onChange={(event) => onToggleDirectorySelected(directory, event.target.checked)}
+                    className={checkboxClass}
+                  />
+                </div>
 
                 <IconButton
                   size="sm"
                   variant="ghost"
                   label="更多操作"
                   onClick={(event) => openDirectoryActionsMenu(directory, event.currentTarget)}
-                  className="-mr-1 shrink-0"
+                  className="absolute right-2 top-2 z-10 bg-surface/90 shadow-card backdrop-blur"
                 >
                   <MoreVertical size={16} />
                 </IconButton>
+
+                <button
+                  type="button"
+                  onClick={() => onOpenDirectory(directory)}
+                  className="grid aspect-[16/10] w-full place-items-center focus-visible:outline-none focus-visible:focus-ring"
+                >
+                  <span className="grid size-20 place-items-center rounded-3xl bg-primary-soft text-primary-strong shadow-card ring-1 ring-primary/15 transition-transform duration-150 group-hover:scale-105">
+                    <Folder size={38} />
+                  </span>
+                </button>
               </div>
 
               <button
                 type="button"
                 onClick={() => onOpenDirectory(directory)}
-                className="mt-2 flex min-w-0 flex-1 items-start gap-3 rounded-xl text-left focus-visible:outline-none focus-visible:focus-ring"
+                className="mt-3 min-w-0 rounded-xl text-left focus-visible:outline-none focus-visible:focus-ring"
               >
-                <span className="grid size-14 shrink-0 place-items-center rounded-xl bg-primary-soft text-primary-strong ring-1 ring-primary/15">
-                  <Folder size={26} />
-                </span>
-                <span className="min-w-0 flex-1 pt-0.5">
-                  <span className="overflow-hidden break-all text-sm font-semibold leading-5 text-foreground [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2]" title={directory.name}>
-                    {directory.name}
-                  </span>
-                  <span className="mt-1.5 block truncate text-xs text-muted">
-                    {directory.file_count} 个文件 · {formatBytes(directory.total_size)}
-                  </span>
-                  <span className="mt-0.5 block truncate text-xs text-subtle">{formatDateTime(directory.created_at)}</span>
+                <span className="block h-10 overflow-hidden break-all text-[15px] font-semibold leading-5 text-foreground [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2]" title={directory.name}>
+                  {directory.name}
                 </span>
               </button>
+
+              <div className="mt-auto flex flex-col gap-1.5 pt-3">
+                <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                  <span className="rounded-full bg-primary-soft px-2 py-0.5 text-xs font-medium text-primary-strong">文件夹</span>
+                  <span className="truncate text-xs text-muted">{directory.file_count} 个文件 · {formatBytes(directory.total_size)}</span>
+                </div>
+                <span className="truncate text-xs text-subtle">{formatDateTime(directory.created_at)}</span>
+              </div>
             </article>
           );
         })}
@@ -867,54 +888,59 @@ function FileGridView({
                 }
               }}
               className={cn(
-                "group flex min-h-[8.5rem] min-w-0 flex-col rounded-xl border bg-surface p-3.5 shadow-card transition-[border-color,box-shadow,transform,background-color] duration-150 hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-card-hover",
+                "group flex min-h-[17rem] min-w-0 flex-col overflow-hidden rounded-2xl border bg-surface p-3 shadow-card transition-[border-color,box-shadow,transform,background-color] duration-150 hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-card-hover",
                 selected ? "border-primary/35 bg-primary-soft/25 ring-1 ring-primary/15" : "border-border"
               )}
             >
-              <div className="flex items-center justify-between gap-2">
-                <input
-                  type="checkbox"
-                  aria-label={`选择 ${file.file_name}`}
-                  checked={selected}
-                  onChange={(event) => onToggleFileSelected(file, event.target.checked)}
-                  className={checkboxClass}
-                />
+              <div className="relative overflow-hidden rounded-2xl bg-background ring-1 ring-border">
+                <div className="absolute left-3 top-3 z-10 grid size-7 place-items-center rounded-lg border border-border bg-surface/90 shadow-card backdrop-blur">
+                  <input
+                    type="checkbox"
+                    aria-label={`选择 ${file.file_name}`}
+                    checked={selected}
+                    onChange={(event) => onToggleFileSelected(file, event.target.checked)}
+                    className={checkboxClass}
+                  />
+                </div>
 
                 <IconButton
                   size="sm"
                   variant="ghost"
                   label="更多操作"
                   onClick={(event) => openFileActionsMenu(file, event.currentTarget)}
-                  className="-mr-1 shrink-0"
+                  className="absolute right-2 top-2 z-10 bg-surface/90 shadow-card backdrop-blur"
                 >
                   <MoreVertical size={16} />
                 </IconButton>
-              </div>
 
-              <div className="mt-2 flex min-w-0 flex-1 items-start gap-3">
                 <FileVisual
                   mimeType={file.mime_type}
                   fileName={file.file_name}
                   url={linkFile ? file.file_path : undefined}
                   thumbnailUrl={file.thumbnail_url}
-                  size="md"
-                  className="size-14 rounded-xl"
+                  size="lg"
+                  className="!h-auto !w-full aspect-[16/10] rounded-2xl border-0 ring-0"
                   onClick={previewFromThumbnail}
                   actionLabel={`预览缩略图 ${file.file_name}`}
                 />
-                <button
-                  type="button"
-                  onClick={() => (canPreviewFile ? onPreview(file) : onDetail(file))}
-                  className="min-w-0 flex-1 rounded-xl pt-0.5 text-left focus-visible:outline-none focus-visible:focus-ring"
-                >
-                  <span className="overflow-hidden break-all text-sm font-semibold leading-5 text-foreground [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2]" title={file.file_name}>
-                    {file.file_name}
-                  </span>
-                  <span className="mt-1.5 block truncate text-xs text-muted">
-                    {kind.label} · {formatBytes(file.size)}
-                  </span>
-                  <span className="mt-0.5 block truncate text-xs text-subtle">{formatDateTime(file.created_at)}</span>
-                </button>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => (canPreviewFile ? onPreview(file) : onDetail(file))}
+                className="mt-3 min-w-0 rounded-xl text-left focus-visible:outline-none focus-visible:focus-ring"
+              >
+                <span className="block h-10 overflow-hidden break-all text-[15px] font-semibold leading-5 text-foreground [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2]" title={file.file_name}>
+                  {file.file_name}
+                </span>
+              </button>
+
+              <div className="mt-auto flex flex-col gap-1.5 pt-3">
+                <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                  <span className="rounded-full bg-background px-2 py-0.5 text-xs font-medium text-muted ring-1 ring-border">{kind.label}</span>
+                  <span className="truncate text-xs text-muted">{formatBytes(file.size)}</span>
+                </div>
+                <span className="truncate text-xs text-subtle">{formatDateTime(file.created_at)}</span>
               </div>
             </article>
           );

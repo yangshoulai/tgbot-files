@@ -32,6 +32,7 @@ import { MetricsRow, Metric } from "../components/files/MetricsRow";
 import { FileTable } from "../components/files/FileTable";
 import { PreviewDialog } from "../components/files/PreviewDialog";
 import { ThumbnailPreviewDialog } from "../components/files/ThumbnailPreviewDialog";
+import { ThumbnailEditDialog } from "../components/files/ThumbnailEditDialog";
 import { FileDetailDialog } from "../components/files/FileDetailDialog";
 import { DirectoryTree } from "../components/files/DirectoryTree";
 import {
@@ -233,6 +234,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   const [operationLabel, setOperationLabel] = useState<string | null>(null);
   const [previewFile, setPreviewFile] = useState<FileItem | null>(null);
   const [thumbnailPreviewFile, setThumbnailPreviewFile] = useState<FileItem | null>(null);
+  const [thumbnailEditingFile, setThumbnailEditingFile] = useState<FileItem | null>(null);
   const [detailFile, setDetailFile] = useState<FileItem | null>(null);
   const [editingFile, setEditingFile] = useState<FileItem | null>(null);
   const [editFileName, setEditFileName] = useState("");
@@ -603,6 +605,15 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     } finally {
       setSavingFile(false);
     }
+  }
+
+  function handleThumbnailSaved(updated: FileItem) {
+    setFiles((current) => current.map((file) => (file.id === updated.id ? updated : file)));
+    if (previewFile?.id === updated.id) setPreviewFile(updated);
+    if (thumbnailPreviewFile?.id === updated.id) setThumbnailPreviewFile(updated.thumbnail_url ? updated : null);
+    if (thumbnailEditingFile?.id === updated.id) setThumbnailEditingFile(updated);
+    if (detailFile?.id === updated.id) setDetailFile(updated);
+    if (editingFile?.id === updated.id) setEditingFile(updated);
   }
 
   async function onMoveSelected() {
@@ -1444,6 +1455,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
                 onTogglePage={togglePage}
                 onDetail={setDetailFile}
                 onEdit={openEditDialog}
+                onEditThumbnail={setThumbnailEditingFile}
                 onMoveFile={openMoveDialog}
                 onPreview={setPreviewFile}
                 onThumbnailPreview={setThumbnailPreviewFile}
@@ -1469,6 +1481,11 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       <ThumbnailPreviewDialog
         file={thumbnailPreviewFile}
         onClose={() => setThumbnailPreviewFile(null)}
+      />
+      <ThumbnailEditDialog
+        file={thumbnailEditingFile}
+        onClose={() => setThumbnailEditingFile(null)}
+        onSaved={handleThumbnailSaved}
       />
       <FileDetailDialog
         file={detailFile}
