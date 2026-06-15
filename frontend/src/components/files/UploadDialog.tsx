@@ -219,6 +219,13 @@ interface UrlUploadState {
   magnet?: MagnetUrlState;
 }
 
+interface QueuedUrlUploadTask {
+  id: string;
+  sourceUrl: string;
+  directoryPath: string;
+  remark: string;
+}
+
 type UploadThumbnailStatus = "idle" | "generating" | "ready" | "failed" | "removed";
 
 interface UploadThumbnailState {
@@ -310,6 +317,16 @@ function makeSourceHeaderRow(name = "", value = ""): SourceHeaderRow {
   };
 }
 
+function makeQueuedUrlUploadTask(sourceUrl: string, directoryPath: string, remark: string): QueuedUrlUploadTask {
+  counter += 1;
+  return {
+    id: `queued-url-${Date.now()}-${counter}`,
+    sourceUrl,
+    directoryPath,
+    remark
+  };
+}
+
 function isLocalItemAwaitingDecision(item: QueueItem): boolean {
   return item.status === "pending" || item.status === "error";
 }
@@ -369,6 +386,10 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   const [thumbnailUrlText, setThumbnailUrlText] = useState("");
   const [thumbnailUrlError, setThumbnailUrlError] = useState<string>();
   const [urlUpload, setUrlUpload] = useState<UrlUploadState>({ status: "pending" });
+  const [queuedUrlTasks, setQueuedUrlTasks] = useState<QueuedUrlUploadTask[]>([]);
+  const [queuedUrlDraft, setQueuedUrlDraft] = useState("");
+  const [queuedUrlDraftError, setQueuedUrlDraftError] = useState<string>();
+  const [queuedUrlPreparedTaskId, setQueuedUrlPreparedTaskId] = useState<string | null>(null);
   const [remark, setRemark] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [checkingConflicts, setCheckingConflicts] = useState(false);
@@ -383,6 +404,9 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   const activeUploadRef = useRef<UploadAbortContext | null>(null);
   const itemsRef = useRef(items);
   const urlUploadRef = useRef(urlUpload);
+  const queuedUrlTasksRef = useRef(queuedUrlTasks);
+  const queuedUrlLaunchingRef = useRef(false);
+  const activePersistedTaskIdRef = useRef<string | null>(null);
   const preserveHiddenUploadStateRef = useRef(false);
   const recoveringPersistedTaskRef = useRef(false);
   const uploadTaskLockOwnerRef = useRef(`upload-tab-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -390,6 +414,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   const hlsThumbnailGeneratingRef = useRef(false);
   const [activeUploadKind, setActiveUploadKind] = useState<"local" | "url" | null>(null);
   const [activeUploadItemId, setActiveUploadItemId] = useState<string | null>(null);
+  const [activePersistedTaskId, setActivePersistedTaskIdState] = useState<string | null>(null);
   const [stopRequested, setStopRequested] = useState(false);
   const effectiveUploadConcurrency = normalizeUploadConcurrency(uploadConcurrency);
 
@@ -409,6 +434,10 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   useEffect(() => {
     urlUploadRef.current = urlUpload;
   }, [urlUpload]);
+
+  useEffect(() => {
+    queuedUrlTasksRef.current = queuedUrlTasks;
+  }, [queuedUrlTasks]);
 
   useEffect(() => {
     const task = firstResumableUploadTask();
@@ -477,6 +506,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       setCheckingConflicts(false);
       setDragOver(false);
       setUploadDirectoryPath(directoryPath);
+      resetQueuedUrlDraftState();
       return;
     }
 
@@ -505,6 +535,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       revokeThumbnail(current.thumbnail?.generated);
       return { status: "pending" };
     });
+    resetQueuedUrlDraftState();
   }, [checkingConflicts, directoryPath, open, initialFiles, submitting]);
 
   useEffect(() => {
@@ -722,6 +753,109 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         item.fileNameOverride.trim().length === 0
       );
   const hasDone = urlUpload.status === "done" || items.some((item) => item.status === "done");
+  const queuedUrlStartBlocked = mode === "url"
+    ? Boolean(normalizedSourceUrl && urlUpload.status !== "done")
+    : items.some((item) => item.status === "pending" || item.status === "uploading" || item.status === "error");
+  const showQueuedUrlComposer = uploadBusy || activeUploadKind !== null || queuedUrlTasks.length > 0;
+
+  useEffect(() => {
+    if (recoveringPersistedTaskRef.current || queuedUrlLaunchingRef.current || queuedUrlPreparedTaskId) {
+      return;
+    }
+
+    if (activeUploadKind || submitting || checkingConflicts || queuedUrlStartBlocked) {
+      return;
+    }
+
+    const nextTask = queuedUrlTasksRef.current[0];
+    if (!nextTask) {
+      return;
+    }
+
+    launchQueuedUrlTask(nextTask);
+  }, [activeUploadKind, checkingConflicts, queuedUrlPreparedTaskId, queuedUrlStartBlocked, queuedUrlTasks, submitting]);
+
+  useEffect(() => {
+    if (!queuedUrlPreparedTaskId) {
+      return;
+    }
+
+    if (activeUploadKind || submitting || checkingConflicts || mode !== "url" || !normalizedSourceUrl) {
+      return;
+    }
+
+    const validationError = validateSourceUrl(normalizedSourceUrl);
+    if (validationError) {
+      setUrlUpload({ status: "error", message: validationError });
+      setQueuedUrlPreparedTaskId(null);
+      queuedUrlLaunchingRef.current = false;
+      onError(validationError);
+      return;
+    }
+
+    setQueuedUrlPreparedTaskId(null);
+    void submitUrlUpload();
+    queuedUrlLaunchingRef.current = false;
+  }, [activeUploadKind, checkingConflicts, mode, normalizedSourceUrl, queuedUrlPreparedTaskId, submitting]);
+
+  function launchQueuedUrlTask(task: QueuedUrlUploadTask) {
+    queuedUrlLaunchingRef.current = true;
+    setQueuedUrlTasks((current) => current.filter((item) => item.id !== task.id));
+    setMode("url");
+    setUploadDirectoryPath(task.directoryPath);
+    setRemark(task.remark);
+    setSourceUrl(task.sourceUrl);
+    setSourceHeaderRows([]);
+    setCurlImportOpen(false);
+    setCurlImportText("");
+    setCurlImportError(undefined);
+    setThumbnailUrlPicker(null);
+    setThumbnailUrlText("");
+    setThumbnailUrlError(undefined);
+    setUrlUpload((current) => {
+      cleanupTemporaryHlsUpload(current);
+      cleanupTemporaryMagnetUpload(current);
+      revokeThumbnail(current.thumbnail?.generated);
+      hlsThumbnailGeneratingRef.current = false;
+      hlsThumbnailPromiseRef.current = null;
+      return { status: "pending", message: "已从等待队列开始导入" };
+    });
+    setQueuedUrlPreparedTaskId(task.id);
+  }
+
+  function addQueuedUrlTaskFromDraft() {
+    const nextUrl = queuedUrlDraft.trim();
+    const error = validateSourceUrl(nextUrl);
+    if (error) {
+      setQueuedUrlDraftError(error);
+      return;
+    }
+
+    const duplicateCurrent = mode === "url" && normalizedSourceUrl === nextUrl && urlUpload.status !== "done";
+    const duplicateQueued = queuedUrlTasksRef.current.some((task) => task.sourceUrl === nextUrl);
+    if (duplicateCurrent || duplicateQueued) {
+      setQueuedUrlDraftError("该链接已在任务列表中");
+      return;
+    }
+
+    setQueuedUrlTasks((current) => [
+      ...current,
+      makeQueuedUrlUploadTask(nextUrl, uploadDirectoryPath, remark.trim())
+    ]);
+    setQueuedUrlDraft("");
+    setQueuedUrlDraftError(undefined);
+  }
+
+  function removeQueuedUrlTask(id: string) {
+    setQueuedUrlTasks((current) => current.filter((task) => task.id !== id));
+  }
+
+  function resetQueuedUrlDraftState() {
+    setQueuedUrlDraft("");
+    setQueuedUrlDraftError(undefined);
+    setQueuedUrlPreparedTaskId(null);
+    queuedUrlLaunchingRef.current = false;
+  }
 
   function clearSettledTasks() {
     if (activeUploadRef.current || submitting || checkingConflicts) {
@@ -730,6 +864,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
 
     preserveHiddenUploadStateRef.current = false;
     clearCurrentPersistedTask({ allowFallback: false });
+    resetQueuedUrlDraftState();
     abortUploadTask(activeUploadRef.current);
     activeUploadRef.current = null;
     hlsThumbnailGeneratingRef.current = false;
@@ -806,10 +941,12 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       mode,
       items,
       urlUpload,
+      queuedUrlTasks,
       sourceUrl: normalizedSourceUrl,
       uploadDirectoryPath,
       activeUploadKind,
       activeUploadItemId,
+      activePersistedTaskId,
       stopRequested,
       running: uploadBusy,
       persistedTasks: readUploadTaskQueue().tasks
@@ -819,10 +956,12 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   }, [
     activeUploadItemId,
     activeUploadKind,
+    activePersistedTaskId,
     items,
     mode,
     normalizedSourceUrl,
     onTaskSnapshotChange,
+    queuedUrlTasks,
     stopRequested,
     uploadBusy,
     uploadDirectoryPath,
@@ -1510,11 +1649,17 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     }
   }
 
+  function setActivePersistedTaskId(taskId: string | null) {
+    activePersistedTaskIdRef.current = taskId;
+    setActivePersistedTaskIdState(taskId);
+  }
+
   function persistLocalUploadTask(item: QueueItem, retry: MultipartRetryState) {
     const now = Date.now();
+    const taskId = makePersistedTaskId("local", retry.uploadId);
     upsertUploadTask({
       version: 1,
-      id: makePersistedTaskId("local", retry.uploadId),
+      id: taskId,
       kind: "local",
       status: item.recoveredLocalPlaceholder ? "waiting-file" : "running",
       savedAt: now,
@@ -1528,15 +1673,17 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       ...(item.relativePath ? { relativePath: item.relativePath } : {}),
       retry
     });
+    setActivePersistedTaskId(taskId);
   }
 
   function persistUrlMultipartUploadTask(retry: MultipartRetryState, fileNameOverride?: string) {
     const sourceHeaders = sourceHeadersForPersistence();
     const safeHeaders = sanitizeSourceHeadersForPersistence(sourceHeaders);
     const now = Date.now();
+    const taskId = makePersistedTaskId("url-multipart", retry.uploadId);
     upsertUploadTask({
       version: 1,
-      id: makePersistedTaskId("url-multipart", retry.uploadId),
+      id: taskId,
       kind: "url-multipart",
       status: "running",
       savedAt: now,
@@ -1549,15 +1696,17 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       ...(safeHeaders.strippedHeaderNames ? { strippedHeaderNames: safeHeaders.strippedHeaderNames } : {}),
       retry
     });
+    setActivePersistedTaskId(taskId);
   }
 
   function persistHlsUploadTask(retry: HlsRetryState, fileNameOverride?: string, variantId?: string) {
     const sourceHeaders = sourceHeadersForPersistence();
     const safeHeaders = sanitizeSourceHeadersForPersistence(sourceHeaders);
     const now = Date.now();
+    const taskId = makePersistedTaskId("hls", retry.assetId);
     upsertUploadTask({
       version: 1,
-      id: makePersistedTaskId("hls", retry.assetId),
+      id: taskId,
       kind: "hls",
       status: "running",
       savedAt: now,
@@ -1571,13 +1720,15 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       ...(safeHeaders.strippedHeaderNames ? { strippedHeaderNames: safeHeaders.strippedHeaderNames } : {}),
       retry
     });
+    setActivePersistedTaskId(taskId);
   }
 
   function persistMagnetUploadTask(importId: string, selectedIndexes: number[], uploads?: MagnetUploadEntry[]) {
     const now = Date.now();
+    const taskId = makePersistedTaskId("magnet", importId);
     upsertUploadTask({
       version: 1,
-      id: makePersistedTaskId("magnet", importId),
+      id: taskId,
       kind: "magnet",
       status: "running",
       savedAt: now,
@@ -1589,12 +1740,16 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       selectedIndexes,
       ...(uploads ? { uploads } : {})
     });
+    setActivePersistedTaskId(taskId);
   }
 
   function clearCurrentPersistedTask(options: { allowFallback?: boolean } = {}) {
     const taskId = currentPersistedTaskId();
     if (taskId) {
       removeUploadTask(taskId);
+      if (activePersistedTaskIdRef.current === taskId) {
+        setActivePersistedTaskId(null);
+      }
       return;
     }
 
@@ -1605,10 +1760,17 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     const fallback = firstResumableUploadTask();
     if (fallback) {
       removeUploadTask(fallback.id);
+      if (activePersistedTaskIdRef.current === fallback.id) {
+        setActivePersistedTaskId(null);
+      }
     }
   }
 
   function currentPersistedTaskId(): string | undefined {
+    if (activePersistedTaskIdRef.current) {
+      return activePersistedTaskIdRef.current;
+    }
+
     const activeTask = activeUploadRef.current;
     const currentUrlUpload = urlUploadRef.current;
 
@@ -1664,6 +1826,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     }
 
     activeUploadRef.current = null;
+    setActivePersistedTaskId(null);
     setActiveUploadKind(null);
     setActiveUploadItemId(null);
     setStopRequested(false);
@@ -3782,6 +3945,89 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
           本地文件、URL 和磁力导入都会先创建上传会话，再上传或导入分片，最后统一生成文件索引。图片/视频会尝试生成缩略图；失败时不影响文件上传。
         </div>
 
+        {showQueuedUrlComposer ? (
+          <div className="flex flex-col gap-2 rounded-xl border border-border bg-background p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <label htmlFor="queued-upload-url" className="text-xs font-medium text-muted">
+                新增 URL 任务
+              </label>
+              {queuedUrlTasks.length > 0 ? (
+                <span className="text-xs text-muted">等待 {queuedUrlTasks.length} 个</span>
+              ) : null}
+            </div>
+            <div className="flex flex-col gap-2 sm:flex-row">
+              <Input
+                id="queued-upload-url"
+                type="text"
+                placeholder="https://example.com/video.m3u8 或 magnet:?xt=urn:btih:..."
+                value={queuedUrlDraft}
+                invalid={Boolean(queuedUrlDraftError)}
+                leadingIcon={<Link2 size={15} />}
+                inputClassName="!text-sm !text-muted"
+                onChange={(event) => {
+                  setQueuedUrlDraft(event.target.value);
+                  setQueuedUrlDraftError(undefined);
+                }}
+                onPaste={(event) => {
+                  const pasted = event.clipboardData.getData("text");
+                  const pastedUrl = extractFirstUrl(pasted);
+                  if (pastedUrl) {
+                    event.preventDefault();
+                    setQueuedUrlDraft(pastedUrl);
+                    setQueuedUrlDraftError(undefined);
+                  }
+                }}
+                onKeyDown={(event) => {
+                  if (event.key !== "Enter") return;
+                  event.preventDefault();
+                  addQueuedUrlTaskFromDraft();
+                }}
+              />
+              <Button
+                variant="secondary"
+                className="sm:w-auto"
+                leadingIcon={<Plus size={15} />}
+                disabled={queuedUrlDraft.trim().length === 0}
+                onClick={addQueuedUrlTaskFromDraft}
+              >
+                加入队列
+              </Button>
+            </div>
+            {queuedUrlDraftError ? (
+              <p className="text-xs text-danger">{queuedUrlDraftError}</p>
+            ) : null}
+            {queuedUrlTasks.length > 0 ? (
+              <div className="flex flex-col gap-1.5">
+                {queuedUrlTasks.map((task) => (
+                  <div key={task.id} className="flex items-center gap-2 rounded-lg border border-border bg-surface px-2.5 py-2">
+                    <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-primary-soft text-primary-strong">
+                      <Link2 size={14} />
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-xs font-medium text-foreground" title={remoteFileLabel(task.sourceUrl)}>
+                        {remoteFileLabel(task.sourceUrl)}
+                      </p>
+                      <p className="truncate text-[11px] text-muted" title={task.sourceUrl}>
+                        {task.sourceUrl}
+                      </p>
+                    </div>
+                    <span className="shrink-0 text-[11px] text-muted">等待</span>
+                    <button
+                      type="button"
+                      aria-label={`移除等待任务 ${remoteFileLabel(task.sourceUrl)}`}
+                      title="移除等待任务"
+                      className="grid size-7 shrink-0 place-items-center rounded-md text-subtle transition-colors hover:bg-danger-soft hover:text-danger focus-visible:outline-none focus-visible:focus-ring"
+                      onClick={() => removeQueuedUrlTask(task.id)}
+                    >
+                      <X size={13} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+
         <div className="flex flex-col gap-1.5">
           <div className="flex items-center justify-between gap-2">
             <label className="text-xs font-medium text-muted">
@@ -4215,10 +4461,12 @@ function createUploadTaskSnapshot(params: {
   mode: UploadMode;
   items: QueueItem[];
   urlUpload: UrlUploadState;
+  queuedUrlTasks: QueuedUrlUploadTask[];
   sourceUrl: string;
   uploadDirectoryPath: string;
   activeUploadKind: "local" | "url" | null;
   activeUploadItemId: string | null;
+  activePersistedTaskId: string | null;
   stopRequested: boolean;
   running: boolean;
   persistedTasks: PersistedUploadTask[];
@@ -4261,12 +4509,14 @@ function createUploadTaskSnapshot(params: {
       }]
     : [];
 
-  const visiblePersistedIds = currentVisiblePersistedTaskIds(params.items, params.urlUpload);
+  const queuedUrlItems = params.queuedUrlTasks.map(queuedUrlTaskSnapshotItem);
+
+  const visiblePersistedIds = currentVisiblePersistedTaskIds(params.items, params.urlUpload, params.activePersistedTaskId);
   const persistedItems = params.persistedTasks
     .filter((task) => !visiblePersistedIds.has(task.id))
     .map(persistedTaskSnapshotItem);
 
-  const taskItems = [...localItems, ...urlItems, ...persistedItems].filter((item) =>
+  const taskItems = [...localItems, ...urlItems, ...queuedUrlItems, ...persistedItems].filter((item) =>
     item.status !== "pending" || item.progressLabel || item.kind === params.mode
   );
   if (taskItems.length === 0) return null;
@@ -4286,6 +4536,19 @@ function createUploadTaskSnapshot(params: {
     stopRequested: params.stopRequested,
     activeItemId,
     summary
+  };
+}
+
+function queuedUrlTaskSnapshotItem(task: QueuedUrlUploadTask): UploadTaskSnapshotItem {
+  return {
+    id: task.id,
+    kind: "url",
+    title: remoteFileLabel(task.sourceUrl),
+    description: `${task.directoryPath} · ${task.sourceUrl}`,
+    status: "pending",
+    progressPercent: 0,
+    progressLabel: "等待上传",
+    canStop: false
   };
 }
 
@@ -4312,8 +4575,15 @@ function persistedTaskSnapshotItem(task: PersistedUploadTask): UploadTaskSnapsho
   };
 }
 
-function currentVisiblePersistedTaskIds(items: QueueItem[], urlUpload: UrlUploadState): Set<string> {
+function currentVisiblePersistedTaskIds(
+  items: QueueItem[],
+  urlUpload: UrlUploadState,
+  activePersistedTaskId: string | null
+): Set<string> {
   const ids = new Set<string>();
+  if (activePersistedTaskId) {
+    ids.add(activePersistedTaskId);
+  }
   for (const item of items) {
     if (item.retry?.kind === "local") {
       ids.add(makePersistedTaskId("local", item.retry.uploadId));
@@ -4322,8 +4592,9 @@ function currentVisiblePersistedTaskIds(items: QueueItem[], urlUpload: UrlUpload
   if (urlUpload.retry?.kind === "url") {
     ids.add(makePersistedTaskId("url-multipart", urlUpload.retry.uploadId));
   }
-  if (urlUpload.hls?.retry) {
-    ids.add(makePersistedTaskId("hls", urlUpload.hls.retry.assetId));
+  const hlsAssetId = urlUpload.hls?.retry?.assetId ?? urlUpload.hls?.assetId;
+  if (hlsAssetId) {
+    ids.add(makePersistedTaskId("hls", hlsAssetId));
   }
   if (urlUpload.magnet?.import) {
     ids.add(makePersistedTaskId("magnet", urlUpload.magnet.import.id));

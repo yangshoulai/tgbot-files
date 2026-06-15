@@ -111,13 +111,6 @@ function AppShell() {
   }, []);
 
   const openUpload = useCallback((files: File[] = [], directoryPath = dashboardDirectoryPath) => {
-    if (uploadTaskSnapshot?.running) {
-      setUploadOpen(true);
-      setTaskCenterOpen(true);
-      toast.info("当前已有上传任务在执行，已打开任务详情");
-      return;
-    }
-
     if (uploadTaskSnapshot?.summary.error) {
       const waitingLocalTask = uploadTaskSnapshot.items.some((item) =>
         item.kind === "local" && item.status === "error" && item.progressLabel?.includes("重新选择本地文件")
@@ -134,7 +127,7 @@ function AppShell() {
     setUploadDirectoryPath(directoryPath);
     setUploadFiles(files);
     setUploadOpen(true);
-  }, [dashboardDirectoryPath, toast, uploadTaskSnapshot]);
+  }, [dashboardDirectoryPath, uploadTaskSnapshot]);
 
   const onLogout = useCallback(async () => {
     try {

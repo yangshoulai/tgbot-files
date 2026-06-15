@@ -15,6 +15,7 @@ interface UploadTaskCenterProps {
 export function UploadTaskCenter({ snapshot, open, onOpenChange, onShowDetails, onStop }: UploadTaskCenterProps) {
   if (!snapshot) return null;
 
+  const hasWork = snapshot.items.some((item) => item.status === "uploading" || item.status === "pending");
   const activeItem = snapshot.activeItemId
     ? snapshot.items.find((item) => item.id === snapshot.activeItemId)
     : snapshot.items.find((item) => item.status === "uploading");
@@ -33,9 +34,9 @@ export function UploadTaskCenter({ snapshot, open, onOpenChange, onShowDetails, 
         >
           <span className={cn(
             "grid size-9 shrink-0 place-items-center rounded-xl",
-            snapshot.running ? "bg-primary-soft text-primary-strong" : snapshot.summary.error > 0 ? "bg-danger-soft text-danger" : "bg-success-soft text-success"
+            hasWork ? "bg-primary-soft text-primary-strong" : snapshot.summary.error > 0 ? "bg-danger-soft text-danger" : "bg-success-soft text-success"
           )}>
-            {snapshot.running ? <Layers3 size={17} /> : snapshot.summary.error > 0 ? <AlertTriangle size={17} /> : <CheckCircle2 size={17} />}
+            {hasWork ? <Layers3 size={17} /> : snapshot.summary.error > 0 ? <AlertTriangle size={17} /> : <CheckCircle2 size={17} />}
           </span>
           <span className="min-w-0 flex-1">
             <span className="block text-sm font-semibold text-foreground">上传任务中心</span>
