@@ -88,6 +88,10 @@ export function fileKind(file: Pick<FileItem, "mime_type" | "file_name"> & Parti
     return { label: "PDF", tone: "pdf" };
   }
 
+  if (isOfficeFile(file)) {
+    return { label: officeFileLabel(file), tone: "file" };
+  }
+
   if (mime.startsWith("text/") || /\.(md|markdown|txt|json|csv|log|js|jsx|ts|tsx|css|html|htm|yaml|yml|toml)$/i.test(name)) {
     return { label: "文本", tone: "text" };
   }
@@ -99,7 +103,7 @@ export function fileKind(file: Pick<FileItem, "mime_type" | "file_name"> & Parti
   return { label: "文件", tone: "file" };
 }
 
-export type PreviewKind = "image" | "video" | "audio" | "text" | "markdown";
+export type PreviewKind = "image" | "video" | "audio" | "text" | "markdown" | "pdf" | "office";
 
 export function previewKind(file: Pick<FileItem, "mime_type" | "file_name"> & Partial<Pick<FileItem, "storage_backend">>): PreviewKind | null {
   const mime = file.mime_type.toLowerCase();
@@ -123,6 +127,14 @@ export function previewKind(file: Pick<FileItem, "mime_type" | "file_name"> & Pa
     return "audio";
   }
 
+  if (mime === "application/pdf" || name.endsWith(".pdf")) {
+    return "pdf";
+  }
+
+  if (isOfficeFile(file)) {
+    return "office";
+  }
+
   if (mime === "text/markdown" || name.endsWith(".md") || name.endsWith(".markdown")) {
     return "markdown";
   }
@@ -140,6 +152,42 @@ export function previewKind(file: Pick<FileItem, "mime_type" | "file_name"> & Pa
 
 export function canPreview(file: Pick<FileItem, "mime_type" | "file_name">): boolean {
   return previewKind(file) !== null;
+}
+
+export function isOfficeFile(file: Pick<FileItem, "mime_type" | "file_name">): boolean {
+  const mime = file.mime_type.toLowerCase();
+  const name = file.file_name.toLowerCase();
+  return isWordFile(mime, name) || isExcelFile(mime, name) || isPowerPointFile(mime, name);
+}
+
+export function officeFileLabel(file: Pick<FileItem, "mime_type" | "file_name">): string {
+  const mime = file.mime_type.toLowerCase();
+  const name = file.file_name.toLowerCase();
+  if (isWordFile(mime, name)) return "Word";
+  if (isExcelFile(mime, name)) return "Excel";
+  if (isPowerPointFile(mime, name)) return "PowerPoint";
+  return "Office";
+}
+
+function isWordFile(mime: string, name: string): boolean {
+  return [
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  ].includes(mime) || /\.(doc|docx)$/i.test(name);
+}
+
+function isExcelFile(mime: string, name: string): boolean {
+  return [
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+  ].includes(mime) || /\.(xls|xlsx)$/i.test(name);
+}
+
+function isPowerPointFile(mime: string, name: string): boolean {
+  return [
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+  ].includes(mime) || /\.(ppt|pptx)$/i.test(name);
 }
 
 export function fileInitial(file: Pick<FileItem, "mime_type" | "file_name">): string {

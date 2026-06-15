@@ -17,6 +17,8 @@ import { VideoPreview } from "./preview/VideoPreview";
 import { AudioPreview } from "./preview/AudioPreview";
 import { TextPreview } from "./preview/TextPreview";
 import { MarkdownPreview } from "./preview/MarkdownPreview";
+import { PdfPreview } from "./preview/PdfPreview";
+import { OfficePreview } from "./preview/OfficePreview";
 import { UnsupportedPreview } from "./preview/UnsupportedPreview";
 import type { TextPreviewState } from "./preview/types";
 
@@ -255,6 +257,10 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
             <TextPreview file={file} state={textState} fullscreen={maximized || nativeFullscreen} />
           ) : preview === "markdown" ? (
             <MarkdownPreview state={textState} fullscreen={maximized || nativeFullscreen} />
+          ) : preview === "pdf" ? (
+            <PdfPreview file={file} fullscreen={maximized || nativeFullscreen} />
+          ) : preview === "office" ? (
+            <OfficePreview file={file} fullscreen={maximized || nativeFullscreen} />
           ) : (
             <UnsupportedPreview file={file} />
           )}
