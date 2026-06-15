@@ -42,6 +42,7 @@ const SUBTITLE_PREVIEW_TIMEOUT_MS = 20_000;
 export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscreen, onToggleNativeFullscreen, videoPreviewCacheBytes, videoPreviewConcurrency }: VideoPreviewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const frameRef = useRef<HTMLDivElement>(null);
+  const hlsRef = useRef<Hls | null>(null);
   const loadingTimerRef = useRef<number | null>(null);
   const previewCacheSessionIdRef = useRef(`video-preview-${file.id}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   const playbackProgressReportRef = useRef({ sentAt: 0, marker: -1, currentTime: -1 });
@@ -218,6 +219,55 @@ export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscr
           : "pending";
       });
   }, [failed]);
+
+  const recoverPlayback = useCallback((video: HTMLMediaElement) => {
+    if (!(video instanceof HTMLVideoElement) || !videoSrc) {
+      return false;
+    }
+
+    const resumeAt = Number.isFinite(video.currentTime) && video.currentTime > 0
+      ? video.currentTime
+      : 0;
+
+    setFailed(false);
+    showLoading(true);
+    initialPlaybackAttemptRef.current = "pending";
+
+    const restorePlayback = () => {
+      if (resumeAt > 0 && Number.isFinite(video.duration) && video.duration > resumeAt) {
+        video.currentTime = resumeAt;
+      }
+      void video.play().catch(() => undefined);
+    };
+
+    video.addEventListener("loadedmetadata", restorePlayback, { once: true });
+
+    let recoveredWithHls = false;
+    const hls = isHlsPackage ? hlsRef.current : null;
+    if (hls) {
+      try {
+        hls.startLoad(resumeAt > 0 ? resumeAt : -1);
+        hls.recoverMediaError();
+        recoveredWithHls = true;
+      } catch {
+        recoveredWithHls = false;
+      }
+    }
+
+    if (!recoveredWithHls) {
+      video.load();
+    }
+
+    void video.play().catch(() => undefined);
+
+    window.setTimeout(() => {
+      if (video.error) {
+        video.removeEventListener("loadedmetadata", restorePlayback);
+      }
+    }, 10_000);
+
+    return true;
+  }, [isHlsPackage, showLoading, videoSrc]);
 
   useEffect(() => {
     if (videoSrc) {
@@ -426,6 +476,7 @@ export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscr
         xhr.withCredentials = true;
       }
     });
+    hlsRef.current = hls;
     hls.on(Hls.Events.ERROR, (_event, data) => {
       if (data.fatal) {
         hideLoading();
@@ -436,6 +487,9 @@ export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscr
     hls.attachMedia(video);
 
     return () => {
+      if (hlsRef.current === hls) {
+        hlsRef.current = null;
+      }
       hls?.destroy();
       video.removeAttribute("src");
       video.load();
@@ -575,6 +629,8 @@ export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscr
             variant="floating"
             density={controlsDensity}
             interactive={true}
+            playbackFailed={failed}
+            onRecoverPlayback={recoverPlayback}
             subtitles={subtitleOptions}
             selectedSubtitleId={selectedSubtitleId}
             onSubtitleChange={setSelectedSubtitleId}

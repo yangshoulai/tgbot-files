@@ -25,6 +25,8 @@ interface MediaControlsProps {
   subtitles?: MediaSubtitleOption[];
   selectedSubtitleId?: string | null;
   onSubtitleChange?: (subtitleId: string | null) => void;
+  playbackFailed?: boolean;
+  onRecoverPlayback?: (media: HTMLMediaElement) => boolean;
   compact?: boolean;
   variant?: "panel" | "floating" | "inline";
   density?: "regular" | "narrow" | "tiny";
@@ -54,6 +56,8 @@ export function MediaControls({
   subtitles = [],
   selectedSubtitleId = null,
   onSubtitleChange,
+  playbackFailed = false,
+  onRecoverPlayback,
   compact = false,
   variant = "panel",
   density = "regular",
@@ -123,6 +127,10 @@ export function MediaControls({
     if (!media) return;
 
     if (media.paused || media.ended) {
+      if ((playbackFailed || media.error) && onRecoverPlayback?.(media)) {
+        syncState();
+        return;
+      }
       await media.play().catch(() => undefined);
     } else {
       media.pause();
