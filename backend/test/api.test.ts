@@ -10,6 +10,7 @@ import type {
   FileRecord,
   HlsAssetRecord,
   HlsSegmentRecord,
+  MagnetImportRecord,
   MultipartUploadRecord,
   TelegramChannelRecord
 } from "../src/database";
@@ -35,6 +36,7 @@ class FakeDatabase {
   readonly fileChunks: FileChunkRecord[] = [];
   readonly hlsAssets: HlsAssetRecord[] = [];
   readonly hlsSegments: HlsSegmentRecord[] = [];
+  readonly magnetImports: MagnetImportRecord[] = [];
   readonly appSettings = new Map<string, string>();
   batchCalls = 0;
 
@@ -53,6 +55,7 @@ class FakeDatabase {
       fileChunks: this.fileChunks.map((item) => ({ ...item })),
       hlsAssets: this.hlsAssets.map((item) => ({ ...item })),
       hlsSegments: this.hlsSegments.map((item) => ({ ...item })),
+      magnetImports: this.magnetImports.map((item) => ({ ...item })),
       appSettings: new Map(this.appSettings)
     };
     const results: AppResult<T>[] = [];
@@ -71,6 +74,7 @@ class FakeDatabase {
       this.fileChunks.splice(0, this.fileChunks.length, ...snapshots.fileChunks);
       this.hlsAssets.splice(0, this.hlsAssets.length, ...snapshots.hlsAssets);
       this.hlsSegments.splice(0, this.hlsSegments.length, ...snapshots.hlsSegments);
+      this.magnetImports.splice(0, this.magnetImports.length, ...snapshots.magnetImports);
       this.appSettings.clear();
       for (const [key, value] of snapshots.appSettings) this.appSettings.set(key, value);
       throw error;
@@ -979,6 +983,56 @@ class FakeDatabaseStatement {
       };
     }
 
+    if (normalizedSql.includes("FROM MULTIPART_UPLOADS")) {
+      const limit = Number(this.bindings[0]);
+      return {
+        success: true,
+        meta: fakeDatabaseMeta(),
+        results: this.db.multipartUploads
+          .filter((item) => item.completed_at === null)
+          .sort((left, right) => right.created_at.localeCompare(left.created_at))
+          .slice(0, Number.isFinite(limit) ? limit : undefined) as T[]
+      };
+    }
+
+    if (normalizedSql.includes("FROM HLS_ASSETS")) {
+      const limit = Number(this.bindings[0]);
+      return {
+        success: true,
+        meta: fakeDatabaseMeta(),
+        results: this.db.hlsAssets
+          .filter((item) =>
+            item.deleted_at === null &&
+            item.final_file_id === null &&
+            (item.status === "pending" || item.status === "importing" || item.status === "failed")
+          )
+          .sort((left, right) => right.updated_at.localeCompare(left.updated_at))
+          .slice(0, Number.isFinite(limit) ? limit : undefined) as T[]
+      };
+    }
+
+    if (normalizedSql.includes("FROM MAGNET_IMPORTS")) {
+      const limit = Number(this.bindings[0]);
+      return {
+        success: true,
+        meta: fakeDatabaseMeta(),
+        results: this.db.magnetImports
+          .filter((item) =>
+            item.completed_at === null &&
+            (
+              item.status === "probing" ||
+              item.status === "ready" ||
+              item.status === "downloading" ||
+              item.status === "downloaded" ||
+              item.status === "importing" ||
+              item.status === "failed"
+            )
+          )
+          .sort((left, right) => right.updated_at.localeCompare(left.updated_at))
+          .slice(0, Number.isFinite(limit) ? limit : undefined) as T[]
+      };
+    }
+
     if (normalizedSql.includes("FROM DIRECTORIES")) {
       const directories = normalizedSql.includes("DELETED_AT IS NULL") ||
         normalizedSql.includes("PARENT_ID IS NULL") ||
@@ -1376,6 +1430,32 @@ function hlsSegmentRecord(segmentIndex: number, overrides: Partial<HlsSegmentRec
     created_at: "2026-06-01T00:00:00.000Z",
     updated_at: "2026-06-01T00:00:00.000Z",
     completed_at: "2026-06-01T00:00:00.000Z",
+    ...overrides
+  };
+}
+
+function magnetImportRecord(overrides: Partial<MagnetImportRecord> = {}): MagnetImportRecord {
+  return {
+    id: "magnet-import",
+    magnet_uri: "magnet:?xt=urn:btih:example",
+    info_hash: "example",
+    name: "movie-pack",
+    status: "downloading",
+    aria2_metadata_gid: null,
+    aria2_download_gid: "aria2-download",
+    download_dir: "/tmp/tgbot-files",
+    selected_indexes_json: "[0]",
+    file_count: 1,
+    total_size: 2048,
+    error_message: null,
+    uploaded_by: "admin",
+    created_at: "2026-06-01T00:00:00.000Z",
+    updated_at: "2026-06-01T00:00:00.000Z",
+    metadata_completed_at: null,
+    download_started_at: "2026-06-01T00:00:00.000Z",
+    download_completed_at: null,
+    completed_at: null,
+    cancelled_at: null,
     ...overrides
   };
 }
@@ -3218,6 +3298,123 @@ describe("admin file manager", () => {
     expect(listResponse.status).toBe(200);
     expect(listBody.multipart_chunk_bytes).toBe(configuredChunkSize);
     expect(listBody.direct_access_max_chunks).toBe(Math.ceil(maxMultipartFileBytes / configuredChunkSize));
+  });
+
+  it("lists resumable admin upload tasks across multipart, HLS, and magnet imports", async () => {
+    const db = new FakeDatabase();
+    const adminEnv: AppEnv = {
+      ...AppEnv,
+      DATABASE: db as unknown as AppDatabase,
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "secret"
+    };
+    const cookie = await loginAndGetCookie(adminEnv);
+
+    db.multipartUploads.push(
+      {
+        id: "multipart-active",
+        source_kind: "url",
+        source_url: "https://files.example.com/movie.bin",
+        source_headers_json: null,
+        source_range_start: null,
+        file_name: "movie.bin",
+        mime_type: "application/octet-stream",
+        size: 1024,
+        chunk_size: 512,
+        chunk_count: 2,
+        remark: null,
+        uploaded_by: "admin",
+        created_at: "2026-06-01T00:00:03.000Z",
+        completed_at: null,
+        directory_id: null,
+        directory_path: "/uploads",
+        telegram_channel_group: "default"
+      },
+      {
+        id: "multipart-done",
+        source_kind: "local",
+        source_url: null,
+        source_headers_json: null,
+        source_range_start: null,
+        file_name: "done.bin",
+        mime_type: "application/octet-stream",
+        size: 1,
+        chunk_size: 1,
+        chunk_count: 1,
+        remark: null,
+        uploaded_by: "admin",
+        created_at: "2026-06-01T00:00:04.000Z",
+        completed_at: "2026-06-01T00:00:05.000Z",
+        directory_id: null,
+        directory_path: "/",
+        telegram_channel_group: "default"
+      }
+    );
+    db.hlsAssets.push(
+      hlsAssetRecord({
+        id: "hls-active",
+        file_name: "stream.m3u8",
+        status: "failed",
+        final_file_id: null,
+        completed_at: null,
+        updated_at: "2026-06-01T00:00:02.000Z"
+      }),
+      hlsAssetRecord({
+        id: "hls-cancelled",
+        status: "cancelled",
+        final_file_id: null,
+        completed_at: null,
+        updated_at: "2026-06-01T00:00:06.000Z"
+      })
+    );
+    db.magnetImports.push(
+      magnetImportRecord({
+        id: "magnet-active",
+        name: "pack",
+        status: "downloading",
+        updated_at: "2026-06-01T00:00:01.000Z"
+      }),
+      magnetImportRecord({
+        id: "magnet-cancelled",
+        status: "cancelled",
+        updated_at: "2026-06-01T00:00:07.000Z"
+      })
+    );
+
+    const response = await handleRequest(
+      new Request("https://files.example.com/api/admin/uploads/tasks", {
+        headers: { Cookie: cookie }
+      }),
+      adminEnv
+    );
+    const body = await response.json() as {
+      tasks: Array<{ kind: string; id: string; status?: string; source_kind?: string; file_name?: string; name?: string }>;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.tasks).toEqual([
+      expect.objectContaining({
+        kind: "multipart",
+        id: "multipart-active",
+        source_kind: "url",
+        file_name: "movie.bin"
+      }),
+      expect.objectContaining({
+        kind: "hls",
+        id: "hls-active",
+        status: "failed",
+        file_name: "stream.m3u8"
+      }),
+      expect.objectContaining({
+        kind: "magnet",
+        id: "magnet-active",
+        status: "downloading",
+        name: "pack"
+      })
+    ]);
+    expect(body.tasks.map((task) => task.id)).not.toContain("multipart-done");
+    expect(body.tasks.map((task) => task.id)).not.toContain("hls-cancelled");
+    expect(body.tasks.map((task) => task.id)).not.toContain("magnet-cancelled");
   });
 
   it("uses file-type specific Telegram chunk sizes for new multipart upload sessions", async () => {

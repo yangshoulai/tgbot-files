@@ -1392,6 +1392,38 @@ export async function getMultipartUploadRecord(db: AppDatabase, id: string): Pro
     .first<MultipartUploadRecord>();
 }
 
+export async function listIncompleteMultipartUploadRecords(db: AppDatabase, limit = 100): Promise<MultipartUploadRecord[]> {
+  const result = await db
+    .prepare(
+      `SELECT
+        id,
+        source_kind,
+        source_url,
+        source_headers_json,
+        source_range_start,
+        file_name,
+        mime_type,
+        size,
+        chunk_size,
+        chunk_count,
+        remark,
+        uploaded_by,
+        created_at,
+        directory_id,
+        COALESCE(directory_path, '/') AS directory_path,
+        COALESCE(telegram_channel_group, 'default') AS telegram_channel_group,
+        completed_at
+      FROM multipart_uploads
+      WHERE completed_at IS NULL
+      ORDER BY created_at DESC
+      LIMIT ?`
+    )
+    .bind(limit)
+    .all<MultipartUploadRecord>();
+
+  return result.results ?? [];
+}
+
 export async function completeMultipartUploadRecord(
   db: AppDatabase,
   id: string,
@@ -1513,6 +1545,42 @@ export async function getMagnetImportRecord(db: AppDatabase, id: string): Promis
     )
     .bind(id)
     .first<MagnetImportRecord>();
+}
+
+export async function listIncompleteMagnetImportRecords(db: AppDatabase, limit = 100): Promise<MagnetImportRecord[]> {
+  const result = await db
+    .prepare(
+      `SELECT
+        id,
+        magnet_uri,
+        info_hash,
+        name,
+        status,
+        aria2_metadata_gid,
+        aria2_download_gid,
+        download_dir,
+        selected_indexes_json,
+        file_count,
+        total_size,
+        error_message,
+        uploaded_by,
+        created_at,
+        updated_at,
+        metadata_completed_at,
+        download_started_at,
+        download_completed_at,
+        completed_at,
+        cancelled_at
+      FROM magnet_imports
+      WHERE completed_at IS NULL
+        AND status IN ('probing', 'ready', 'downloading', 'downloaded', 'importing', 'failed')
+      ORDER BY updated_at DESC
+      LIMIT ?`
+    )
+    .bind(limit)
+    .all<MagnetImportRecord>();
+
+  return result.results ?? [];
 }
 
 export async function findReusableMagnetImportRecord(
@@ -2449,6 +2517,59 @@ export async function getHlsAssetRecord(db: AppDatabase, id: string): Promise<Hl
     )
     .bind(id)
     .first<HlsAssetRecord>();
+}
+
+export async function listIncompleteHlsAssetRecords(db: AppDatabase, limit = 100): Promise<HlsAssetRecord[]> {
+  const result = await db
+    .prepare(
+      `SELECT
+        id,
+        source_url,
+        source_headers_json,
+        media_playlist_url,
+        file_name,
+        mime_type,
+        directory_id,
+        COALESCE(directory_path, '/') AS directory_path,
+        status,
+        selected_variant_id,
+        target_duration_seconds,
+        duration_seconds,
+        segment_count,
+        estimated_size,
+        playlist_text,
+        playlist_file_id,
+        final_file_id,
+        init_source_url,
+        init_byte_range_start,
+        init_byte_range_length,
+        init_mime_type,
+        init_size,
+        init_storage_backend,
+        init_telegram_file_id,
+        init_telegram_file_unique_id,
+        COALESCE(init_telegram_channel_id, 'default') AS init_telegram_channel_id,
+        COALESCE(init_status, 'none') AS init_status,
+        init_error_message,
+        init_completed_at,
+        COALESCE(thumbnail_status, 'none') AS thumbnail_status,
+        remark,
+        uploaded_by,
+        created_at,
+        updated_at,
+        completed_at,
+        deleted_at
+      FROM hls_assets
+      WHERE deleted_at IS NULL
+        AND final_file_id IS NULL
+        AND status IN ('pending', 'importing', 'failed')
+      ORDER BY updated_at DESC
+      LIMIT ?`
+    )
+    .bind(limit)
+    .all<HlsAssetRecord>();
+
+  return result.results ?? [];
 }
 
 export async function getHlsAssetRecordByFinalFileId(db: AppDatabase, finalFileId: string): Promise<HlsAssetRecord | null> {

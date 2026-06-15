@@ -192,6 +192,52 @@ export interface AdminUploadResponse {
   file: FileItem;
 }
 
+export type AdminUploadTask =
+  | AdminMultipartUploadTask
+  | AdminHlsUploadTask
+  | AdminMagnetUploadTask;
+
+export interface AdminMultipartUploadTask {
+  kind: "multipart";
+  id: string;
+  source_kind: "local" | "url" | "magnet";
+  file_name: string;
+  size: number;
+  chunk_count: number;
+  directory_path?: string;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface AdminHlsUploadTask {
+  kind: "hls";
+  id: string;
+  file_name: string;
+  status: "pending" | "importing" | "failed";
+  segment_count: number;
+  directory_path: string;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+export interface AdminMagnetUploadTask {
+  kind: "magnet";
+  id: string;
+  name: string | null;
+  status: "probing" | "ready" | "downloading" | "downloaded" | "importing" | "failed";
+  file_count: number;
+  total_size: number | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+export interface AdminUploadTaskListResponse {
+  ok: boolean;
+  tasks: AdminUploadTask[];
+}
+
 export type FileNameConflictAction = "error" | "overwrite";
 
 export interface FileUpdateResponse {
@@ -782,6 +828,11 @@ export function getMultipartUploadStatus(uploadId: string, signal?: AbortSignal)
     `/api/admin/uploads/${encodeURIComponent(uploadId)}/status`,
     { signal }
   );
+}
+
+export function listUploadTasks(limit = 100) {
+  const search = new URLSearchParams({ limit: String(limit) });
+  return requestJson<AdminUploadTaskListResponse>(`/api/admin/uploads/tasks?${search.toString()}`);
 }
 
 export function probeMagnetUpload(magnet: string, signal?: AbortSignal) {

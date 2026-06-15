@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, SessionResponse, getSession, logout } from "./api";
 import { Spinner } from "./components/ui/Spinner";
 import { Shell, ShellRoute } from "./components/layout/Shell";
@@ -6,7 +6,8 @@ import { LoginPage } from "./pages/LoginPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { ApiDocsPage } from "./pages/ApiDocsPage";
-import { UploadDialog } from "./components/files/UploadDialog";
+import { UploadDialog, type UploadDialogHandle, type UploadTaskSnapshot } from "./components/files/UploadDialog";
+import { UploadTaskCenter } from "./components/files/UploadTaskCenter";
 import { GlobalDropzone } from "./lib/dropzone";
 import { ToastProvider, useToast } from "./lib/toast";
 import { ConfirmProvider } from "./lib/confirm";
@@ -39,6 +40,7 @@ export function App() {
 
 function AppShell() {
   const toast = useToast();
+  const uploadDialogRef = useRef<UploadDialogHandle>(null);
   const [path, setPath] = useState<Route>(currentRoute());
   const [session, setSession] = useState<SessionResponse | null>(null);
   const [sessionLoading, setSessionLoading] = useState(true);
@@ -48,6 +50,8 @@ function AppShell() {
   const [uploadDirectoryPath, setUploadDirectoryPath] = useState("/");
   const [uploadVersion, setUploadVersion] = useState(0);
   const [dashboardDirectoryPath, setDashboardDirectoryPath] = useState("/");
+  const [uploadTaskSnapshot, setUploadTaskSnapshot] = useState<UploadTaskSnapshot | null>(null);
+  const [taskCenterOpen, setTaskCenterOpen] = useState(false);
 
   const navigate = useCallback((route: Route) => {
     if (window.location.pathname !== route) {
@@ -107,10 +111,30 @@ function AppShell() {
   }, []);
 
   const openUpload = useCallback((files: File[] = [], directoryPath = dashboardDirectoryPath) => {
+    if (uploadTaskSnapshot?.running) {
+      setUploadOpen(true);
+      setTaskCenterOpen(true);
+      toast.info("当前已有上传任务在执行，已打开任务详情");
+      return;
+    }
+
+    if (uploadTaskSnapshot?.summary.error) {
+      const waitingLocalTask = uploadTaskSnapshot.items.some((item) =>
+        item.kind === "local" && item.status === "error" && item.progressLabel?.includes("重新选择本地文件")
+      );
+      if (waitingLocalTask && files.length > 0) {
+        uploadDialogRef.current?.resumeLocalFile(files[0]);
+      }
+      setUploadOpen(true);
+      setTaskCenterOpen(true);
+      return;
+    }
+
+    uploadDialogRef.current?.clearSettledTasks();
     setUploadDirectoryPath(directoryPath);
     setUploadFiles(files);
     setUploadOpen(true);
-  }, [dashboardDirectoryPath]);
+  }, [dashboardDirectoryPath, toast, uploadTaskSnapshot]);
 
   const onLogout = useCallback(async () => {
     try {
@@ -124,8 +148,8 @@ function AppShell() {
   }, [navigate, toast]);
 
   const dropzoneEnabled = useMemo(
-    () => session !== null && path !== "/login" && !uploadOpen,
-    [session, path, uploadOpen]
+    () => session !== null && path !== "/login" && !uploadOpen && !uploadTaskSnapshot?.running,
+    [session, path, uploadOpen, uploadTaskSnapshot?.running]
   );
 
   if (path === "/login" || !session) {
@@ -169,6 +193,7 @@ function AppShell() {
       </Shell>
 
       <UploadDialog
+        ref={uploadDialogRef}
         open={uploadOpen}
         initialFiles={uploadFiles}
         maxBytes={session.max_file_bytes}
@@ -183,6 +208,18 @@ function AppShell() {
           }
         }}
         onError={(message) => toast.danger(message)}
+        onTaskSnapshotChange={setUploadTaskSnapshot}
+      />
+
+      <UploadTaskCenter
+        snapshot={uploadTaskSnapshot}
+        open={taskCenterOpen}
+        onOpenChange={setTaskCenterOpen}
+        onShowDetails={() => {
+          setUploadOpen(true);
+          setTaskCenterOpen(false);
+        }}
+        onStop={() => uploadDialogRef.current?.stopCurrentUpload()}
       />
 
       <GlobalDropzone enabled={dropzoneEnabled} onDrop={openUpload} />

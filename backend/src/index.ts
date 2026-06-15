@@ -51,6 +51,9 @@ import {
   listDirectoryChildren,
   listFileChunkRecords,
   listHlsSegmentRecords,
+  listIncompleteHlsAssetRecords,
+  listIncompleteMagnetImportRecords,
+  listIncompleteMultipartUploadRecords,
   listApiKeyRecords,
   listFileRecords,
   listMagnetImportFileRecords,
@@ -1403,6 +1406,54 @@ async function handleAdminMultipartUploads(request: Request, env: AppEnv, userna
 
   if (url.pathname === "/api/admin/uploads/magnet" || url.pathname.startsWith("/api/admin/uploads/magnet/")) {
     return handleAdminMagnetUploads(request, env, username);
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/admin/uploads/tasks") {
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") ?? "100") || 100));
+    const [multipart, hls, magnet] = await Promise.all([
+      listIncompleteMultipartUploadRecords(db, limit),
+      listIncompleteHlsAssetRecords(db, limit),
+      listIncompleteMagnetImportRecords(db, limit)
+    ]);
+
+    return jsonResponse({
+      ok: true,
+      tasks: [
+        ...multipart.map((upload) => ({
+          kind: "multipart",
+          id: upload.id,
+          source_kind: upload.source_kind,
+          file_name: upload.file_name,
+          size: upload.size,
+          chunk_count: upload.chunk_count,
+          directory_path: upload.directory_path,
+          created_at: upload.created_at,
+          completed_at: upload.completed_at
+        })),
+        ...hls.map((asset) => ({
+          kind: "hls",
+          id: asset.id,
+          file_name: asset.file_name,
+          status: asset.status,
+          segment_count: asset.segment_count,
+          directory_path: asset.directory_path,
+          created_at: asset.created_at,
+          updated_at: asset.updated_at,
+          completed_at: asset.completed_at
+        })),
+        ...magnet.map((task) => ({
+          kind: "magnet",
+          id: task.id,
+          name: task.name,
+          status: task.status,
+          file_count: task.file_count,
+          total_size: task.total_size,
+          created_at: task.created_at,
+          updated_at: task.updated_at,
+          completed_at: task.completed_at
+        }))
+      ]
+    });
   }
 
   if (request.method === "POST" && url.pathname === "/api/admin/uploads/preflight") {

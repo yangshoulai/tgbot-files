@@ -1,4 +1,4 @@
-import { ChangeEvent, FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, forwardRef, type ReactNode, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { AlertTriangle, Check, CheckCircle2, ClipboardPaste, FilePlus2, FolderOpen, FolderTree, ImageOff, ImagePlus, Layers3, Link2, Pencil, Plus, Trash2, UploadCloud, X } from "lucide-react";
 import {
   ApiError,
@@ -51,6 +51,23 @@ import { DirectoryTreeSelect } from "./DirectoryTreeSelect";
 import { cn } from "../../lib/cn";
 import { parseCurlCommand } from "../../lib/curl";
 import {
+  acquireUploadTaskLock,
+  firstResumableUploadTask,
+  makePersistedTaskId,
+  releaseUploadTaskLock,
+  removeUploadTask,
+  readUploadTaskQueue,
+  renewUploadTaskLock,
+  sanitizeSourceHeadersForPersistence,
+  upsertUploadTask,
+  type HlsRetryState,
+  type MagnetUploadEntry,
+  type MultipartRetryState,
+  type PersistedLocalUploadTask,
+  type PersistedMagnetUploadTask,
+  type PersistedUploadTask
+} from "../../lib/upload-tasks";
+import {
   canAutoGenerateThumbnail,
   generateThumbnailFromFile,
   generateThumbnailFromHlsPlaylist,
@@ -69,9 +86,45 @@ interface UploadDialogProps {
   onClose: () => void;
   onUploaded: (uploadedCount: number) => void;
   onError: (message: string) => void;
+  onTaskSnapshotChange?: (snapshot: UploadTaskSnapshot | null) => void;
 }
 
-type ItemStatus = "pending" | "uploading" | "done" | "error" | "skipped";
+export type UploadTaskSnapshotStatus = "pending" | "uploading" | "done" | "error" | "skipped";
+
+export interface UploadTaskSnapshotItem {
+  id: string;
+  kind: "local" | "url";
+  title: string;
+  description?: string;
+  status: UploadTaskSnapshotStatus;
+  progressPercent: number;
+  progressLabel?: string;
+  canStop: boolean;
+}
+
+export interface UploadTaskSnapshot {
+  items: UploadTaskSnapshotItem[];
+  running: boolean;
+  stopRequested: boolean;
+  activeItemId: string | null;
+  summary: {
+    total: number;
+    pending: number;
+    uploading: number;
+    done: number;
+    error: number;
+    skipped: number;
+  };
+}
+
+export interface UploadDialogHandle {
+  stopCurrentUpload: () => void;
+  hasActiveUpload: () => boolean;
+  clearSettledTasks: () => void;
+  resumeLocalFile: (file: File) => void;
+}
+
+export type ItemStatus = "pending" | "uploading" | "done" | "error" | "skipped";
 type UploadMode = "file" | "url";
 type UploadChunkStatus = "queued" | "uploading" | "completed" | "failed";
 
@@ -101,28 +154,6 @@ interface SourceHeaderRow {
   value: string;
 }
 
-interface MultipartRetryState {
-  kind: "local" | "url";
-  uploadId: string;
-  size: number;
-  chunkSize: number;
-  chunkCount: number;
-  directAccess: boolean;
-  conflictAction: FileNameConflictAction;
-  completedChunks: number[];
-  failedChunks: number[];
-}
-
-interface HlsRetryState {
-  assetId: string;
-  fileName: string;
-  segmentCount: number;
-  previewPlaylistUrl: string;
-  conflictAction: FileNameConflictAction;
-  completedSegments: number[];
-  failedSegments: number[];
-}
-
 interface HlsUrlState {
   probe?: HlsProbeInfo;
   variantId?: string;
@@ -130,13 +161,6 @@ interface HlsUrlState {
   segmentCount?: number;
   previewPlaylistUrl?: string;
   retry?: HlsRetryState;
-}
-
-interface MagnetUploadEntry {
-  fileIndex: number;
-  upload: MultipartUpload;
-  targetDirectoryPath: string;
-  conflictAction: FileNameConflictAction;
 }
 
 interface MagnetFileDecision {
@@ -177,6 +201,7 @@ interface QueueItem {
   conflictAction?: FileNameConflictAction;
   thumbnail?: UploadThumbnailState;
   chunksExpanded?: boolean;
+  recoveredLocalPlaceholder?: boolean;
 }
 
 interface UrlUploadState {
@@ -300,7 +325,28 @@ function normalizeUploadConcurrency(value: number): number {
   return value;
 }
 
-export function UploadDialog({
+function sourceHeaderRowsFromHeaders(headers?: SourceRequestHeaders): SourceHeaderRow[] {
+  if (!headers) return [];
+  return Object.entries(headers).map(([name, value]) => makeSourceHeaderRow(name, value));
+}
+
+function makePlaceholderLocalItem(task: PersistedLocalUploadTask): QueueItem {
+  const file = new File([], task.fileName, {
+    type: task.mimeType || "application/octet-stream",
+    lastModified: task.lastModified
+  });
+  return {
+    ...makeItem(file, { relativePath: task.relativePath }),
+    status: "error",
+    message: `刷新后需要重新选择同一个文件：${task.fileName}`,
+    retry: task.retry,
+    progress: retryFailureProgress(task.retry, "等待重新选择本地文件"),
+    thumbnail: undefined,
+    recoveredLocalPlaceholder: true
+  };
+}
+
+export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(function UploadDialog({
   open,
   initialFiles,
   maxBytes,
@@ -309,8 +355,9 @@ export function UploadDialog({
   directoryPath,
   onClose,
   onUploaded,
-  onError
-}: UploadDialogProps) {
+  onError,
+  onTaskSnapshotChange
+}, ref) {
   const [mode, setMode] = useState<UploadMode>("file");
   const [items, setItems] = useState<QueueItem[]>([]);
   const [sourceUrl, setSourceUrl] = useState("");
@@ -327,13 +374,18 @@ export function UploadDialog({
   const [checkingConflicts, setCheckingConflicts] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [uploadDirectoryPath, setUploadDirectoryPath] = useState(directoryPath);
+  const [pendingMagnetResume, setPendingMagnetResume] = useState(false);
   const [directoryOptions, setDirectoryOptions] = useState<DirectoryItem[]>([]);
   const [directoriesLoading, setDirectoriesLoading] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const folderInput = useRef<HTMLInputElement>(null);
   const onErrorRef = useRef(onError);
   const activeUploadRef = useRef<UploadAbortContext | null>(null);
+  const itemsRef = useRef(items);
   const urlUploadRef = useRef(urlUpload);
+  const preserveHiddenUploadStateRef = useRef(false);
+  const recoveringPersistedTaskRef = useRef(false);
+  const uploadTaskLockOwnerRef = useRef(`upload-tab-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   const hlsThumbnailPromiseRef = useRef<Promise<GeneratedThumbnail | undefined> | null>(null);
   const hlsThumbnailGeneratingRef = useRef(false);
   const [activeUploadKind, setActiveUploadKind] = useState<"local" | "url" | null>(null);
@@ -351,25 +403,49 @@ export function UploadDialog({
   }, [onError]);
 
   useEffect(() => {
+    itemsRef.current = items;
+  }, [items]);
+
+  useEffect(() => {
     urlUploadRef.current = urlUpload;
   }, [urlUpload]);
 
   useEffect(() => {
-    const cancelActiveMagnetUpload = () => {
-      const importId = unfinishedMagnetImportId(urlUploadRef.current);
-      if (importId) {
-        cancelMagnetUploadKeepalive(importId);
-      }
-    };
+    const task = firstResumableUploadTask();
+    if (!task) return;
+    if (task.kind !== "local" && !acquireUploadTaskLock(uploadTaskLockOwnerRef.current)) {
+      onErrorRef.current("检测到其他标签页正在恢复上传任务，本页不会重复执行");
+      return;
+    }
 
-    window.addEventListener("pagehide", cancelActiveMagnetUpload);
-    return () => {
-      window.removeEventListener("pagehide", cancelActiveMagnetUpload);
-    };
+    recoveringPersistedTaskRef.current = true;
+    restorePersistedUploadTask(task);
+    window.setTimeout(() => {
+      recoveringPersistedTaskRef.current = false;
+    }, 0);
+    // 恢复只在组件首次挂载时执行；后续打开弹框由 open effect 管理。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
+    if (!activeUploadKind) return;
+    renewUploadTaskLock(uploadTaskLockOwnerRef.current);
+    const timer = window.setInterval(() => {
+      renewUploadTaskLock(uploadTaskLockOwnerRef.current);
+    }, 5_000);
+    return () => window.clearInterval(timer);
+  }, [activeUploadKind]);
+
+  useEffect(() => {
+    if (recoveringPersistedTaskRef.current) {
+      return;
+    }
+
     if (!open) {
+      if (activeUploadRef.current || submitting || checkingConflicts || preserveHiddenUploadStateRef.current) {
+        preserveHiddenUploadStateRef.current = true;
+        return;
+      }
       abortUploadTask(activeUploadRef.current);
       activeUploadRef.current = null;
       hlsThumbnailGeneratingRef.current = false;
@@ -403,6 +479,12 @@ export function UploadDialog({
       setUploadDirectoryPath(directoryPath);
       return;
     }
+
+    if (activeUploadRef.current || submitting || checkingConflicts || preserveHiddenUploadStateRef.current) {
+      preserveHiddenUploadStateRef.current = false;
+      return;
+    }
+
     setMode("file");
     setUploadDirectoryPath(directoryPath);
     setItems((current) => {
@@ -423,7 +505,7 @@ export function UploadDialog({
       revokeThumbnail(current.thumbnail?.generated);
       return { status: "pending" };
     });
-  }, [directoryPath, open, initialFiles]);
+  }, [checkingConflicts, directoryPath, open, initialFiles, submitting]);
 
   useEffect(() => {
     if (!open) return;
@@ -480,7 +562,13 @@ export function UploadDialog({
   const handlePick = (event: ChangeEvent<HTMLInputElement>) => {
     const list = event.target.files;
     if (!list) return;
-    addFiles(Array.from(list));
+    const files = Array.from(list);
+    const needsLocalResume = items.some((item) => item.recoveredLocalPlaceholder);
+    if (needsLocalResume && files.length > 0) {
+      resumeLocalFile(files[0]);
+    } else {
+      addFiles(files);
+    }
     event.target.value = "";
   };
 
@@ -634,6 +722,124 @@ export function UploadDialog({
         item.fileNameOverride.trim().length === 0
       );
   const hasDone = urlUpload.status === "done" || items.some((item) => item.status === "done");
+
+  function clearSettledTasks() {
+    if (activeUploadRef.current || submitting || checkingConflicts) {
+      return;
+    }
+
+    preserveHiddenUploadStateRef.current = false;
+    clearCurrentPersistedTask({ allowFallback: false });
+    abortUploadTask(activeUploadRef.current);
+    activeUploadRef.current = null;
+    hlsThumbnailGeneratingRef.current = false;
+    hlsThumbnailPromiseRef.current = null;
+    setActiveUploadKind(null);
+    setActiveUploadItemId(null);
+    setStopRequested(false);
+    setItems((current) => {
+      current.forEach((item) => revokeThumbnail(item.thumbnail?.generated));
+      return [];
+    });
+    setUrlUpload((current) => {
+      cleanupTemporaryHlsUpload(current);
+      cleanupTemporaryMagnetUpload(current);
+      revokeThumbnail(current.thumbnail?.generated);
+      return { status: "pending" };
+    });
+    setMode("file");
+    setSourceUrl("");
+    setSourceHeaderRows([]);
+    setCurlImportOpen(false);
+    setCurlImportText("");
+    setCurlImportError(undefined);
+    setThumbnailUrlPicker(null);
+    setThumbnailUrlText("");
+    setThumbnailUrlError(undefined);
+    setRemark("");
+    setSubmitting(false);
+    setCheckingConflicts(false);
+    setDragOver(false);
+    setUploadDirectoryPath(directoryPath);
+  }
+
+  function resumeLocalFile(file: File) {
+    const target = items.find((item) => item.recoveredLocalPlaceholder);
+    if (!target?.retry) {
+      addFiles([file]);
+      return;
+    }
+
+    if (file.name !== target.file.name || file.size !== target.retry.size) {
+      onError(`请选择同一个文件：${target.file.name}（${formatBytes(target.retry.size)}）`);
+      return;
+    }
+
+    setItems((current) =>
+      current.map((item) =>
+        item.id === target.id
+          ? {
+              ...item,
+              file,
+              status: "error",
+              message: "已重新关联本地文件，可继续上传未完成分片",
+              progress: retryFailureProgress(target.retry!, "待继续上传"),
+              thumbnail: canAutoGenerateThumbnail(file) ? { status: "idle" } : undefined,
+              recoveredLocalPlaceholder: false
+            }
+          : item
+      )
+    );
+  }
+
+  useImperativeHandle(ref, () => ({
+    stopCurrentUpload,
+    hasActiveUpload: () => Boolean(activeUploadRef.current),
+    clearSettledTasks,
+    resumeLocalFile
+  }));
+
+  useEffect(() => {
+    if (!onTaskSnapshotChange) return;
+
+    const snapshot = createUploadTaskSnapshot({
+      mode,
+      items,
+      urlUpload,
+      sourceUrl: normalizedSourceUrl,
+      uploadDirectoryPath,
+      activeUploadKind,
+      activeUploadItemId,
+      stopRequested,
+      running: uploadBusy,
+      persistedTasks: readUploadTaskQueue().tasks
+    });
+
+    onTaskSnapshotChange(snapshot);
+  }, [
+    activeUploadItemId,
+    activeUploadKind,
+    items,
+    mode,
+    normalizedSourceUrl,
+    onTaskSnapshotChange,
+    stopRequested,
+    uploadBusy,
+    uploadDirectoryPath,
+    urlUpload
+  ]);
+
+  useEffect(() => {
+    if (!pendingMagnetResume) return;
+    if (!sourceUrl.trim() || !urlUpload.magnet?.import) return;
+    if (urlUpload.magnet.import.status === "ready" || urlUpload.magnet.import.status === "done" || urlUpload.magnet.import.status === "failed" || urlUpload.magnet.import.status === "cancelled") {
+      return;
+    }
+
+    setPendingMagnetResume(false);
+    void submitMagnetUpload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingMagnetResume, sourceUrl, urlUpload.magnet?.import?.id, urlUpload.magnet?.import?.status]);
 
   useEffect(() => {
     if (!open) return;
@@ -1195,8 +1401,247 @@ export function UploadDialog({
     }
   }
 
+  function restorePersistedUploadTask(task: PersistedUploadTask) {
+    setUploadDirectoryPath(task.directoryPath);
+    setRemark(task.remark ?? "");
+
+    if (task.kind === "local") {
+      const item = makePlaceholderLocalItem(task);
+      setMode("file");
+      setItems([item]);
+      setUrlUpload({ status: "pending" });
+      onErrorRef.current(`检测到未完成的本地上传：${task.fileName}。请重新选择同一个文件后继续上传。`);
+      return;
+    }
+
+    setMode("url");
+    setSourceUrl(task.sourceUrl);
+    setSourceHeaderRows(sourceHeaderRowsFromHeaders(task.kind === "magnet" ? undefined : task.sourceHeaders));
+    setItems([]);
+
+    if (task.kind === "url-multipart") {
+      setUrlUpload({
+        status: "error",
+        message: "检测到未完成的 URL 上传，可点击继续完成",
+        retry: task.retry,
+        fileNameOverride: task.fileNameOverride,
+        conflictAction: task.retry.conflictAction,
+        progress: retryFailureProgress(task.retry, "刷新后待继续")
+      });
+      window.setTimeout(() => {
+        void retryUrlMultipart(task.retry);
+      }, 0);
+      return;
+    }
+
+    if (task.kind === "hls") {
+      const hlsState: HlsUrlState = {
+        assetId: task.retry.assetId,
+        segmentCount: task.retry.segmentCount,
+        previewPlaylistUrl: task.retry.previewPlaylistUrl,
+        retry: task.retry,
+        ...(task.variantId ? { variantId: task.variantId } : {})
+      };
+      setUrlUpload({
+        status: "error",
+        message: "检测到未完成的 HLS 上传，可点击继续完成",
+        fileNameOverride: task.fileNameOverride,
+        conflictAction: task.retry.conflictAction,
+        progress: hlsRetryFailureProgress(task.retry, "刷新后待继续"),
+        hls: hlsState
+      });
+      window.setTimeout(() => {
+        void retryHlsUpload(task.retry);
+      }, 0);
+      return;
+    }
+
+    window.setTimeout(() => {
+      void restoreAndResumeMagnetUpload(task);
+    }, 0);
+  }
+
+  async function restoreAndResumeMagnetUpload(task: PersistedMagnetUploadTask) {
+    setUrlUpload({
+      status: "uploading",
+      message: "正在恢复磁力导入任务",
+      progress: { completed: 0, total: Math.max(1, task.selectedIndexes.length), label: "读取磁力任务状态" },
+      magnet: {
+        selectedIndexes: task.selectedIndexes,
+        ...(task.uploads ? { uploads: task.uploads } : {})
+      }
+    });
+
+    try {
+      const response = await getMagnetUploadStatus(task.importId);
+      setUrlUpload((current) => ({
+        ...current,
+        status: response.magnet.status === "ready" ? "pending" : "uploading",
+        message: response.magnet.status === "ready" ? "磁力文件已解析，点击上传继续导入" : "已恢复磁力导入任务",
+        progress: response.magnet.status === "ready"
+          ? undefined
+          : { completed: 0, total: Math.max(1, task.selectedIndexes.length), label: magnetStatusProgressLabel("继续磁力任务", response.magnet) },
+        magnet: {
+          import: response.magnet,
+          selectedIndexes: task.selectedIndexes,
+          ...(task.uploads ? { uploads: task.uploads } : {})
+        }
+      }));
+
+      if (response.magnet.status !== "ready" && response.magnet.status !== "done" && response.magnet.status !== "failed" && response.magnet.status !== "cancelled") {
+        setPendingMagnetResume(true);
+      }
+    } catch (error) {
+      setUrlUpload((current) => ({
+        ...current,
+        status: "error",
+        message: `恢复磁力任务失败：${errorMessage(error)}`,
+        progress: undefined
+      }));
+      onErrorRef.current(`恢复磁力任务失败：${errorMessage(error)}`);
+    }
+  }
+
+  function sourceHeadersForPersistence(): SourceRequestHeaders | undefined {
+    try {
+      return parseSourceHeaderRows(sourceHeaderRows);
+    } catch {
+      return undefined;
+    }
+  }
+
+  function persistLocalUploadTask(item: QueueItem, retry: MultipartRetryState) {
+    const now = Date.now();
+    upsertUploadTask({
+      version: 1,
+      id: makePersistedTaskId("local", retry.uploadId),
+      kind: "local",
+      status: item.recoveredLocalPlaceholder ? "waiting-file" : "running",
+      savedAt: now,
+      updatedAt: now,
+      directoryPath: effectiveDirectoryPath(item, uploadDirectoryPath),
+      ...(remark.trim() ? { remark: remark.trim() } : {}),
+      fileName: item.file.name,
+      mimeType: item.file.type || "application/octet-stream",
+      size: item.file.size,
+      lastModified: item.file.lastModified,
+      ...(item.relativePath ? { relativePath: item.relativePath } : {}),
+      retry
+    });
+  }
+
+  function persistUrlMultipartUploadTask(retry: MultipartRetryState, fileNameOverride?: string) {
+    const sourceHeaders = sourceHeadersForPersistence();
+    const safeHeaders = sanitizeSourceHeadersForPersistence(sourceHeaders);
+    const now = Date.now();
+    upsertUploadTask({
+      version: 1,
+      id: makePersistedTaskId("url-multipart", retry.uploadId),
+      kind: "url-multipart",
+      status: "running",
+      savedAt: now,
+      updatedAt: now,
+      directoryPath: uploadDirectoryPath,
+      ...(remark.trim() ? { remark: remark.trim() } : {}),
+      sourceUrl: normalizedSourceUrl,
+      ...(fileNameOverride ? { fileNameOverride } : {}),
+      ...(safeHeaders.headers ? { sourceHeaders: safeHeaders.headers } : {}),
+      ...(safeHeaders.strippedHeaderNames ? { strippedHeaderNames: safeHeaders.strippedHeaderNames } : {}),
+      retry
+    });
+  }
+
+  function persistHlsUploadTask(retry: HlsRetryState, fileNameOverride?: string, variantId?: string) {
+    const sourceHeaders = sourceHeadersForPersistence();
+    const safeHeaders = sanitizeSourceHeadersForPersistence(sourceHeaders);
+    const now = Date.now();
+    upsertUploadTask({
+      version: 1,
+      id: makePersistedTaskId("hls", retry.assetId),
+      kind: "hls",
+      status: "running",
+      savedAt: now,
+      updatedAt: now,
+      directoryPath: uploadDirectoryPath,
+      ...(remark.trim() ? { remark: remark.trim() } : {}),
+      sourceUrl: normalizedSourceUrl,
+      ...(fileNameOverride ? { fileNameOverride } : {}),
+      ...(variantId ? { variantId } : {}),
+      ...(safeHeaders.headers ? { sourceHeaders: safeHeaders.headers } : {}),
+      ...(safeHeaders.strippedHeaderNames ? { strippedHeaderNames: safeHeaders.strippedHeaderNames } : {}),
+      retry
+    });
+  }
+
+  function persistMagnetUploadTask(importId: string, selectedIndexes: number[], uploads?: MagnetUploadEntry[]) {
+    const now = Date.now();
+    upsertUploadTask({
+      version: 1,
+      id: makePersistedTaskId("magnet", importId),
+      kind: "magnet",
+      status: "running",
+      savedAt: now,
+      updatedAt: now,
+      directoryPath: uploadDirectoryPath,
+      ...(remark.trim() ? { remark: remark.trim() } : {}),
+      sourceUrl: normalizedSourceUrl,
+      importId,
+      selectedIndexes,
+      ...(uploads ? { uploads } : {})
+    });
+  }
+
+  function clearCurrentPersistedTask(options: { allowFallback?: boolean } = {}) {
+    const taskId = currentPersistedTaskId();
+    if (taskId) {
+      removeUploadTask(taskId);
+      return;
+    }
+
+    if (options.allowFallback === false) {
+      return;
+    }
+
+    const fallback = firstResumableUploadTask();
+    if (fallback) {
+      removeUploadTask(fallback.id);
+    }
+  }
+
+  function currentPersistedTaskId(): string | undefined {
+    const activeTask = activeUploadRef.current;
+    const currentUrlUpload = urlUploadRef.current;
+
+    if (activeTask?.kind === "local" && activeTask.itemId) {
+      const itemRetry = itemsRef.current.find((item) => item.id === activeTask.itemId)?.retry;
+      if (itemRetry?.kind === "local") {
+        return makePersistedTaskId("local", itemRetry.uploadId);
+      }
+    }
+
+    const magnetImportId = unfinishedMagnetImportId(currentUrlUpload);
+    if (magnetImportId) {
+      return makePersistedTaskId("magnet", magnetImportId);
+    }
+
+    if (currentUrlUpload.hls?.retry) {
+      return makePersistedTaskId("hls", currentUrlUpload.hls.retry.assetId);
+    }
+
+    if (currentUrlUpload.hls?.assetId) {
+      return makePersistedTaskId("hls", currentUrlUpload.hls.assetId);
+    }
+
+    if (currentUrlUpload.retry?.kind === "url") {
+      return makePersistedTaskId("url-multipart", currentUrlUpload.retry.uploadId);
+    }
+
+    return undefined;
+  }
+
   function startUploadTask(kind: "local" | "url", itemId?: string): UploadAbortContext {
     abortUploadTask(activeUploadRef.current);
+    acquireUploadTaskLock(uploadTaskLockOwnerRef.current);
 
     const task: UploadAbortContext = {
       kind,
@@ -1222,6 +1667,7 @@ export function UploadDialog({
     setActiveUploadKind(null);
     setActiveUploadItemId(null);
     setStopRequested(false);
+    releaseUploadTaskLock(uploadTaskLockOwnerRef.current);
   }
 
   function stopCurrentUpload() {
@@ -1233,6 +1679,8 @@ export function UploadDialog({
     const magnetImportId = task.kind === "url" ? unfinishedMagnetImportId(urlUploadRef.current) : undefined;
     task.cancelled = true;
     setStopRequested(true);
+    clearCurrentPersistedTask();
+    releaseUploadTaskLock(uploadTaskLockOwnerRef.current);
     if (magnetImportId) {
       cancelTemporaryMagnetUpload(magnetImportId);
     }
@@ -1541,6 +1989,18 @@ export function UploadDialog({
       ...(remark.trim() ? { remark: remark.trim() } : {})
     }, task.abortController.signal);
     const upload = init.upload;
+    const initialRetry: MultipartRetryState = {
+      kind: "local",
+      uploadId: upload.id,
+      size: upload.size,
+      chunkSize: upload.chunk_size,
+      chunkCount: upload.chunk_count,
+      directAccess: upload.direct_access !== false,
+      conflictAction,
+      completedChunks: [],
+      failedChunks: chunkRange(upload.chunk_count)
+    };
+    persistLocalUploadTask(target, initialRetry);
 
     setItems((current) =>
       current.map((item) =>
@@ -1573,10 +2033,11 @@ export function UploadDialog({
         chunkSize: upload.chunk_size,
         chunkCount: upload.chunk_count,
         directAccess: upload.direct_access !== false,
-        conflictAction,
-        completedChunks: result.completedChunks,
-        failedChunks: result.failedChunks
-      });
+          conflictAction,
+          completedChunks: result.completedChunks,
+          failedChunks: result.failedChunks
+        });
+      persistLocalUploadTask(target, retry);
       throw new MultipartChunkUploadError(
         result.cancelled ? "已停止，可重试未完成分片" : `有 ${result.failedChunks.length} 个分片上传失败，可手动重试`,
         retry,
@@ -1601,6 +2062,7 @@ export function UploadDialog({
       task,
       timeoutMs: LOCAL_CHUNK_REQUEST_TIMEOUT_MS
     });
+    clearCurrentPersistedTask();
   }
 
   async function resolveLocalThumbnailForUpload(target: QueueItem): Promise<ThumbnailUploadPayload | undefined> {
@@ -1722,6 +2184,7 @@ export function UploadDialog({
         completedChunks: result.completedChunks,
         failedChunks: result.failedChunks
       });
+      persistLocalUploadTask(target, nextRetry);
       throw new MultipartChunkUploadError(
         result.cancelled ? "已停止，可重试未完成分片" : `仍有 ${result.failedChunks.length} 个分片上传失败，可继续手动重试`,
         nextRetry,
@@ -1740,6 +2203,7 @@ export function UploadDialog({
       task,
       timeoutMs: LOCAL_CHUNK_REQUEST_TIMEOUT_MS
     });
+    clearCurrentPersistedTask();
   }
 
   async function runConcurrentChunks(params: {
@@ -2072,6 +2536,18 @@ export function UploadDialog({
       );
       if (init.mode === "multipart" && init.upload) {
         const upload = init.upload;
+        const initialRetry: MultipartRetryState = {
+          kind: "url",
+          uploadId: upload.id,
+          size: upload.size,
+          chunkSize: upload.chunk_size,
+          chunkCount: upload.chunk_count,
+          directAccess: upload.direct_access !== false,
+          conflictAction,
+          completedChunks: [],
+          failedChunks: chunkRange(upload.chunk_count)
+        };
+        persistUrlMultipartUploadTask(initialRetry, fileNameOverride);
         const thumbnail = await resolveUrlThumbnailForUpload(upload.thumbnail_source);
         setUrlUpload((current) => ({
           ...current,
@@ -2110,6 +2586,7 @@ export function UploadDialog({
             completedChunks: result.completedChunks,
             failedChunks: result.failedChunks
           });
+          persistUrlMultipartUploadTask(retry, fileNameOverride);
           throw new MultipartChunkUploadError(
             result.cancelled ? "已停止，可重试未完成分片" : `有 ${result.failedChunks.length} 个分片导入失败，可手动重试`,
             retry,
@@ -2151,6 +2628,7 @@ export function UploadDialog({
         conflictAction: "error",
         editingFileName: false
       }));
+      clearCurrentPersistedTask();
       onUploaded(1);
     } catch (uploadError) {
       const retry = uploadError instanceof MultipartChunkUploadError ? uploadError.retry : undefined;
@@ -2176,6 +2654,9 @@ export function UploadDialog({
           ? retryFailureProgress(retry, stopped ? "已停止，可重试未完成分片" : "分片导入失败，可手动重试")
           : undefined
       }));
+      if (retry && !conflict && !stopped) {
+        persistUrlMultipartUploadTask(retry, normalizedFileNameOverride(urlUpload.fileNameOverride));
+      }
       if (!stopped) {
         onError(conflict ? FILE_NAME_CONFLICT_TOAST_MESSAGE : message);
       }
@@ -2215,6 +2696,7 @@ export function UploadDialog({
         }
         const parsedMagnet = magnet;
         selectedIndexes = selectedMagnetIndexesForResume(parsedMagnet, maxMultipartBytes);
+        persistMagnetUploadTask(parsedMagnet.id, selectedIndexes);
         setUrlUpload((current) => ({
           ...current,
           status: parsedMagnet.status === "ready" ? "pending" : parsedMagnet.status === "failed" || parsedMagnet.status === "cancelled" ? "error" : "uploading",
@@ -2274,6 +2756,7 @@ export function UploadDialog({
         targetDirectoryPath: entry.target_directory_path,
         conflictAction: conflictActionByFileIndex.get(entry.file_index) ?? "error"
       }));
+      persistMagnetUploadTask(magnet.id, selectedIndexes, uploads);
 
       setUrlUpload((current) => ({
         ...current,
@@ -2306,6 +2789,7 @@ export function UploadDialog({
           magnet: current.magnet ? { ...current.magnet, import: magnet, uploads } : { import: magnet, selectedIndexes, uploads }
         }));
         onUploaded(uploads.length);
+        clearCurrentPersistedTask();
         return;
       }
 
@@ -2394,6 +2878,7 @@ export function UploadDialog({
           uploads
         }
       }));
+      clearCurrentPersistedTask();
       onUploaded(completedFiles);
     } catch (uploadError) {
       const stopped = task.cancelled || isAbortError(uploadError);
@@ -2415,6 +2900,13 @@ export function UploadDialog({
         conflictAction: "error",
         progress: undefined
       }));
+      if (!stopped && urlUploadRef.current.magnet?.import) {
+        persistMagnetUploadTask(
+          urlUploadRef.current.magnet.import.id,
+          urlUploadRef.current.magnet.selectedIndexes,
+          urlUploadRef.current.magnet.uploads
+        );
+      }
       if (!stopped) {
         onError(message);
       }
@@ -2582,6 +3074,7 @@ export function UploadDialog({
       const previewPlaylistUrl = sameOriginAdminUrl(asset.preview_playlist_url);
 
       completionRetry = hlsRetryFromStatus(asset, segments, conflictAction);
+      persistHlsUploadTask(completionRetry, fileName, selectedVariantId);
       setUrlUpload((current) => ({
         ...current,
         status: "uploading",
@@ -2623,6 +3116,7 @@ export function UploadDialog({
           completedSegments: result.completedChunks,
           failedSegments: result.failedChunks
         });
+        persistHlsUploadTask(retry, fileName, selectedVariantId);
         throw new HlsSegmentUploadError(
           result.cancelled ? "已停止，可重试未完成 HLS 片段" : `有 ${result.failedChunks.length} 个 HLS 片段导入失败，可手动重试`,
           retry,
@@ -2635,6 +3129,7 @@ export function UploadDialog({
         completedSegments: chunkRange(asset.segment_count),
         failedSegments: []
       });
+      persistHlsUploadTask(completionRetry, fileName, selectedVariantId);
       setUrlUpload((current) => ({
         ...current,
         status: "uploading",
@@ -2655,6 +3150,7 @@ export function UploadDialog({
         editingFileName: false,
         hls: current.hls ? withoutHlsRetry(current.hls) : current.hls
       }));
+      clearCurrentPersistedTask();
       onUploaded(1);
     } catch (uploadError) {
       const retry = uploadError instanceof HlsSegmentUploadError ? uploadError.retry : completionRetry;
@@ -2690,6 +3186,9 @@ export function UploadDialog({
             }
           : current.hls
       }));
+      if (retry && !conflict && !stopped) {
+        persistHlsUploadTask(retry, normalizedFileNameOverride(urlUpload.fileNameOverride), urlUpload.hls?.variantId);
+      }
       if (!stopped) {
         onError(conflict ? FILE_NAME_CONFLICT_TOAST_MESSAGE : message);
       }
@@ -2703,6 +3202,7 @@ export function UploadDialog({
     const task = startUploadTask("url");
     const conflictAction = urlUpload.conflictAction ?? retry.conflictAction;
     let syncedRetry = await refreshHlsRetryState({ ...retry, conflictAction });
+    persistHlsUploadTask(syncedRetry, normalizedFileNameOverride(urlUpload.fileNameOverride), urlUpload.hls?.variantId);
 
     setSubmitting(true);
     setUrlUpload((current) => ({
@@ -2752,6 +3252,7 @@ export function UploadDialog({
             completedSegments: result.completedChunks,
             failedSegments: result.failedChunks
           });
+          persistHlsUploadTask(nextRetry, normalizedFileNameOverride(urlUpload.fileNameOverride), urlUpload.hls?.variantId);
           throw new HlsSegmentUploadError(
             result.cancelled ? "已停止，可重试未完成 HLS 片段" : `仍有 ${result.failedChunks.length} 个 HLS 片段导入失败，可继续手动重试`,
             nextRetry,
@@ -2764,6 +3265,7 @@ export function UploadDialog({
           completedSegments: result.completedChunks,
           failedSegments: []
         });
+        persistHlsUploadTask(syncedRetry, normalizedFileNameOverride(urlUpload.fileNameOverride), urlUpload.hls?.variantId);
       }
 
       setUrlUpload((current) => ({
@@ -2786,6 +3288,7 @@ export function UploadDialog({
         editingFileName: false,
         hls: current.hls ? withoutHlsRetry(current.hls) : current.hls
       }));
+      clearCurrentPersistedTask();
       onUploaded(1);
     } catch (uploadError) {
       const nextRetry = uploadError instanceof HlsSegmentUploadError ? uploadError.retry : syncedRetry;
@@ -2812,6 +3315,9 @@ export function UploadDialog({
           retry: nextRetry
         }
       }));
+      if (nextRetry && !conflict && !stopped) {
+        persistHlsUploadTask(nextRetry, normalizedFileNameOverride(urlUpload.fileNameOverride), urlUpload.hls?.variantId);
+      }
       if (!stopped) {
         onError(conflict ? FILE_NAME_CONFLICT_TOAST_MESSAGE : message);
       }
@@ -3024,6 +3530,7 @@ export function UploadDialog({
   async function retryUrlMultipart(retry: MultipartRetryState) {
     const task = startUploadTask("url");
     const syncedRetry = await refreshMultipartRetryState(retry);
+    persistUrlMultipartUploadTask(syncedRetry, normalizedFileNameOverride(urlUpload.fileNameOverride));
     setSubmitting(true);
     setUrlUpload((current) => ({
       ...current,
@@ -3063,6 +3570,7 @@ export function UploadDialog({
           completedChunks: result.completedChunks,
           failedChunks: result.failedChunks
         });
+        persistUrlMultipartUploadTask(nextRetry, normalizedFileNameOverride(urlUpload.fileNameOverride));
         throw new MultipartChunkUploadError(
           result.cancelled ? "已停止，可重试未完成分片" : `仍有 ${result.failedChunks.length} 个分片导入失败，可继续手动重试`,
           nextRetry,
@@ -3097,6 +3605,7 @@ export function UploadDialog({
         conflictAction: "error",
         editingFileName: false
       }));
+      clearCurrentPersistedTask();
       onUploaded(1);
     } catch (uploadError) {
       const nextRetry = uploadError instanceof MultipartChunkUploadError ? uploadError.retry : syncedRetry;
@@ -3109,6 +3618,9 @@ export function UploadDialog({
         retry: nextRetry,
         progress: retryFailureProgress(nextRetry, stopped ? "已停止，可重试未完成分片" : "分片导入失败，可手动重试")
       }));
+      if (nextRetry && !stopped) {
+        persistUrlMultipartUploadTask(nextRetry, normalizedFileNameOverride(urlUpload.fileNameOverride));
+      }
       if (!stopped) {
         onError(message);
       }
@@ -3209,7 +3721,7 @@ export function UploadDialog({
         description={`上传到 ${uploadDirectoryPath}；按文件类型和系统配置自动选择分片大小，单文件上限 ${formatBytes(maxMultipartBytes)}，最多 ${effectiveUploadConcurrency} 分片并发`}
         size="wide"
         closeOnBackdrop={false}
-        closeOnEscape={!uploadBusy && !curlImportOpen && !thumbnailUrlPicker}
+        closeOnEscape={!curlImportOpen && !thumbnailUrlPicker}
         trapFocus={!curlImportOpen && !thumbnailUrlPicker}
         footer={
           <>
@@ -3227,8 +3739,8 @@ export function UploadDialog({
                     : "停止上传"}
               </Button>
             ) : null}
-            <Button variant="secondary" disabled={uploadBusy} onClick={onClose}>
-              {hasDone ? "关闭" : "取消"}
+            <Button variant="secondary" onClick={onClose}>
+              {uploadBusy ? "收起" : hasDone ? "关闭" : "取消"}
             </Button>
             <Button
               type="submit"
@@ -3697,6 +4209,193 @@ export function UploadDialog({
       </Modal>
     </>
   );
+});
+
+function createUploadTaskSnapshot(params: {
+  mode: UploadMode;
+  items: QueueItem[];
+  urlUpload: UrlUploadState;
+  sourceUrl: string;
+  uploadDirectoryPath: string;
+  activeUploadKind: "local" | "url" | null;
+  activeUploadItemId: string | null;
+  stopRequested: boolean;
+  running: boolean;
+  persistedTasks: PersistedUploadTask[];
+}): UploadTaskSnapshot | null {
+  const activeItemId = params.activeUploadKind === "url" ? "url" : params.activeUploadItemId;
+  const localItems: UploadTaskSnapshotItem[] = params.items.map((item) => {
+    const progressPercent = uploadTaskProgressPercent(item.status, item.progress);
+    return {
+      id: item.id,
+      kind: "local",
+      title: effectiveFileName(item),
+      description: item.relativePath
+        ? `${effectiveDirectoryPath(item, params.uploadDirectoryPath)} · ${formatCompactBytes(item.file.size)}`
+        : `${params.uploadDirectoryPath} · ${formatCompactBytes(item.file.size)}`,
+      status: item.status,
+      progressPercent,
+      progressLabel: item.progress?.label ?? item.message,
+      canStop: params.activeUploadKind === "local" && params.activeUploadItemId === item.id && !params.stopRequested
+    };
+  });
+
+  const hasUrlTask = Boolean(
+    params.sourceUrl ||
+    params.urlUpload.status !== "pending" ||
+    params.urlUpload.progress ||
+    params.urlUpload.retry ||
+    params.urlUpload.hls?.retry ||
+    params.urlUpload.magnet?.import
+  );
+  const urlItems: UploadTaskSnapshotItem[] = hasUrlTask
+    ? [{
+        id: "url",
+        kind: "url",
+        title: params.sourceUrl ? remoteFileLabel(params.sourceUrl) : "远程上传任务",
+        description: params.sourceUrl || undefined,
+        status: params.urlUpload.status,
+        progressPercent: uploadTaskProgressPercent(params.urlUpload.status, params.urlUpload.progress),
+        progressLabel: params.urlUpload.progress?.label ?? params.urlUpload.message,
+        canStop: params.activeUploadKind === "url" && !params.stopRequested
+      }]
+    : [];
+
+  const visiblePersistedIds = currentVisiblePersistedTaskIds(params.items, params.urlUpload);
+  const persistedItems = params.persistedTasks
+    .filter((task) => !visiblePersistedIds.has(task.id))
+    .map(persistedTaskSnapshotItem);
+
+  const taskItems = [...localItems, ...urlItems, ...persistedItems].filter((item) =>
+    item.status !== "pending" || item.progressLabel || item.kind === params.mode
+  );
+  if (taskItems.length === 0) return null;
+
+  const summary = taskItems.reduce<UploadTaskSnapshot["summary"]>(
+    (current, item) => {
+      current.total += 1;
+      current[item.status] += 1;
+      return current;
+    },
+    { total: 0, pending: 0, uploading: 0, done: 0, error: 0, skipped: 0 }
+  );
+
+  return {
+    items: taskItems,
+    running: params.running,
+    stopRequested: params.stopRequested,
+    activeItemId,
+    summary
+  };
+}
+
+function uploadTaskProgressPercent(status: ItemStatus, progress?: ChunkProgress): number {
+  if (progress?.total) {
+    return Math.min(100, Math.max(0, Math.round((progress.completed / progress.total) * 100)));
+  }
+  if (status === "done") return 100;
+  return 0;
+}
+
+function persistedTaskSnapshotItem(task: PersistedUploadTask): UploadTaskSnapshotItem {
+  const status = persistedTaskStatusToItemStatus(task.status);
+  const progress = persistedTaskProgress(task);
+  return {
+    id: task.id,
+    kind: task.kind === "local" ? "local" : "url",
+    title: persistedTaskTitle(task),
+    description: persistedTaskDescription(task),
+    status,
+    progressPercent: progress.percent,
+    progressLabel: progress.label,
+    canStop: false
+  };
+}
+
+function currentVisiblePersistedTaskIds(items: QueueItem[], urlUpload: UrlUploadState): Set<string> {
+  const ids = new Set<string>();
+  for (const item of items) {
+    if (item.retry?.kind === "local") {
+      ids.add(makePersistedTaskId("local", item.retry.uploadId));
+    }
+  }
+  if (urlUpload.retry?.kind === "url") {
+    ids.add(makePersistedTaskId("url-multipart", urlUpload.retry.uploadId));
+  }
+  if (urlUpload.hls?.retry) {
+    ids.add(makePersistedTaskId("hls", urlUpload.hls.retry.assetId));
+  }
+  if (urlUpload.magnet?.import) {
+    ids.add(makePersistedTaskId("magnet", urlUpload.magnet.import.id));
+  }
+  return ids;
+}
+
+function persistedTaskStatusToItemStatus(status: PersistedUploadTask["status"]): ItemStatus {
+  switch (status) {
+    case "running":
+      return "pending";
+    case "done":
+      return "done";
+    case "cancelled":
+      return "skipped";
+    case "failed":
+    case "waiting-file":
+      return "error";
+    default:
+      return "pending";
+  }
+}
+
+function persistedTaskTitle(task: PersistedUploadTask): string {
+  switch (task.kind) {
+    case "local":
+      return task.fileName;
+    case "hls":
+      return task.retry.fileName;
+    case "magnet":
+      return remoteFileLabel(task.sourceUrl);
+    case "url-multipart":
+      return task.fileNameOverride || remoteFileLabel(task.sourceUrl);
+  }
+}
+
+function persistedTaskDescription(task: PersistedUploadTask): string {
+  switch (task.kind) {
+    case "local":
+      return `${task.directoryPath} · ${formatCompactBytes(task.size)}`;
+    case "hls":
+      return `${task.directoryPath} · HLS · ${task.retry.segmentCount} 个片段`;
+    case "magnet":
+      return `${task.directoryPath} · 磁力任务 · ${task.selectedIndexes.length} 个文件`;
+    case "url-multipart":
+      return `${task.directoryPath} · ${formatCompactBytes(task.retry.size)}`;
+  }
+}
+
+function persistedTaskProgress(task: PersistedUploadTask): { percent: number; label: string } {
+  if (task.kind === "hls") {
+    const total = Math.max(1, task.retry.segmentCount);
+    return {
+      percent: Math.round((task.retry.completedSegments.length / total) * 100),
+      label: task.status === "waiting-file" ? "等待操作" : `已完成 ${task.retry.completedSegments.length}/${total} 个片段`
+    };
+  }
+
+  if (task.kind === "magnet") {
+    return {
+      percent: task.status === "done" ? 100 : 0,
+      label: task.status === "queued" ? "等待恢复磁力任务" : "磁力任务待处理"
+    };
+  }
+
+  const total = Math.max(1, task.retry.chunkCount);
+  return {
+    percent: Math.round((task.retry.completedChunks.length / total) * 100),
+    label: task.kind === "local" && task.status === "waiting-file"
+      ? "等待重新选择本地文件"
+      : `已完成 ${task.retry.completedChunks.length}/${total} 个分片`
+  };
 }
 
 function abortUploadTask(task: UploadAbortContext | null) {
