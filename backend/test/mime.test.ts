@@ -57,6 +57,7 @@ describe("MIME type detection", () => {
 
   it("maps common URL file names and MIME types for remote uploads", () => {
     expect(mimeTypeForFileName("report.PDF")).toBe("application/pdf");
+    expect(mimeTypeForFileName("pdf.worker.mjs")).toBe("text/javascript");
     expect(mimeTypeForFileName("photo.webp")).toBe("image/webp");
     expect(mimeTypeForFileName("合同.docx")).toBe("application/vnd.openxmlformats-officedocument.wordprocessingml.document");
     expect(mimeTypeForFileName("预算.xlsx")).toBe("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");

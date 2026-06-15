@@ -19,6 +19,7 @@ const EXTENSION_TO_MIME: Record<string, string> = {
   js: "text/javascript",
   json: "application/json",
   log: "text/plain",
+  mjs: "text/javascript",
   m4v: "video/mp4",
   markdown: "text/markdown",
   md: "text/markdown",
