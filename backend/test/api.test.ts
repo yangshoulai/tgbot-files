@@ -2012,6 +2012,12 @@ describe("API key multipart endpoints", () => {
     expect(downloadResponse.headers.get("X-Chunk-Count")).toBe("1");
     expect(downloadResponse.headers.get("Content-Disposition")).toContain("small.txt.part-1-of-1");
 
+    const directResponse = await handleRequest(new Request(completeBody.file.url), apiEnv);
+    expect(directResponse.status).toBe(200);
+    expect(directResponse.headers.get("X-Frame-Options")).toBeNull();
+    expect(directResponse.headers.get("Content-Security-Policy")).toBe("frame-ancestors 'self'");
+    expect(await directResponse.text()).toBe("hello");
+
     const publicPathParts = new URL(completeBody.file.url).pathname.split("/");
     const token = publicPathParts[2] ?? "";
     const rangeResponse = await handleRequest(
@@ -2417,8 +2423,8 @@ describe("worker file access endpoint", () => {
       {
         v: 1,
         file_id: "tg-file-id",
-        name: "hello.txt",
-        mime_type: "text/plain",
+        name: "hello.pdf",
+        mime_type: "application/pdf",
         size: 5,
         iat: 1_768_566_400
       },
@@ -2450,12 +2456,14 @@ describe("worker file access endpoint", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await handleRequest(new Request(`https://files.example.com/f/${token}/hello.txt`), AppEnv);
+    const response = await handleRequest(new Request(`https://files.example.com/f/${token}/hello.pdf`), AppEnv);
 
     expect(response.status).toBe(200);
     expect(await response.text()).toBe("hello");
-    expect(response.headers.get("Content-Type")).toBe("text/plain");
-    expect(response.headers.get("Content-Disposition")).toContain("hello.txt");
+    expect(response.headers.get("Content-Type")).toBe("application/pdf");
+    expect(response.headers.get("Content-Disposition")).toContain("hello.pdf");
+    expect(response.headers.get("X-Frame-Options")).toBeNull();
+    expect(response.headers.get("Content-Security-Policy")).toBe("frame-ancestors 'self'");
     expect(response.headers.get("Cache-Control")).toBe("public, max-age=31536000, immutable");
     expect(response.headers.get("Content-Length")).toBe("5");
     expect(fetchMock).toHaveBeenCalledTimes(2);

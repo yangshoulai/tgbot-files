@@ -67,6 +67,13 @@ export function withSecurityHeaders(headers: HeadersInit = {}): Headers {
   return result;
 }
 
+export function withEmbeddableFileSecurityHeaders(headers: HeadersInit = {}): Headers {
+  const result = withSecurityHeaders(headers);
+  result.delete("X-Frame-Options");
+  result.set("Content-Security-Policy", "frame-ancestors 'self'");
+  return result;
+}
+
 export function requireEnv(env: object, name: string): string {
   const value = (env as Record<string, string | undefined>)[name]?.trim();
 

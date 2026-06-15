@@ -151,6 +151,7 @@ import {
   redirectResponse,
   requireEnv,
   sanitizeFileName,
+  withEmbeddableFileSecurityHeaders,
   withSecurityHeaders
 } from "./http";
 import { md5Hex } from "./md5";
@@ -7368,7 +7369,7 @@ async function handleFileAccess(request: Request, env: AppEnv): Promise<Response
     fileUrl: telegramFileUrl,
     rangeHeader
   });
-  const headers = withSecurityHeaders();
+  const headers = withEmbeddableFileSecurityHeaders();
 
   headers.set("Content-Type", payload.mime_type || telegramResponse.headers.get("Content-Type") || "application/octet-stream");
   headers.set(
@@ -8170,7 +8171,7 @@ async function handleMultipartFileAccess(params: {
     return rangeNotSatisfiableResponse(params.payload.size);
   }
 
-  const headers = withSecurityHeaders();
+  const headers = withEmbeddableFileSecurityHeaders();
   headers.set("Content-Type", params.payload.mime_type);
   headers.set(
     "Content-Disposition",
