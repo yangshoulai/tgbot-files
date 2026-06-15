@@ -70,7 +70,7 @@ export function withSecurityHeaders(headers: HeadersInit = {}): Headers {
 export function withEmbeddableFileSecurityHeaders(headers: HeadersInit = {}): Headers {
   const result = withSecurityHeaders(headers);
   result.delete("X-Frame-Options");
-  result.set("Content-Security-Policy", "frame-ancestors 'self'");
+  result.delete("Content-Security-Policy");
   return result;
 }
 

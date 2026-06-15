@@ -2015,7 +2015,7 @@ describe("API key multipart endpoints", () => {
     const directResponse = await handleRequest(new Request(completeBody.file.url), apiEnv);
     expect(directResponse.status).toBe(200);
     expect(directResponse.headers.get("X-Frame-Options")).toBeNull();
-    expect(directResponse.headers.get("Content-Security-Policy")).toBe("frame-ancestors 'self'");
+    expect(directResponse.headers.get("Content-Security-Policy")).toBeNull();
     expect(await directResponse.text()).toBe("hello");
 
     const publicPathParts = new URL(completeBody.file.url).pathname.split("/");
@@ -2463,7 +2463,7 @@ describe("worker file access endpoint", () => {
     expect(response.headers.get("Content-Type")).toBe("application/pdf");
     expect(response.headers.get("Content-Disposition")).toContain("hello.pdf");
     expect(response.headers.get("X-Frame-Options")).toBeNull();
-    expect(response.headers.get("Content-Security-Policy")).toBe("frame-ancestors 'self'");
+    expect(response.headers.get("Content-Security-Policy")).toBeNull();
     expect(response.headers.get("Cache-Control")).toBe("public, max-age=31536000, immutable");
     expect(response.headers.get("Content-Length")).toBe("5");
     expect(fetchMock).toHaveBeenCalledTimes(2);
