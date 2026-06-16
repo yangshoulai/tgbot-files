@@ -181,15 +181,63 @@ async function handleHlsPartRequest(request, event) {
   const partKind = parts[3] === "init" ? "init" : "segment";
   const partIndex = Number(parts[4] || "0");
   const sourceUrl = normalizeSameOriginSourceUrl(url.searchParams.get("source"));
+  const fullSourceUrl = normalizeSameOriginSourceUrl(url.searchParams.get("full_source"));
   const cacheMaxBytes = normalizeCacheMaxBytes(url.searchParams.get("cache_max"));
   const prefetchConcurrency = normalizePreviewPrefetchConcurrency(url.searchParams.get("prefetch_concurrency"));
+  const metadata = normalizeFileCacheMetadata({
+    kind: "hls",
+    fileId,
+    fileName: url.searchParams.get("file_name") || fileId,
+    directoryPath: normalizeDirectoryPath(url.searchParams.get("directory_path")),
+    mimeType: url.searchParams.get("mime") || "application/vnd.apple.mpegurl",
+    sourceUrl,
+    size: Number(url.searchParams.get("size")),
+    chunkSize: Number(url.searchParams.get("chunk_size")),
+    chunkCount: Number(url.searchParams.get("chunk_count")),
+    cacheMaxBytes,
+    cacheSource: normalizeCacheSource(url.searchParams.get("cache_source"))
+  });
 
   if (!fileId || !Number.isSafeInteger(partIndex) || partIndex < 0 || !sourceUrl) {
     return new Response("Invalid HLS preview part", { status: 400 });
   }
 
   try {
-    const response = await fetchAndCacheHlsPart({ fileId, partKind, partIndex, sourceUrl, cacheMaxBytes });
+    const range = parseRange(request.headers.get("Range"), Number(url.searchParams.get("full_size")) || Number(url.searchParams.get("chunk_size")) || 1, Number(url.searchParams.get("full_size")) || Number(url.searchParams.get("chunk_size")) || 1);
+    if (partKind === "segment" && range && fullSourceUrl) {
+      const cachedFullPart = await (await caches.open(CACHE_NAME)).match(`${self.location.origin}/__preview-cache/hls/${encodeURIComponent(fileId)}/${partKind}/${partIndex}`);
+      if (cachedFullPart) {
+        const bytes = await cachedFullPart.arrayBuffer();
+        const slice = bytes.slice(range.start, range.end + 1);
+        return new Response(slice, {
+          status: 206,
+          headers: {
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-store",
+            "Content-Type": cachedFullPart.headers.get("Content-Type") || "application/octet-stream",
+            "Content-Length": String(slice.byteLength),
+            "Content-Range": `bytes ${range.start}-${range.end}/${bytes.byteLength}`,
+            "X-Preview-Cache": "hls-segment-range"
+          }
+        });
+      }
+
+      const fallback = await fetch(sourceUrl, { credentials: "omit" });
+      if (!fallback.ok) {
+        throw new Error(`HLS ${partKind} ${partIndex} preview load failed (HTTP ${fallback.status})`);
+      }
+      return new Response(fallback.body || await fallback.arrayBuffer(), {
+        status: fallback.status,
+        headers: {
+          "Cache-Control": "no-store",
+          "Content-Type": fallback.headers.get("Content-Type") || "application/octet-stream",
+          "Content-Length": fallback.headers.get("Content-Length") || String(Number(url.searchParams.get("chunk_size")) || 0),
+          "X-Preview-Cache": "hls-segment-range-miss"
+        }
+      });
+    }
+
+    const response = await fetchAndCacheHlsPart({ fileId, partKind, partIndex, sourceUrl, cacheMaxBytes, metadata });
     if (partKind === "segment") {
       event.waitUntil(prioritizeHlsPreviewCache(fileId, partIndex, cacheMaxBytes, prefetchConcurrency));
       event.waitUntil(prefetchHlsSegments(fileId, partIndex + 1, prefetchConcurrency, cacheMaxBytes));
@@ -1560,6 +1608,14 @@ async function openChunkRangeSource(metadata, segment) {
   const cachedSource = await openCachedChunkRangeSource(metadata, segment);
   if (cachedSource) {
     return cachedSource;
+  }
+
+  const expectedSize = expectedChunkSize(metadata, segment.chunkIndex);
+  if (segment.start === 0 && segment.endExclusive === expectedSize) {
+    const bytes = await getChunkBytes(metadata, segment.chunkIndex);
+    return {
+      bytes: new Uint8Array(bytes, segment.start, segment.endExclusive - segment.start)
+    };
   }
 
   const stream = await fetchChunkByteRange(metadata, segment);

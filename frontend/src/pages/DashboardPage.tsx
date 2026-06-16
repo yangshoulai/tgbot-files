@@ -23,6 +23,7 @@ import { useToast } from "../lib/toast";
 import { useConfirm } from "../lib/confirm";
 import {
   buildFileCacheMetadata,
+  buildFileCacheUrl,
   cacheFileManually,
   canCacheFile,
   clearAutomaticFileCache,
@@ -68,6 +69,7 @@ import {
   supportsNativeFileSave
 } from "../lib/accelerated-download";
 import { canUseHlsAcceleratedDownload, hasFileLinkAccess, type LinkAccessibleFile } from "../lib/file-access";
+import { isVideoPreviewServiceWorkerControlling } from "../lib/video-preview-service-worker";
 
 type FileTypeFilter = "all" | "image" | "video" | "text" | "pdf" | "archive" | "other";
 type FileSortKey = "name" | "size" | "created_at" | "type";
@@ -122,6 +124,15 @@ interface AcceleratedDownloadPartTask {
     signal: AbortSignal,
     onProgress: (downloadedBytes: number) => void
   ) => Promise<ArrayBuffer>;
+}
+
+interface HlsAcceleratedDownloadContext {
+  fileId: string;
+  fileName: string;
+  directoryPath: string;
+  mimeType: string;
+  totalSize: number;
+  chunkCount: number;
 }
 
 interface AcceleratedDownloadTask {
@@ -289,14 +300,14 @@ function CacheManagerDialog({
           <div className="max-h-[min(68dvh,42rem)] overflow-y-auto overflow-x-hidden scroll-thin">
             <table className="w-full table-fixed border-collapse text-sm">
               <colgroup>
-                <col className="w-[25%]" />
-                <col className="w-[16%]" />
+                <col className="w-[22%]" />
+                <col className="w-[14%]" />
+                <col className="w-[9%]" />
+                <col className="w-[7%]" />
+                <col className="w-[8%]" />
                 <col className="w-[10%]" />
                 <col className="w-[8%]" />
-                <col className="w-[9%]" />
-                <col className="w-[11%]" />
-                <col className="w-[8%]" />
-                <col className="w-[13%]" />
+                <col className="w-[22%]" />
               </colgroup>
               <thead className="sticky top-0 z-10 border-b border-border bg-surface">
                 <tr className="text-left text-xs font-medium text-muted">
@@ -332,11 +343,12 @@ function CacheManagerDialog({
                         </span>
                       </td>
                       <td className="px-2 py-2 text-right">
-                        <div className="flex min-w-0 justify-end gap-1">
+                        <div className="flex min-w-0 flex-wrap justify-end gap-1">
                           {entry.manualCacheStatus === "caching" ? (
                             <Button
                               variant="secondary"
                               size="sm"
+                              className="h-7 px-2 text-xs"
                               disabled={Boolean(entryOperation)}
                               onClick={() => onPauseFile(entry)}
                             >
@@ -347,6 +359,7 @@ function CacheManagerDialog({
                             <Button
                               variant="secondary"
                               size="sm"
+                              className="h-7 px-2 text-xs"
                               disabled={Boolean(entryOperation)}
                               onClick={() => onResumeFile(entry)}
                             >
@@ -357,6 +370,7 @@ function CacheManagerDialog({
                             <Button
                               variant="danger-ghost"
                               size="sm"
+                              className="h-7 px-2 text-xs"
                               disabled={Boolean(entryOperation)}
                               onClick={() => onTerminateFile(entry)}
                             >
@@ -366,6 +380,7 @@ function CacheManagerDialog({
                             <Button
                               variant="danger-ghost"
                               size="sm"
+                              className="h-7 px-2 text-xs"
                               disabled={Boolean(entryOperation)}
                               onClick={() => onClearFile(entry)}
                             >
@@ -1064,7 +1079,14 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         const plan = (await getHlsDownloadPlan(file.id)).hls_download;
         fileName = plan.file_name;
         totalBytes = plan.total_size;
-        parts = createHlsAcceleratedParts(plan.parts);
+        parts = createHlsAcceleratedParts(plan.parts, {
+          fileId: file.id,
+          fileName: file.file_name,
+          directoryPath: file.directory_path || "/",
+          mimeType: file.mime_type || "application/vnd.apple.mpegurl",
+          totalSize: plan.total_size,
+          chunkCount: plan.part_count
+        });
       } else {
         if (!linkFile) {
           toast.info("该文件暂无可下载链接");
@@ -1397,29 +1419,46 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   }
 
   function createMultipartAcceleratedParts(file: MultipartDownloadFile, token: string): AcceleratedDownloadPartTask[] {
+    const cacheUrl = isVideoPreviewServiceWorkerControlling()
+      ? buildFileCacheUrl(buildFileCacheMetadata(file, session.video_preview_cache_bytes, "auto"))
+      : null;
+
     return Array.from({ length: file.chunk_count }, (_, index) => ({
       index,
       size: expectedMultipartChunkSize(file, index),
       offset: index * file.chunk_size,
       download: (signal, onProgress) =>
-        downloadMultipartChunk({
-          file,
-          token,
-          chunkIndex: index,
-          signal,
-          onProgress: (progress) => onProgress(progress.downloadedBytes)
-        })
+        cacheUrl
+          ? downloadAcceleratedPart({
+              url: cacheUrl,
+              expectedSize: expectedMultipartChunkSize(file, index),
+              label: `分片 ${index + 1}`,
+              signal,
+              headers: { Range: `bytes=${index * file.chunk_size}-${index * file.chunk_size + expectedMultipartChunkSize(file, index) - 1}` },
+              onProgress: (progress) => onProgress(progress.downloadedBytes)
+            })
+          : downloadMultipartChunk({
+              file,
+              token,
+              chunkIndex: index,
+              signal,
+              onProgress: (progress) => onProgress(progress.downloadedBytes)
+            })
     }));
   }
 
   function createSingleFileAcceleratedParts(file: LinkAccessibleFile): AcceleratedDownloadPartTask[] {
+    const cacheUrl = isVideoPreviewServiceWorkerControlling()
+      ? buildFileCacheUrl(buildFileCacheMetadata(file, session.video_preview_cache_bytes, "auto"))
+      : null;
+
     return [{
       index: 0,
       size: file.size,
       offset: 0,
       download: (signal, onProgress) =>
         downloadAcceleratedPart({
-          url: file.url,
+          url: cacheUrl || file.url,
           expectedSize: file.size,
           label: "文件",
           signal,
@@ -1428,14 +1467,28 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     }];
   }
 
-  function createHlsAcceleratedParts(parts: HlsDownloadPart[]): AcceleratedDownloadPartTask[] {
+  function createHlsAcceleratedParts(parts: HlsDownloadPart[], context: HlsAcceleratedDownloadContext): AcceleratedDownloadPartTask[] {
+    const fullSegments = new Map<number, { offset: number; size: number; url: string }>();
+    for (const part of parts) {
+      if (part.kind === "segment" && part.segment_index !== null && part.chunk_index === null) {
+        const path = sameOriginPath(part.url);
+        if (path) {
+          fullSegments.set(part.segment_index, {
+            offset: part.offset,
+            size: part.size,
+            url: path
+          });
+        }
+      }
+    }
+
     return parts.map((part) => ({
       index: part.index,
       size: part.size,
       offset: part.offset,
       download: (signal, onProgress) =>
         downloadAcceleratedPart({
-          url: part.url,
+          url: hlsAcceleratedPartCacheUrl(part, context, fullSegments) || part.url,
           expectedSize: part.size,
           label: part.kind === "init" || part.segment_index === null
             ? "HLS 初始化片段"
@@ -1443,9 +1496,78 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
               ? `HLS 片段 ${part.segment_index + 1}`
               : `HLS 片段 ${part.segment_index + 1} / 分片 ${part.chunk_index + 1}`,
           signal,
+          headers: hlsAcceleratedPartCacheHeaders(part, fullSegments),
           onProgress: (progress) => onProgress(progress.downloadedBytes)
         })
     }));
+  }
+
+  function hlsAcceleratedPartCacheUrl(part: HlsDownloadPart, context: HlsAcceleratedDownloadContext, fullSegments: Map<number, { offset: number; size: number; url: string }>): string | null {
+    if (!isVideoPreviewServiceWorkerControlling()) {
+      return null;
+    }
+
+    const fullSegment = part.kind === "segment" && part.chunk_index !== null && part.segment_index !== null
+      ? fullSegments.get(part.segment_index)
+      : null;
+    if (part.kind === "segment" && part.chunk_index !== null && !fullSegment) {
+      return null;
+    }
+
+    const sourceUrl = sameOriginPath(part.url);
+    if (!sourceUrl) {
+      return null;
+    }
+
+    const partKind = part.kind === "init" || part.segment_index === null ? "init" : "segment";
+    const partIndex = partKind === "init" ? 0 : part.segment_index;
+    if (partIndex === null || !Number.isSafeInteger(partIndex) || partIndex < 0) {
+      return null;
+    }
+
+    const params = new URLSearchParams({
+      source: sourceUrl,
+      cache_max: String(session.video_preview_cache_bytes),
+      prefetch_concurrency: String(Math.max(1, Math.min(session.upload_concurrency, 32))),
+      file_name: context.fileName,
+      directory_path: context.directoryPath,
+      mime: context.mimeType,
+      size: String(context.totalSize),
+      chunk_size: String(part.size),
+      chunk_count: String(context.chunkCount),
+      cache_source: "auto"
+    });
+
+    if (fullSegment) {
+      params.set("full_source", fullSegment.url);
+      params.set("full_size", String(fullSegment.size));
+    }
+
+    return `/__video-preview/hls-part/${encodeURIComponent(context.fileId)}/${partKind}/${partIndex}?${params.toString()}`;
+  }
+
+  function hlsAcceleratedPartCacheHeaders(part: HlsDownloadPart, fullSegments: Map<number, { offset: number; size: number; url: string }>): HeadersInit | undefined {
+    const fullSegment = part.kind === "segment" && part.chunk_index !== null && part.segment_index !== null
+      ? fullSegments.get(part.segment_index)
+      : null;
+    if (!fullSegment) {
+      return undefined;
+    }
+
+    const start = part.offset - fullSegment.offset;
+    return { Range: `bytes=${start}-${start + part.size - 1}` };
+  }
+
+  function sameOriginPath(url: string): string | null {
+    try {
+      const parsed = new URL(url, window.location.origin);
+      if (parsed.origin !== window.location.origin) {
+        return null;
+      }
+      return `${parsed.pathname}${parsed.search}`;
+    } catch {
+      return null;
+    }
   }
 
   function createInitialAcceleratedChunks(parts: AcceleratedDownloadPartTask[]): AcceleratedChunkState[] {

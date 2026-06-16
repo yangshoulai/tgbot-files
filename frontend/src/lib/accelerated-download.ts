@@ -106,17 +106,20 @@ export async function downloadAcceleratedPart({
   expectedSize,
   label,
   signal,
+  headers,
   onProgress
 }: {
   url: string;
   expectedSize: number;
   label: string;
   signal: AbortSignal;
+  headers?: HeadersInit;
   onProgress?: (progress: AcceleratedDownloadProgress) => void;
 }): Promise<ArrayBuffer> {
   const response = await fetch(url, {
     signal,
-    credentials: "omit"
+    credentials: "omit",
+    headers
   });
 
   if (!response.ok) {
