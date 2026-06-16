@@ -3,6 +3,7 @@ import type { FileItem } from "../../../api";
 export interface PreviewComponentProps {
   file: FileItem;
   fullscreen: boolean;
+  previewUrl?: string;
 }
 
 export interface TextPreviewState {

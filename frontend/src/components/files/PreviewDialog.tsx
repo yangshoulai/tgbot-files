@@ -6,6 +6,7 @@ import {
   hasFileLinkAccess,
   TEXT_PREVIEW_MAX_BYTES
 } from "../../lib/file-access";
+import { buildFileCacheMetadata, buildFileCacheUrl } from "../../lib/file-cache";
 import { cn } from "../../lib/cn";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
@@ -40,6 +41,9 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
   const [maximized, setMaximized] = useState(false);
   const [nativeFullscreen, setNativeFullscreen] = useState(false);
   const [textState, setTextState] = useState<TextPreviewState>({ status: "idle", content: "" });
+  const cachePreviewUrl = file
+    ? buildFileCacheUrl(buildFileCacheMetadata(file, videoPreviewCacheBytes, "auto"))
+    : null;
 
   useEffect(() => {
     if (!file || (preview !== "text" && preview !== "markdown")) {
@@ -69,7 +73,7 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
     const timeout = window.setTimeout(() => controller.abort("timeout"), TEXT_PREVIEW_TIMEOUT_MS);
     setTextState({ status: "loading", content: "" });
 
-    fetch(file.file_path, { signal: controller.signal })
+    fetch(cachePreviewUrl || file.file_path, { signal: controller.signal })
       .then(async (response) => {
         if (!response.ok) {
           throw new Error(response.statusText || "读取预览内容失败");
@@ -99,7 +103,16 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
       window.clearTimeout(timeout);
       controller.abort();
     };
-  }, [file, preview]);
+  }, [cachePreviewUrl, file, preview]);
+
+  useEffect(() => {
+    if (!file || preview !== "office" || !cachePreviewUrl) return;
+
+    const controller = new AbortController();
+    fetch(cachePreviewUrl, { signal: controller.signal }).catch(() => undefined);
+
+    return () => controller.abort();
+  }, [cachePreviewUrl, file, preview]);
 
   useEffect(() => {
     setMaximized(false);
@@ -234,7 +247,7 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
         ) : null}
         <PreviewFrame fullscreen={maximized || nativeFullscreen} tone={previewTone(preview)} className={nativeFullscreen ? "h-screen rounded-none border-0" : undefined}>
           {preview === "image" ? (
-            <ImagePreview file={file} fullscreen={maximized || nativeFullscreen} />
+            <ImagePreview file={file} fullscreen={maximized || nativeFullscreen} previewUrl={cachePreviewUrl || undefined} />
           ) : preview === "video" ? (
             <VideoPreview
               file={file}
@@ -249,6 +262,7 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
             <AudioPreview
               file={file}
               fullscreen={maximized || nativeFullscreen}
+              previewUrl={cachePreviewUrl || undefined}
               onToggleMaximized={toggleMaximized}
               nativeFullscreen={nativeFullscreen}
               onToggleNativeFullscreen={toggleNativeFullscreen}
@@ -258,7 +272,7 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
           ) : preview === "markdown" ? (
             <MarkdownPreview state={textState} fullscreen={maximized || nativeFullscreen} />
           ) : preview === "pdf" ? (
-            <PdfPreview file={file} fullscreen={maximized || nativeFullscreen} />
+            <PdfPreview file={file} fullscreen={maximized || nativeFullscreen} previewUrl={cachePreviewUrl || undefined} />
           ) : preview === "office" ? (
             <OfficePreview file={file} fullscreen={maximized || nativeFullscreen} />
           ) : (

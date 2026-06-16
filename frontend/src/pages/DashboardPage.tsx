@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, ChevronRight, FolderInput, FolderPlus, LayoutGrid, List, PanelLeftClose, PanelLeftOpen, Pencil, RefreshCw, Search, Trash2 } from "lucide-react";
+import { ArrowUp, ChevronRight, Database, FolderInput, FolderPlus, LayoutGrid, List, PanelLeftClose, PanelLeftOpen, Pencil, RefreshCw, Search, Trash2 } from "lucide-react";
 import {
   ApiError,
   DirectoryItem,
@@ -21,6 +21,18 @@ import {
 import { fileKind, formatBytes, sumFileSize } from "../utils";
 import { useToast } from "../lib/toast";
 import { useConfirm } from "../lib/confirm";
+import {
+  buildFileCacheMetadata,
+  cacheFileManually,
+  canCacheFile,
+  clearAutomaticFileCache,
+  clearFileCache,
+  clearFilesCache,
+  getFileCacheSummary,
+  requestPersistentFileCacheStorage,
+  type FileCacheEntry,
+  type FileCacheSummary
+} from "../lib/file-cache";
 import { Input } from "../components/ui/Input";
 import { IconButton } from "../components/ui/IconButton";
 import { Button } from "../components/ui/Button";
@@ -215,6 +227,104 @@ function FileListBusyOverlay({ label }: { label: string }) {
   );
 }
 
+function CacheManagerDialog({
+  open,
+  summary,
+  busyFileId,
+  onClose,
+  onRefresh,
+  onClearAutomatic,
+  onClearFile
+}: {
+  open: boolean;
+  summary: FileCacheSummary | null;
+  busyFileId: string | null;
+  onClose: () => void;
+  onRefresh: () => void;
+  onClearAutomatic: () => void;
+  onClearFile: (entry: FileCacheEntry) => void;
+}) {
+  const entries = summary?.entries ?? [];
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="缓存管理"
+      description={`已缓存 ${entries.length} 个文件，手动 ${formatBytes(summary?.manualBytes ?? 0)}，自动 ${formatBytes(summary?.autoBytes ?? 0)}`}
+      size="xl"
+      footer={
+        <>
+          <Button variant="secondary" leadingIcon={<RefreshCw size={15} />} onClick={onRefresh}>
+            刷新
+          </Button>
+          <Button variant="secondary" leadingIcon={<Trash2 size={15} />} disabled={(summary?.autoBytes ?? 0) <= 0} onClick={onClearAutomatic}>
+            清理自动缓存
+          </Button>
+          <Button variant="primary" onClick={onClose}>
+            完成
+          </Button>
+        </>
+      }
+    >
+      <div className="overflow-hidden rounded-2xl border border-border bg-background">
+        {entries.length === 0 ? (
+          <div className="px-5 py-10 text-center">
+            <p className="text-sm font-medium text-foreground">暂无缓存文件</p>
+            <p className="mt-1 text-xs text-muted">预览文件会产生自动缓存，也可以在文件菜单中手动缓存。</p>
+          </div>
+        ) : (
+          <div className="max-h-[min(68dvh,42rem)] overflow-auto scroll-thin">
+            <table className="w-full min-w-[58rem] border-collapse text-sm">
+              <thead className="sticky top-0 z-10 border-b border-border bg-surface">
+                <tr className="text-left text-xs font-medium uppercase tracking-wide text-muted">
+                  <th className="px-3 py-2">文件名</th>
+                  <th className="px-3 py-2">类型</th>
+                  <th className="px-3 py-2">总大小</th>
+                  <th className="px-3 py-2">分片数</th>
+                  <th className="px-3 py-2">已缓存分片</th>
+                  <th className="px-3 py-2">已缓存大小</th>
+                  <th className="px-3 py-2">来源</th>
+                  <th className="px-3 py-2 text-right">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {entries.map((entry) => (
+                  <tr key={entry.fileId} className="border-b border-border last:border-b-0">
+                    <td className="max-w-72 px-3 py-2">
+                      <p className="truncate font-medium text-foreground" title={entry.fileName}>{entry.fileName}</p>
+                    </td>
+                    <td className="px-3 py-2 text-muted">{entry.mimeType || "未知"}</td>
+                    <td className="whitespace-nowrap px-3 py-2 text-foreground">{formatBytes(entry.size)}</td>
+                    <td className="whitespace-nowrap px-3 py-2 text-muted">{entry.chunkCount}</td>
+                    <td className="whitespace-nowrap px-3 py-2 text-muted">{entry.cachedChunks}</td>
+                    <td className="whitespace-nowrap px-3 py-2 text-foreground">{formatBytes(entry.cachedBytes)}</td>
+                    <td className="whitespace-nowrap px-3 py-2">
+                      <span className="rounded-full border border-border bg-surface px-2 py-0.5 text-xs text-muted">
+                        {entry.cacheSource === "manual" ? "手动" : "自动"}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2 text-right">
+                      <Button
+                        variant="danger-ghost"
+                        size="sm"
+                        disabled={busyFileId === entry.fileId}
+                        onClick={() => onClearFile(entry)}
+                      >
+                        {busyFileId === entry.fileId ? "清理中" : "清除缓存"}
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
 export function DashboardPage({ session, uploadVersion, copyText, onDirectoryChange, onUploadToDirectory }: DashboardPageProps) {
   const toast = useToast();
   const confirm = useConfirm();
@@ -262,6 +372,9 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   const [renamingDirectorySaving, setRenamingDirectorySaving] = useState(false);
   const [directoryPanelVisible, setDirectoryPanelVisible] = useState(true);
   const [acceleratedDownload, setAcceleratedDownload] = useState<AcceleratedDownloadState | null>(null);
+  const [cacheSummary, setCacheSummary] = useState<FileCacheSummary | null>(null);
+  const [cacheManagerOpen, setCacheManagerOpen] = useState(false);
+  const [cacheOperationFileId, setCacheOperationFileId] = useState<string | null>(null);
   const listBusyLabel = operationLabel ?? (loading ? "正在加载目录内容..." : undefined);
   const isListBusy = Boolean(listBusyLabel);
 
@@ -305,6 +418,14 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     }
   }, [toast]);
 
+  const refreshCacheSummary = useCallback(async () => {
+    try {
+      setCacheSummary(await getFileCacheSummary());
+    } catch {
+      setCacheSummary(null);
+    }
+  }, []);
+
   useEffect(() => {
     void loadFiles();
   }, [loadFiles]);
@@ -312,6 +433,18 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   useEffect(() => {
     void loadDirectoryOptions();
   }, [loadDirectoryOptions]);
+
+  useEffect(() => {
+    void refreshCacheSummary();
+  }, [refreshCacheSummary]);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      void refreshCacheSummary();
+    }, 2500);
+
+    return () => window.clearInterval(intervalId);
+  }, [refreshCacheSummary]);
 
   useEffect(() => {
     onDirectoryChange(currentDirPath);
@@ -365,9 +498,14 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         value:
           session.config.telegram_bot_token && session.config.telegram_storage_chat_id ? "已连接" : "未配置",
         hint: "Telegram Bot API"
+      },
+      {
+        label: "缓存空间",
+        value: formatBytes(cacheSummary?.totalBytes ?? 0),
+        hint: `手动 ${formatBytes(cacheSummary?.manualBytes ?? 0)} · 自动 ${formatBytes(cacheSummary?.autoBytes ?? 0)}`
       }
     ];
-  }, [currentDirPath, directories.length, files, globalStats, session.config]);
+  }, [cacheSummary?.autoBytes, cacheSummary?.manualBytes, cacheSummary?.totalBytes, currentDirPath, directories.length, files, globalStats, session.config]);
 
   async function onDelete(file: FileItem) {
     const ok = await confirm({
@@ -395,6 +533,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         next.delete(file.id);
         return next;
       });
+      await clearCachesBestEffort([file.id]);
       await loadFiles();
     } catch (error) {
       toast.danger(errorMessage(error));
@@ -408,6 +547,10 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     const targetDirectories = directories.filter((directory) => selectedDirectoryIds.has(directory.id));
     const totalTargets = targetFiles.length + targetDirectories.length;
     if (totalTargets === 0) return;
+    const cacheFileIds = [
+      ...targetFiles.map((file) => file.id),
+      ...await fileIdsForDirectoryTrees(targetDirectories).catch(() => [])
+    ];
 
     const ok = await confirm({
       title: `删除选中的 ${totalTargets} 个项目？`,
@@ -434,6 +577,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       if (detailFile && targetFiles.some((file) => file.id === detailFile.id)) setDetailFile(null);
       setSelectedFileIds(new Set());
       setSelectedDirectoryIds(new Set());
+      await clearCachesBestEffort(cacheFileIds);
       await loadFiles();
     } catch (error) {
       toast.danger(errorMessage(error));
@@ -464,6 +608,47 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     }
   }
 
+  async function onCacheFile(file: FileItem) {
+    const metadata = buildFileCacheMetadata(file, session.video_preview_cache_bytes, "manual");
+    if (!metadata || !canCacheFile(file)) {
+      toast.danger("该文件缺少可缓存的访问链接");
+      return;
+    }
+
+    setCacheOperationFileId(file.id);
+    try {
+      await requestPersistentFileCacheStorage();
+      await cacheFileManually(metadata);
+      await refreshCacheSummary();
+      toast.success("文件已缓存");
+    } catch (error) {
+      toast.danger(errorMessage(error));
+    } finally {
+      setCacheOperationFileId(null);
+    }
+  }
+
+  async function onClearFileCache(file: FileItem) {
+    setCacheOperationFileId(file.id);
+    try {
+      setCacheSummary(await clearFileCache(file.id));
+      toast.success("缓存已清除");
+    } catch (error) {
+      toast.danger(errorMessage(error));
+    } finally {
+      setCacheOperationFileId(null);
+    }
+  }
+
+  async function onClearAutomaticCache() {
+    try {
+      setCacheSummary(await clearAutomaticFileCache());
+      toast.success("自动缓存已清理");
+    } catch (error) {
+      toast.danger(errorMessage(error));
+    }
+  }
+
   async function onDeleteDirectory(directory: DirectoryItem) {
     const ok = await confirm({
       title: `删除目录 ${directory.name}？`,
@@ -477,6 +662,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
       confirmText: "递归删除"
     });
     if (!ok) return;
+    const cacheFileIds = await fileIdsForDirectoryTrees([directory]).catch(() => []);
 
     setOperationLabel("正在删除目录...");
     try {
@@ -487,11 +673,47 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         next.delete(directory.id);
         return next;
       });
+      await clearCachesBestEffort(cacheFileIds);
       await Promise.all([loadFiles(), loadDirectoryOptions()]);
     } catch (error) {
       toast.danger(errorMessage(error));
     } finally {
       setOperationLabel(null);
+    }
+  }
+
+  async function fileIdsForDirectoryTrees(targetDirectories: DirectoryItem[]): Promise<string[]> {
+    if (targetDirectories.length === 0) return [];
+
+    const paths = new Set<string>();
+    for (const directory of targetDirectories) {
+      paths.add(directory.path);
+      for (const option of directoryOptions) {
+        if (option.path.startsWith(`${directory.path}/`)) {
+          paths.add(option.path);
+        }
+      }
+    }
+
+    const ids = new Set<string>();
+    for (const path of paths) {
+      const response = await listFiles({ q: "", dir: path, all: true, type: "all" });
+      for (const file of response.files) {
+        ids.add(file.id);
+      }
+    }
+
+    return Array.from(ids);
+  }
+
+  async function clearCachesBestEffort(fileIds: string[]) {
+    const uniqueIds = Array.from(new Set(fileIds.filter(Boolean)));
+    if (uniqueIds.length === 0) return;
+
+    try {
+      setCacheSummary(await clearFilesCache(uniqueIds));
+    } catch {
+      // 删除文件不应被浏览器本地缓存清理失败阻塞。
     }
   }
 
@@ -1313,6 +1535,13 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
             <div className="flex shrink-0 flex-wrap items-center gap-2">
               <Button
                 variant="secondary"
+                leadingIcon={<Database size={16} />}
+                onClick={() => setCacheManagerOpen(true)}
+              >
+                缓存管理
+              </Button>
+              <Button
+                variant="secondary"
                 leadingIcon={<ArrowUp size={16} />}
                 disabled={currentDirPath === "/" || isListBusy}
                 onClick={() => goToDirectory(parentDirectoryPath(currentDirPath))}
@@ -1440,6 +1669,9 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
                 onThumbnailPreview={setThumbnailPreviewFile}
                 onCopy={onCopy}
                 onAcceleratedDownload={(file) => void onAcceleratedDownload(file)}
+                cacheSummary={cacheSummary}
+                onCacheFile={(file) => void onCacheFile(file)}
+                onClearFileCache={(file) => void onClearFileCache(file)}
                 onDelete={onDelete}
                 layout={fileLayoutMode}
               />
@@ -1478,6 +1710,27 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         onClose={() => setAcceleratedDownload(null)}
         onRetryChunk={retryAcceleratedChunk}
         onRetryFailed={retryFailedAcceleratedChunks}
+      />
+      <CacheManagerDialog
+        open={cacheManagerOpen}
+        summary={cacheSummary}
+        busyFileId={cacheOperationFileId}
+        onClose={() => setCacheManagerOpen(false)}
+        onRefresh={() => void refreshCacheSummary()}
+        onClearAutomatic={() => void onClearAutomaticCache()}
+        onClearFile={(entry) => {
+          const file = files.find((item) => item.id === entry.fileId);
+          if (file) {
+            void onClearFileCache(file);
+            return;
+          }
+          setCacheOperationFileId(entry.fileId);
+          clearFileCache(entry.fileId)
+            .then(setCacheSummary)
+            .then(() => toast.success("缓存已清除"))
+            .catch((error) => toast.danger(errorMessage(error)))
+            .finally(() => setCacheOperationFileId(null));
+        }}
       />
 
       <Modal

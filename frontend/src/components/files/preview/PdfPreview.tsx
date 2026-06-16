@@ -20,7 +20,7 @@ const MIN_SCALE = 0.7;
 const MAX_SCALE = 2.2;
 const SCALE_STEP = 0.2;
 
-export function PdfPreview({ file, fullscreen }: PreviewComponentProps) {
+export function PdfPreview({ file, fullscreen, previewUrl }: PreviewComponentProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const renderTaskRef = useRef<pdfjsLib.RenderTask | null>(null);
   const linkFile = hasFileLinkAccess(file) ? file : null;
@@ -37,7 +37,7 @@ export function PdfPreview({ file, fullscreen }: PreviewComponentProps) {
 
     let disposed = false;
     const loadingTask = pdfjsLib.getDocument({
-      url: file.file_path,
+      url: previewUrl || file.file_path,
       withCredentials: true
     });
 
@@ -65,7 +65,7 @@ export function PdfPreview({ file, fullscreen }: PreviewComponentProps) {
       renderTaskRef.current = null;
       void loadingTask.destroy();
     };
-  }, [file.file_path, file.id, linkFile]);
+  }, [file.file_path, file.id, linkFile, previewUrl]);
 
   useEffect(() => {
     if (state.status !== "ready") return;

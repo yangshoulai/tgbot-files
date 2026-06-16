@@ -32,7 +32,7 @@ interface LyricsLine {
 const AUDIO_PREVIEW_TIMEOUT_MS = 30_000;
 const LYRICS_PREVIEW_TIMEOUT_MS = 20_000;
 
-export function AudioPreview({ file, fullscreen, onToggleMaximized, nativeFullscreen, onToggleNativeFullscreen }: AudioPreviewProps) {
+export function AudioPreview({ file, fullscreen, previewUrl, onToggleMaximized, nativeFullscreen, onToggleNativeFullscreen }: AudioPreviewProps) {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
@@ -207,7 +207,7 @@ export function AudioPreview({ file, fullscreen, onToggleMaximized, nativeFullsc
 
         <audio
           ref={audioRef}
-          src={file.file_path}
+          src={previewUrl || file.file_path}
           preload="metadata"
           onLoadStart={() => setLoading(true)}
           onLoadedMetadata={() => {

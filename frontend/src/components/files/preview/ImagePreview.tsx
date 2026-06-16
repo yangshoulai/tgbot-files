@@ -5,7 +5,7 @@ import { cn } from "../../../lib/cn";
 import type { PreviewComponentProps } from "./types";
 import { PreviewError, PreviewLoading } from "./PreviewFrame";
 
-export function ImagePreview({ file, fullscreen }: PreviewComponentProps) {
+export function ImagePreview({ file, fullscreen, previewUrl }: PreviewComponentProps) {
   const [loaded, setLoaded] = useState(false);
   const [failed, setFailed] = useState(false);
   const linkFile = hasFileLinkAccess(file) ? file : null;
@@ -42,7 +42,7 @@ export function ImagePreview({ file, fullscreen }: PreviewComponentProps) {
       ) : null}
       <div className="absolute inset-4 flex min-h-0 min-w-0 items-center justify-center">
         <img
-          src={file.file_path}
+          src={previewUrl || file.file_path}
           alt={file.file_name}
           className={cn(
             "block max-h-full max-w-full rounded-xl object-contain shadow-dialog transition-opacity duration-200",

@@ -11,6 +11,7 @@ import {
   FolderOpen,
   Info,
   ImagePlus,
+  HardDriveDownload,
   Pencil,
   MoreVertical,
   Trash2,
@@ -22,6 +23,7 @@ import {
   hasFileLinkAccess
 } from "../../lib/file-access";
 import { cn } from "../../lib/cn";
+import { canCacheFile, type FileCacheSummary } from "../../lib/file-cache";
 import { fileKind, formatBytes, formatDateTime } from "../../utils";
 import { IconButton } from "../ui/IconButton";
 import { FileVisual } from "../ui/FileVisual";
@@ -73,6 +75,9 @@ interface FileTableProps {
   onThumbnailPreview: (file: FileItem) => void;
   onCopy: (file: FileItem) => void;
   onAcceleratedDownload: (file: FileItem) => void;
+  onCacheFile: (file: FileItem) => void;
+  onClearFileCache: (file: FileItem) => void;
+  cacheSummary: FileCacheSummary | null;
   onDelete: (file: FileItem) => void;
 }
 
@@ -148,6 +153,9 @@ export function FileTable({
   onThumbnailPreview,
   onCopy,
   onAcceleratedDownload,
+  onCacheFile,
+  onClearFileCache,
+  cacheSummary,
   onDelete
 }: FileTableProps) {
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
@@ -295,6 +303,9 @@ export function FileTable({
     const { file } = state;
     const linkFile = hasFileLinkAccess(file) ? file : null;
     const canPreviewFile = canPreviewThroughAvailableAccess(file);
+    const cacheEntry = cacheSummary?.entries.find((entry) => entry.fileId === file.id) ?? null;
+    const cached = Boolean(cacheEntry?.cachedBytes);
+    const cacheLabel = `缓存（${formatBytes(file.size)}）`;
 
     return [
       {
@@ -349,6 +360,22 @@ export function FileTable({
         label: "加速下载",
         icon: <Download size={15} />,
         onSelect: () => runContextAction(() => onAcceleratedDownload(file))
+      },
+      {
+        type: "item",
+        key: "cache",
+        label: cacheLabel,
+        icon: <HardDriveDownload size={15} />,
+        disabled: !canCacheFile(file),
+        onSelect: () => runContextAction(() => onCacheFile(file))
+      },
+      {
+        type: "item",
+        key: "clear-cache",
+        label: cached ? `清除缓存（${formatBytes(cacheEntry!.cachedBytes)}）` : "清除缓存",
+        icon: <Trash2 size={15} />,
+        disabled: !cached,
+        onSelect: () => runContextAction(() => onClearFileCache(file))
       },
       { type: "separator", key: "file-danger-separator" },
       {
