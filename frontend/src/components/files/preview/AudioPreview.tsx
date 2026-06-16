@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { FileText, Languages, Music2 } from "lucide-react";
 import { listFiles, type FileItem } from "../../../api";
-import { hasFileLinkAccess } from "../../../lib/file-access";
+import { buildAutomaticFileCacheUrl } from "../../../lib/file-cache";
 import { formatBytes } from "../../../utils";
 import { cn } from "../../../lib/cn";
 import type { PreviewComponentProps } from "./types";
@@ -10,6 +10,7 @@ import { PreviewError } from "./PreviewFrame";
 import { Spinner } from "../../ui/Spinner";
 
 interface AudioPreviewProps extends PreviewComponentProps {
+  cacheMaxBytes: number;
   onToggleMaximized: () => void;
   nativeFullscreen: boolean;
   onToggleNativeFullscreen: () => void;
@@ -32,7 +33,7 @@ interface LyricsLine {
 const AUDIO_PREVIEW_TIMEOUT_MS = 30_000;
 const LYRICS_PREVIEW_TIMEOUT_MS = 20_000;
 
-export function AudioPreview({ file, fullscreen, previewUrl, onToggleMaximized, nativeFullscreen, onToggleNativeFullscreen }: AudioPreviewProps) {
+export function AudioPreview({ file, fullscreen, previewUrl, cacheMaxBytes, onToggleMaximized, nativeFullscreen, onToggleNativeFullscreen }: AudioPreviewProps) {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
@@ -42,7 +43,6 @@ export function AudioPreview({ file, fullscreen, previewUrl, onToggleMaximized, 
   const [lyricsTracks, setLyricsTracks] = useState<LoadedLyricsTrack[]>([]);
   const [selectedLyricsId, setSelectedLyricsId] = useState<string | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
-  const linkFile = hasFileLinkAccess(file) ? file : null;
   const coverUrl = file.thumbnail_url && !coverFailed ? file.thumbnail_url : null;
   const selectedLyrics = useMemo(
     () => lyricsTracks.find((track) => track.id === selectedLyricsId) ?? null,
@@ -62,7 +62,7 @@ export function AudioPreview({ file, fullscreen, previewUrl, onToggleMaximized, 
   }, [file.id]);
 
   useEffect(() => {
-    if (!loading || failed || !linkFile) return;
+    if (!loading || failed || !previewUrl) return;
 
     const timeout = window.setTimeout(() => {
       setLoading(false);
@@ -70,7 +70,7 @@ export function AudioPreview({ file, fullscreen, previewUrl, onToggleMaximized, 
     }, AUDIO_PREVIEW_TIMEOUT_MS);
 
     return () => window.clearTimeout(timeout);
-  }, [linkFile, failed, loading]);
+  }, [failed, loading, previewUrl]);
 
   useEffect(() => {
     const audio = audioRef.current;
@@ -112,7 +112,7 @@ export function AudioPreview({ file, fullscreen, previewUrl, onToggleMaximized, 
       if (disposed) return;
 
       const lyricsFiles = matchingLyricsFiles(result.files, file);
-      const loaded = (await Promise.all(lyricsFiles.map((lyricsFile) => loadLyricsFile(lyricsFile, file.file_name, controller.signal))))
+      const loaded = (await Promise.all(lyricsFiles.map((lyricsFile) => loadLyricsFile(lyricsFile, file.file_name, cacheMaxBytes, controller.signal))))
         .filter((track): track is LoadedLyricsTrack => Boolean(track));
       if (disposed) return;
 
@@ -143,10 +143,10 @@ export function AudioPreview({ file, fullscreen, previewUrl, onToggleMaximized, 
       window.clearTimeout(timeoutId);
       controller.abort();
     };
-  }, [file.directory_path, file.file_name, file.id]);
+  }, [cacheMaxBytes, file.directory_path, file.file_name, file.id]);
 
-  if (!linkFile) {
-    return <PreviewError message="该音频不提供完整访问链接，无法直接在线播放" dark />;
+  if (!previewUrl) {
+    return <PreviewError message="该音频缺少缓存代理地址，无法在线播放" dark />;
   }
 
   return (
@@ -207,7 +207,7 @@ export function AudioPreview({ file, fullscreen, previewUrl, onToggleMaximized, 
 
         <audio
           ref={audioRef}
-          src={previewUrl || file.file_path}
+          src={previewUrl}
           preload="metadata"
           onLoadStart={() => setLoading(true)}
           onLoadedMetadata={() => {
@@ -401,15 +401,17 @@ function LyricsPanel({
 async function loadLyricsFile(
   lyricsFile: FileItem,
   audioFileName: string,
+  cacheMaxBytes: number,
   signal: AbortSignal
 ): Promise<LoadedLyricsTrack | null> {
-  if (!hasFileLinkAccess(lyricsFile)) return null;
-
   const extension = lyricsExtension(lyricsFile.file_name);
   if (!extension) return null;
 
+  const previewUrl = buildAutomaticFileCacheUrl(lyricsFile, cacheMaxBytes);
+  if (!previewUrl) return null;
+
   try {
-    const response = await fetch(lyricsFile.file_path, {
+    const response = await fetch(previewUrl, {
       credentials: "include",
       signal
     });

@@ -6,7 +6,11 @@ import {
   hasFileLinkAccess,
   TEXT_PREVIEW_MAX_BYTES
 } from "../../lib/file-access";
-import { buildFileCacheMetadata, buildFileCacheUrl } from "../../lib/file-cache";
+import { buildAutomaticFileCacheUrl } from "../../lib/file-cache";
+import {
+  ensureVideoPreviewServiceWorker,
+  isVideoPreviewServiceWorkerControlling
+} from "../../lib/video-preview-service-worker";
 import { cn } from "../../lib/cn";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
@@ -21,6 +25,7 @@ import { MarkdownPreview } from "./preview/MarkdownPreview";
 import { PdfPreview } from "./preview/PdfPreview";
 import { OfficePreview } from "./preview/OfficePreview";
 import { UnsupportedPreview } from "./preview/UnsupportedPreview";
+import { PreviewError, PreviewLoading } from "./preview/PreviewFrame";
 import type { TextPreviewState } from "./preview/types";
 
 const TEXT_PREVIEW_TIMEOUT_MS = 30_000;
@@ -41,9 +46,62 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
   const [maximized, setMaximized] = useState(false);
   const [nativeFullscreen, setNativeFullscreen] = useState(false);
   const [textState, setTextState] = useState<TextPreviewState>({ status: "idle", content: "" });
+  const [serviceWorkerState, setServiceWorkerState] = useState<FilePreviewServiceWorkerState>(initialFilePreviewServiceWorkerState);
   const cachePreviewUrl = file
-    ? buildFileCacheUrl(buildFileCacheMetadata(file, videoPreviewCacheBytes, "auto"))
+    ? buildAutomaticFileCacheUrl(file, videoPreviewCacheBytes)
     : null;
+  const needsFileCachePreview = Boolean(preview && preview !== "video");
+  const serviceWorkerReady = !needsFileCachePreview || serviceWorkerState.status === "controlled";
+  const fileCachePreviewMessage = needsFileCachePreview
+    ? filePreviewUnavailableMessage({
+      hasPreviewUrl: Boolean(cachePreviewUrl),
+      serviceWorkerState
+    })
+    : null;
+  const fileCachePreviewChecking = needsFileCachePreview && serviceWorkerState.status === "checking";
+  const fileCachePreviewError = fileCachePreviewChecking ? null : fileCachePreviewMessage;
+
+  useEffect(() => {
+    if (!file || !preview || preview === "video") {
+      return;
+    }
+
+    let disposed = false;
+
+    async function refreshServiceWorker() {
+      if (isVideoPreviewServiceWorkerControlling()) {
+        setServiceWorkerState({ status: "controlled" });
+        return;
+      }
+
+      setServiceWorkerState({ status: "checking" });
+      const result = await ensureVideoPreviewServiceWorker();
+      if (disposed) return;
+
+      if (result.controlled) {
+        setServiceWorkerState({ status: "controlled" });
+        return;
+      }
+
+      if (!result.supported) {
+        setServiceWorkerState({ status: "unsupported", message: result.error || "当前浏览器不支持 Service Worker" });
+        return;
+      }
+
+      if (!result.registered) {
+        setServiceWorkerState({ status: "failed", message: result.error || "Service Worker 注册失败" });
+        return;
+      }
+
+      setServiceWorkerState({ status: "need-reload", message: "Service Worker 已注册，但当前页面还没有被它接管" });
+    }
+
+    void refreshServiceWorker();
+
+    return () => {
+      disposed = true;
+    };
+  }, [file?.id, preview]);
 
   useEffect(() => {
     if (!file || (preview !== "text" && preview !== "markdown")) {
@@ -60,11 +118,20 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
       return;
     }
 
-    if (!hasFileLinkAccess(file)) {
+    if (!cachePreviewUrl) {
       setTextState({
         status: "error",
         content: "",
-        message: "该文件不提供完整访问链接，无法直接读取文本预览"
+        message: "该文件缺少可代理的访问链接，无法通过缓存代理读取文本预览"
+      });
+      return;
+    }
+
+    if (!serviceWorkerReady) {
+      setTextState({
+        status: "error",
+        content: "",
+        message: fileCachePreviewMessage || "Service Worker 尚未接管当前页面，请刷新后再预览"
       });
       return;
     }
@@ -73,7 +140,10 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
     const timeout = window.setTimeout(() => controller.abort("timeout"), TEXT_PREVIEW_TIMEOUT_MS);
     setTextState({ status: "loading", content: "" });
 
-    fetch(cachePreviewUrl || file.file_path, { signal: controller.signal })
+    fetch(cachePreviewUrl, {
+      credentials: "include",
+      signal: controller.signal
+    })
       .then(async (response) => {
         if (!response.ok) {
           throw new Error(response.statusText || "读取预览内容失败");
@@ -103,16 +173,19 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
       window.clearTimeout(timeout);
       controller.abort();
     };
-  }, [cachePreviewUrl, file, preview]);
+  }, [cachePreviewUrl, file, fileCachePreviewMessage, preview, serviceWorkerReady]);
 
   useEffect(() => {
-    if (!file || preview !== "office" || !cachePreviewUrl) return;
+    if (!file || preview !== "office" || !cachePreviewUrl || !serviceWorkerReady) return;
 
     const controller = new AbortController();
-    fetch(cachePreviewUrl, { signal: controller.signal }).catch(() => undefined);
+    fetch(cachePreviewUrl, {
+      credentials: "include",
+      signal: controller.signal
+    }).catch(() => undefined);
 
     return () => controller.abort();
-  }, [cachePreviewUrl, file, preview]);
+  }, [cachePreviewUrl, file, preview, serviceWorkerReady]);
 
   useEffect(() => {
     setMaximized(false);
@@ -246,8 +319,12 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
           </button>
         ) : null}
         <PreviewFrame fullscreen={maximized || nativeFullscreen} tone={previewTone(preview)} className={nativeFullscreen ? "h-screen rounded-none border-0" : undefined}>
-          {preview === "image" ? (
-            <ImagePreview file={file} fullscreen={maximized || nativeFullscreen} previewUrl={cachePreviewUrl || undefined} />
+          {fileCachePreviewChecking ? (
+            <PreviewLoading label="正在准备缓存代理…" dark={preview === "audio"} />
+          ) : fileCachePreviewError ? (
+            <PreviewError message={fileCachePreviewError} dark={preview === "audio"} />
+          ) : preview === "image" && cachePreviewUrl ? (
+            <ImagePreview file={file} fullscreen={maximized || nativeFullscreen} previewUrl={cachePreviewUrl} />
           ) : preview === "video" ? (
             <VideoPreview
               file={file}
@@ -258,11 +335,12 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
               videoPreviewCacheBytes={videoPreviewCacheBytes}
               videoPreviewConcurrency={videoPreviewConcurrency}
             />
-          ) : preview === "audio" ? (
+          ) : preview === "audio" && cachePreviewUrl ? (
             <AudioPreview
               file={file}
               fullscreen={maximized || nativeFullscreen}
-              previewUrl={cachePreviewUrl || undefined}
+              previewUrl={cachePreviewUrl}
+              cacheMaxBytes={videoPreviewCacheBytes}
               onToggleMaximized={toggleMaximized}
               nativeFullscreen={nativeFullscreen}
               onToggleNativeFullscreen={toggleNativeFullscreen}
@@ -271,8 +349,8 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
             <TextPreview file={file} state={textState} fullscreen={maximized || nativeFullscreen} />
           ) : preview === "markdown" ? (
             <MarkdownPreview state={textState} fullscreen={maximized || nativeFullscreen} />
-          ) : preview === "pdf" ? (
-            <PdfPreview file={file} fullscreen={maximized || nativeFullscreen} previewUrl={cachePreviewUrl || undefined} />
+          ) : preview === "pdf" && cachePreviewUrl ? (
+            <PdfPreview file={file} fullscreen={maximized || nativeFullscreen} previewUrl={cachePreviewUrl} />
           ) : preview === "office" ? (
             <OfficePreview file={file} fullscreen={maximized || nativeFullscreen} />
           ) : (
@@ -282,6 +360,33 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
       </div>
     </Modal>
   );
+}
+
+type FilePreviewServiceWorkerState = {
+  status: "checking" | "controlled" | "need-reload" | "unsupported" | "failed";
+  message?: string;
+};
+
+function initialFilePreviewServiceWorkerState(): FilePreviewServiceWorkerState {
+  return isVideoPreviewServiceWorkerControlling() ? { status: "controlled" } : { status: "checking" };
+}
+
+function filePreviewUnavailableMessage({
+  hasPreviewUrl,
+  serviceWorkerState
+}: {
+  hasPreviewUrl: boolean;
+  serviceWorkerState: FilePreviewServiceWorkerState;
+}): string | null {
+  if (!hasPreviewUrl) return "该文件缺少可代理的访问链接，无法通过缓存代理预览。";
+  if (serviceWorkerState.status === "controlled") return null;
+  if (serviceWorkerState.status === "checking") return "正在注册并等待 Service Worker 接管页面；如果长时间没有变化，请刷新页面后再预览。";
+  if (serviceWorkerState.status === "need-reload") {
+    return serviceWorkerState.message ? `${serviceWorkerState.message}，请刷新页面后再预览。` : "Service Worker 已注册，但当前页面还没有被它接管，请刷新页面后再预览。";
+  }
+  if (serviceWorkerState.status === "unsupported") return serviceWorkerState.message || "当前浏览器不支持 Service Worker，无法通过缓存代理预览该文件。";
+  if (serviceWorkerState.status === "failed") return serviceWorkerState.message ? `Service Worker 注册或激活失败：${serviceWorkerState.message}` : "Service Worker 注册或激活失败，无法接管文件预览请求。";
+  return "Service Worker 尚未接管当前页面，请刷新页面后再预览。";
 }
 
 function previewTone(preview: ReturnType<typeof previewKind>): "surface" | "dark" | "code" {

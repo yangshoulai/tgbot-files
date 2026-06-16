@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 import { ImageOff } from "lucide-react";
-import { hasFileLinkAccess } from "../../../lib/file-access";
 import { cn } from "../../../lib/cn";
 import type { PreviewComponentProps } from "./types";
 import { PreviewError, PreviewLoading } from "./PreviewFrame";
@@ -8,15 +7,14 @@ import { PreviewError, PreviewLoading } from "./PreviewFrame";
 export function ImagePreview({ file, fullscreen, previewUrl }: PreviewComponentProps) {
   const [loaded, setLoaded] = useState(false);
   const [failed, setFailed] = useState(false);
-  const linkFile = hasFileLinkAccess(file) ? file : null;
 
   useEffect(() => {
     setLoaded(false);
     setFailed(false);
   }, [file.id]);
 
-  if (!linkFile) {
-    return <PreviewError message="该文件不提供完整访问链接，无法直接预览图片" />;
+  if (!previewUrl) {
+    return <PreviewError message="该图片缺少缓存代理地址，无法预览" />;
   }
 
   if (failed) {
@@ -42,7 +40,7 @@ export function ImagePreview({ file, fullscreen, previewUrl }: PreviewComponentP
       ) : null}
       <div className="absolute inset-4 flex min-h-0 min-w-0 items-center justify-center">
         <img
-          src={previewUrl || file.file_path}
+          src={previewUrl}
           alt={file.file_name}
           className={cn(
             "block max-h-full max-w-full rounded-xl object-contain shadow-dialog transition-opacity duration-200",

@@ -17,7 +17,7 @@ import {
   ensureVideoPreviewServiceWorker,
   isVideoPreviewServiceWorkerControlling
 } from "../../../lib/video-preview-service-worker";
-import { hasFileLinkAccess } from "../../../lib/file-access";
+import { buildAutomaticFileCacheUrl } from "../../../lib/file-cache";
 import { cn } from "../../../lib/cn";
 import { Button } from "../../ui/Button";
 import { Spinner } from "../../ui/Spinner";
@@ -379,6 +379,12 @@ export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscr
   }, [previewMetadata, previewUrl]);
 
   useEffect(() => {
+    if (!serviceWorkerReady) {
+      setSubtitleTracks([]);
+      setSelectedSubtitleId(null);
+      return undefined;
+    }
+
     let disposed = false;
     const subtitleObjectUrls: string[] = [];
     const controller = new AbortController();
@@ -400,7 +406,7 @@ export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscr
       if (disposed) return;
 
       const subtitleFiles = matchingSubtitleFiles(result.files, file);
-      const loaded = (await Promise.all(subtitleFiles.map((subtitle) => loadSubtitleFile(subtitle, file.file_name, controller.signal))))
+      const loaded = (await Promise.all(subtitleFiles.map((subtitle) => loadSubtitleFile(subtitle, file.file_name, videoPreviewCacheBytes, controller.signal))))
         .filter((track): track is LoadedSubtitleTrack => Boolean(track));
       if (loaded.length === 0) return;
 
@@ -430,7 +436,7 @@ export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscr
       controller.abort();
       subtitleObjectUrls.forEach((src) => URL.revokeObjectURL(src));
     };
-  }, [file.directory_path, file.file_name, file.id]);
+  }, [file.directory_path, file.file_name, file.id, serviceWorkerReady, videoPreviewCacheBytes]);
 
   useEffect(() => {
     if (!videoRef.current) return undefined;
@@ -679,15 +685,17 @@ function videoPreviewUnavailableMessage({
 async function loadSubtitleFile(
   subtitle: FileItem,
   videoFileName: string,
+  cacheMaxBytes: number,
   signal: AbortSignal
 ): Promise<LoadedSubtitleTrack | null> {
-  if (!hasFileLinkAccess(subtitle)) return null;
-
   const extension = subtitleExtension(subtitle.file_name);
   if (!extension) return null;
 
+  const previewUrl = buildAutomaticFileCacheUrl(subtitle, cacheMaxBytes);
+  if (!previewUrl) return null;
+
   try {
-    const response = await fetch(subtitle.file_path, {
+    const response = await fetch(previewUrl, {
       credentials: "include",
       signal
     });

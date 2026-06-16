@@ -133,6 +133,10 @@ export function buildFileCacheUrl(metadata: FileCacheMetadata | null): string | 
   return `/__file-cache/${metadata.kind}/${encodeURIComponent(metadata.fileId)}/${encodeURIComponent(metadata.fileName)}?${params.toString()}`;
 }
 
+export function buildAutomaticFileCacheUrl(file: FileItem, cacheMaxBytes: number): string | null {
+  return buildFileCacheUrl(buildFileCacheMetadata(file, cacheMaxBytes, "auto"));
+}
+
 export function canCacheFile(file: FileItem): boolean {
   return Boolean(buildFileCacheMetadata(file, Number.MAX_SAFE_INTEGER, "manual"));
 }

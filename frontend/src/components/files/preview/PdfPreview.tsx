@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, FileWarning, ZoomIn, ZoomOut } from "lucide-react";
 import * as pdfjsLib from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
-import { hasFileLinkAccess } from "../../../lib/file-access";
 import { cn } from "../../../lib/cn";
 import { Button } from "../../ui/Button";
 import { IconButton } from "../../ui/IconButton";
@@ -23,21 +22,20 @@ const SCALE_STEP = 0.2;
 export function PdfPreview({ file, fullscreen, previewUrl }: PreviewComponentProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const renderTaskRef = useRef<pdfjsLib.RenderTask | null>(null);
-  const linkFile = hasFileLinkAccess(file) ? file : null;
   const [state, setState] = useState<PdfState>({ status: "idle" });
   const [pageNumber, setPageNumber] = useState(1);
   const [scale, setScale] = useState(1.2);
   const [rendering, setRendering] = useState(false);
 
   useEffect(() => {
-    if (!linkFile) {
+    if (!previewUrl) {
       setState({ status: "idle" });
       return;
     }
 
     let disposed = false;
     const loadingTask = pdfjsLib.getDocument({
-      url: previewUrl || file.file_path,
+      url: previewUrl,
       withCredentials: true
     });
 
@@ -65,7 +63,7 @@ export function PdfPreview({ file, fullscreen, previewUrl }: PreviewComponentPro
       renderTaskRef.current = null;
       void loadingTask.destroy();
     };
-  }, [file.file_path, file.id, linkFile, previewUrl]);
+  }, [file.id, previewUrl]);
 
   useEffect(() => {
     if (state.status !== "ready") return;
@@ -124,8 +122,8 @@ export function PdfPreview({ file, fullscreen, previewUrl }: PreviewComponentPro
     setScale(1.2);
   }, [file.id]);
 
-  if (!linkFile) {
-    return <PreviewError message="该 PDF 不提供完整访问链接，无法直接预览" />;
+  if (!previewUrl) {
+    return <PreviewError message="该 PDF 缺少缓存代理地址，无法预览" />;
   }
 
   switch (state.status) {
