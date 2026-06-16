@@ -76,6 +76,9 @@ interface FileTableProps {
   onCopy: (file: FileItem) => void;
   onAcceleratedDownload: (file: FileItem) => void;
   onCacheFile: (file: FileItem) => void;
+  onPauseFileCache: (file: FileItem) => void;
+  onResumeFileCache: (file: FileItem) => void;
+  onTerminateFileCache: (file: FileItem) => void;
   onClearFileCache: (file: FileItem) => void;
   cacheSummary: FileCacheSummary | null;
   onDelete: (file: FileItem) => void;
@@ -154,6 +157,9 @@ export function FileTable({
   onCopy,
   onAcceleratedDownload,
   onCacheFile,
+  onPauseFileCache,
+  onResumeFileCache,
+  onTerminateFileCache,
   onClearFileCache,
   cacheSummary,
   onDelete
@@ -305,7 +311,8 @@ export function FileTable({
     const canPreviewFile = canPreviewThroughAvailableAccess(file);
     const cacheEntry = cacheSummary?.entries.find((entry) => entry.fileId === file.id) ?? null;
     const cached = Boolean(cacheEntry?.cachedBytes);
-    const cacheLabel = `缓存（${formatBytes(file.size)}）`;
+    const cacheStatus = cacheEntry?.manualCacheStatus;
+    const cacheLabel = "缓存";
 
     return [
       {
@@ -366,8 +373,32 @@ export function FileTable({
         key: "cache",
         label: cacheLabel,
         icon: <HardDriveDownload size={15} />,
-        disabled: !canCacheFile(file),
+        disabled: !canCacheFile(file) || cacheStatus === "caching",
         onSelect: () => runContextAction(() => onCacheFile(file))
+      },
+      {
+        type: "item",
+        key: "pause-cache",
+        label: "停止缓存",
+        icon: <HardDriveDownload size={15} />,
+        disabled: cacheStatus !== "caching",
+        onSelect: () => runContextAction(() => onPauseFileCache(file))
+      },
+      {
+        type: "item",
+        key: "resume-cache",
+        label: "继续缓存",
+        icon: <HardDriveDownload size={15} />,
+        disabled: cacheStatus !== "paused",
+        onSelect: () => runContextAction(() => onResumeFileCache(file))
+      },
+      {
+        type: "item",
+        key: "terminate-cache",
+        label: "终止缓存",
+        icon: <Trash2 size={15} />,
+        disabled: !cacheStatus,
+        onSelect: () => runContextAction(() => onTerminateFileCache(file))
       },
       {
         type: "item",

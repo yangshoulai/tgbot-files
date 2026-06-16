@@ -5,15 +5,16 @@ import { getVideoPreviewServiceWorkerController } from "./video-preview-service-
 
 export type FileCacheSource = "auto" | "manual";
 export type FileCacheKind = "single" | "multipart" | "hls";
+export type FileManualCacheStatus = "caching" | "paused";
 
 const DEFAULT_FILE_CACHE_CHUNK_BYTES = 2 * 1024 * 1024;
 const DEFAULT_CACHE_REQUEST_TIMEOUT_MS = 2_000;
-const LONG_CACHE_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
 
 export interface FileCacheMetadata {
   kind: FileCacheKind;
   fileId: string;
   fileName: string;
+  directoryPath: string;
   mimeType: string;
   size: number;
   chunkSize: number;
@@ -27,15 +28,20 @@ export interface FileCacheMetadata {
 export interface FileCacheEntry {
   fileId: string;
   fileName: string;
+  directoryPath: string;
+  kind: FileCacheKind;
   mimeType: string;
   size: number;
   chunkSize: number;
   chunkCount: number;
+  sourceUrl?: string;
+  token?: string;
   cachedChunks: number;
   cachedBytes: number;
   manualBytes: number;
   autoBytes: number;
   cacheSource: FileCacheSource;
+  manualCacheStatus?: FileManualCacheStatus;
   lastAccessed: number;
   complete: boolean;
 }
@@ -54,6 +60,7 @@ export function buildFileCacheMetadata(file: FileItem, cacheMaxBytes: number, ca
       kind: "hls",
       fileId: file.id,
       fileName: file.file_name,
+      directoryPath: file.directory_path || "/",
       mimeType: file.mime_type || "application/vnd.apple.mpegurl",
       size: file.size,
       chunkSize: Math.max(1, Math.ceil(file.size / chunkCount)),
@@ -71,6 +78,7 @@ export function buildFileCacheMetadata(file: FileItem, cacheMaxBytes: number, ca
         kind: "multipart",
         fileId: file.id,
         fileName: file.file_name,
+        directoryPath: file.directory_path || "/",
         mimeType: file.mime_type || "application/octet-stream",
         size: file.size,
         chunkSize: file.chunk_size,
@@ -91,6 +99,7 @@ export function buildFileCacheMetadata(file: FileItem, cacheMaxBytes: number, ca
     kind: "single",
     fileId: file.id,
     fileName: file.file_name,
+    directoryPath: file.directory_path || "/",
     mimeType: file.mime_type || "application/octet-stream",
     size: file.size,
     chunkSize,
@@ -109,6 +118,7 @@ export function buildFileCacheUrl(metadata: FileCacheMetadata | null): string | 
   const params = new URLSearchParams({
     kind: metadata.kind,
     file_name: metadata.fileName,
+    directory_path: metadata.directoryPath || "/",
     mime: metadata.mimeType,
     size: String(metadata.size),
     chunk_size: String(metadata.chunkSize),
@@ -139,14 +149,35 @@ export async function requestPersistentFileCacheStorage(): Promise<boolean> {
   }
 }
 
-export function cacheFileManually(metadata: FileCacheMetadata): Promise<FileCacheEntry | null> {
-  return requestFileCacheMessage<FileCacheEntry | null>({
+export function cacheFileManually(metadata: FileCacheMetadata): Promise<FileCacheSummary> {
+  return requestFileCacheMessage<FileCacheSummary>({
     type: "FILE_CACHE_CACHE_FILE",
     metadata: {
       ...metadata,
       cacheSource: "manual"
     }
-  }, LONG_CACHE_REQUEST_TIMEOUT_MS);
+  }).then((summary) => normalizeFileCacheSummary(summary));
+}
+
+export function pauseFileCache(fileId: string): Promise<FileCacheSummary> {
+  return requestFileCacheMessage<FileCacheSummary>({
+    type: "FILE_CACHE_PAUSE_FILE",
+    fileId
+  }).then((summary) => normalizeFileCacheSummary(summary));
+}
+
+export function resumeFileCache(fileId: string): Promise<FileCacheSummary> {
+  return requestFileCacheMessage<FileCacheSummary>({
+    type: "FILE_CACHE_RESUME_FILE",
+    fileId
+  }).then((summary) => normalizeFileCacheSummary(summary));
+}
+
+export function terminateFileCache(fileId: string): Promise<FileCacheSummary> {
+  return requestFileCacheMessage<FileCacheSummary>({
+    type: "FILE_CACHE_TERMINATE_FILE",
+    fileId
+  }).then((summary) => normalizeFileCacheSummary(summary));
 }
 
 export function getFileCacheSummary(): Promise<FileCacheSummary> {
@@ -236,6 +267,9 @@ function normalizeFileCacheSummary(value: FileCacheSummary | null | undefined): 
 
 type FileCacheRequestMessage =
   | { type: "FILE_CACHE_CACHE_FILE"; metadata: FileCacheMetadata }
+  | { type: "FILE_CACHE_PAUSE_FILE"; fileId: string }
+  | { type: "FILE_CACHE_RESUME_FILE"; fileId: string }
+  | { type: "FILE_CACHE_TERMINATE_FILE"; fileId: string }
   | { type: "FILE_CACHE_STATE_REQUEST"; metadata: FileCacheMetadata }
   | { type: "FILE_CACHE_LIST_REQUEST" }
   | { type: "FILE_CACHE_CLEAR_FILE"; fileId: string }

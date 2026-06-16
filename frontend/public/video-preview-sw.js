@@ -15,6 +15,7 @@ const continuousPrefetchSessions = new Map();
 const hotChunkCache = new Map();
 const hlsPreviewSources = new Map();
 const hlsPreviewCacheSessions = new Map();
+const fileCacheSessions = new Map();
 let hotChunkCacheBytes = 0;
 
 self.addEventListener("install", (event) => {
@@ -261,6 +262,15 @@ async function handleFileCacheMessage(event, requestId) {
       const metadata = normalizeFileCacheMetadata(event.data.metadata);
       if (!metadata) throw new Error("文件缓存参数无效");
       result = await cacheWholeFile(metadata);
+    } else if (event.data.type === "FILE_CACHE_PAUSE_FILE") {
+      await pauseFileCacheSession(normalizeFileId(event.data.fileId));
+      result = await readFileCacheSummary();
+    } else if (event.data.type === "FILE_CACHE_RESUME_FILE") {
+      await resumeFileCacheSession(normalizeFileId(event.data.fileId));
+      result = await readFileCacheSummary();
+    } else if (event.data.type === "FILE_CACHE_TERMINATE_FILE") {
+      await terminateFileCacheSession(normalizeFileId(event.data.fileId));
+      result = await readFileCacheSummary();
     } else if (event.data.type === "FILE_CACHE_STATE_REQUEST") {
       const metadata = normalizeFileCacheMetadata(event.data.metadata);
       if (!metadata) throw new Error("文件缓存参数无效");
@@ -268,12 +278,12 @@ async function handleFileCacheMessage(event, requestId) {
     } else if (event.data.type === "FILE_CACHE_LIST_REQUEST") {
       result = await readFileCacheSummary();
     } else if (event.data.type === "FILE_CACHE_CLEAR_FILE") {
-      await deleteFileCache(normalizeFileId(event.data.fileId));
+      await terminateFileCacheSession(normalizeFileId(event.data.fileId));
       result = await readFileCacheSummary();
     } else if (event.data.type === "FILE_CACHE_CLEAR_FILES") {
       const fileIds = Array.isArray(event.data.fileIds) ? event.data.fileIds.map(normalizeFileId).filter(Boolean) : [];
       for (const fileId of fileIds) {
-        await deleteFileCache(fileId);
+        await terminateFileCacheSession(fileId);
       }
       result = await readFileCacheSummary();
     } else if (event.data.type === "FILE_CACHE_CLEAR_AUTO") {
@@ -310,20 +320,126 @@ async function cacheWholeFile(metadata) {
     cacheMaxBytes: Number.MAX_SAFE_INTEGER
   };
 
-  if (manualMetadata.kind === "hls") {
-    await cacheWholeHlsFile(manualMetadata);
-    return readFileCacheEntry(manualMetadata.fileId);
+  const existing = fileCacheSessions.get(manualMetadata.fileId);
+  if (existing?.status === "caching") {
+    return readFileCacheSummary();
+  }
+  if (existing?.status === "paused") {
+    await resumeFileCacheSession(manualMetadata.fileId);
+    return readFileCacheSummary();
   }
 
-  for (let chunkIndex = 0; chunkIndex < manualMetadata.chunkCount; chunkIndex += 1) {
-    await getChunkBytes(manualMetadata, chunkIndex);
-  }
+  const session = {
+    fileId: manualMetadata.fileId,
+    metadata: manualMetadata,
+    status: "caching",
+    controller: new AbortController(),
+    promise: null
+  };
+  fileCacheSessions.set(manualMetadata.fileId, session);
+  session.promise = runManualFileCacheSession(session)
+    .catch((error) => {
+      if (session.status !== "paused") {
+        warnPreviewCacheError(`manual cache ${manualMetadata.fileId}`, error);
+      }
+    })
+    .finally(() => {
+      if (fileCacheSessions.get(manualMetadata.fileId) === session && session.status === "caching") {
+        fileCacheSessions.delete(manualMetadata.fileId);
+      }
+    });
 
-  return readFileCacheEntry(manualMetadata.fileId);
+  await putFileRecordMetadata(manualMetadata);
+  return readFileCacheSummary();
 }
 
-async function cacheWholeHlsFile(metadata) {
-  const response = await fetch(metadata.sourceUrl, { credentials: "omit" });
+async function runManualFileCacheSession(session) {
+  const { metadata } = session;
+  if (metadata.kind === "hls") {
+    await cacheWholeHlsFile(metadata, session);
+    return;
+  }
+
+  for (let chunkIndex = 0; chunkIndex < metadata.chunkCount; chunkIndex += 1) {
+    throwIfFileCacheStopped(session);
+    await getChunkBytes(metadata, chunkIndex, session.controller.signal);
+  }
+}
+
+function pauseFileCacheSession(fileId) {
+  const session = fileCacheSessions.get(fileId);
+  if (!session || session.status !== "caching") {
+    return;
+  }
+  session.status = "paused";
+  session.controller.abort();
+}
+
+async function resumeFileCacheSession(fileId) {
+  const session = fileCacheSessions.get(fileId);
+  if (session) {
+    if (session.status !== "paused") {
+      return;
+    }
+
+    session.status = "caching";
+    session.controller = new AbortController();
+    session.promise = runManualFileCacheSession(session)
+      .catch((error) => {
+        if (session.status !== "paused") {
+          warnPreviewCacheError(`manual cache ${fileId}`, error);
+        }
+      })
+      .finally(() => {
+        if (fileCacheSessions.get(fileId) === session && session.status === "caching") {
+          fileCacheSessions.delete(fileId);
+        }
+      });
+    return;
+  }
+
+  const entry = await readFileCacheEntry(fileId);
+  if (!entry || entry.complete) {
+    return;
+  }
+
+  const metadata = normalizeFileCacheMetadata({
+    kind: entry.kind,
+    fileId: entry.fileId,
+    fileName: entry.fileName,
+    directoryPath: entry.directoryPath,
+    mimeType: entry.mimeType,
+    size: entry.size,
+    chunkSize: entry.chunkSize,
+    chunkCount: entry.chunkCount,
+    sourceUrl: entry.sourceUrl,
+    token: entry.token,
+    cacheMaxBytes: Number.MAX_SAFE_INTEGER,
+    cacheSource: "manual"
+  });
+  if (metadata) {
+    await cacheWholeFile(metadata);
+  }
+}
+
+async function terminateFileCacheSession(fileId) {
+  const session = fileCacheSessions.get(fileId);
+  if (session) {
+    session.status = "terminated";
+    session.controller.abort();
+    fileCacheSessions.delete(fileId);
+  }
+  await deleteFileCache(fileId);
+}
+
+function throwIfFileCacheStopped(session) {
+  if (session.status !== "caching" || session.controller.signal.aborted) {
+    throw new DOMException("文件缓存已停止", "AbortError");
+  }
+}
+
+async function cacheWholeHlsFile(metadata, session) {
+  const response = await fetch(metadata.sourceUrl, { credentials: "omit", signal: session.controller.signal });
   if (!response.ok) {
     throw new Error(`HLS 播放列表加载失败（HTTP ${response.status}）`);
   }
@@ -333,6 +449,7 @@ async function cacheWholeHlsFile(metadata) {
   hlsPreviewSources.set(metadata.fileId, rewritten.sources);
 
   if (rewritten.sources.init) {
+    throwIfFileCacheStopped(session);
     await fetchAndCacheHlsPart({
       fileId: metadata.fileId,
       partKind: "init",
@@ -340,11 +457,13 @@ async function cacheWholeHlsFile(metadata) {
       sourceUrl: rewritten.sources.init,
       cacheMaxBytes: Number.MAX_SAFE_INTEGER,
       cacheSource: "manual",
-      metadata
+      metadata,
+      signal: session.controller.signal
     });
   }
 
   for (let index = 0; index < rewritten.sources.segments.length; index += 1) {
+    throwIfFileCacheStopped(session);
     await fetchAndCacheHlsPart({
       fileId: metadata.fileId,
       partKind: "segment",
@@ -355,7 +474,8 @@ async function cacheWholeHlsFile(metadata) {
       metadata: {
         ...metadata,
         chunkCount: rewritten.sources.segments.length
-      }
+      },
+      signal: session.controller.signal
     });
   }
 }
@@ -474,7 +594,7 @@ function hlsPartPreviewUrl(metadata, partKind, index, sourceUrl) {
   return `/__video-preview/hls-part/${encodeURIComponent(metadata.fileId)}/${partKind}/${index}?${params.toString()}`;
 }
 
-async function fetchAndCacheHlsPart({ fileId, partKind, partIndex, sourceUrl, cacheMaxBytes, cacheSource = "auto", metadata = null }) {
+async function fetchAndCacheHlsPart({ fileId, partKind, partIndex, sourceUrl, cacheMaxBytes, cacheSource = "auto", metadata = null, signal = null }) {
   const cacheKey = `${self.location.origin}/__preview-cache/hls/${encodeURIComponent(fileId)}/${partKind}/${partIndex}`;
   const cache = await caches.open(CACHE_NAME);
   const cached = await cache.match(cacheKey);
@@ -494,7 +614,8 @@ async function fetchAndCacheHlsPart({ fileId, partKind, partIndex, sourceUrl, ca
       cacheMaxBytes,
       cacheKey,
       cacheSource,
-      metadata
+      metadata,
+      signal
     }).finally(() => {
       hlsPartLoads.delete(loadKey);
     });
@@ -505,8 +626,8 @@ async function fetchAndCacheHlsPart({ fileId, partKind, partIndex, sourceUrl, ca
   return createHlsPartResponse(result.bytes, result.contentType);
 }
 
-async function fetchAndCacheHlsPartBytes({ fileId, partKind, partIndex, sourceUrl, cacheMaxBytes, cacheKey, cacheSource = "auto", metadata = null }) {
-  const response = await fetch(sourceUrl, { credentials: "omit" });
+async function fetchAndCacheHlsPartBytes({ fileId, partKind, partIndex, sourceUrl, cacheMaxBytes, cacheKey, cacheSource = "auto", metadata = null, signal = null }) {
+  const response = await fetch(sourceUrl, { credentials: "omit", signal: signal || undefined });
   if (!response.ok) {
     throw new Error(`HLS ${partKind} ${partIndex} preview load failed (HTTP ${response.status})`);
   }
@@ -531,6 +652,7 @@ async function fetchAndCacheHlsPartBytes({ fileId, partKind, partIndex, sourceUr
     fileId,
     chunkIndex: hlsChunkIndex(partKind, partIndex),
     fileName: metadata?.fileName || fileId,
+    directoryPath: metadata?.directoryPath || "/",
     mimeType: metadata?.mimeType || contentType,
     totalSize: metadata?.size || bytes.byteLength,
     chunkSize: metadata?.chunkSize || bytes.byteLength,
@@ -957,6 +1079,7 @@ function parseFileCacheMetadata(url) {
   const kind = normalizeFileCacheKind(url.searchParams.get("kind") || parts[1]);
   const fileId = parts[2] || "";
   const fileName = url.searchParams.get("file_name") || decodeURIComponent(parts[3] || fileId);
+  const directoryPath = normalizeDirectoryPath(url.searchParams.get("directory_path"));
   const token = url.searchParams.get("token");
   const sourceUrl = normalizeSameOriginSourceUrl(url.searchParams.get("source"));
   const size = Number(url.searchParams.get("size"));
@@ -970,6 +1093,7 @@ function parseFileCacheMetadata(url) {
     kind,
     fileId,
     fileName,
+    directoryPath,
     token,
     sourceUrl,
     size,
@@ -989,6 +1113,7 @@ function normalizeFileCacheMetadata(value) {
   const kind = normalizeFileCacheKind(value.kind);
   const fileId = typeof value.fileId === "string" ? value.fileId : "";
   const fileName = typeof value.fileName === "string" && value.fileName ? value.fileName : fileId;
+  const directoryPath = normalizeDirectoryPath(value.directoryPath);
   const token = typeof value.token === "string" ? value.token : "";
   const sourceUrl = normalizeSameOriginSourceUrl(value.sourceUrl);
   const size = Number(value.size);
@@ -1014,6 +1139,7 @@ function normalizeFileCacheMetadata(value) {
     kind,
     fileId,
     fileName,
+    directoryPath,
     token,
     sourceUrl,
     size,
@@ -1032,6 +1158,14 @@ function normalizeFileCacheKind(value) {
 
 function normalizeCacheSource(value) {
   return value === "manual" ? "manual" : "auto";
+}
+
+function normalizeDirectoryPath(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    return "/";
+  }
+  const normalized = value.trim();
+  return normalized.startsWith("/") ? normalized : `/${normalized}`;
 }
 
 function normalizeCacheMaxBytes(value) {
@@ -1632,6 +1766,7 @@ function touchPreviewCacheMetadata(metadataOrFileId, chunkIndex, size, cacheKey)
     ? {
         fileId: metadataOrFileId,
         fileName: metadataOrFileId,
+        directoryPath: "/",
         mimeType: "application/octet-stream",
         size,
         chunkSize: size,
@@ -1644,10 +1779,14 @@ function touchPreviewCacheMetadata(metadataOrFileId, chunkIndex, size, cacheKey)
     fileId: metadata.fileId,
     chunkIndex,
     fileName: metadata.fileName || metadata.fileId,
+    directoryPath: metadata.directoryPath || "/",
+    kind: metadata.kind || "single",
     mimeType: metadata.mimeType || "application/octet-stream",
     totalSize: metadata.size || size,
     chunkSize: metadata.chunkSize || size,
     chunkCount: metadata.chunkCount || 1,
+    sourceUrl: metadata.sourceUrl || "",
+    token: metadata.token || "",
     cacheSource: metadata.cacheSource || "auto",
     size,
     createdAt: now,
@@ -1657,7 +1796,7 @@ function touchPreviewCacheMetadata(metadataOrFileId, chunkIndex, size, cacheKey)
   });
 }
 
-async function getChunkBytes(metadata, chunkIndex) {
+async function getChunkBytes(metadata, chunkIndex, signal = null) {
   if (chunkIndex < 0 || chunkIndex >= metadata.chunkCount) {
     throw new Error("Chunk index is out of range");
   }
@@ -1673,7 +1812,7 @@ async function getChunkBytes(metadata, chunkIndex) {
     return pendingLoad;
   }
 
-  const load = fetchAndCacheChunkBytes(metadata, chunkIndex)
+  const load = fetchAndCacheChunkBytes(metadata, chunkIndex, signal)
     .finally(() => {
       fullChunkLoads.delete(loadKey);
     });
@@ -1682,9 +1821,10 @@ async function getChunkBytes(metadata, chunkIndex) {
   return load;
 }
 
-async function fetchAndCacheChunkBytes(metadata, chunkIndex) {
+async function fetchAndCacheChunkBytes(metadata, chunkIndex, signal = null) {
   const expectedSize = expectedChunkSize(metadata, chunkIndex);
   const response = await fetch(chunkSourceUrl(metadata, chunkIndex), {
+    signal: signal || undefined,
     credentials: "omit",
     headers: metadata.kind === "single"
       ? { Range: chunkRangeHeader(metadata, chunkIndex, 0, expectedSize) }
@@ -1722,6 +1862,7 @@ async function fetchAndCacheChunkBytes(metadata, chunkIndex) {
       fileId: metadata.fileId,
       chunkIndex,
       fileName: metadata.fileName || metadata.fileId,
+      directoryPath: metadata.directoryPath || "/",
       mimeType: metadata.mimeType || "application/octet-stream",
       totalSize: metadata.size,
       chunkSize: metadata.chunkSize,
@@ -2108,10 +2249,14 @@ async function putFileRecordMetadata(metadata) {
     .map((chunk) => putChunkMetadata({
       ...chunk,
       fileName: metadata.fileName || chunk.fileName || metadata.fileId,
+      directoryPath: metadata.directoryPath || chunk.directoryPath || "/",
+      kind: metadata.kind || chunk.kind || "single",
       mimeType: metadata.mimeType || chunk.mimeType || "application/octet-stream",
       totalSize: metadata.size || chunk.totalSize || chunk.size,
       chunkSize: metadata.chunkSize || chunk.chunkSize || chunk.size,
       chunkCount: metadata.chunkCount || chunk.chunkCount || 1,
+      sourceUrl: metadata.sourceUrl || chunk.sourceUrl || "",
+      token: metadata.token || chunk.token || "",
       cacheSource: entry.cacheSource === "manual" ? "manual" : metadata.cacheSource || chunk.cacheSource || "auto",
       lastAccessed: Date.now()
     }, true)));
@@ -2139,10 +2284,14 @@ async function readFileCacheSummary() {
     const current = byFile.get(entry.fileId) || {
       fileId: entry.fileId,
       fileName: entry.fileName || entry.fileId,
+      directoryPath: entry.directoryPath || "/",
+      kind: entry.kind || "single",
       mimeType: entry.mimeType || "application/octet-stream",
       size: safeSize(entry.totalSize),
       chunkSize: safeSize(entry.chunkSize),
       chunkCount: Number.isSafeInteger(entry.chunkCount) && entry.chunkCount > 0 ? entry.chunkCount : 1,
+      sourceUrl: entry.sourceUrl || "",
+      token: entry.token || "",
       cachedChunkIndexes: new Set(),
       cachedBytes: 0,
       manualBytes: 0,
@@ -2152,7 +2301,11 @@ async function readFileCacheSummary() {
     };
 
     current.fileName = entry.fileName || current.fileName;
+    current.directoryPath = entry.directoryPath || current.directoryPath || "/";
+    current.kind = entry.kind || current.kind || "single";
     current.mimeType = entry.mimeType || current.mimeType;
+    current.sourceUrl = entry.sourceUrl || current.sourceUrl || "";
+    current.token = entry.token || current.token || "";
     current.size = Math.max(current.size, safeSize(entry.totalSize));
     current.chunkSize = Math.max(current.chunkSize, safeSize(entry.chunkSize));
     current.chunkCount = Math.max(current.chunkCount, Number.isSafeInteger(entry.chunkCount) ? entry.chunkCount : 1);
@@ -2171,22 +2324,65 @@ async function readFileCacheSummary() {
   }
 
   const normalizedEntries = Array.from(byFile.values())
-    .map((entry) => ({
-      fileId: entry.fileId,
-      fileName: entry.fileName,
-      mimeType: entry.mimeType,
-      size: entry.size,
-      chunkSize: entry.chunkSize,
-      chunkCount: entry.chunkCount,
-      cachedChunks: Array.from(entry.cachedChunkIndexes).filter((index) => Number.isSafeInteger(index)).length,
-      cachedBytes: entry.cachedBytes,
-      manualBytes: entry.manualBytes,
-      autoBytes: entry.autoBytes,
-      cacheSource: entry.cacheSource,
-      lastAccessed: entry.lastAccessed,
-      complete: entry.cachedBytes >= entry.size && entry.size > 0
-    }))
+    .map((entry) => {
+      const complete = entry.cachedBytes >= entry.size && entry.size > 0;
+      return {
+        fileId: entry.fileId,
+        fileName: entry.fileName,
+        directoryPath: entry.directoryPath || "/",
+        kind: entry.kind || "single",
+        mimeType: entry.mimeType,
+        size: entry.size,
+        chunkSize: entry.chunkSize,
+        chunkCount: entry.chunkCount,
+        sourceUrl: entry.sourceUrl || undefined,
+        token: entry.token || undefined,
+        cachedChunks: Array.from(entry.cachedChunkIndexes).filter((index) => Number.isSafeInteger(index)).length,
+        cachedBytes: entry.cachedBytes,
+        manualBytes: entry.manualBytes,
+        autoBytes: entry.autoBytes,
+        cacheSource: entry.cacheSource,
+        manualCacheStatus: entry.cacheSource === "manual" && !complete ? "paused" : undefined,
+        lastAccessed: entry.lastAccessed,
+        complete
+      };
+    })
     .sort((left, right) => right.lastAccessed - left.lastAccessed);
+
+  for (const session of fileCacheSessions.values()) {
+    if (session.status !== "caching" && session.status !== "paused") {
+      continue;
+    }
+
+    const existing = normalizedEntries.find((entry) => entry.fileId === session.fileId);
+    if (existing) {
+      existing.manualCacheStatus = session.status;
+      existing.cacheSource = "manual";
+      existing.lastAccessed = Math.max(existing.lastAccessed, Date.now());
+      continue;
+    }
+
+    normalizedEntries.unshift({
+      fileId: session.metadata.fileId,
+      fileName: session.metadata.fileName,
+      directoryPath: session.metadata.directoryPath || "/",
+      kind: session.metadata.kind,
+      mimeType: session.metadata.mimeType || "application/octet-stream",
+      size: safeSize(session.metadata.size),
+      chunkSize: safeSize(session.metadata.chunkSize),
+      chunkCount: Number.isSafeInteger(session.metadata.chunkCount) && session.metadata.chunkCount > 0 ? session.metadata.chunkCount : 1,
+      sourceUrl: session.metadata.sourceUrl || undefined,
+      token: session.metadata.token || undefined,
+      cachedChunks: 0,
+      cachedBytes: 0,
+      manualBytes: 0,
+      autoBytes: 0,
+      cacheSource: "manual",
+      manualCacheStatus: session.status,
+      lastAccessed: Date.now(),
+      complete: false
+    });
+  }
 
   return {
     entries: normalizedEntries,
@@ -2310,10 +2506,14 @@ async function putChunkMetadata(entry, preserveCreatedAt) {
         cacheSource: existingManual || nextManual ? "manual" : entry.cacheSource || "auto",
         createdAt: existing?.createdAt || entry.createdAt,
         fileName: entry.fileName || existing?.fileName || entry.fileId,
+        directoryPath: entry.directoryPath || existing?.directoryPath || "/",
+        kind: entry.kind || existing?.kind || "single",
         mimeType: entry.mimeType || existing?.mimeType || "application/octet-stream",
         totalSize: entry.totalSize || existing?.totalSize || entry.size,
         chunkSize: entry.chunkSize || existing?.chunkSize || entry.size,
-        chunkCount: entry.chunkCount || existing?.chunkCount || 1
+        chunkCount: entry.chunkCount || existing?.chunkCount || 1,
+        sourceUrl: entry.sourceUrl || existing?.sourceUrl || "",
+        token: entry.token || existing?.token || ""
       });
     };
     return undefined;
