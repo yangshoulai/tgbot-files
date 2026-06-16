@@ -365,6 +365,12 @@ function DirectoryTreeRow({
           type="button"
           disabled={disabled}
           onClick={() => onSelect(node.path)}
+          onDoubleClick={(event) => {
+            if (!hasChildren) return;
+            event.preventDefault();
+            event.stopPropagation();
+            onToggle(node.path);
+          }}
           className={cn(
             "flex min-w-0 flex-1 items-center text-left focus-visible:outline-none focus-visible:focus-ring disabled:cursor-not-allowed",
             sidebar ? "gap-1.5 py-1.5" : "gap-2 py-2"

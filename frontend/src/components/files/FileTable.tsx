@@ -798,7 +798,7 @@ function FileGridView({
           {directories.length} 个目录 · {files.length} 个文件 · 双击可打开或预览
         </p>
       </div>
-      <div className="grid gap-4 p-4 [grid-template-columns:repeat(auto-fill,minmax(min(20rem,100%),1fr))]">
+      <div className="grid gap-4 p-4 [grid-template-columns:repeat(auto-fill,minmax(min(15rem,100%),1fr))]">
         {directories.map((directory) => {
           const selected = selectedDirectoryIds.has(directory.id);
 

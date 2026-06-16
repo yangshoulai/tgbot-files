@@ -74,6 +74,7 @@ export function Shell({ active, session, onNavigate, onLogout, onUpload, childre
               size="md"
               leadingIcon={<UploadCloud size={16} />}
               onClick={onUpload}
+              title="上传文件（快捷键 U）"
               className="hidden sm:inline-flex"
             >
               上传文件
@@ -81,7 +82,7 @@ export function Shell({ active, session, onNavigate, onLogout, onUpload, childre
             <IconButton
               variant="default"
               size="md"
-              label="上传文件"
+              label="上传文件（快捷键 U）"
               onClick={onUpload}
               className="sm:hidden"
             >

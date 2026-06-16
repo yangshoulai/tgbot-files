@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, ChevronRight, FolderInput, FolderPlus, LayoutGrid, List, PanelLeftClose, PanelLeftOpen, Pencil, RefreshCw, Search, Trash2, UploadCloud } from "lucide-react";
+import { ArrowUp, ChevronRight, FolderInput, FolderPlus, LayoutGrid, List, PanelLeftClose, PanelLeftOpen, Pencil, RefreshCw, Search, Trash2 } from "lucide-react";
 import {
   ApiError,
   DirectoryItem,
@@ -1233,27 +1233,6 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
                   {directoryOptions.length} 个目录
                 </span>
               </div>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <Button
-                variant="secondary"
-                leadingIcon={<FolderPlus size={16} />}
-                disabled={isListBusy}
-                onClick={() => {
-                  setCreateDirParentPath(currentDirPath);
-                  setCreateDirOpen(true);
-                }}
-              >
-                新建目录
-              </Button>
-              <Button
-                variant="primary"
-                leadingIcon={<UploadCloud size={16} />}
-                disabled={isListBusy}
-                onClick={() => onUploadToDirectory(currentDirPath)}
-              >
-                上传到当前目录
-              </Button>
             </div>
           </div>
         </div>

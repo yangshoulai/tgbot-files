@@ -129,6 +129,20 @@ function AppShell() {
     setUploadOpen(true);
   }, [dashboardDirectoryPath, uploadTaskSnapshot]);
 
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
+      if (event.key.toLowerCase() !== "u") return;
+      if (isEditableShortcutTarget(event.target)) return;
+
+      event.preventDefault();
+      openUpload([]);
+    }
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [openUpload]);
+
   const onLogout = useCallback(async () => {
     try {
       await logout();
@@ -218,6 +232,17 @@ function AppShell() {
       <GlobalDropzone enabled={dropzoneEnabled} onDrop={openUpload} />
     </>
   );
+}
+
+function isEditableShortcutTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+
+  const tagName = target.tagName.toLowerCase();
+  return target.isContentEditable ||
+    tagName === "input" ||
+    tagName === "textarea" ||
+    tagName === "select" ||
+    Boolean(target.closest("[contenteditable='true']"));
 }
 
 function Splash() {
