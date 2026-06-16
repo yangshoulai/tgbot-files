@@ -637,7 +637,14 @@ function hlsPartPreviewUrl(metadata, partKind, index, sourceUrl) {
   const params = new URLSearchParams({
     source: sourceUrl,
     cache_max: String(metadata.cacheMaxBytes),
-    prefetch_concurrency: String(metadata.prefetchConcurrency)
+    prefetch_concurrency: String(metadata.prefetchConcurrency),
+    file_name: metadata.fileName || metadata.fileId,
+    directory_path: metadata.directoryPath || "/",
+    mime: metadata.mimeType || "application/vnd.apple.mpegurl",
+    size: String(metadata.size || 0),
+    chunk_size: String(metadata.chunkSize || 1),
+    chunk_count: String(metadata.chunkCount || 1),
+    cache_source: metadata.cacheSource || "auto"
   });
   return `/__video-preview/hls-part/${encodeURIComponent(metadata.fileId)}/${partKind}/${index}?${params.toString()}`;
 }
@@ -647,7 +654,7 @@ async function fetchAndCacheHlsPart({ fileId, partKind, partIndex, sourceUrl, ca
   const cache = await caches.open(CACHE_NAME);
   const cached = await cache.match(cacheKey);
   if (cached) {
-    touchPreviewCacheMetadata(fileId, hlsChunkIndex(partKind, partIndex), safeSize(Number(cached.headers.get("Content-Length"))), cacheKey);
+    touchPreviewCacheMetadata(metadata || fileId, hlsChunkIndex(partKind, partIndex), safeSize(Number(cached.headers.get("Content-Length"))), cacheKey);
     return cached;
   }
 

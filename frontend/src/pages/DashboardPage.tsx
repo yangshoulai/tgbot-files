@@ -246,7 +246,7 @@ function CacheManagerDialog({
   open,
   summary,
   operation,
-  fileDirectoryPaths,
+  cacheFileIndex,
   onClose,
   onRefresh,
   onClearAutomatic,
@@ -258,7 +258,7 @@ function CacheManagerDialog({
   open: boolean;
   summary: FileCacheSummary | null;
   operation: CacheOperation;
-  fileDirectoryPaths: Map<string, string>;
+  cacheFileIndex: Map<string, FileItem>;
   onClose: () => void;
   onRefresh: () => void;
   onClearAutomatic: () => void;
@@ -275,7 +275,9 @@ function CacheManagerDialog({
       onClose={onClose}
       title="缓存管理"
       description={`已缓存 ${entries.length} 个文件，手动 ${formatBytes(summary?.manualBytes ?? 0)}，自动 ${formatBytes(summary?.autoBytes ?? 0)}`}
-      size="xl"
+      size="full"
+      className="h-[min(86dvh,54rem)] max-h-[86dvh] rounded-2xl border shadow-dialog sm:w-[min(96vw,110rem)] sm:max-w-[110rem]"
+      bodyClassName="overflow-auto px-5 py-5 sm:px-6"
       footer={
         <>
           <Button variant="secondary" leadingIcon={<RefreshCw size={15} />} onClick={onRefresh}>
@@ -323,13 +325,15 @@ function CacheManagerDialog({
               </thead>
               <tbody>
                 {entries.map((entry) => {
-                  const directoryPath = entry.directoryPath || fileDirectoryPaths.get(entry.fileId) || "/";
+                  const indexedFile = cacheFileIndex.get(entry.fileId);
+                  const displayFileName = indexedFile?.file_name || entry.fileName;
+                  const directoryPath = indexedFile?.directory_path || entry.directoryPath || "/";
                   const entryOperation = operation?.fileId === entry.fileId ? operation.kind : null;
 
                   return (
                     <tr key={entry.fileId} className="border-b border-border last:border-b-0">
                       <td className="min-w-0 px-2 py-2">
-                        <p className="truncate font-medium text-foreground" title={entry.fileName}>{entry.fileName}</p>
+                        <p className="truncate font-medium text-foreground" title={displayFileName}>{displayFileName}</p>
                         <p className="mt-0.5 truncate text-[11px] text-subtle" title={directoryPath}>{directoryPath}</p>
                       </td>
                       <td className="break-all px-2 py-2 text-muted">{entry.mimeType || "未知"}</td>
@@ -449,6 +453,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   const [directoryPanelVisible, setDirectoryPanelVisible] = useState(true);
   const [acceleratedDownload, setAcceleratedDownload] = useState<AcceleratedDownloadState | null>(null);
   const [cacheSummary, setCacheSummary] = useState<FileCacheSummary | null>(null);
+  const [cacheFiles, setCacheFiles] = useState<FileItem[]>([]);
   const [cacheManagerOpen, setCacheManagerOpen] = useState(false);
   const [cacheOperation, setCacheOperation] = useState<CacheOperation>(null);
   const listBusyLabel = operationLabel ?? (loading ? "正在加载目录内容..." : undefined);
@@ -502,6 +507,20 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     }
   }, []);
 
+  const refreshCacheFileIndex = useCallback(async () => {
+    try {
+      const response = await listFiles({
+        q: "",
+        dir: "/",
+        all: true,
+        type: "all"
+      });
+      setCacheFiles(response.files);
+    } catch {
+      setCacheFiles([]);
+    }
+  }, []);
+
   useEffect(() => {
     void loadFiles();
   }, [loadFiles]);
@@ -517,8 +536,9 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
   useEffect(() => {
     if (cacheManagerOpen) {
       void refreshCacheSummary();
+      void refreshCacheFileIndex();
     }
-  }, [cacheManagerOpen, refreshCacheSummary]);
+  }, [cacheManagerOpen, refreshCacheFileIndex, refreshCacheSummary]);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
@@ -1612,9 +1632,9 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     () => [...directories].sort((left, right) => compareDirectoryItems(left, right, sortKey, sortDirection)),
     [directories, sortDirection, sortKey]
   );
-  const fileDirectoryPaths = useMemo(
-    () => new Map(files.map((file) => [file.id, file.directory_path || "/"])),
-    [files]
+  const cacheFileIndex = useMemo(
+    () => new Map([...cacheFiles, ...files].map((file) => [file.id, file])),
+    [cacheFiles, files]
   );
 
   function changeSort(nextKey: FileSortKey) {
@@ -1966,7 +1986,7 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
         open={cacheManagerOpen}
         summary={cacheSummary}
         operation={cacheOperation}
-        fileDirectoryPaths={fileDirectoryPaths}
+        cacheFileIndex={cacheFileIndex}
         onClose={() => setCacheManagerOpen(false)}
         onRefresh={() => void refreshCacheSummary()}
         onClearAutomatic={() => void onClearAutomaticCache()}
