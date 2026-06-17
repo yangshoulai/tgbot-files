@@ -227,6 +227,7 @@ function AppShell() {
           setTaskCenterOpen(false);
         }}
         onStop={() => uploadDialogRef.current?.stopCurrentUpload()}
+        onDelete={(id) => uploadDialogRef.current?.deleteTask(id)}
       />
 
       <GlobalDropzone enabled={dropzoneEnabled} onDrop={openUpload} />

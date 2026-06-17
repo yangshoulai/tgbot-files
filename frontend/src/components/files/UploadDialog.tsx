@@ -4,7 +4,6 @@ import {
   ApiError,
   cancelHlsUpload,
   cancelMagnetUpload,
-  cancelMagnetUploadKeepalive,
   completeHlsSegment,
   completeHlsUpload,
   completeMagnetMultipartUpload,
@@ -60,6 +59,7 @@ import {
   renewUploadTaskLock,
   sanitizeSourceHeadersForPersistence,
   upsertUploadTask,
+  writeUploadTaskQueue,
   type HlsRetryState,
   type MagnetUploadEntry,
   type MultipartRetryState,
@@ -100,6 +100,7 @@ export interface UploadTaskSnapshotItem {
   progressPercent: number;
   progressLabel?: string;
   canStop: boolean;
+  canDelete: boolean;
 }
 
 export interface UploadTaskSnapshot {
@@ -121,6 +122,7 @@ export interface UploadDialogHandle {
   stopCurrentUpload: () => void;
   hasActiveUpload: () => boolean;
   clearSettledTasks: () => void;
+  deleteTask: (id: string) => void;
   resumeLocalFile: (file: File) => void;
 }
 
@@ -270,6 +272,7 @@ const MAGNET_DOWNLOAD_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const MAGNET_STATUS_MAX_TRANSIENT_FAILURES = 5;
 const MAGNET_STATUS_RETRY_DELAY_MS = 2_000;
 const FILE_NAME_CONFLICT_TOAST_MESSAGE = "上传目录已存在同名文件，请选择覆盖或改名上传";
+const CHUNK_UI_UPDATE_INTERVAL_MS = 160;
 
 class MultipartChunkUploadError extends Error {
   constructor(
@@ -859,6 +862,35 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     setQueuedUrlTasks((current) => current.filter((task) => task.id !== id));
   }
 
+  function deleteTask(id: string) {
+    if (activeUploadRef.current) {
+      return;
+    }
+
+    setItems((current) => {
+      const target = current.find((item) => item.id === id);
+      revokeThumbnail(target?.thumbnail?.generated);
+      return current.filter((item) => item.id !== id);
+    });
+    setQueuedUrlTasks((current) => current.filter((task) => task.id !== id));
+    removeUploadTask(id);
+
+    if (activePersistedTaskIdRef.current === id) {
+      setActivePersistedTaskId(null);
+    }
+
+    if (id === "url" && !submitting && !checkingConflicts) {
+      setUrlUpload((current) => {
+        cleanupTemporaryHlsUpload(current);
+        cleanupTemporaryMagnetUpload(current);
+        revokeThumbnail(current.thumbnail?.generated);
+        return { status: "pending" };
+      });
+      setSourceUrl("");
+      setSourceHeaderRows([]);
+    }
+  }
+
   function resetQueuedUrlDraftState() {
     setQueuedUrlDraft("");
     setQueuedUrlDraftError(undefined);
@@ -940,6 +972,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     stopCurrentUpload,
     hasActiveUpload: () => Boolean(activeUploadRef.current),
     clearSettledTasks,
+    deleteTask,
     resumeLocalFile
   }));
 
@@ -1735,6 +1768,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   function persistMagnetUploadTask(importId: string, selectedIndexes: number[], uploads?: MagnetUploadEntry[]) {
     const now = Date.now();
     const taskId = makePersistedTaskId("magnet", importId);
+    removeStaleMagnetUploadTasks(normalizedSourceUrl, taskId);
     upsertUploadTask({
       version: 1,
       id: taskId,
@@ -1750,6 +1784,23 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       ...(uploads ? { uploads } : {})
     });
     setActivePersistedTaskId(taskId);
+  }
+
+  function removeStaleMagnetUploadTasks(sourceUrl: string, keepTaskId?: string) {
+    const queue = readUploadTaskQueue();
+    const tasks = queue.tasks.filter((task) => {
+      if (task.kind !== "magnet") {
+        return true;
+      }
+      if (keepTaskId && task.id === keepTaskId) {
+        return true;
+      }
+      return task.sourceUrl !== sourceUrl;
+    });
+
+    if (tasks.length !== queue.tasks.length) {
+      writeUploadTaskQueue({ version: 1, tasks });
+    }
   }
 
   function clearCurrentPersistedTask(options: { allowFallback?: boolean } = {}) {
@@ -2396,9 +2447,10 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     const failedChunks: number[] = [];
     const concurrency = Math.min(params.concurrency ?? effectiveUploadConcurrency, Math.max(1, chunkIndexes.length));
     let nextIndex = 0;
+    const uiUpdates = createChunkUiUpdateBatcher(params.onProgress, params.onChunkState);
 
     const suffix = concurrency > 1 ? `（${concurrency} 并发）` : "";
-    params.onProgress({
+    uiUpdates.progress({
       completed: completedSet.size,
       total: params.total,
       label: `${params.taskLabel} ${completedSet.size}/${params.total}${suffix}`
@@ -2422,6 +2474,8 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         try {
           await uploadChunkWithRetry({
             ...params,
+            onProgress: uiUpdates.progress,
+            onChunkState: uiUpdates.chunkState,
             index,
             suffix,
             completed: () => completedSet.size
@@ -2431,7 +2485,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
           failedChunks.push(index);
         }
 
-        params.onProgress({
+        uiUpdates.progress({
           completed: completedSet.size,
           total: params.total,
           failed: failedChunks.length,
@@ -2448,13 +2502,15 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       for (const index of chunkIndexes) {
         if (!completedSet.has(index)) {
           failedChunks.push(index);
-          params.onChunkState?.(index, {
+          uiUpdates.chunkState(index, {
             status: "failed",
             errorMessage: "已停止"
           });
         }
       }
     }
+
+    uiUpdates.flush();
 
     return {
       completedChunks: Array.from(completedSet).sort((left, right) => left - right),
@@ -2529,6 +2585,54 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         await delay(retryDelayMs(attempt, error), params.task.abortController.signal);
       }
     }
+  }
+
+  function createChunkUiUpdateBatcher(
+    onProgress: (progress: ChunkProgress) => void,
+    onChunkState?: (index: number, patch: Partial<UploadChunkState>) => void
+  ) {
+    let pendingProgress: ChunkProgress | null = null;
+    const pendingChunkStates = new Map<number, Partial<UploadChunkState>>();
+    let timerId: number | null = null;
+
+    const flush = () => {
+      if (timerId !== null) {
+        window.clearTimeout(timerId);
+        timerId = null;
+      }
+
+      for (const [index, patch] of pendingChunkStates) {
+        onChunkState?.(index, patch);
+      }
+      pendingChunkStates.clear();
+
+      if (pendingProgress) {
+        onProgress(pendingProgress);
+        pendingProgress = null;
+      }
+    };
+
+    const schedule = () => {
+      if (timerId !== null) {
+        return;
+      }
+      timerId = window.setTimeout(flush, CHUNK_UI_UPDATE_INTERVAL_MS);
+    };
+
+    return {
+      progress(progress: ChunkProgress) {
+        pendingProgress = progress;
+        schedule();
+      },
+      chunkState(index: number, patch: Partial<UploadChunkState>) {
+        pendingChunkStates.set(index, {
+          ...(pendingChunkStates.get(index) ?? {}),
+          ...patch
+        });
+        schedule();
+      },
+      flush
+    };
   }
 
   async function runAbortableUploadRequest<T>(
@@ -4493,7 +4597,8 @@ function createUploadTaskSnapshot(params: {
       status: item.status,
       progressPercent,
       progressLabel: item.progress?.label ?? item.message,
-      canStop: params.activeUploadKind === "local" && params.activeUploadItemId === item.id && !params.stopRequested
+      canStop: params.activeUploadKind === "local" && params.activeUploadItemId === item.id && !params.stopRequested,
+      canDelete: !(params.activeUploadKind === "local" && params.activeUploadItemId === item.id)
     };
   });
 
@@ -4514,7 +4619,8 @@ function createUploadTaskSnapshot(params: {
         status: params.urlUpload.status,
         progressPercent: uploadTaskProgressPercent(params.urlUpload.status, params.urlUpload.progress),
         progressLabel: params.urlUpload.progress?.label ?? params.urlUpload.message,
-        canStop: params.activeUploadKind === "url" && !params.stopRequested
+        canStop: params.activeUploadKind === "url" && !params.stopRequested,
+        canDelete: params.activeUploadKind !== "url"
       }]
     : [];
 
@@ -4557,7 +4663,8 @@ function queuedUrlTaskSnapshotItem(task: QueuedUrlUploadTask): UploadTaskSnapsho
     status: "pending",
     progressPercent: 0,
     progressLabel: "等待上传",
-    canStop: false
+    canStop: false,
+    canDelete: true
   };
 }
 
@@ -4580,7 +4687,8 @@ function persistedTaskSnapshotItem(task: PersistedUploadTask): UploadTaskSnapsho
     status,
     progressPercent: progress.percent,
     progressLabel: progress.label,
-    canStop: false
+    canStop: false,
+    canDelete: true
   };
 }
 
@@ -5228,6 +5336,7 @@ function cleanupTemporaryMagnetUpload(state: UrlUploadState): void {
 }
 
 function cancelTemporaryMagnetUpload(importId: string): void {
+  removeUploadTask(makePersistedTaskId("magnet", importId));
   void cancelMagnetUpload(importId).catch(() => undefined);
 }
 

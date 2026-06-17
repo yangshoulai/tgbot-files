@@ -1,4 +1,4 @@
-import { AlertTriangle, CheckCircle2, ChevronDown, ChevronUp, Clock3, Layers3, Square } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronUp, Clock3, Layers3, Square, Trash2 } from "lucide-react";
 import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
 import { cn } from "../../lib/cn";
@@ -10,9 +10,10 @@ interface UploadTaskCenterProps {
   onOpenChange: (open: boolean) => void;
   onShowDetails: () => void;
   onStop: () => void;
+  onDelete: (id: string) => void;
 }
 
-export function UploadTaskCenter({ snapshot, open, onOpenChange, onShowDetails, onStop }: UploadTaskCenterProps) {
+export function UploadTaskCenter({ snapshot, open, onOpenChange, onShowDetails, onStop, onDelete }: UploadTaskCenterProps) {
   if (!snapshot) return null;
 
   const hasWork = snapshot.items.some((item) => item.status === "uploading" || item.status === "pending");
@@ -56,7 +57,12 @@ export function UploadTaskCenter({ snapshot, open, onOpenChange, onShowDetails, 
 
             <div className="max-h-72 space-y-2 overflow-auto pr-1 scroll-thin">
               {snapshot.items.map((item) => (
-                <UploadTaskRow key={`${item.kind}-${item.id}`} item={item} active={snapshot.activeItemId === item.id} />
+                <UploadTaskRow
+                  key={`${item.kind}-${item.id}`}
+                  item={item}
+                  active={snapshot.activeItemId === item.id}
+                  onDelete={() => onDelete(item.id)}
+                />
               ))}
             </div>
 
@@ -100,7 +106,7 @@ function TaskMetric({ label, value }: { label: string; value: number }) {
   );
 }
 
-function UploadTaskRow({ item, active }: { item: UploadTaskSnapshotItem; active: boolean }) {
+function UploadTaskRow({ item, active, onDelete }: { item: UploadTaskSnapshotItem; active: boolean; onDelete: () => void }) {
   const status = uploadTaskStatusMeta(item);
   const Icon = status.icon;
   return (
@@ -115,7 +121,19 @@ function UploadTaskRow({ item, active }: { item: UploadTaskSnapshotItem; active:
         <div className="min-w-0 flex-1">
           <div className="flex items-center justify-between gap-3">
             <p className="truncate text-sm font-medium text-foreground" title={item.title}>{item.title}</p>
-            <span className={cn("shrink-0 text-xs font-medium", status.fg)}>{status.label}</span>
+            <span className="inline-flex shrink-0 items-center gap-1.5">
+              <span className={cn("text-xs font-medium", status.fg)}>{status.label}</span>
+              <IconButton
+                variant="ghost"
+                size="sm"
+                label="删除任务"
+                disabled={!item.canDelete}
+                onClick={onDelete}
+                className="size-6 text-subtle hover:bg-danger-soft hover:text-danger"
+              >
+                <Trash2 size={13} />
+              </IconButton>
+            </span>
           </div>
           {item.description ? (
             <p className="mt-0.5 truncate text-xs text-muted" title={item.description}>{item.description}</p>
