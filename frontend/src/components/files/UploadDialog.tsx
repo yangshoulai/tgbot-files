@@ -408,6 +408,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   const queuedUrlLaunchingRef = useRef(false);
   const activePersistedTaskIdRef = useRef<string | null>(null);
   const preserveHiddenUploadStateRef = useRef(false);
+  const previousOpenRef = useRef(open);
   const recoveringPersistedTaskRef = useRef(false);
   const uploadTaskLockOwnerRef = useRef(`upload-tab-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   const hlsThumbnailPromiseRef = useRef<Promise<GeneratedThumbnail | undefined> | null>(null);
@@ -470,6 +471,10 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       return;
     }
 
+    const wasOpen = previousOpenRef.current;
+    const shouldInitializeOpenState = open && !wasOpen;
+    previousOpenRef.current = open;
+
     if (!open) {
       if (activeUploadRef.current || submitting || checkingConflicts || preserveHiddenUploadStateRef.current) {
         preserveHiddenUploadStateRef.current = true;
@@ -507,6 +512,10 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       setDragOver(false);
       setUploadDirectoryPath(directoryPath);
       resetQueuedUrlDraftState();
+      return;
+    }
+
+    if (!shouldInitializeOpenState) {
       return;
     }
 
