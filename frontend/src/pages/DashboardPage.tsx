@@ -683,13 +683,17 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
 
   const refreshCacheFileIndex = useCallback(async () => {
     try {
-      const response = await listFiles({
-        q: "",
-        dir: "/",
-        all: true,
-        type: "all"
-      });
-      setCacheFiles(response.files);
+      const directoryResponse = await listDirectories(true);
+      const directoryPaths = Array.from(new Set(["/", ...directoryResponse.directories.map((directory) => directory.path)]));
+      const responses = await Promise.all(directoryPaths.map((dir) =>
+        listFiles({
+          q: "",
+          dir,
+          all: true,
+          type: "all"
+        })
+      ));
+      setCacheFiles(responses.flatMap((response) => response.files));
     } catch {
       setCacheFiles([]);
     }
@@ -920,7 +924,8 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
     setCacheOperation({ fileId: file.id, kind: "resume" });
     try {
       await requestPersistentFileCacheStorage();
-      setCacheSummary(await resumeFileCache(file.id));
+      const metadata = buildFileCacheMetadata(file, Number.MAX_SAFE_INTEGER, "manual");
+      setCacheSummary(await resumeFileCache(file.id, metadata ?? undefined));
       toast.success("缓存已继续");
     } catch (error) {
       toast.danger(errorMessage(error));
@@ -944,7 +949,10 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
   async function resumeFileCacheById(fileId: string) {
     setCacheOperation({ fileId, kind: "resume" });
     try {
-      setCacheSummary(await resumeFileCache(fileId));
+      await requestPersistentFileCacheStorage();
+      const indexedFile = cacheFileIndex.get(fileId);
+      const metadata = indexedFile ? buildFileCacheMetadata(indexedFile, Number.MAX_SAFE_INTEGER, "manual") : null;
+      setCacheSummary(await resumeFileCache(fileId, metadata ?? undefined));
       toast.success("缓存已继续");
     } catch (error) {
       toast.danger(errorMessage(error));

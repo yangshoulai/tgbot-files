@@ -171,10 +171,11 @@ export function pauseFileCache(fileId: string): Promise<FileCacheSummary> {
   }).then((summary) => normalizeFileCacheSummary(summary));
 }
 
-export function resumeFileCache(fileId: string): Promise<FileCacheSummary> {
+export function resumeFileCache(fileId: string, metadata?: FileCacheMetadata): Promise<FileCacheSummary> {
   return requestFileCacheMessage<FileCacheSummary>({
     type: "FILE_CACHE_RESUME_FILE",
-    fileId
+    fileId,
+    ...(metadata ? { metadata } : {})
   }).then((summary) => normalizeFileCacheSummary(summary));
 }
 
@@ -273,7 +274,7 @@ function normalizeFileCacheSummary(value: FileCacheSummary | null | undefined): 
 type FileCacheRequestMessage =
   | { type: "FILE_CACHE_CACHE_FILE"; metadata: FileCacheMetadata }
   | { type: "FILE_CACHE_PAUSE_FILE"; fileId: string }
-  | { type: "FILE_CACHE_RESUME_FILE"; fileId: string }
+  | { type: "FILE_CACHE_RESUME_FILE"; fileId: string; metadata?: FileCacheMetadata }
   | { type: "FILE_CACHE_TERMINATE_FILE"; fileId: string }
   | { type: "FILE_CACHE_STATE_REQUEST"; metadata: FileCacheMetadata }
   | { type: "FILE_CACHE_LIST_REQUEST" }
