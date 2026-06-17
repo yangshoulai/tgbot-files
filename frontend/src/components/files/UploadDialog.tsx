@@ -407,6 +407,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   const activeUploadRef = useRef<UploadAbortContext | null>(null);
   const itemsRef = useRef(items);
   const urlUploadRef = useRef(urlUpload);
+  const lastTaskSnapshotKeyRef = useRef<string | null>(null);
   const queuedUrlTasksRef = useRef(queuedUrlTasks);
   const queuedUrlLaunchingRef = useRef(false);
   const activePersistedTaskIdRef = useRef<string | null>(null);
@@ -994,6 +995,11 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       persistedTasks: readUploadTaskQueue().tasks
     });
 
+    const snapshotKey = uploadTaskSnapshotKey(snapshot);
+    if (snapshotKey === lastTaskSnapshotKeyRef.current) {
+      return;
+    }
+    lastTaskSnapshotKeyRef.current = snapshotKey;
     onTaskSnapshotChange(snapshot);
   }, [
     activeUploadItemId,
@@ -3245,15 +3251,32 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         continue;
       }
 
-      setUrlUpload((current) => ({
-        ...current,
-        magnet: current.magnet
+      setUrlUpload((current) => {
+        const progressLabel = magnetStatusProgressLabel(label, magnet);
+        const nextProgress = current.progress
+          ? { ...current.progress, label: progressLabel }
+          : { completed: 0, total: 1, label: progressLabel };
+        const nextMagnet = current.magnet
           ? { ...current.magnet, import: magnet }
-          : { import: magnet, selectedIndexes: selectedMagnetIndexesForResume(magnet, maxMultipartBytes) },
-        progress: current.progress
-          ? { ...current.progress, label: magnetStatusProgressLabel(label, magnet) }
-          : { completed: 0, total: 1, label: magnetStatusProgressLabel(label, magnet) }
-      }));
+          : { import: magnet, selectedIndexes: selectedMagnetIndexesForResume(magnet, maxMultipartBytes) };
+
+        if (
+          current.progress?.label === nextProgress.label &&
+          current.progress?.completed === nextProgress.completed &&
+          current.progress?.total === nextProgress.total &&
+          current.progress?.failed === nextProgress.failed &&
+          current.magnet?.import &&
+          magnetImportRuntimeKey(current.magnet.import) === magnetImportRuntimeKey(magnet)
+        ) {
+          return current;
+        }
+
+        return {
+          ...current,
+          magnet: nextMagnet,
+          progress: nextProgress
+        };
+      });
 
       if (isDone(magnet)) {
         return magnet;
@@ -4654,6 +4677,30 @@ function createUploadTaskSnapshot(params: {
   };
 }
 
+function uploadTaskSnapshotKey(snapshot: UploadTaskSnapshot | null): string {
+  if (!snapshot) {
+    return "empty";
+  }
+
+  return JSON.stringify({
+    running: snapshot.running,
+    stopRequested: snapshot.stopRequested,
+    activeItemId: snapshot.activeItemId,
+    summary: snapshot.summary,
+    items: snapshot.items.map((item) => ({
+      id: item.id,
+      kind: item.kind,
+      title: item.title,
+      description: item.description,
+      status: item.status,
+      progressPercent: item.progressPercent,
+      progressLabel: item.progressLabel,
+      canStop: item.canStop,
+      canDelete: item.canDelete
+    }))
+  });
+}
+
 function queuedUrlTaskSnapshotItem(task: QueuedUrlUploadTask): UploadTaskSnapshotItem {
   return {
     id: task.id,
@@ -5430,6 +5477,25 @@ function magnetDownloadProgressLabel(magnet: MagnetImport): string | null {
     : "";
 
   return `${formatBytes(completed)}/${formatBytes(total)} · ${progress >= 10 ? progress.toFixed(0) : progress.toFixed(1)}%${speed}`;
+}
+
+function magnetImportRuntimeKey(magnet: MagnetImport): string {
+  return JSON.stringify({
+    status: magnet.status,
+    error: magnet.error_message ?? "",
+    aria2Status: magnet.aria2_status ?? "",
+    completedBytes: magnet.download_completed_bytes ?? 0,
+    totalBytes: magnet.download_total_bytes ?? 0,
+    progress: Math.round((magnet.download_progress ?? 0) * 1000),
+    speed: Math.round((magnet.download_speed_bytes_per_second ?? 0) / 1024),
+    files: magnet.files.map((file) => [
+      file.file_index,
+      file.selected,
+      file.status,
+      file.upload_id ?? "",
+      file.error_message ?? ""
+    ])
+  });
 }
 
 function isLikelyHlsUrl(value: string): boolean {
