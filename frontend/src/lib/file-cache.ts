@@ -42,6 +42,7 @@ export interface FileCacheEntry {
   autoBytes: number;
   cacheSource: FileCacheSource;
   manualCacheStatus?: FileManualCacheStatus;
+  manualStartedAt?: number;
   lastAccessed: number;
   complete: boolean;
 }

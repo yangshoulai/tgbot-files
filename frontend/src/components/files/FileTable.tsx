@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type MouseEvent, type ReactNode, type RefObject } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode, type RefObject } from "react";
 import {
   ArrowDown,
   ArrowUp,
@@ -23,7 +23,7 @@ import {
   hasFileLinkAccess
 } from "../../lib/file-access";
 import { cn } from "../../lib/cn";
-import { canCacheFile, type FileCacheSummary } from "../../lib/file-cache";
+import { canCacheFile, type FileCacheEntry, type FileCacheSummary } from "../../lib/file-cache";
 import { fileKind, formatBytes, formatDateTime } from "../../utils";
 import { IconButton } from "../ui/IconButton";
 import { FileVisual } from "../ui/FileVisual";
@@ -130,6 +130,54 @@ function SortHeader({
   );
 }
 
+function fileCachePercent(entry: FileCacheEntry | null): number {
+  if (!entry) return 0;
+  if (entry.complete) return 100;
+  if (entry.size > 0) {
+    return Math.max(0, Math.min(100, Math.round((entry.cachedBytes / entry.size) * 100)));
+  }
+  if (entry.chunkCount > 0) {
+    return Math.max(0, Math.min(100, Math.round((entry.cachedChunks / entry.chunkCount) * 100)));
+  }
+  return 0;
+}
+
+function fileCacheStatusText(entry: FileCacheEntry | null): string {
+  if (!entry || entry.cachedBytes <= 0) return "未缓存";
+  const percent = fileCachePercent(entry);
+  if (entry.manualCacheStatus === "caching") return `缓存中（${percent}%）`;
+  if (entry.manualCacheStatus === "paused") return `已停止（${percent}%）`;
+  if (entry.complete) return "已缓存（100%）";
+  return `已缓存（${percent}%）`;
+}
+
+function FileCacheBadge({ entry }: { entry: FileCacheEntry | null }) {
+  const percent = fileCachePercent(entry);
+
+  return (
+    <span
+      className={cn(
+        "inline-flex max-w-full items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium",
+        !entry || entry.cachedBytes <= 0
+          ? "bg-surface text-subtle ring-1 ring-border"
+          : entry.manualCacheStatus === "caching"
+            ? "bg-primary-soft text-primary-strong"
+            : entry.manualCacheStatus === "paused"
+              ? "bg-warning-soft text-warning"
+              : entry.complete
+                ? "bg-success-soft text-success"
+                : "bg-primary-soft text-primary-strong"
+      )}
+      title={entry ? `已缓存 ${formatBytes(entry.cachedBytes)} / ${formatBytes(entry.size)}` : "未缓存"}
+    >
+      <span className="truncate">{fileCacheStatusText(entry)}</span>
+      {entry && entry.cachedBytes > 0 && !entry.complete ? (
+        <span className="hidden text-current/70 xl:inline">{percent}%</span>
+      ) : null}
+    </span>
+  );
+}
+
 export function FileTable({
   directories,
   files,
@@ -166,6 +214,13 @@ export function FileTable({
 }: FileTableProps) {
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
+  const cacheEntryMap = useMemo(() => {
+    const map = new Map<string, FileCacheEntry>();
+    for (const entry of cacheSummary?.entries ?? []) {
+      map.set(entry.fileId, entry);
+    }
+    return map;
+  }, [cacheSummary]);
 
   useEffect(() => {
     if (!contextMenu) return;
@@ -309,7 +364,7 @@ export function FileTable({
     const { file } = state;
     const linkFile = hasFileLinkAccess(file) ? file : null;
     const canPreviewFile = canPreviewThroughAvailableAccess(file);
-    const cacheEntry = cacheSummary?.entries.find((entry) => entry.fileId === file.id) ?? null;
+    const cacheEntry = cacheEntryMap.get(file.id) ?? null;
     const cached = Boolean(cacheEntry?.cachedBytes);
     const cacheStatus = cacheEntry?.manualCacheStatus;
     const cacheLabel = "缓存";
@@ -442,6 +497,7 @@ export function FileTable({
       openFileContextMenu={openFileContextMenu}
       openDirectoryActionsMenu={openDirectoryActionsMenu}
       openFileActionsMenu={openFileActionsMenu}
+      cacheEntryMap={cacheEntryMap}
     />
   ) : (
     <FileListTableView
@@ -462,6 +518,7 @@ export function FileTable({
       onThumbnailPreview={onThumbnailPreview}
       openDirectoryContextMenu={openDirectoryContextMenu}
       openFileContextMenu={openFileContextMenu}
+      cacheEntryMap={cacheEntryMap}
     />
   );
 
@@ -522,6 +579,7 @@ export function FileTable({
           const mimeLabel = file.mime_type || "未知 MIME";
           const previewFromThumbnail = file.thumbnail_url ? () => onThumbnailPreview(file) : undefined;
           const canPreviewFile = canPreviewThroughAvailableAccess(file);
+          const cacheEntry = cacheEntryMap.get(file.id) ?? null;
 
           return (
             <div
@@ -569,6 +627,9 @@ export function FileTable({
                     <p className="mt-0.5 truncate text-xs text-muted">
                       {formatBytes(file.size)} · {formatDateTime(file.created_at)}
                     </p>
+                    <p className="mt-1">
+                      <FileCacheBadge entry={cacheEntry} />
+                    </p>
                   </div>
                 </div>
                 <IconButton
@@ -614,7 +675,8 @@ function FileListTableView({
   onPreview,
   onThumbnailPreview,
   openDirectoryContextMenu,
-  openFileContextMenu
+  openFileContextMenu,
+  cacheEntryMap
 }: {
   directories: DirectoryItem[];
   files: FileItem[];
@@ -633,6 +695,7 @@ function FileListTableView({
   onThumbnailPreview: (file: FileItem) => void;
   openDirectoryContextMenu: (event: MouseEvent, directory: DirectoryItem) => void;
   openFileContextMenu: (event: MouseEvent, file: FileItem) => void;
+  cacheEntryMap: Map<string, FileCacheEntry>;
 }) {
   return (
     <div className="hidden overflow-x-hidden sm:block">
@@ -667,6 +730,9 @@ function FileListTableView({
               onSort={onSort}
               className="hidden w-32 px-4 py-3 text-left font-medium text-muted lg:table-cell"
             />
+            <th className="hidden w-36 px-4 py-3 text-left font-medium text-muted xl:table-cell">
+              缓存
+            </th>
             <SortHeader
               label="上传时间"
               sortId="created_at"
@@ -726,6 +792,9 @@ function FileListTableView({
                   <span className="text-xs text-muted">{directory.file_count} 个文件</span>
                 </div>
               </td>
+              <td className="hidden px-4 py-3 align-middle xl:table-cell">
+                <span className="text-xs text-subtle">不适用</span>
+              </td>
               <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted md:table-cell">
                 {formatDateTime(directory.created_at)}
               </td>
@@ -737,6 +806,7 @@ function FileListTableView({
             const kind = fileKind(file);
             const mimeLabel = file.mime_type || "未知 MIME";
             const previewFromThumbnail = file.thumbnail_url ? () => onThumbnailPreview(file) : undefined;
+            const cacheEntry = cacheEntryMap.get(file.id) ?? null;
 
             return (
               <tr
@@ -785,11 +855,17 @@ function FileListTableView({
                       <span className="hidden truncate text-xs text-muted lg:inline">
                         {kind.label} · {mimeLabel}
                       </span>
+                      <span className="truncate text-xs text-muted xl:hidden">
+                        {fileCacheStatusText(cacheEntry)}
+                      </span>
                     </div>
                   </div>
                 </td>
                 <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-foreground lg:table-cell">
                   {formatBytes(file.size)}
+                </td>
+                <td className="hidden px-4 py-3 align-middle xl:table-cell">
+                  <FileCacheBadge entry={cacheEntry} />
                 </td>
                 <td className="hidden whitespace-nowrap px-4 py-3 align-middle text-sm text-muted md:table-cell">
                   {formatDateTime(file.created_at)}
@@ -819,7 +895,8 @@ function FileGridView({
   openDirectoryContextMenu,
   openFileContextMenu,
   openDirectoryActionsMenu,
-  openFileActionsMenu
+  openFileActionsMenu,
+  cacheEntryMap
 }: {
   directories: DirectoryItem[];
   files: FileItem[];
@@ -837,6 +914,7 @@ function FileGridView({
   openFileContextMenu: (event: MouseEvent, file: FileItem) => void;
   openDirectoryActionsMenu: (directory: DirectoryItem, anchor: HTMLElement) => void;
   openFileActionsMenu: (file: FileItem, anchor: HTMLElement) => void;
+  cacheEntryMap: Map<string, FileCacheEntry>;
 }) {
   return (
     <div className="bg-background/45">
@@ -932,6 +1010,7 @@ function FileGridView({
           const kind = fileKind(file);
           const previewFromThumbnail = file.thumbnail_url ? () => onThumbnailPreview(file) : undefined;
           const canPreviewFile = canPreviewThroughAvailableAccess(file);
+          const cacheEntry = cacheEntryMap.get(file.id) ?? null;
 
           return (
             <article
@@ -997,6 +1076,9 @@ function FileGridView({
                 <div className="flex min-w-0 flex-wrap items-center gap-1.5">
                   <span className="rounded-full bg-background px-2 py-0.5 text-xs font-medium text-muted ring-1 ring-border">{kind.label}</span>
                   <span className="truncate text-xs text-muted">{formatBytes(file.size)}</span>
+                </div>
+                <div>
+                  <FileCacheBadge entry={cacheEntry} />
                 </div>
                 <span className="truncate text-xs text-subtle">{formatDateTime(file.created_at)}</span>
               </div>

@@ -6,6 +6,7 @@ const DEFAULT_MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024;
 const RESPONSE_WINDOW_BYTES = 2 * 1024 * 1024;
 const DEFAULT_PREVIEW_PREFETCH_CONCURRENCY = 5;
 const MAX_PREVIEW_PREFETCH_CONCURRENCY = 32;
+const MAX_MANUAL_FILE_CACHE_SESSIONS = 5;
 const CONTINUOUS_PREFETCH_SESSION_TTL_MS = 12_000;
 const CONTINUOUS_PREFETCH_RETRY_DELAY_MS = 3_000;
 const HOT_CHUNK_CACHE_MAX_BYTES = 160 * 1024 * 1024;
@@ -362,6 +363,8 @@ function postFileCacheResponse(event, response) {
 }
 
 async function cacheWholeFile(metadata) {
+  await enforceManualFileCacheLimit(metadata.fileId);
+
   const manualMetadata = {
     ...metadata,
     cacheSource: "manual",
@@ -377,10 +380,13 @@ async function cacheWholeFile(metadata) {
     return readFileCacheSummary();
   }
 
+  const manualStartedAt = Date.now();
+  manualMetadata.manualStartedAt = manualStartedAt;
   const session = {
     fileId: manualMetadata.fileId,
     metadata: manualMetadata,
     status: "caching",
+    manualStartedAt,
     controller: new AbortController(),
     promise: null
   };
@@ -397,12 +403,13 @@ async function cacheWholeFile(metadata) {
       }
     });
 
-  await putFileRecordMetadata(manualMetadata);
+  await putFileRecordMetadata(manualMetadata, { manualStartedAt });
   return readFileCacheSummary();
 }
 
 async function runManualFileCacheSession(session) {
   const { metadata } = session;
+  await putFileRecordMetadata(metadata, { manualStartedAt: session.manualStartedAt });
   if (metadata.kind === "hls") {
     await cacheWholeHlsFile(metadata, session);
     return;
@@ -410,7 +417,22 @@ async function runManualFileCacheSession(session) {
 
   for (let chunkIndex = 0; chunkIndex < metadata.chunkCount; chunkIndex += 1) {
     throwIfFileCacheStopped(session);
+    if (await getCachedChunkResponse(metadata, chunkIndex)) {
+      continue;
+    }
     await getChunkBytes(metadata, chunkIndex, session.controller.signal);
+  }
+}
+
+async function enforceManualFileCacheLimit(nextFileId) {
+  const activeSessions = Array.from(fileCacheSessions.values())
+    .filter((session) => session.status === "caching" && session.fileId !== nextFileId)
+    .sort((left, right) => safeTime(left.manualStartedAt) - safeTime(right.manualStartedAt));
+
+  while (activeSessions.length >= MAX_MANUAL_FILE_CACHE_SESSIONS) {
+    const oldest = activeSessions.shift();
+    if (!oldest) break;
+    pauseFileCacheSession(oldest.fileId);
   }
 }
 
@@ -424,6 +446,8 @@ function pauseFileCacheSession(fileId) {
 }
 
 async function resumeFileCacheSession(fileId) {
+  await enforceManualFileCacheLimit(fileId);
+
   const session = fileCacheSessions.get(fileId);
   if (session) {
     if (session.status !== "paused") {
@@ -431,6 +455,13 @@ async function resumeFileCacheSession(fileId) {
     }
 
     session.status = "caching";
+    session.manualStartedAt = Date.now();
+    session.metadata = {
+      ...session.metadata,
+      manualStartedAt: session.manualStartedAt,
+      cacheSource: "manual",
+      cacheMaxBytes: Number.MAX_SAFE_INTEGER
+    };
     session.controller = new AbortController();
     session.promise = runManualFileCacheSession(session)
       .catch((error) => {
@@ -466,6 +497,7 @@ async function resumeFileCacheSession(fileId) {
     cacheSource: "manual"
   });
   if (metadata) {
+    metadata.manualStartedAt = Date.now();
     await cacheWholeFile(metadata);
   }
 }
@@ -714,6 +746,7 @@ async function fetchAndCacheHlsPartBytes({ fileId, partKind, partIndex, sourceUr
     chunkCount: metadata?.chunkCount || 1,
     cacheSource,
     size: bytes.byteLength,
+    manualStartedAt: metadata?.manualStartedAt,
     createdAt: now,
     lastAccessed: now
   }, true);
@@ -1932,6 +1965,7 @@ async function fetchAndCacheChunkBytes(metadata, chunkIndex, signal = null) {
       chunkCount: metadata.chunkCount,
       cacheSource: metadata.cacheSource || "auto",
       size: bytes.byteLength,
+      manualStartedAt: metadata.manualStartedAt,
       createdAt: now,
       lastAccessed: now
     }, true);
@@ -2300,7 +2334,7 @@ async function deleteChunk(cacheKey) {
   await deleteChunkMetadata(cacheKey);
 }
 
-async function putFileRecordMetadata(metadata) {
+async function putFileRecordMetadata(metadata, extra = {}) {
   const entry = await readFileCacheEntry(metadata.fileId);
   if (!entry) {
     return;
@@ -2321,6 +2355,7 @@ async function putFileRecordMetadata(metadata) {
       sourceUrl: metadata.sourceUrl || chunk.sourceUrl || "",
       token: metadata.token || chunk.token || "",
       cacheSource: entry.cacheSource === "manual" ? "manual" : metadata.cacheSource || chunk.cacheSource || "auto",
+      manualStartedAt: extra.manualStartedAt || metadata.manualStartedAt || chunk.manualStartedAt,
       lastAccessed: Date.now()
     }, true)));
 }
@@ -2360,6 +2395,7 @@ async function readFileCacheSummary() {
       manualBytes: 0,
       autoBytes: 0,
       cacheSource: "auto",
+      manualStartedAt: 0,
       lastAccessed: 0
     };
 
@@ -2375,10 +2411,12 @@ async function readFileCacheSummary() {
     current.cachedChunkIndexes.add(Number(entry.chunkIndex));
     current.cachedBytes += safeSize(entry.size);
     current.lastAccessed = Math.max(current.lastAccessed, safeTime(entry.lastAccessed));
+    current.manualStartedAt = current.manualStartedAt || safeTime(entry.manualStartedAt);
 
     if (entry.cacheSource === "manual") {
       current.manualBytes += safeSize(entry.size);
       current.cacheSource = "manual";
+      current.manualStartedAt = current.manualStartedAt || safeTime(entry.manualStartedAt) || safeTime(entry.createdAt);
     } else {
       current.autoBytes += safeSize(entry.size);
     }
@@ -2406,11 +2444,12 @@ async function readFileCacheSummary() {
         autoBytes: entry.autoBytes,
         cacheSource: entry.cacheSource,
         manualCacheStatus: entry.cacheSource === "manual" && !complete ? "paused" : undefined,
+        manualStartedAt: entry.manualStartedAt || 0,
         lastAccessed: entry.lastAccessed,
         complete
       };
     })
-    .sort((left, right) => right.lastAccessed - left.lastAccessed);
+    .sort(compareFileCacheEntries);
 
   for (const session of fileCacheSessions.values()) {
     if (session.status !== "caching" && session.status !== "paused") {
@@ -2421,7 +2460,7 @@ async function readFileCacheSummary() {
     if (existing) {
       existing.manualCacheStatus = session.status;
       existing.cacheSource = "manual";
-      existing.lastAccessed = Math.max(existing.lastAccessed, Date.now());
+      existing.manualStartedAt = session.manualStartedAt || existing.manualStartedAt || Date.now();
       continue;
     }
 
@@ -2442,10 +2481,13 @@ async function readFileCacheSummary() {
       autoBytes: 0,
       cacheSource: "manual",
       manualCacheStatus: session.status,
+      manualStartedAt: session.manualStartedAt || Date.now(),
       lastAccessed: Date.now(),
       complete: false
     });
   }
+
+  normalizedEntries.sort(compareFileCacheEntries);
 
   return {
     entries: normalizedEntries,
@@ -2453,6 +2495,22 @@ async function readFileCacheSummary() {
     manualBytes: normalizedEntries.reduce((sum, entry) => sum + entry.manualBytes, 0),
     autoBytes: normalizedEntries.reduce((sum, entry) => sum + entry.autoBytes, 0)
   };
+}
+
+function compareFileCacheEntries(left, right) {
+  const leftManual = left.cacheSource === "manual" || Boolean(left.manualCacheStatus) || safeTime(left.manualStartedAt) > 0;
+  const rightManual = right.cacheSource === "manual" || Boolean(right.manualCacheStatus) || safeTime(right.manualStartedAt) > 0;
+
+  if (leftManual !== rightManual) {
+    return leftManual ? -1 : 1;
+  }
+
+  if (leftManual && rightManual) {
+    return (safeTime(right.manualStartedAt) || safeTime(right.lastAccessed)) -
+      (safeTime(left.manualStartedAt) || safeTime(left.lastAccessed));
+  }
+
+  return safeTime(right.lastAccessed) - safeTime(left.lastAccessed);
 }
 
 async function readFileCacheEntry(fileId) {
@@ -2576,7 +2634,8 @@ async function putChunkMetadata(entry, preserveCreatedAt) {
         chunkSize: entry.chunkSize || existing?.chunkSize || entry.size,
         chunkCount: entry.chunkCount || existing?.chunkCount || 1,
         sourceUrl: entry.sourceUrl || existing?.sourceUrl || "",
-        token: entry.token || existing?.token || ""
+        token: entry.token || existing?.token || "",
+        manualStartedAt: entry.manualStartedAt || existing?.manualStartedAt
       });
     };
     return undefined;
