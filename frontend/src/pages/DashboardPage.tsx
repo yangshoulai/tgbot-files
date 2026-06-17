@@ -393,6 +393,8 @@ function CacheManagerDialog({
                               "w-fit rounded-full px-2 py-0.5 text-xs font-medium",
                               entry.manualCacheStatus === "caching"
                                 ? "bg-primary-soft text-primary-strong"
+                                : entry.manualCacheStatus === "waiting"
+                                  ? "bg-surface text-muted ring-1 ring-border"
                                 : entry.manualCacheStatus === "paused"
                                   ? "bg-warning-soft text-warning"
                                   : entry.complete
@@ -413,6 +415,17 @@ function CacheManagerDialog({
                                 disabled={actionDisabled}
                                 onClick={() => setActionEntry(entry)}
                               />
+                            ) : null}
+                            {entry.manualCacheStatus === "waiting" ? (
+                              <IconButton
+                                size="sm"
+                                variant="default"
+                                label="停止或终止缓存"
+                                disabled={actionDisabled}
+                                onClick={() => setActionEntry(entry)}
+                              >
+                                <Square size={16} />
+                              </IconButton>
                             ) : null}
                             {entry.manualCacheStatus === "paused" ? (
                               <IconButton
@@ -523,6 +536,7 @@ function fileCacheProgressPercent(entry: FileCacheEntry): number {
 
 function cacheEntryStatusLabel(entry: FileCacheEntry): string {
   if (entry.manualCacheStatus === "caching") return "缓存中";
+  if (entry.manualCacheStatus === "waiting") return "等待中";
   if (entry.manualCacheStatus === "paused") return "已停止";
   if (entry.complete) return "已完成";
   return "部分缓存";

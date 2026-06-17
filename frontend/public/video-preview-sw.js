@@ -8,6 +8,8 @@ const RESPONSE_WINDOW_BYTES = 2 * 1024 * 1024;
 const DEFAULT_PREVIEW_PREFETCH_CONCURRENCY = 5;
 const MAX_PREVIEW_PREFETCH_CONCURRENCY = 32;
 const MAX_MANUAL_FILE_CACHE_SESSIONS = 5;
+const MAX_MANUAL_FILE_CACHE_WORKERS = 5;
+const CACHE_STORAGE_METADATA_SNAPSHOT_TTL_MS = 5_000;
 const CONTINUOUS_PREFETCH_SESSION_TTL_MS = 12_000;
 const CONTINUOUS_PREFETCH_RETRY_DELAY_MS = 3_000;
 const HOT_CHUNK_CACHE_MAX_BYTES = 160 * 1024 * 1024;
@@ -18,6 +20,9 @@ const hotChunkCache = new Map();
 const hlsPreviewSources = new Map();
 const hlsPreviewCacheSessions = new Map();
 const fileCacheSessions = new Map();
+let cacheStorageMetadataSnapshot = null;
+let cacheStorageMetadataSnapshotAt = 0;
+let cacheStorageMetadataSnapshotPromise = null;
 let hotChunkCacheBytes = 0;
 
 self.addEventListener("install", (event) => {
@@ -29,6 +34,9 @@ self.addEventListener("activate", (event) => {
     await self.clients.claim();
     void cleanupPreviewCache().catch((error) => {
       warnPreviewCacheError("cleanup on activate", error);
+    });
+    void rehydrateManualFileCacheSessions().catch((error) => {
+      warnPreviewCacheError("rehydrate manual cache sessions", error);
     });
   })());
 });
@@ -207,7 +215,7 @@ async function handleHlsPartRequest(request, event) {
   try {
     const range = parseRange(request.headers.get("Range"), Number(url.searchParams.get("full_size")) || Number(url.searchParams.get("chunk_size")) || 1, Number(url.searchParams.get("full_size")) || Number(url.searchParams.get("chunk_size")) || 1);
     if (partKind === "segment" && range && fullSourceUrl) {
-      const cachedFullPart = await (await caches.open(CACHE_NAME)).match(`${self.location.origin}/__preview-cache/hls/${encodeURIComponent(fileId)}/${partKind}/${partIndex}`);
+      const cachedFullPart = await (await caches.open(CACHE_NAME)).match(hlsPartCacheKey(fileId, partKind, partIndex));
       if (cachedFullPart) {
         const bytes = await cachedFullPart.arrayBuffer();
         const slice = bytes.slice(range.start, range.end + 1);
@@ -364,8 +372,6 @@ function postFileCacheResponse(event, response) {
 }
 
 async function cacheWholeFile(metadata) {
-  await enforceManualFileCacheLimit(metadata.fileId);
-
   const manualMetadata = {
     ...metadata,
     cacheSource: "manual",
@@ -376,107 +382,222 @@ async function cacheWholeFile(metadata) {
   if (existing?.status === "caching") {
     return readFileCacheSummary();
   }
-  if (existing?.status === "paused") {
-    await resumeFileCacheSession(manualMetadata.fileId);
+  if (existing?.status === "paused" || existing?.status === "waiting") {
+    await resumeFileCacheSession(manualMetadata.fileId, manualMetadata);
     return readFileCacheSummary();
   }
 
   const manualStartedAt = Date.now();
-  manualMetadata.manualStartedAt = manualStartedAt;
+  const session = createManualFileCacheSession(manualMetadata, "waiting", manualStartedAt);
+  fileCacheSessions.set(manualMetadata.fileId, session);
+  await putFileRecordMetadata(session.metadata, { manualStartedAt, manualCacheStatus: "waiting" });
+  await pumpManualFileCacheQueue();
+  return readFileCacheSummary();
+}
+
+function createManualFileCacheSession(metadata, status, manualStartedAt) {
+  const normalizedManualStartedAt = safeTime(manualStartedAt) || Date.now();
   const session = {
-    fileId: manualMetadata.fileId,
-    metadata: manualMetadata,
-    status: "caching",
-    manualStartedAt,
-    controller: new AbortController(),
+    fileId: metadata.fileId,
+    metadata: {
+      ...metadata,
+      manualStartedAt: normalizedManualStartedAt,
+      ...(status === "waiting" || status === "paused" ? { manualCacheStatus: status } : {})
+    },
+    status,
+    manualStartedAt: normalizedManualStartedAt,
+    controller: null,
     promise: null
   };
-  fileCacheSessions.set(manualMetadata.fileId, session);
-  await putFileRecordMetadata(manualMetadata, { manualStartedAt });
-  session.promise = runManualFileCacheSession(session)
-    .catch((error) => {
-      if (session.status !== "paused") {
-        warnPreviewCacheError(`manual cache ${manualMetadata.fileId}`, error);
-      }
-    })
-    .finally(() => {
-      if (fileCacheSessions.get(manualMetadata.fileId) === session && session.status === "caching") {
-        fileCacheSessions.delete(manualMetadata.fileId);
-      }
-    });
-
-  return readFileCacheSummary();
+  return session;
 }
 
 async function runManualFileCacheSession(session) {
   const { metadata } = session;
-  await putFileRecordMetadata(metadata, { manualStartedAt: session.manualStartedAt });
+  await putFileRecordMetadata(metadata, { manualStartedAt: session.manualStartedAt, manualCacheStatus: undefined });
   if (metadata.kind === "hls") {
     await cacheWholeHlsFile(metadata, session);
     return;
   }
 
-  for (let chunkIndex = 0; chunkIndex < metadata.chunkCount; chunkIndex += 1) {
+  const queue = createPriorityChunkQueue(metadata.chunkCount, 0);
+  await runConcurrentManualCacheWorkers(session, queue, async (chunkIndex) => {
     throwIfFileCacheStopped(session);
     if (await getCachedChunkResponse(metadata, chunkIndex)) {
-      continue;
+      await markChunkMetadataForManualCache(metadata, chunkIndex, expectedChunkSize(metadata, chunkIndex));
+      return;
     }
-    await getChunkBytes(metadata, chunkIndex, session.controller.signal);
-  }
+    const bytes = await getChunkBytes(metadata, chunkIndex, session.controller.signal);
+    await markChunkMetadataForManualCache(metadata, chunkIndex, bytes.byteLength || expectedChunkSize(metadata, chunkIndex));
+  });
 }
 
-async function enforceManualFileCacheLimit(nextFileId) {
-  const activeSessions = Array.from(fileCacheSessions.values())
-    .filter((session) => session.status === "caching" && session.fileId !== nextFileId)
+async function runConcurrentManualCacheWorkers(session, queue, loadNext) {
+  const workerCount = Math.min(MAX_MANUAL_FILE_CACHE_WORKERS, Math.max(1, queue.length));
+
+  async function runWorker() {
+    while (queue.length > 0) {
+      throwIfFileCacheStopped(session);
+      const item = queue.shift();
+      if (item === undefined) {
+        continue;
+      }
+      try {
+        await loadNext(item);
+      } catch (error) {
+        if (session.status === "caching") {
+          session.controller?.abort();
+        }
+        throw error;
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+}
+
+async function rehydrateManualFileCacheSessions() {
+  const summary = await readFileCacheSummary();
+  const waitingEntries = summary.entries
+    .filter((entry) => entry.manualCacheStatus === "waiting" && !entry.complete)
     .sort((left, right) => safeTime(left.manualStartedAt) - safeTime(right.manualStartedAt));
 
-  while (activeSessions.length >= MAX_MANUAL_FILE_CACHE_SESSIONS) {
-    const oldest = activeSessions.shift();
-    if (!oldest) break;
-    pauseFileCacheSession(oldest.fileId);
+  for (const entry of waitingEntries) {
+    if (fileCacheSessions.has(entry.fileId)) {
+      continue;
+    }
+
+    const metadata = normalizeFileCacheMetadata({
+      kind: entry.kind,
+      fileId: entry.fileId,
+      fileName: entry.fileName,
+      directoryPath: entry.directoryPath,
+      mimeType: entry.mimeType,
+      size: entry.size,
+      chunkSize: entry.chunkSize,
+      chunkCount: entry.chunkCount,
+      sourceUrl: entry.sourceUrl,
+      token: entry.token,
+      cacheMaxBytes: Number.MAX_SAFE_INTEGER,
+      cacheSource: "manual"
+    });
+
+    if (!metadata) {
+      continue;
+    }
+
+    fileCacheSessions.set(entry.fileId, createManualFileCacheSession({
+      ...metadata,
+      manualCacheStatus: "waiting"
+    }, "waiting", safeTime(entry.manualStartedAt) || Date.now()));
+  }
+
+  await pumpManualFileCacheQueue();
+}
+
+async function pumpManualFileCacheQueue() {
+  const activeSessions = () => Array.from(fileCacheSessions.values())
+    .filter((session) => session.status === "caching");
+
+  while (activeSessions().length < MAX_MANUAL_FILE_CACHE_SESSIONS) {
+    const nextSession = Array.from(fileCacheSessions.values())
+      .filter((session) => session.status === "waiting")
+      .sort((left, right) => safeTime(left.manualStartedAt) - safeTime(right.manualStartedAt))[0];
+
+    if (!nextSession) {
+      break;
+    }
+
+    await startManualFileCacheSession(nextSession);
   }
 }
 
-function pauseFileCacheSession(fileId) {
-  const session = fileCacheSessions.get(fileId);
-  if (!session || session.status !== "caching") {
+async function startManualFileCacheSession(session) {
+  if (session.status !== "waiting" && session.status !== "paused") {
     return;
   }
+
+  if (Array.from(fileCacheSessions.values()).filter((item) => item.status === "caching").length >= MAX_MANUAL_FILE_CACHE_SESSIONS) {
+    return;
+  }
+
+  session.status = "caching";
+  session.controller = new AbortController();
+  session.metadata = {
+    ...session.metadata,
+    manualStartedAt: session.manualStartedAt,
+    cacheSource: "manual",
+    cacheMaxBytes: Number.MAX_SAFE_INTEGER,
+    manualCacheStatus: undefined
+  };
+  await putFileRecordMetadata(session.metadata, { manualStartedAt: session.manualStartedAt, manualCacheStatus: undefined });
+  session.promise = runManualFileCacheSession(session)
+    .catch(async (error) => {
+      if (session.status !== "paused") {
+        warnPreviewCacheError(`manual cache ${session.fileId}`, error);
+        if (fileCacheSessions.get(session.fileId) === session && session.status === "caching") {
+          session.status = "paused";
+          session.metadata = {
+            ...session.metadata,
+            manualCacheStatus: "paused"
+          };
+          await putFileRecordMetadata(session.metadata, { manualStartedAt: session.manualStartedAt, manualCacheStatus: "paused" });
+        }
+      }
+    })
+    .finally(() => {
+      if (fileCacheSessions.get(session.fileId) === session && session.status === "caching") {
+        fileCacheSessions.delete(session.fileId);
+        void deleteChunkMetadata(fileRecordCacheKey(session.fileId)).catch((error) => {
+          warnPreviewCacheError(`delete manual cache record ${session.fileId}`, error);
+        });
+      }
+      session.promise = null;
+      session.controller = null;
+      void pumpManualFileCacheQueue();
+    });
+}
+
+async function pauseFileCacheSession(fileId) {
+  const session = fileCacheSessions.get(fileId);
+  if (!session || (session.status !== "caching" && session.status !== "waiting")) {
+    return;
+  }
+  const wasCaching = session.status === "caching";
   session.status = "paused";
-  session.controller.abort();
+  session.metadata = {
+    ...session.metadata,
+    manualCacheStatus: "paused"
+  };
+  await putFileRecordMetadata(session.metadata, { manualStartedAt: session.manualStartedAt, manualCacheStatus: "paused" });
+  if (wasCaching) {
+    session.controller?.abort();
+  } else {
+    await pumpManualFileCacheQueue();
+  }
 }
 
 async function resumeFileCacheSession(fileId, fallbackMetadata = null) {
-  await enforceManualFileCacheLimit(fileId);
-
   const session = fileCacheSessions.get(fileId);
   if (session) {
-    if (session.status !== "paused") {
+    if (session.status === "caching") {
       return;
     }
 
-    session.status = "caching";
-    session.manualStartedAt = Date.now();
     const nextMetadata = fallbackMetadata?.fileId === fileId ? fallbackMetadata : session.metadata;
+    const wasPaused = session.status === "paused";
+    session.status = "waiting";
+    session.manualStartedAt = wasPaused ? Date.now() : session.manualStartedAt || Date.now();
     session.metadata = {
       ...session.metadata,
       ...nextMetadata,
       manualStartedAt: session.manualStartedAt,
       cacheSource: "manual",
-      cacheMaxBytes: Number.MAX_SAFE_INTEGER
+      cacheMaxBytes: Number.MAX_SAFE_INTEGER,
+      manualCacheStatus: "waiting"
     };
-    session.controller = new AbortController();
-    session.promise = runManualFileCacheSession(session)
-      .catch((error) => {
-        if (session.status !== "paused") {
-          warnPreviewCacheError(`manual cache ${fileId}`, error);
-        }
-      })
-      .finally(() => {
-        if (fileCacheSessions.get(fileId) === session && session.status === "caching") {
-          fileCacheSessions.delete(fileId);
-        }
-      });
+    await putFileRecordMetadata(session.metadata, { manualStartedAt: session.manualStartedAt, manualCacheStatus: "waiting" });
+    await pumpManualFileCacheQueue();
     return;
   }
 
@@ -504,8 +625,13 @@ async function resumeFileCacheSession(fileId, fallbackMetadata = null) {
     cacheSource: "manual"
   }) : null;
   if (metadata) {
-    metadata.manualStartedAt = Date.now();
-    await cacheWholeFile(metadata);
+    const sessionToQueue = createManualFileCacheSession({
+      ...metadata,
+      manualCacheStatus: "waiting"
+    }, "waiting", Date.now());
+    fileCacheSessions.set(fileId, sessionToQueue);
+    await putFileRecordMetadata(sessionToQueue.metadata, { manualStartedAt: sessionToQueue.manualStartedAt, manualCacheStatus: "waiting" });
+    await pumpManualFileCacheQueue();
   }
 }
 
@@ -513,10 +639,11 @@ async function terminateFileCacheSession(fileId) {
   const session = fileCacheSessions.get(fileId);
   if (session) {
     session.status = "terminated";
-    session.controller.abort();
+    session.controller?.abort();
     fileCacheSessions.delete(fileId);
   }
   await deleteFileCache(fileId);
+  await pumpManualFileCacheQueue();
 }
 
 function throwIfFileCacheStopped(session) {
@@ -534,37 +661,30 @@ async function cacheWholeHlsFile(metadata, session) {
   const playlistText = await response.text();
   const rewritten = rewriteHlsPlaylist(playlistText, metadata);
   hlsPreviewSources.set(metadata.fileId, rewritten.sources);
+  const queue = createHlsPriorityQueue(rewritten.sources, 0);
+  await runConcurrentManualCacheWorkers(session, queue, async (part) => {
+    if (!part?.sourceUrl) {
+      return;
+    }
 
-  if (rewritten.sources.init) {
-    throwIfFileCacheStopped(session);
-    await fetchAndCacheHlsPart({
+    const partMetadata = part.partKind === "segment"
+      ? {
+          ...metadata,
+          chunkCount: rewritten.sources.segments.length
+        }
+      : metadata;
+    const response = await fetchAndCacheHlsPart({
       fileId: metadata.fileId,
-      partKind: "init",
-      partIndex: 0,
-      sourceUrl: rewritten.sources.init,
+      partKind: part.partKind,
+      partIndex: part.partIndex,
+      sourceUrl: part.sourceUrl,
       cacheMaxBytes: Number.MAX_SAFE_INTEGER,
       cacheSource: "manual",
-      metadata,
+      metadata: partMetadata,
       signal: session.controller.signal
     });
-  }
-
-  for (let index = 0; index < rewritten.sources.segments.length; index += 1) {
-    throwIfFileCacheStopped(session);
-    await fetchAndCacheHlsPart({
-      fileId: metadata.fileId,
-      partKind: "segment",
-      partIndex: index,
-      sourceUrl: rewritten.sources.segments[index],
-      cacheMaxBytes: Number.MAX_SAFE_INTEGER,
-      cacheSource: "manual",
-      metadata: {
-        ...metadata,
-        chunkCount: rewritten.sources.segments.length
-      },
-      signal: session.controller.signal
-    });
-  }
+    await markHlsPartMetadataForManualCache(partMetadata, part.partKind, part.partIndex, response);
+  });
 }
 
 async function updateFileCacheAccess(metadata, chunkIndex) {
@@ -689,7 +809,7 @@ function hlsPartPreviewUrl(metadata, partKind, index, sourceUrl) {
 }
 
 async function fetchAndCacheHlsPart({ fileId, partKind, partIndex, sourceUrl, cacheMaxBytes, cacheSource = "auto", metadata = null, signal = null }) {
-  const cacheKey = `${self.location.origin}/__preview-cache/hls/${encodeURIComponent(fileId)}/${partKind}/${partIndex}`;
+  const cacheKey = hlsPartCacheKey(fileId, partKind, partIndex);
   const cache = await caches.open(CACHE_NAME);
   const cached = await cache.match(cacheKey);
   if (cached) {
@@ -735,12 +855,21 @@ async function fetchAndCacheHlsPartBytes({ fileId, partKind, partIndex, sourceUr
   }
   const cache = await caches.open(CACHE_NAME);
   await cache.put(cacheKey, new Response(bytes.slice(0), {
-    headers: {
-      "Content-Type": contentType,
-      "Content-Length": String(bytes.byteLength),
-      "Cache-Control": "public, max-age=31536000, immutable"
-    }
+    headers: cacheStorageResponseHeaders({
+      fileId,
+      metadata,
+      kind: "hls",
+      partKind,
+      partIndex,
+      chunkIndex: hlsChunkIndex(partKind, partIndex),
+      sourceUrl: metadata?.sourceUrl || sourceUrl,
+      cacheSource,
+      contentType,
+      size: bytes.byteLength,
+      now
+    })
   }));
+  invalidateCacheStorageMetadataSnapshot();
   await putChunkMetadata({
     cacheKey,
     fileId,
@@ -776,6 +905,66 @@ function createHlsPartResponse(bytes, contentType) {
       "X-Preview-Cache": "hls-segment"
     }
   });
+}
+
+function cacheStorageResponseHeaders({
+  fileId,
+  metadata = null,
+  kind,
+  partKind = "chunk",
+  partIndex,
+  chunkIndex,
+  sourceUrl,
+  cacheSource,
+  contentType,
+  size,
+  now
+}) {
+  const headers = new Headers({
+    "Content-Type": contentType || metadata?.mimeType || "application/octet-stream",
+    "Content-Length": String(safeSize(size)),
+    "Cache-Control": "public, max-age=31536000, immutable",
+    "X-Preview-Cache-File-Id": fileId || metadata?.fileId || "",
+    "X-Preview-Cache-File-Name": encodeMetadataHeader(metadata?.fileName || fileId || ""),
+    "X-Preview-Cache-Directory-Path": encodeMetadataHeader(metadata?.directoryPath || "/"),
+    "X-Preview-Cache-Kind": kind || metadata?.kind || "single",
+    "X-Preview-Cache-Mime": metadata?.mimeType || contentType || "application/octet-stream",
+    "X-Preview-Cache-Total-Size": String(safeSize(metadata?.size) || safeSize(size)),
+    "X-Preview-Cache-Chunk-Size": String(safeSize(metadata?.chunkSize) || safeSize(size)),
+    "X-Preview-Cache-Chunk-Index": String(Number.isSafeInteger(chunkIndex) ? chunkIndex : 0),
+    "X-Preview-Cache-Part-Kind": partKind || "chunk",
+    "X-Preview-Cache-Source": normalizeCacheSource(cacheSource || metadata?.cacheSource),
+    "X-Preview-Cache-Created-At": String(safeTime(now) || Date.now()),
+    "X-Preview-Cache-Last-Accessed": String(safeTime(now) || Date.now())
+  });
+
+  if (Number.isSafeInteger(metadata?.chunkCount) && metadata.chunkCount > 0) {
+    headers.set("X-Preview-Cache-Chunk-Count", String(metadata.chunkCount));
+  }
+
+  const normalizedSourceUrl = sourceUrl || metadata?.sourceUrl || "";
+  if (normalizedSourceUrl) {
+    headers.set("X-Preview-Cache-Source-Url", encodeMetadataHeader(normalizedSourceUrl));
+  }
+  if (metadata?.token) {
+    headers.set("X-Preview-Cache-Token", encodeMetadataHeader(metadata.token));
+  }
+  if (metadata?.manualStartedAt) {
+    headers.set("X-Preview-Cache-Manual-Started-At", String(safeTime(metadata.manualStartedAt)));
+  }
+  const manualStatus = normalizeManualCacheStatus(metadata?.manualCacheStatus);
+  if (manualStatus) {
+    headers.set("X-Preview-Cache-Manual-Status", manualStatus);
+  }
+  if (Number.isSafeInteger(partIndex)) {
+    headers.set("X-Preview-Cache-Part-Index", String(partIndex));
+  }
+
+  return headers;
+}
+
+function encodeMetadataHeader(value) {
+  return encodeURIComponent(String(value || ""));
 }
 
 async function prefetchHlsSegments(fileId, startIndex, count, cacheMaxBytes) {
@@ -841,6 +1030,24 @@ async function runConcurrentPrefetchWorkers(session, generation, sessions, loadN
 
 function hlsChunkIndex(partKind, partIndex) {
   return partKind === "init" ? -1 : partIndex;
+}
+
+function hlsPartCacheKey(fileId, partKind, partIndex) {
+  return `${self.location.origin}/__preview-cache/hls/${encodeURIComponent(fileId)}/${partKind}/${partIndex}`;
+}
+
+function markHlsPartMetadataForManualCache(metadata, partKind, partIndex, response) {
+  const size = safeSize(Number(response.headers.get("Content-Length")));
+  if (size <= 0) {
+    return Promise.resolve();
+  }
+
+  return markChunkMetadataForManualCache(
+    metadata,
+    hlsChunkIndex(partKind, partIndex),
+    size,
+    hlsPartCacheKey(metadata.fileId, partKind, partIndex)
+  );
 }
 
 function startHlsPreviewCacheSession(sessionId, metadata) {
@@ -1258,6 +1465,10 @@ function normalizeCacheSource(value) {
   return value === "manual" ? "manual" : "auto";
 }
 
+function normalizeManualCacheStatus(value) {
+  return value === "caching" || value === "paused" || value === "waiting" ? value : undefined;
+}
+
 function normalizeDirectoryPath(value) {
   if (typeof value !== "string" || !value.trim()) {
     return "/";
@@ -1347,6 +1558,17 @@ async function readPreviewCacheState(metadata) {
 
       seen.add(chunkIndex);
       cachedChunks.push(chunkIndex);
+    }
+
+    if (cachedChunks.length < chunkCount) {
+      const fallback = await readCacheStorageMetadataForFile(metadata.fileId);
+      for (const chunkIndex of fallback.cachedChunks) {
+        if (chunkIndex < 0 || chunkIndex >= chunkCount || seen.has(chunkIndex)) {
+          continue;
+        }
+        seen.add(chunkIndex);
+        cachedChunks.push(chunkIndex);
+      }
     }
   }
 
@@ -1866,6 +2088,28 @@ function touchChunkMetadata(metadata, chunkIndex, size, cacheKey = chunkCacheKey
   touchPreviewCacheMetadata(metadata, chunkIndex, size, cacheKey);
 }
 
+function markChunkMetadataForManualCache(metadata, chunkIndex, size, cacheKey = chunkCacheKey(metadata.fileId, chunkIndex)) {
+  invalidateCacheStorageMetadataSnapshot();
+  return putChunkMetadata({
+    cacheKey,
+    fileId: metadata.fileId,
+    chunkIndex,
+    fileName: metadata.fileName || metadata.fileId,
+    directoryPath: metadata.directoryPath || "/",
+    kind: metadata.kind || "single",
+    mimeType: metadata.mimeType || "application/octet-stream",
+    totalSize: metadata.size || size,
+    chunkSize: metadata.chunkSize || size,
+    chunkCount: metadata.chunkCount || 1,
+    sourceUrl: metadata.sourceUrl || "",
+    token: metadata.token || "",
+    cacheSource: "manual",
+    size,
+    manualStartedAt: metadata.manualStartedAt,
+    lastAccessed: Date.now()
+  }, true);
+}
+
 function touchPreviewCacheMetadata(metadataOrFileId, chunkIndex, size, cacheKey) {
   const now = Date.now();
   const metadata = typeof metadataOrFileId === "string"
@@ -1957,22 +2201,31 @@ async function fetchAndCacheChunkBytes(metadata, chunkIndex, signal = null) {
       await cleanupPreviewCache(bytes.byteLength, metadata.cacheMaxBytes);
     }
     await cache.put(cacheKey, new Response(bytes.slice(0), {
-      headers: {
-        "Content-Type": "application/octet-stream",
-        "Content-Length": String(bytes.byteLength),
-        "Cache-Control": "public, max-age=31536000, immutable"
-      }
+      headers: cacheStorageResponseHeaders({
+        fileId: metadata.fileId,
+        metadata,
+        kind: metadata.kind || "single",
+        chunkIndex,
+        cacheSource: metadata.cacheSource || "auto",
+        contentType: "application/octet-stream",
+        size: bytes.byteLength,
+        now
+      })
     }));
+    invalidateCacheStorageMetadataSnapshot();
     await putChunkMetadata({
       cacheKey,
       fileId: metadata.fileId,
       chunkIndex,
       fileName: metadata.fileName || metadata.fileId,
       directoryPath: metadata.directoryPath || "/",
+      kind: metadata.kind || "single",
       mimeType: metadata.mimeType || "application/octet-stream",
       totalSize: metadata.size,
       chunkSize: metadata.chunkSize,
       chunkCount: metadata.chunkCount,
+      sourceUrl: metadata.sourceUrl || "",
+      token: metadata.token || "",
       cacheSource: metadata.cacheSource || "auto",
       size: bytes.byteLength,
       manualStartedAt: metadata.manualStartedAt,
@@ -2349,6 +2602,7 @@ async function deleteChunk(cacheKey) {
   deleteHotChunk(cacheKey);
   const cache = await caches.open(CACHE_NAME);
   await cache.delete(cacheKey);
+  invalidateCacheStorageMetadataSnapshot();
   await deleteChunkMetadata(cacheKey);
 }
 
@@ -2359,6 +2613,10 @@ async function putFileRecordMetadata(metadata, extra = {}) {
   const chunks = await getAllChunkMetadata();
   const keepManual = metadata.cacheSource === "manual" || existingRecord?.cacheSource === "manual";
   const relatedChunks = chunks.filter((chunk) => chunk?.fileId === metadata.fileId && !isFileRecordMetadata(chunk));
+  const hasManualCacheStatus = Object.prototype.hasOwnProperty.call(extra, "manualCacheStatus");
+  const nextManualCacheStatus = hasManualCacheStatus
+    ? normalizeManualCacheStatus(extra.manualCacheStatus)
+    : normalizeManualCacheStatus(metadata.manualCacheStatus) || normalizeManualCacheStatus(existingRecord?.manualCacheStatus);
 
   if (keepManual) {
     await putChunkMetadata({
@@ -2377,6 +2635,7 @@ async function putFileRecordMetadata(metadata, extra = {}) {
       token: metadata.token || existingRecord?.token || "",
       cacheSource: "manual",
       size: 0,
+      manualCacheStatus: nextManualCacheStatus,
       manualStartedAt: extra.manualStartedAt || metadata.manualStartedAt || existingRecord?.manualStartedAt,
       createdAt: existingRecord?.createdAt || now,
       lastAccessed: now
@@ -2395,6 +2654,9 @@ async function putFileRecordMetadata(metadata, extra = {}) {
       sourceUrl: metadata.sourceUrl || chunk.sourceUrl || "",
       token: metadata.token || chunk.token || "",
       cacheSource: keepManual ? "manual" : metadata.cacheSource || chunk.cacheSource || "auto",
+      manualCacheStatus: hasManualCacheStatus
+        ? normalizeManualCacheStatus(extra.manualCacheStatus)
+        : normalizeManualCacheStatus(metadata.manualCacheStatus) || normalizeManualCacheStatus(chunk.manualCacheStatus),
       manualStartedAt: extra.manualStartedAt || metadata.manualStartedAt || chunk.manualStartedAt,
       lastAccessed: Date.now()
     }, true)));
@@ -2436,6 +2698,7 @@ async function readFileCacheSummary() {
       manualBytes: 0,
       autoBytes: 0,
       cacheSource: "auto",
+      manualCacheStatus: undefined,
       manualStartedAt: 0,
       lastAccessed: 0
     };
@@ -2466,6 +2729,7 @@ async function readFileCacheSummary() {
         current.manualBytes += safeSize(entry.size);
       }
       current.cacheSource = "manual";
+      current.manualCacheStatus = entry.manualCacheStatus || current.manualCacheStatus;
       current.manualStartedAt = current.manualStartedAt || safeTime(entry.manualStartedAt) || safeTime(entry.createdAt);
     } else if (!isFileRecord) {
       current.autoBytes += safeSize(entry.size);
@@ -2493,13 +2757,71 @@ async function readFileCacheSummary() {
         manualBytes: entry.manualBytes,
         autoBytes: entry.autoBytes,
         cacheSource: entry.cacheSource,
-        manualCacheStatus: entry.cacheSource === "manual" && !complete ? "paused" : undefined,
+        manualCacheStatus: entry.cacheSource === "manual" && !complete ? normalizeManualCacheStatus(entry.manualCacheStatus) || "paused" : undefined,
         manualStartedAt: entry.manualStartedAt || 0,
         lastAccessed: entry.lastAccessed,
         complete
       };
     })
     .sort(compareFileCacheEntries);
+
+  const fallbackEntries = await readCacheStorageFileSummaries();
+  for (const fallback of fallbackEntries) {
+    if (!fallback?.fileId) {
+      continue;
+    }
+
+    const existing = normalizedEntries.find((entry) => entry.fileId === fallback.fileId);
+    if (existing) {
+      const existingCachedBytes = existing.cachedBytes;
+      existing.cachedBytes = Math.max(existing.cachedBytes, fallback.cachedBytes);
+      existing.cachedChunks = Math.max(existing.cachedChunks, fallback.cachedChunks.length);
+      existing.size = Math.max(existing.size, safeSize(fallback.size));
+      existing.chunkSize = Math.max(existing.chunkSize, safeSize(fallback.chunkSize));
+      existing.chunkCount = Math.max(existing.chunkCount, Number.isSafeInteger(fallback.chunkCount) ? fallback.chunkCount : 1);
+      existing.lastAccessed = Math.max(safeTime(existing.lastAccessed), safeTime(fallback.lastAccessed));
+      if (!existing.sourceUrl && fallback.sourceUrl) existing.sourceUrl = fallback.sourceUrl;
+      if (!existing.token && fallback.token) existing.token = fallback.token;
+      if (fallback.cacheSource === "manual") {
+        existing.cacheSource = "manual";
+        existing.manualBytes = Math.max(existing.manualBytes, fallback.manualBytes || fallback.cachedBytes);
+        existing.manualStartedAt = existing.manualStartedAt || fallback.manualStartedAt || 0;
+      } else if (existing.cacheSource !== "manual") {
+        existing.autoBytes = Math.max(existing.autoBytes, fallback.autoBytes || fallback.cachedBytes);
+      }
+      if (existing.cachedBytes !== existingCachedBytes) {
+        existing.complete = existing.cachedBytes >= existing.size && existing.size > 0;
+      }
+      existing.manualCacheStatus = existing.cacheSource === "manual" && !existing.complete
+        ? normalizeManualCacheStatus(existing.manualCacheStatus || fallback.manualCacheStatus) || "paused"
+        : undefined;
+      continue;
+    }
+
+    normalizedEntries.push({
+      fileId: fallback.fileId,
+      fileName: fallback.fileName || fallback.fileId,
+      directoryPath: fallback.directoryPath || "/",
+      kind: fallback.kind || "single",
+      mimeType: fallback.mimeType || "application/octet-stream",
+      size: safeSize(fallback.size),
+      chunkSize: safeSize(fallback.chunkSize),
+      chunkCount: Number.isSafeInteger(fallback.chunkCount) && fallback.chunkCount > 0 ? fallback.chunkCount : Math.max(1, fallback.cachedChunks.length || 1),
+      sourceUrl: fallback.sourceUrl || undefined,
+      token: fallback.token || undefined,
+      cachedChunks: fallback.cachedChunks.length,
+      cachedBytes: fallback.cachedBytes,
+      manualBytes: fallback.manualBytes,
+      autoBytes: fallback.autoBytes,
+      cacheSource: fallback.cacheSource,
+      manualCacheStatus: fallback.cacheSource === "manual" && !fallback.complete ? normalizeManualCacheStatus(fallback.manualCacheStatus) || "paused" : undefined,
+      manualStartedAt: fallback.manualStartedAt || 0,
+      lastAccessed: fallback.lastAccessed || 0,
+      complete: fallback.complete
+    });
+  }
+
+  normalizedEntries.sort(compareFileCacheEntries);
 
   for (const session of fileCacheSessions.values()) {
     if (session.status !== "caching" && session.status !== "paused") {
@@ -2563,6 +2885,294 @@ function compareFileCacheEntries(left, right) {
   return safeTime(right.lastAccessed) - safeTime(left.lastAccessed);
 }
 
+async function readCacheStorageMetadataForFile(fileId) {
+  const normalizedFileId = normalizeFileId(fileId);
+  if (!normalizedFileId) {
+    return { entries: [], cachedChunks: [] };
+  }
+
+  const entries = await readCacheStorageMetadataSnapshot();
+  const fileEntries = entries.filter((entry) => entry.fileId === normalizedFileId);
+  const seen = new Set();
+  const cachedChunks = [];
+
+  for (const entry of fileEntries) {
+    if (!Number.isSafeInteger(entry.chunkIndex) || entry.chunkIndex < 0 || seen.has(entry.chunkIndex)) {
+      continue;
+    }
+    seen.add(entry.chunkIndex);
+    cachedChunks.push(entry.chunkIndex);
+  }
+
+  cachedChunks.sort((left, right) => left - right);
+  return { entries: fileEntries, cachedChunks };
+}
+
+async function readCacheStorageFileSummaries() {
+  const entries = await readCacheStorageMetadataSnapshot();
+  const byFile = new Map();
+
+  for (const entry of entries) {
+    if (!entry?.fileId || !entry.cacheKey) {
+      continue;
+    }
+
+    const current = byFile.get(entry.fileId) || {
+      fileId: entry.fileId,
+      fileName: entry.fileName || entry.fileId,
+      directoryPath: entry.directoryPath || "/",
+      kind: entry.kind || "single",
+      mimeType: entry.mimeType || "application/octet-stream",
+      size: 0,
+      chunkSize: 0,
+      chunkCount: 0,
+      sourceUrl: entry.sourceUrl || "",
+      token: entry.token || "",
+      cachedChunkIndexes: new Set(),
+      cachedBytes: 0,
+      manualBytes: 0,
+      autoBytes: 0,
+      cacheSource: "auto",
+      manualCacheStatus: undefined,
+      hasKnownTotalSize: false,
+      hasKnownChunkCount: false,
+      manualStartedAt: 0,
+      lastAccessed: 0
+    };
+
+    current.fileName = entry.fileName || current.fileName || entry.fileId;
+    current.directoryPath = entry.directoryPath || current.directoryPath || "/";
+    current.kind = entry.kind || current.kind || "single";
+    current.mimeType = entry.mimeType || current.mimeType || "application/octet-stream";
+    if (safeSize(entry.totalSize) > 0) {
+      current.hasKnownTotalSize = true;
+      current.size = Math.max(current.size, safeSize(entry.totalSize));
+    }
+    current.chunkSize = Math.max(current.chunkSize, safeSize(entry.chunkSize));
+    if (Number.isSafeInteger(entry.chunkCount) && entry.chunkCount > 0) {
+      current.hasKnownChunkCount = true;
+      current.chunkCount = Math.max(current.chunkCount, entry.chunkCount);
+    }
+    current.sourceUrl = entry.sourceUrl || current.sourceUrl || "";
+    current.token = entry.token || current.token || "";
+    current.lastAccessed = Math.max(current.lastAccessed, safeTime(entry.lastAccessed));
+    current.manualStartedAt = current.manualStartedAt || safeTime(entry.manualStartedAt);
+
+    if (Number.isSafeInteger(entry.chunkIndex) && entry.chunkIndex >= 0) {
+      current.cachedChunkIndexes.add(entry.chunkIndex);
+      current.cachedBytes += safeSize(entry.size);
+    }
+
+    if (entry.cacheSource === "manual") {
+      current.manualBytes += safeSize(entry.size);
+      current.cacheSource = "manual";
+      current.manualCacheStatus = normalizeManualCacheStatus(entry.manualCacheStatus) || current.manualCacheStatus;
+      current.manualStartedAt = current.manualStartedAt || safeTime(entry.manualStartedAt) || safeTime(entry.createdAt);
+    } else {
+      current.autoBytes += safeSize(entry.size);
+    }
+
+    byFile.set(entry.fileId, current);
+  }
+
+  return Array.from(byFile.values()).map((entry) => {
+    const cachedChunks = Array.from(entry.cachedChunkIndexes)
+      .filter((index) => Number.isSafeInteger(index) && index >= 0)
+      .sort((left, right) => left - right);
+    const inferredChunkCount = entry.hasKnownChunkCount && entry.chunkCount > 0
+      ? entry.chunkCount
+      : Math.max(1, cachedChunks.length + 1);
+    const inferredChunkSize = entry.chunkSize > 0
+      ? entry.chunkSize
+      : inferChunkSizeFromCachedBytes(entry.cachedBytes, cachedChunks.length);
+    const inferredSize = entry.hasKnownTotalSize && entry.size > 0
+      ? entry.size
+      : 0;
+    const complete = entry.hasKnownTotalSize
+      ? entry.cachedBytes >= inferredSize && inferredSize > 0
+      : entry.hasKnownChunkCount && cachedChunks.length > 0 && cachedChunks.length >= inferredChunkCount;
+
+    return {
+      fileId: entry.fileId,
+      fileName: entry.fileName || entry.fileId,
+      directoryPath: entry.directoryPath || "/",
+      kind: entry.kind || "single",
+      mimeType: entry.mimeType || "application/octet-stream",
+      size: inferredSize,
+      chunkSize: inferredChunkSize,
+      chunkCount: inferredChunkCount,
+      sourceUrl: entry.sourceUrl || "",
+      token: entry.token || "",
+      cachedChunks,
+      cachedBytes: entry.cachedBytes,
+      manualBytes: entry.manualBytes,
+      autoBytes: entry.autoBytes,
+      cacheSource: entry.cacheSource,
+      manualCacheStatus: normalizeManualCacheStatus(entry.manualCacheStatus),
+      manualStartedAt: entry.manualStartedAt || 0,
+      lastAccessed: entry.lastAccessed || 0,
+      complete
+    };
+  });
+}
+
+function inferChunkSizeFromCachedBytes(cachedBytes, chunkCount) {
+  if (!Number.isSafeInteger(chunkCount) || chunkCount <= 0) {
+    return safeSize(cachedBytes) || 1;
+  }
+
+  return Math.max(1, Math.ceil(safeSize(cachedBytes) / chunkCount));
+}
+
+async function readCacheStorageMetadataSnapshot() {
+  const now = Date.now();
+  if (cacheStorageMetadataSnapshot && now - cacheStorageMetadataSnapshotAt < CACHE_STORAGE_METADATA_SNAPSHOT_TTL_MS) {
+    return cacheStorageMetadataSnapshot;
+  }
+
+  if (!cacheStorageMetadataSnapshotPromise) {
+    cacheStorageMetadataSnapshotPromise = readCacheStorageMetadataEntries()
+      .then((entries) => {
+        cacheStorageMetadataSnapshot = entries;
+        cacheStorageMetadataSnapshotAt = Date.now();
+        return entries;
+      })
+      .finally(() => {
+        cacheStorageMetadataSnapshotPromise = null;
+      });
+  }
+
+  return cacheStorageMetadataSnapshotPromise;
+}
+
+async function readCacheStorageMetadataEntries() {
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    const requests = await cache.keys();
+    const entries = [];
+
+    for (const request of requests) {
+      const parsed = parseCacheStorageCacheKey(request.url);
+      if (!parsed) {
+        continue;
+      }
+
+      const response = await cache.match(request);
+      if (!response) {
+        continue;
+      }
+
+      entries.push(cacheStorageEntryFromResponse(parsed, response));
+    }
+
+    return entries;
+  } catch (error) {
+    warnPreviewCacheError("scan CacheStorage metadata", error);
+    return [];
+  }
+}
+
+function parseCacheStorageCacheKey(cacheKey) {
+  try {
+    const url = new URL(cacheKey);
+    if (url.origin !== self.location.origin) {
+      return null;
+    }
+
+    const parts = url.pathname.split("/").filter(Boolean);
+    if (parts[0] !== "__preview-cache") {
+      return null;
+    }
+
+    if (parts[1] === "files" && parts[3] === "chunks") {
+      const fileId = decodeURIComponent(parts[2] || "");
+      const chunkIndex = Math.floor(Number(parts[4]));
+      if (!fileId || !Number.isSafeInteger(chunkIndex) || chunkIndex < 0) {
+        return null;
+      }
+      return {
+        cacheKey: url.href,
+        fileId,
+        chunkIndex,
+        partKind: "chunk",
+        partIndex: chunkIndex
+      };
+    }
+
+    if (parts[1] === "hls") {
+      const fileId = decodeURIComponent(parts[2] || "");
+      const partKind = parts[3] === "init" ? "init" : "segment";
+      const partIndex = Math.floor(Number(parts[4]));
+      if (!fileId || !Number.isSafeInteger(partIndex) || partIndex < 0) {
+        return null;
+      }
+      return {
+        cacheKey: url.href,
+        fileId,
+        chunkIndex: hlsChunkIndex(partKind, partIndex),
+        partKind,
+        partIndex
+      };
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function cacheStorageEntryFromResponse(parsed, response) {
+  const headers = response.headers;
+  const responseSize = safeSize(Number(headers.get("Content-Length")));
+  const totalSize = safeSize(Number(headers.get("X-Preview-Cache-Total-Size")));
+  const chunkSize = safeSize(Number(headers.get("X-Preview-Cache-Chunk-Size"))) || responseSize;
+  const chunkCount = Math.floor(Number(headers.get("X-Preview-Cache-Chunk-Count")));
+  const partKind = headers.get("X-Preview-Cache-Part-Kind") || parsed.partKind;
+  const fileName = decodeMetadataHeader(headers.get("X-Preview-Cache-File-Name")) || parsed.fileId;
+  const directoryPath = normalizeDirectoryPath(decodeMetadataHeader(headers.get("X-Preview-Cache-Directory-Path")) || "/");
+  const cacheSource = normalizeCacheSource(headers.get("X-Preview-Cache-Source"));
+
+  return {
+    cacheKey: parsed.cacheKey,
+    fileId: parsed.fileId,
+    chunkIndex: parsed.chunkIndex,
+    fileName,
+    directoryPath,
+    kind: parsed.partKind === "chunk" ? normalizeFileCacheKind(headers.get("X-Preview-Cache-Kind")) || "single" : "hls",
+    mimeType: headers.get("X-Preview-Cache-Mime") || response.headers.get("Content-Type") || "application/octet-stream",
+    totalSize,
+    chunkSize,
+    chunkCount: Number.isSafeInteger(chunkCount) && chunkCount > 0 ? chunkCount : 0,
+    sourceUrl: decodeMetadataHeader(headers.get("X-Preview-Cache-Source-Url")) || "",
+    token: decodeMetadataHeader(headers.get("X-Preview-Cache-Token")) || "",
+    cacheSource,
+    manualCacheStatus: normalizeManualCacheStatus(headers.get("X-Preview-Cache-Manual-Status")),
+    manualStartedAt: safeTime(Number(headers.get("X-Preview-Cache-Manual-Started-At"))),
+    partKind,
+    partIndex: parsed.partIndex,
+    size: responseSize,
+    createdAt: safeTime(Number(headers.get("X-Preview-Cache-Created-At"))),
+    lastAccessed: safeTime(Number(headers.get("X-Preview-Cache-Last-Accessed"))) || safeTime(Number(headers.get("Date")))
+  };
+}
+
+function decodeMetadataHeader(value) {
+  if (typeof value !== "string" || !value) {
+    return "";
+  }
+
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function invalidateCacheStorageMetadataSnapshot() {
+  cacheStorageMetadataSnapshot = null;
+  cacheStorageMetadataSnapshotAt = 0;
+}
+
 async function readFileCacheEntry(fileId) {
   const normalizedFileId = normalizeFileId(fileId);
   if (!normalizedFileId) {
@@ -2585,14 +3195,40 @@ async function deleteFileCache(fileId) {
       await deleteChunk(entry.cacheKey);
     }
   }
+
+  await deleteCacheStorageEntriesForFile(normalizedFileId);
 }
 
 async function clearAutomaticCacheEntries() {
   const entries = await getAllChunkMetadata();
+  const manualCacheKeys = new Set();
+  const manualFileIds = new Set();
   for (const entry of entries) {
-    if (entry?.cacheSource !== "manual") {
+    if (entry?.cacheSource === "manual") {
+      if (entry.fileId) {
+        manualFileIds.add(entry.fileId);
+      }
+      if (entry.cacheKey) {
+        manualCacheKeys.add(entry.cacheKey);
+      }
+    } else if (entry?.cacheKey) {
       await deleteChunk(entry.cacheKey);
     }
+  }
+
+  const fallbackEntries = await readCacheStorageMetadataSnapshot();
+  for (const entry of fallbackEntries) {
+    if (entry?.cacheSource === "manual" || manualCacheKeys.has(entry.cacheKey) || manualFileIds.has(entry.fileId)) {
+      continue;
+    }
+    await deleteChunk(entry.cacheKey);
+  }
+}
+
+async function deleteCacheStorageEntriesForFile(fileId) {
+  const fallbackEntries = await readCacheStorageMetadataForFile(fileId);
+  for (const entry of fallbackEntries.entries) {
+    await deleteChunk(entry.cacheKey);
   }
 }
 
@@ -2685,6 +3321,9 @@ async function putChunkMetadata(entry, preserveCreatedAt) {
         chunkCount: entry.chunkCount || existing?.chunkCount || 1,
         sourceUrl: entry.sourceUrl || existing?.sourceUrl || "",
         token: entry.token || existing?.token || "",
+        manualCacheStatus: Object.prototype.hasOwnProperty.call(entry, "manualCacheStatus")
+          ? normalizeManualCacheStatus(entry.manualCacheStatus)
+          : normalizeManualCacheStatus(existing?.manualCacheStatus),
         manualStartedAt: entry.manualStartedAt || existing?.manualStartedAt
       });
     };

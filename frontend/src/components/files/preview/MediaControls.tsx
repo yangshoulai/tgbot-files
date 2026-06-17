@@ -301,7 +301,14 @@ export function MediaControls({
         />
       </div>
 
-      <div className={cn("flex min-w-0 items-center", inline ? "flex-wrap gap-y-2" : "flex-nowrap", floating ? "gap-1.5 sm:gap-2" : "gap-2", tiny && "gap-1")}>
+      <div
+        className={cn(
+          "flex min-w-0 items-center",
+          inline || (floating && narrow) ? "flex-wrap gap-y-2" : "flex-nowrap",
+          floating ? "gap-1.5 sm:gap-2" : "gap-2",
+          tiny && "gap-1"
+        )}
+      >
         <div className="flex shrink-0 items-center gap-1 sm:gap-1.5">
           <MediaButton
             label={state.playing ? "暂停" : "播放"}
@@ -364,7 +371,8 @@ export function MediaControls({
         </div>
 
         <div className={cn(
-          "ml-auto flex min-w-0 shrink-0 items-center",
+          "ml-auto flex min-w-0 items-center",
+          floating && narrow ? "w-full shrink basis-full justify-between" : "shrink-0",
           inline && "max-[560px]:ml-0 max-[560px]:w-full max-[560px]:justify-between",
           floating ? "gap-1 sm:gap-1.5" : "gap-1.5"
         )}>
@@ -382,7 +390,7 @@ export function MediaControls({
             tabIndex={controlTabIndex}
             className={cn(
               "h-1.5 cursor-pointer",
-              floating ? "hidden w-16 accent-primary min-[560px]:block" : inline ? "hidden w-16 accent-primary sm:block" : dense ? "hidden w-14 accent-primary lg:block" : "hidden w-20 accent-primary md:block"
+              narrow ? "hidden" : floating ? "hidden w-16 accent-primary min-[560px]:block" : inline ? "hidden w-16 accent-primary sm:block" : dense ? "hidden w-14 accent-primary lg:block" : "hidden w-20 accent-primary md:block"
             )}
           />
           {!tiny ? (
@@ -414,7 +422,7 @@ export function MediaControls({
               className={cn(
                 "inline-flex shrink-0 items-center gap-1 text-xs",
                 inline ? "text-muted" : "text-white/70",
-                narrow && "max-[430px]:hidden"
+                narrow && "hidden"
               )}
               title={subtitles.length > 1 ? "切换字幕" : "字幕"}
             >

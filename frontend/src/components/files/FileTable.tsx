@@ -143,10 +143,12 @@ function fileCachePercent(entry: FileCacheEntry | null): number {
 }
 
 function fileCacheStatusText(entry: FileCacheEntry | null): string {
-  if (!entry || entry.cachedBytes <= 0) return "未缓存";
+  if (!entry) return "未缓存";
   const percent = fileCachePercent(entry);
   if (entry.manualCacheStatus === "caching") return `缓存中（${percent}%）`;
+  if (entry.manualCacheStatus === "waiting") return `等待中（${percent}%）`;
   if (entry.manualCacheStatus === "paused") return `已停止（${percent}%）`;
+  if (entry.cachedBytes <= 0) return "未缓存";
   if (entry.complete) return "已缓存（100%）";
   return `已缓存（${percent}%）`;
 }
@@ -158,12 +160,16 @@ function FileCacheBadge({ entry }: { entry: FileCacheEntry | null }) {
     <span
       className={cn(
         "inline-flex max-w-full items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium",
-        !entry || entry.cachedBytes <= 0
+        !entry
           ? "bg-surface text-subtle ring-1 ring-border"
           : entry.manualCacheStatus === "caching"
             ? "bg-primary-soft text-primary-strong"
+            : entry.manualCacheStatus === "waiting"
+              ? "bg-surface text-muted ring-1 ring-border"
             : entry.manualCacheStatus === "paused"
               ? "bg-warning-soft text-warning"
+              : entry.cachedBytes <= 0
+                ? "bg-surface text-subtle ring-1 ring-border"
               : entry.complete
                 ? "bg-success-soft text-success"
                 : "bg-primary-soft text-primary-strong"
@@ -428,7 +434,7 @@ export function FileTable({
         key: "cache",
         label: cacheLabel,
         icon: <HardDriveDownload size={15} />,
-        disabled: !canCacheFile(file) || cacheStatus === "caching",
+        disabled: !canCacheFile(file) || cacheStatus === "caching" || cacheStatus === "waiting",
         onSelect: () => runContextAction(() => onCacheFile(file))
       },
       {
@@ -436,7 +442,7 @@ export function FileTable({
         key: "pause-cache",
         label: "停止缓存",
         icon: <HardDriveDownload size={15} />,
-        disabled: cacheStatus !== "caching",
+        disabled: cacheStatus !== "caching" && cacheStatus !== "waiting",
         onSelect: () => runContextAction(() => onPauseFileCache(file))
       },
       {

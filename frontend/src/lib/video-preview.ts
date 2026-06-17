@@ -141,7 +141,7 @@ export function reportVideoPreviewPlaybackProgress(
   });
 }
 
-export function requestVideoPreviewCacheState(metadata: VideoPreviewMetadata, timeoutMs = 1500): Promise<VideoPreviewCacheState | null> {
+export function requestVideoPreviewCacheState(metadata: VideoPreviewMetadata, timeoutMs = 6000): Promise<VideoPreviewCacheState | null> {
   const controller = getVideoPreviewServiceWorkerController();
   if (!controller || typeof MessageChannel === "undefined") {
     return Promise.resolve(null);
