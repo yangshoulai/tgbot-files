@@ -1865,7 +1865,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         urlRuntimeStore,
         response.magnet.status === "ready"
           ? undefined
-          : { completed: 0, total: Math.max(1, task.selectedIndexes.length), label: magnetStatusProgressLabel("继续磁力任务", response.magnet) }
+          : { completed: 0, total: Math.max(1, task.selectedIndexes.length), label: magnetStatusProgressLabel("继续磁力任务", response.magnet, task.selectedIndexes.length) }
       );
       setUrlUpload((current) => ({
         ...current,
@@ -3221,7 +3221,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         persistMagnetUploadTask(parsedMagnet.id, selectedIndexes);
         const parsedProgress = parsedMagnet.status === "ready" || parsedMagnet.status === "failed" || parsedMagnet.status === "cancelled"
           ? null
-          : { completed: 0, total: 1, label: magnetStatusProgressLabel("继续磁力任务", parsedMagnet) };
+          : { completed: 0, total: 1, label: magnetStatusProgressLabel("继续磁力任务", parsedMagnet, selectedIndexes.length) };
         seedUploadRuntimeStore(urlRuntimeStore, parsedProgress);
         setUrlUpload((current) => ({
           ...current,
@@ -3300,7 +3300,11 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         magnet.id,
         task,
         (current) => current.status === "downloaded" || current.status === "importing" || current.status === "done" || current.status === "failed" || current.status === "cancelled",
-        "下载磁力文件"
+        "下载磁力文件",
+        {
+          selectedCount: uploads.length,
+          syncUiState: false
+        }
       );
       if (magnet.status === "failed" || magnet.status === "cancelled") {
         throw new Error(magnet.error_message || "磁力文件下载失败");
@@ -3448,7 +3452,11 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     importId: string,
     task: UploadAbortContext,
     isDone: (current: MagnetImport) => boolean,
-    label: string
+    label: string,
+    options: {
+      selectedCount?: number;
+      syncUiState?: boolean;
+    } = {}
   ): Promise<MagnetImport> {
     const deadline = Date.now() + MAGNET_DOWNLOAD_TIMEOUT_MS;
     let transientFailures = 0;
@@ -3491,7 +3499,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         continue;
       }
 
-      const progressLabel = magnetStatusProgressLabel(label, magnet);
+      const progressLabel = magnetStatusProgressLabel(label, magnet, options.selectedCount);
       urlRuntimeStore.setState((current) => ({
         ...current,
         progress: current.progress
@@ -3499,20 +3507,22 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
           : { completed: 0, total: 1, label: progressLabel }
       }));
 
-      setUrlUpload((current) => {
-        const nextMagnet = current.magnet
-          ? { ...current.magnet, import: magnet }
-          : { import: magnet, selectedIndexes: selectedMagnetIndexesForResume(magnet, maxMultipartBytes) };
+      if (options.syncUiState !== false || isDone(magnet)) {
+        setUrlUpload((current) => {
+          const nextMagnet = current.magnet
+            ? { ...current.magnet, import: magnet }
+            : { import: magnet, selectedIndexes: selectedMagnetIndexesForResume(magnet, maxMultipartBytes) };
 
-        if (current.magnet?.import && magnetImportStableUiKey(current.magnet.import) === magnetImportStableUiKey(magnet)) {
-          return current;
-        }
+          if (current.magnet?.import && magnetImportStableUiKey(current.magnet.import) === magnetImportStableUiKey(magnet)) {
+            return current;
+          }
 
-        return {
-          ...current,
-          magnet: mergeMagnetState(current.magnet, nextMagnet)
-        };
-      });
+          return {
+            ...current,
+            magnet: mergeMagnetState(current.magnet, nextMagnet)
+          };
+        });
+      }
 
       if (isDone(magnet)) {
         return magnet;
@@ -5636,10 +5646,10 @@ function magnetStatusLabel(status: MagnetImport["status"]): string {
   }
 }
 
-function magnetStatusProgressLabel(label: string, magnet: MagnetImport): string {
+function magnetStatusProgressLabel(label: string, magnet: MagnetImport, selectedCount?: number): string {
   const status = magnetStatusLabel(magnet.status);
-  const fileCount = magnet.file_count || magnet.files.length;
-  const size = magnet.total_size ? ` · ${formatBytes(magnet.total_size)}` : "";
+  const fileCount = selectedCount ?? (magnet.file_count || magnet.files.length);
+  const size = selectedCount === undefined && magnet.total_size ? ` · ${formatBytes(magnet.total_size)}` : "";
   const download = magnetDownloadProgressLabel(magnet);
   return `${label} · ${status}${download ? ` · ${download}` : ""}${fileCount > 0 ? ` · ${fileCount} 个文件${size}` : ""}`;
 }
@@ -6703,6 +6713,7 @@ const UrlUploadRow = memo(function UrlUploadRow({
         fallbackProgress={progress}
         fallbackChunks={chunks}
         chunkTitle={hls ? "HLS 片段明细" : "分片明细"}
+        compactDuringActive={status === "uploading"}
       />
     </div>
   );
@@ -6896,12 +6907,14 @@ const UrlUploadRuntimeDetails = memo(function UrlUploadRuntimeDetails({
   runtimeStore,
   fallbackProgress,
   fallbackChunks,
-  chunkTitle
+  chunkTitle,
+  compactDuringActive
 }: {
   runtimeStore: UploadRuntimeStore;
   fallbackProgress?: ChunkProgress;
   fallbackChunks?: UploadChunkState[];
   chunkTitle: string;
+  compactDuringActive: boolean;
 }) {
   const runtime = useSyncExternalStore(
     runtimeStore.subscribe,
@@ -6910,18 +6923,20 @@ const UrlUploadRuntimeDetails = memo(function UrlUploadRuntimeDetails({
   );
   const progress = runtime.progress ?? fallbackProgress;
   const chunks = runtime.chunks ?? fallbackChunks;
+  const showChunks = Boolean(chunks) && (!compactDuringActive || Boolean(progress?.failed));
 
   return (
     <>
       {progress ? <ProgressBar progress={progress} /> : null}
-      {chunks ? <UploadChunkList chunks={chunks} title={chunkTitle} /> : null}
+      {showChunks && chunks ? <UploadChunkList chunks={chunks} title={chunkTitle} /> : null}
     </>
   );
 }, (previous, next) =>
   previous.runtimeStore === next.runtimeStore &&
   chunkProgressEqual(previous.fallbackProgress, next.fallbackProgress) &&
   previous.fallbackChunks === next.fallbackChunks &&
-  previous.chunkTitle === next.chunkTitle
+  previous.chunkTitle === next.chunkTitle &&
+  previous.compactDuringActive === next.compactDuringActive
 );
 
 const HlsUploadDetails = memo(function HlsUploadDetails({
