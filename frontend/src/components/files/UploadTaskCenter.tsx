@@ -30,7 +30,7 @@ export function UploadTaskCenter({ getSnapshot, subscribe, open, onOpenChange, o
 
   return (
     <aside className="fixed bottom-4 right-4 z-40 w-[calc(100vw-2rem)] max-w-md sm:bottom-6 sm:right-6">
-      <div className="overflow-hidden rounded-2xl border border-border bg-surface/95 shadow-dialog backdrop-blur-xl">
+      <div className="overflow-hidden rounded-2xl border border-border bg-surface shadow-dialog">
         <button
           type="button"
           onClick={() => onOpenChange(!open)}
@@ -145,7 +145,7 @@ function UploadTaskRow({ item, active, onDelete }: { item: UploadTaskSnapshotIte
           <div className="[contain:layout_paint] mt-2 h-1.5 overflow-hidden rounded-full bg-border">
             <div
               className={cn(
-                "h-full rounded-full transition-[width] duration-300 ease-out will-change-[width]",
+                "h-full rounded-full",
                 item.status === "error" ? "bg-danger" : item.status === "done" ? "bg-success" : "bg-primary"
               )}
               style={{ width: `${item.progressPercent}%` }}
