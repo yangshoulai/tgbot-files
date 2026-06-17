@@ -4290,6 +4290,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         closeOnBackdrop={false}
         closeOnEscape={!curlImportOpen && !thumbnailUrlPicker}
         trapFocus={!curlImportOpen && !thumbnailUrlPicker}
+        stableRendering
         footer={
           <>
             {activeUploadKind ? (

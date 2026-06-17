@@ -19,6 +19,7 @@ interface ModalProps {
   hideClose?: boolean;
   initialFocus?: "first" | "none";
   trapFocus?: boolean;
+  stableRendering?: boolean;
   className?: string;
   bodyClassName?: string;
 }
@@ -48,6 +49,7 @@ export function Modal({
   hideClose = false,
   initialFocus = "first",
   trapFocus = true,
+  stableRendering = false,
   className,
   bodyClassName
 }: ModalProps) {
@@ -118,7 +120,8 @@ export function Modal({
         }
       }}
       className={cn(
-        "fixed inset-0 z-50 flex items-end justify-center bg-foreground/30 backdrop-blur-sm animate-fade-in sm:items-center",
+        "fixed inset-0 z-50 flex items-end justify-center bg-foreground/30 sm:items-center",
+        stableRendering ? "bg-foreground/35" : "backdrop-blur-sm animate-fade-in",
         size === "full" ? "p-0" : "p-2 sm:p-6"
       )}
       data-size={size}
@@ -131,7 +134,8 @@ export function Modal({
         aria-describedby={description ? descId : undefined}
         tabIndex={-1}
         className={cn(
-          "flex max-h-[92dvh] w-full flex-col overflow-hidden rounded-2xl border border-border bg-surface shadow-dialog animate-dialog-in outline-none",
+          "flex max-h-[92dvh] w-full flex-col overflow-hidden rounded-2xl border border-border bg-surface shadow-dialog outline-none",
+          !stableRendering && "animate-dialog-in",
           size === "full" && "h-[100dvh] max-h-[100dvh] rounded-none border-0 shadow-none sm:w-[100vw]",
           sizes[size],
           className
