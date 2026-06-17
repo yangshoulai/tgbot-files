@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, ChevronRight, Database, FolderInput, FolderPlus, LayoutGrid, List, PanelLeftClose, PanelLeftOpen, Pencil, Play, RefreshCw, Search, Square, Trash2 } from "lucide-react";
 import {
   ApiError,
@@ -45,6 +45,7 @@ import { Modal } from "../components/ui/Modal";
 import { Textarea } from "../components/ui/Textarea";
 import { Spinner } from "../components/ui/Spinner";
 import { Segmented } from "../components/ui/Segmented";
+import { FileVisual } from "../components/ui/FileVisual";
 import { MetricsRow, Metric } from "../components/files/MetricsRow";
 import { FileTable } from "../components/files/FileTable";
 import { PreviewDialog } from "../components/files/PreviewDialog";
@@ -341,8 +342,20 @@ function CacheManagerDialog({
                     return (
                       <tr key={entry.fileId} className="border-b border-border last:border-b-0 hover:bg-primary-soft/20">
                         <td className="min-w-0 px-4 py-3">
-                          <p className="truncate text-sm font-semibold text-foreground" title={displayFileName}>{displayFileName}</p>
-                          <p className="mt-1 truncate text-xs text-subtle" title={directoryPath}>{directoryPath}</p>
+                          <div className="flex min-w-0 items-center gap-3">
+                            <FileVisual
+                              mimeType={indexedFile?.mime_type || entry.mimeType || "application/octet-stream"}
+                              fileName={displayFileName}
+                              url={cacheEntryVisualUrl(entry, indexedFile)}
+                              thumbnailUrl={indexedFile?.thumbnail_url}
+                              size="sm"
+                              className="size-12 rounded-lg bg-surface"
+                            />
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate text-sm font-semibold text-foreground" title={displayFileName}>{displayFileName}</p>
+                              <p className="mt-1 truncate text-xs text-subtle" title={directoryPath}>{directoryPath}</p>
+                            </div>
+                          </div>
                         </td>
                         <td className="px-3 py-3">
                           <div className="flex min-w-0 flex-col gap-1">
@@ -515,6 +528,14 @@ function cacheEntryStatusLabel(entry: FileCacheEntry): string {
   return "部分缓存";
 }
 
+function cacheEntryVisualUrl(entry: FileCacheEntry, indexedFile: FileItem | undefined): string | undefined {
+  if (indexedFile && hasFileLinkAccess(indexedFile)) {
+    return indexedFile.url;
+  }
+
+  return entry.sourceUrl;
+}
+
 function CircularCacheAction({
   progress,
   disabled,
@@ -558,7 +579,7 @@ function CircularCacheAction({
   );
 }
 
-export function DashboardPage({ session, uploadVersion, copyText, onDirectoryChange, onUploadToDirectory }: DashboardPageProps) {
+function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryChange, onUploadToDirectory }: DashboardPageProps) {
   const toast = useToast();
   const confirm = useConfirm();
   const acceleratedDownloadTaskRef = useRef<AcceleratedDownloadTask | null>(null);
@@ -2540,3 +2561,5 @@ export function DashboardPage({ session, uploadVersion, copyText, onDirectoryCha
     </div>
   );
 }
+
+export const DashboardPage = memo(DashboardPageComponent);

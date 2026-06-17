@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { ApiError, SessionResponse, getSession, logout } from "./api";
 import { Spinner } from "./components/ui/Spinner";
 import { Shell, ShellRoute } from "./components/layout/Shell";
@@ -40,18 +40,14 @@ export function App() {
 
 function AppShell() {
   const toast = useToast();
-  const uploadDialogRef = useRef<UploadDialogHandle>(null);
+  const uploadLayerRef = useRef<UploadLayerHandle>(null);
   const [path, setPath] = useState<Route>(currentRoute());
   const [session, setSession] = useState<SessionResponse | null>(null);
   const [sessionLoading, setSessionLoading] = useState(true);
 
-  const [uploadOpen, setUploadOpen] = useState(false);
-  const [uploadFiles, setUploadFiles] = useState<File[]>([]);
-  const [uploadDirectoryPath, setUploadDirectoryPath] = useState("/");
   const [uploadVersion, setUploadVersion] = useState(0);
   const [dashboardDirectoryPath, setDashboardDirectoryPath] = useState("/");
-  const [uploadTaskSnapshot, setUploadTaskSnapshot] = useState<UploadTaskSnapshot | null>(null);
-  const [taskCenterOpen, setTaskCenterOpen] = useState(false);
+  const [uploadDropzoneBlocked, setUploadDropzoneBlocked] = useState(false);
 
   const navigate = useCallback((route: Route) => {
     if (window.location.pathname !== route) {
@@ -111,23 +107,16 @@ function AppShell() {
   }, []);
 
   const openUpload = useCallback((files: File[] = [], directoryPath = dashboardDirectoryPath) => {
-    if (uploadTaskSnapshot?.summary.error) {
-      const waitingLocalTask = uploadTaskSnapshot.items.some((item) =>
-        item.kind === "local" && item.status === "error" && item.progressLabel?.includes("重新选择本地文件")
-      );
-      if (waitingLocalTask && files.length > 0) {
-        uploadDialogRef.current?.resumeLocalFile(files[0]);
-      }
-      setUploadOpen(true);
-      setTaskCenterOpen(true);
-      return;
-    }
+    uploadLayerRef.current?.open(files, directoryPath);
+  }, [dashboardDirectoryPath]);
 
-    uploadDialogRef.current?.clearSettledTasks();
-    setUploadDirectoryPath(directoryPath);
-    setUploadFiles(files);
-    setUploadOpen(true);
-  }, [dashboardDirectoryPath, uploadTaskSnapshot]);
+  const openUploadInCurrentDirectory = useCallback(() => {
+    openUpload([]);
+  }, [openUpload]);
+
+  const openUploadToDirectory = useCallback((directoryPath: string) => {
+    openUpload([], directoryPath);
+  }, [openUpload]);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -154,9 +143,20 @@ function AppShell() {
     }
   }, [navigate, toast]);
 
+  const handleUploaded = useCallback((count: number) => {
+    if (count > 0) {
+      setUploadVersion((value) => value + 1);
+      toast.success(count === 1 ? "文件已上传" : `已上传 ${count} 个文件`);
+    }
+  }, [toast]);
+
+  const handleUploadError = useCallback((message: string) => {
+    toast.danger(message);
+  }, [toast]);
+
   const dropzoneEnabled = useMemo(
-    () => session !== null && path !== "/login" && !uploadOpen && !uploadTaskSnapshot?.running,
-    [session, path, uploadOpen, uploadTaskSnapshot?.running]
+    () => session !== null && path !== "/login" && !uploadDropzoneBlocked,
+    [session, path, uploadDropzoneBlocked]
   );
 
   if (path === "/login" || !session) {
@@ -182,7 +182,7 @@ function AppShell() {
         session={session}
         onNavigate={(route) => navigate(route === "settings" ? "/settings" : route === "docs" ? "/docs" : "/admin")}
         onLogout={() => void onLogout()}
-        onUpload={() => openUpload([])}
+        onUpload={openUploadInCurrentDirectory}
       >
         {active === "settings" ? (
           <SettingsPage session={session} onSessionChange={setSession} copyText={copyText} />
@@ -194,40 +194,18 @@ function AppShell() {
             uploadVersion={uploadVersion}
             copyText={copyText}
             onDirectoryChange={setDashboardDirectoryPath}
-            onUploadToDirectory={(directoryPath) => openUpload([], directoryPath)}
+            onUploadToDirectory={openUploadToDirectory}
           />
         )}
       </Shell>
 
-      <UploadDialog
-        ref={uploadDialogRef}
-        open={uploadOpen}
-        initialFiles={uploadFiles}
-        maxBytes={session.max_file_bytes}
-        maxMultipartBytes={session.max_multipart_file_bytes}
-        uploadConcurrency={session.upload_concurrency}
-        directoryPath={uploadDirectoryPath}
-        onClose={() => setUploadOpen(false)}
-        onUploaded={(count) => {
-          if (count > 0) {
-            setUploadVersion((value) => value + 1);
-            toast.success(count === 1 ? "文件已上传" : `已上传 ${count} 个文件`);
-          }
-        }}
-        onError={(message) => toast.danger(message)}
-        onTaskSnapshotChange={setUploadTaskSnapshot}
-      />
-
-      <UploadTaskCenter
-        snapshot={uploadTaskSnapshot}
-        open={taskCenterOpen}
-        onOpenChange={setTaskCenterOpen}
-        onShowDetails={() => {
-          setUploadOpen(true);
-          setTaskCenterOpen(false);
-        }}
-        onStop={() => uploadDialogRef.current?.stopCurrentUpload()}
-        onDelete={(id) => uploadDialogRef.current?.deleteTask(id)}
+      <UploadLayer
+        ref={uploadLayerRef}
+        session={session}
+        defaultDirectoryPath={dashboardDirectoryPath}
+        onDropzoneBlockedChange={setUploadDropzoneBlocked}
+        onUploaded={handleUploaded}
+        onError={handleUploadError}
       />
 
       <GlobalDropzone enabled={dropzoneEnabled} onDrop={openUpload} />
@@ -245,6 +223,116 @@ function isEditableShortcutTarget(target: EventTarget | null): boolean {
     tagName === "select" ||
     Boolean(target.closest("[contenteditable='true']"));
 }
+
+interface UploadLayerHandle {
+  open: (files?: File[], directoryPath?: string) => void;
+}
+
+interface UploadLayerProps {
+  session: SessionResponse;
+  defaultDirectoryPath: string;
+  onUploaded: (uploadedCount: number) => void;
+  onError: (message: string) => void;
+  onDropzoneBlockedChange: (blocked: boolean) => void;
+}
+
+const UploadLayer = forwardRef<UploadLayerHandle, UploadLayerProps>(function UploadLayer({
+  session,
+  defaultDirectoryPath,
+  onUploaded,
+  onError,
+  onDropzoneBlockedChange
+}, ref) {
+  const uploadDialogRef = useRef<UploadDialogHandle>(null);
+  const [uploadOpen, setUploadOpen] = useState(false);
+  const [uploadFiles, setUploadFiles] = useState<File[]>([]);
+  const [uploadDirectoryPath, setUploadDirectoryPath] = useState("/");
+  const [taskCenterOpen, setTaskCenterOpen] = useState(false);
+  const uploadTaskSnapshotRef = useRef<UploadTaskSnapshot | null>(null);
+  const uploadTaskSnapshotListenersRef = useRef(new Set<() => void>());
+  const dropzoneBlockedRef = useRef(false);
+
+  const handleUploadTaskSnapshotChange = useCallback((snapshot: UploadTaskSnapshot | null) => {
+    uploadTaskSnapshotRef.current = snapshot;
+    const blocked = uploadOpen || Boolean(snapshot?.running);
+    if (dropzoneBlockedRef.current !== blocked) {
+      dropzoneBlockedRef.current = blocked;
+      onDropzoneBlockedChange(blocked);
+    }
+    uploadTaskSnapshotListenersRef.current.forEach((listener) => listener());
+  }, [onDropzoneBlockedChange, uploadOpen]);
+
+  const getUploadTaskSnapshot = useCallback(() => uploadTaskSnapshotRef.current, []);
+
+  const subscribeUploadTaskSnapshot = useCallback((listener: () => void) => {
+    uploadTaskSnapshotListenersRef.current.add(listener);
+    return () => uploadTaskSnapshotListenersRef.current.delete(listener);
+  }, []);
+
+  const openUpload = useCallback((files: File[] = [], directoryPath = defaultDirectoryPath) => {
+    const snapshot = uploadTaskSnapshotRef.current;
+    if (snapshot?.summary.error) {
+      const waitingLocalTask = snapshot.items.some((item) =>
+        item.kind === "local" && item.status === "error" && item.progressLabel?.includes("重新选择本地文件")
+      );
+      if (waitingLocalTask && files.length > 0) {
+        uploadDialogRef.current?.resumeLocalFile(files[0]);
+      }
+      setUploadOpen(true);
+      setTaskCenterOpen(true);
+      return;
+    }
+
+    uploadDialogRef.current?.clearSettledTasks();
+    setUploadDirectoryPath(directoryPath);
+    setUploadFiles(files);
+    setUploadOpen(true);
+  }, [defaultDirectoryPath]);
+
+  useImperativeHandle(ref, () => ({
+    open: openUpload
+  }), [openUpload]);
+
+  useEffect(() => {
+    const blocked = uploadOpen || Boolean(uploadTaskSnapshotRef.current?.running);
+    if (dropzoneBlockedRef.current === blocked) {
+      return;
+    }
+    dropzoneBlockedRef.current = blocked;
+    onDropzoneBlockedChange(blocked);
+  }, [onDropzoneBlockedChange, uploadOpen]);
+
+  return (
+    <>
+      <UploadDialog
+        ref={uploadDialogRef}
+        open={uploadOpen}
+        initialFiles={uploadFiles}
+        maxBytes={session.max_file_bytes}
+        maxMultipartBytes={session.max_multipart_file_bytes}
+        uploadConcurrency={session.upload_concurrency}
+        directoryPath={uploadDirectoryPath}
+        onClose={() => setUploadOpen(false)}
+        onUploaded={onUploaded}
+        onError={onError}
+        onTaskSnapshotChange={handleUploadTaskSnapshotChange}
+      />
+
+      <UploadTaskCenter
+        getSnapshot={getUploadTaskSnapshot}
+        subscribe={subscribeUploadTaskSnapshot}
+        open={taskCenterOpen}
+        onOpenChange={setTaskCenterOpen}
+        onShowDetails={() => {
+          setUploadOpen(true);
+          setTaskCenterOpen(false);
+        }}
+        onStop={() => uploadDialogRef.current?.stopCurrentUpload()}
+        onDelete={(id) => uploadDialogRef.current?.deleteTask(id)}
+      />
+    </>
+  );
+});
 
 function Splash() {
   return (

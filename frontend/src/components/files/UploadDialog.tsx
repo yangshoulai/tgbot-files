@@ -1,4 +1,4 @@
-import { ChangeEvent, FormEvent, forwardRef, type ReactNode, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, forwardRef, memo, type ReactNode, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { AlertTriangle, Check, CheckCircle2, ClipboardPaste, FilePlus2, FolderOpen, FolderTree, ImageOff, ImagePlus, Layers3, Link2, Pencil, Plus, Trash2, UploadCloud, X } from "lucide-react";
 import {
   ApiError,
@@ -204,6 +204,7 @@ interface QueueItem {
   thumbnail?: UploadThumbnailState;
   chunksExpanded?: boolean;
   recoveredLocalPlaceholder?: boolean;
+  runtimeStore?: UploadRuntimeStore;
 }
 
 interface UrlUploadState {
@@ -219,6 +220,18 @@ interface UrlUploadState {
   thumbnail?: UploadThumbnailState;
   hls?: HlsUrlState;
   magnet?: MagnetUrlState;
+}
+
+interface UploadRuntimeState {
+  progress?: ChunkProgress;
+  chunks?: UploadChunkState[];
+}
+
+interface UploadRuntimeStore {
+  getSnapshot: () => UploadRuntimeState;
+  subscribe: (listener: () => void) => () => void;
+  setState: (updater: (current: UploadRuntimeState) => UploadRuntimeState) => UploadRuntimeState;
+  reset: () => void;
 }
 
 interface QueuedUrlUploadTask {
@@ -273,6 +286,7 @@ const MAGNET_STATUS_MAX_TRANSIENT_FAILURES = 5;
 const MAGNET_STATUS_RETRY_DELAY_MS = 2_000;
 const FILE_NAME_CONFLICT_TOAST_MESSAGE = "上传目录已存在同名文件，请选择覆盖或改名上传";
 const CHUNK_UI_UPDATE_INTERVAL_MS = 160;
+const TASK_SNAPSHOT_UPDATE_INTERVAL_MS = 500;
 
 class MultipartChunkUploadError extends Error {
   constructor(
@@ -304,6 +318,7 @@ function makeItem(file: File, options: { relativePath?: string } = {}): QueueIte
   return {
     id: `${Date.now()}-${counter}`,
     file,
+    runtimeStore: createUploadRuntimeStore(),
     ...(relativePath ? { relativePath } : {}),
     ...(relativeDirectoryPath ? { relativeDirectoryPath } : {}),
     status: "pending",
@@ -350,20 +365,82 @@ function sourceHeaderRowsFromHeaders(headers?: SourceRequestHeaders): SourceHead
   return Object.entries(headers).map(([name, value]) => makeSourceHeaderRow(name, value));
 }
 
+function extractFirstUrl(value: string): string | undefined {
+  const match = value.match(/(?:https?:\/\/|magnet:\?)[^\s<>"']+/i);
+  return match?.[0];
+}
+
 function makePlaceholderLocalItem(task: PersistedLocalUploadTask): QueueItem {
   const file = new File([], task.fileName, {
     type: task.mimeType || "application/octet-stream",
     lastModified: task.lastModified
   });
+  const item = makeItem(file, { relativePath: task.relativePath });
+  const retryProgress = retryFailureProgress(task.retry, "等待重新选择本地文件");
+  seedUploadRuntimeStore(item.runtimeStore!, retryProgress);
   return {
-    ...makeItem(file, { relativePath: task.relativePath }),
+    ...item,
     status: "error",
     message: `刷新后需要重新选择同一个文件：${task.fileName}`,
     retry: task.retry,
-    progress: retryFailureProgress(task.retry, "等待重新选择本地文件"),
+    progress: retryProgress,
     thumbnail: undefined,
     recoveredLocalPlaceholder: true
   };
+}
+
+function createUploadRuntimeStore(initialState: UploadRuntimeState = {}): UploadRuntimeStore {
+  let state = initialState;
+  const listeners = new Set<() => void>();
+
+  const notify = () => {
+    listeners.forEach((listener) => listener());
+  };
+
+  return {
+    getSnapshot: () => state,
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    setState: (updater) => {
+      const next = updater(state);
+      if (uploadRuntimeStateEqual(state, next)) {
+        return state;
+      }
+      state = next;
+      notify();
+      return state;
+    },
+    reset: () => {
+      if (uploadRuntimeStateEqual(state, {})) {
+        return;
+      }
+      state = {};
+      notify();
+    }
+  };
+}
+
+function seedUploadRuntimeStore(
+  store: UploadRuntimeStore,
+  progress?: ChunkProgress | null,
+  chunks?: UploadChunkState[] | null
+): void {
+  store.setState((current) => ({
+    ...(progress === undefined && current.progress ? { progress: current.progress } : {}),
+    ...(progress ? { progress } : {}),
+    ...(chunks === undefined && current.chunks ? { chunks: current.chunks } : {}),
+    ...(chunks ? { chunks } : {})
+  }));
+}
+
+function resetUploadRuntimeStore(store: UploadRuntimeStore | undefined): void {
+  store?.reset();
+}
+
+function localRuntimeSnapshot(items: QueueItem[]): Map<string, UploadRuntimeState> {
+  return new Map(items.map((item) => [item.id, item.runtimeStore?.getSnapshot() ?? {}]));
 }
 
 export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(function UploadDialog({
@@ -407,7 +484,15 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   const activeUploadRef = useRef<UploadAbortContext | null>(null);
   const itemsRef = useRef(items);
   const urlUploadRef = useRef(urlUpload);
+  const urlRuntimeStoreRef = useRef<UploadRuntimeStore | null>(null);
+  if (!urlRuntimeStoreRef.current) {
+    urlRuntimeStoreRef.current = createUploadRuntimeStore();
+  }
+  const urlRuntimeStore = urlRuntimeStoreRef.current;
   const lastTaskSnapshotKeyRef = useRef<string | null>(null);
+  const lastTaskSnapshotStructureKeyRef = useRef<string | null>(null);
+  const taskSnapshotTimerRef = useRef<number | null>(null);
+  const pendingTaskSnapshotRef = useRef<UploadTaskSnapshot | null>(null);
   const queuedUrlTasksRef = useRef(queuedUrlTasks);
   const queuedUrlLaunchingRef = useRef(false);
   const activePersistedTaskIdRef = useRef<string | null>(null);
@@ -421,6 +506,18 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   const [activeUploadItemId, setActiveUploadItemId] = useState<string | null>(null);
   const [activePersistedTaskId, setActivePersistedTaskIdState] = useState<string | null>(null);
   const [stopRequested, setStopRequested] = useState(false);
+  const uploadDialogStateRef = useRef({
+    mode,
+    queuedUrlTasks,
+    sourceUrl: "",
+    uploadDirectoryPath,
+    activeUploadKind,
+    activeUploadItemId,
+    activePersistedTaskId,
+    stopRequested,
+    uploadBusy: false,
+    onTaskSnapshotChange
+  });
   const effectiveUploadConcurrency = normalizeUploadConcurrency(uploadConcurrency);
 
   useEffect(() => {
@@ -488,6 +585,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       activeUploadRef.current = null;
       hlsThumbnailGeneratingRef.current = false;
       hlsThumbnailPromiseRef.current = null;
+      urlRuntimeStore.reset();
       setActiveUploadKind(null);
       setActiveUploadItemId(null);
       setStopRequested(false);
@@ -530,6 +628,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
 
     setMode("file");
     setUploadDirectoryPath(directoryPath);
+    urlRuntimeStore.reset();
     setItems((current) => {
       current.forEach((item) => revokeThumbnail(item.thumbnail?.generated));
       return initialFiles.map((file) => makeItem(file));
@@ -724,34 +823,43 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   }
 
   const uploadBusy = submitting || checkingConflicts;
-  const filePendingCount = items.filter(isUploadableLocalItem).length;
-  const folderItemCount = items.filter((item) => item.relativePath).length;
-  const conflictItemCount = items.filter((item) =>
+  const filePendingCount = useMemo(() => items.filter(isUploadableLocalItem).length, [items]);
+  const folderItemCount = useMemo(() => items.filter((item) => item.relativePath).length, [items]);
+  const conflictItemCount = useMemo(() => items.filter((item) =>
     isLocalItemAwaitingDecision(item) && Boolean(item.conflict)
-  ).length;
+  ).length, [items]);
   const normalizedSourceUrl = sourceUrl.trim();
   const urlPendingCount = normalizedSourceUrl && urlUpload.status !== "uploading" && urlUpload.status !== "done" ? 1 : 0;
   const pendingCount = mode === "url" ? urlPendingCount : filePendingCount;
   const isMagnetSource = isLikelyMagnetUrl(normalizedSourceUrl);
-  const magnetValidFiles = isMagnetSource && urlUpload.magnet?.import
-    ? urlUpload.magnet.import.files.filter((file) => !file.file_name.startsWith("[METADATA]"))
-    : [];
+  const magnetValidFiles = useMemo(
+    () => isMagnetSource && urlUpload.magnet?.import
+      ? urlUpload.magnet.import.files.filter((file) => !file.file_name.startsWith("[METADATA]"))
+      : [],
+    [isMagnetSource, urlUpload.magnet?.import]
+  );
   const magnetHasNoValidFiles = isMagnetSource && urlUpload.magnet?.import && magnetValidFiles.length === 0;
-  const hasUnresolvedMagnetConflict = isMagnetSource && Boolean(urlUpload.magnet?.selectedIndexes.some((fileIndex) =>
-    Boolean(urlUpload.magnet?.fileDecisions?.[fileIndex]?.conflict)
-  ));
+  const hasUnresolvedMagnetConflict = useMemo(
+    () => isMagnetSource && Boolean(urlUpload.magnet?.selectedIndexes.some((fileIndex) =>
+      Boolean(urlUpload.magnet?.fileDecisions?.[fileIndex]?.conflict)
+    )),
+    [isMagnetSource, urlUpload.magnet?.fileDecisions, urlUpload.magnet?.selectedIndexes]
+  );
   const hasUnresolvedConflict = mode === "url"
     ? Boolean(urlUpload.conflict) || hasUnresolvedMagnetConflict
     : items.some((item) => isLocalItemAwaitingDecision(item) && Boolean(item.conflict));
-  const hasInvalidMagnetFileName = isMagnetSource && Boolean(urlUpload.magnet?.selectedIndexes.some((fileIndex) => {
-    const decision = urlUpload.magnet?.fileDecisions?.[fileIndex];
-    return Boolean(
-      decision &&
-      (decision.editingFileName || decision.conflict) &&
-      decision.fileNameOverride !== undefined &&
-      decision.fileNameOverride.trim().length === 0
-    );
-  }));
+  const hasInvalidMagnetFileName = useMemo(
+    () => isMagnetSource && Boolean(urlUpload.magnet?.selectedIndexes.some((fileIndex) => {
+      const decision = urlUpload.magnet?.fileDecisions?.[fileIndex];
+      return Boolean(
+        decision &&
+        (decision.editingFileName || decision.conflict) &&
+        decision.fileNameOverride !== undefined &&
+        decision.fileNameOverride.trim().length === 0
+      );
+    })),
+    [isMagnetSource, urlUpload.magnet?.fileDecisions, urlUpload.magnet?.selectedIndexes]
+  );
   const hasInvalidFileName = mode === "url"
     ? Boolean(
         normalizedSourceUrl &&
@@ -765,7 +873,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         item.fileNameOverride !== undefined &&
         item.fileNameOverride.trim().length === 0
       );
-  const hasDone = urlUpload.status === "done" || items.some((item) => item.status === "done");
+  const hasDone = useMemo(() => urlUpload.status === "done" || items.some((item) => item.status === "done"), [items, urlUpload.status]);
   const queuedUrlStartBlocked = mode === "url"
     ? Boolean(normalizedSourceUrl && urlUpload.status !== "done")
     : items.some((item) => item.status === "pending" || item.status === "uploading" || item.status === "error");
@@ -881,6 +989,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     }
 
     if (id === "url" && !submitting && !checkingConflicts) {
+      urlRuntimeStore.reset();
       setUrlUpload((current) => {
         cleanupTemporaryHlsUpload(current);
         cleanupTemporaryMagnetUpload(current);
@@ -911,6 +1020,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     activeUploadRef.current = null;
     hlsThumbnailGeneratingRef.current = false;
     hlsThumbnailPromiseRef.current = null;
+    urlRuntimeStore.reset();
     setActiveUploadKind(null);
     setActiveUploadItemId(null);
     setStopRequested(false);
@@ -977,21 +1087,24 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     resumeLocalFile
   }));
 
-  useEffect(() => {
-    if (!onTaskSnapshotChange) return;
+  function emitUploadTaskSnapshot(runtime: UploadRuntimeState = urlRuntimeStore.getSnapshot()) {
+    const state = uploadDialogStateRef.current;
+    if (!state.onTaskSnapshotChange) return;
 
     const snapshot = createUploadTaskSnapshot({
-      mode,
-      items,
-      urlUpload,
-      queuedUrlTasks,
-      sourceUrl: normalizedSourceUrl,
-      uploadDirectoryPath,
-      activeUploadKind,
-      activeUploadItemId,
-      activePersistedTaskId,
-      stopRequested,
-      running: uploadBusy,
+      mode: state.mode,
+      items: itemsRef.current,
+      localRuntime: localRuntimeSnapshot(itemsRef.current),
+      urlUpload: urlUploadRef.current,
+      urlRuntime: runtime,
+      queuedUrlTasks: queuedUrlTasksRef.current,
+      sourceUrl: state.sourceUrl,
+      uploadDirectoryPath: state.uploadDirectoryPath,
+      activeUploadKind: state.activeUploadKind,
+      activeUploadItemId: state.activeUploadItemId,
+      activePersistedTaskId: state.activePersistedTaskId,
+      stopRequested: state.stopRequested,
+      running: state.uploadBusy,
       persistedTasks: readUploadTaskQueue().tasks
     });
 
@@ -999,8 +1112,27 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     if (snapshotKey === lastTaskSnapshotKeyRef.current) {
       return;
     }
+    const structureKey = uploadTaskSnapshotStructureKey(snapshot);
+    const urgentSnapshot = structureKey !== lastTaskSnapshotStructureKeyRef.current;
+    lastTaskSnapshotStructureKeyRef.current = structureKey;
     lastTaskSnapshotKeyRef.current = snapshotKey;
-    onTaskSnapshotChange(snapshot);
+    scheduleTaskSnapshotChange(snapshot, state.onTaskSnapshotChange, urgentSnapshot);
+  }
+
+  useEffect(() => {
+    uploadDialogStateRef.current = {
+      mode,
+      queuedUrlTasks,
+      sourceUrl: normalizedSourceUrl,
+      uploadDirectoryPath,
+      activeUploadKind,
+      activeUploadItemId,
+      activePersistedTaskId,
+      stopRequested,
+      uploadBusy,
+      onTaskSnapshotChange
+    };
+    emitUploadTaskSnapshot();
   }, [
     activeUploadItemId,
     activeUploadKind,
@@ -1017,6 +1149,32 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   ]);
 
   useEffect(() => {
+    return urlRuntimeStore.subscribe(() => {
+      emitUploadTaskSnapshot(urlRuntimeStore.getSnapshot());
+    });
+  }, [urlRuntimeStore]);
+
+  useEffect(() => {
+    const unsubscribers = items
+      .map((item) => item.runtimeStore?.subscribe(() => emitUploadTaskSnapshot()))
+      .filter((unsubscribe): unsubscribe is () => void => Boolean(unsubscribe));
+
+    return () => {
+      unsubscribers.forEach((unsubscribe) => unsubscribe());
+    };
+  }, [items]);
+
+  useEffect(() => {
+    return () => {
+      if (taskSnapshotTimerRef.current !== null) {
+        window.clearTimeout(taskSnapshotTimerRef.current);
+        taskSnapshotTimerRef.current = null;
+      }
+      pendingTaskSnapshotRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
     if (!pendingMagnetResume) return;
     if (!sourceUrl.trim() || !urlUpload.magnet?.import) return;
     if (urlUpload.magnet.import.status === "ready" || urlUpload.magnet.import.status === "done" || urlUpload.magnet.import.status === "failed" || urlUpload.magnet.import.status === "cancelled") {
@@ -1028,25 +1186,63 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingMagnetResume, sourceUrl, urlUpload.magnet?.import?.id, urlUpload.magnet?.import?.status]);
 
+  function scheduleTaskSnapshotChange(
+    snapshot: UploadTaskSnapshot | null,
+    onChange: (snapshot: UploadTaskSnapshot | null) => void,
+    urgent: boolean
+  ) {
+    if (urgent) {
+      if (taskSnapshotTimerRef.current !== null) {
+        window.clearTimeout(taskSnapshotTimerRef.current);
+        taskSnapshotTimerRef.current = null;
+      }
+      pendingTaskSnapshotRef.current = null;
+      onChange(snapshot);
+      return;
+    }
+
+    pendingTaskSnapshotRef.current = snapshot;
+    if (taskSnapshotTimerRef.current !== null) {
+      return;
+    }
+
+    taskSnapshotTimerRef.current = window.setTimeout(() => {
+      taskSnapshotTimerRef.current = null;
+      const pending = pendingTaskSnapshotRef.current;
+      pendingTaskSnapshotRef.current = null;
+      onChange(pending);
+    }, TASK_SNAPSHOT_UPDATE_INTERVAL_MS);
+  }
+
+  const idleThumbnailTargetKey = useMemo(
+    () => {
+      if (!open) return null;
+      const target = items.find((item) => item.thumbnail?.status === "idle");
+      return target ? `${target.id}:${target.file.name}:${target.file.size}:${target.file.lastModified}` : null;
+    },
+    [items, open]
+  );
+
   useEffect(() => {
-    if (!open) return;
+    const idleThumbnailTarget = idleThumbnailTargetKey
+      ? itemsRef.current.find((item) => `${item.id}:${item.file.name}:${item.file.size}:${item.file.lastModified}` === idleThumbnailTargetKey)
+      : null;
+    if (!idleThumbnailTarget) return;
 
-    const target = items.find((item) => item.thumbnail?.status === "idle");
-    if (!target) return;
-
+    const targetId = idleThumbnailTarget.id;
     setItems((current) =>
       current.map((item) =>
-        item.id === target.id
+        item.id === targetId
           ? { ...item, thumbnail: { status: "generating", message: "正在生成缩略图" } }
           : item
       )
     );
 
-    void generateThumbnailFromFile(target.file)
+    void generateThumbnailFromFile(idleThumbnailTarget.file)
       .then((thumbnail) => {
         setItems((current) =>
           current.map((item) => {
-            if (item.id !== target.id) return item;
+            if (item.id !== targetId) return item;
             revokeThumbnail(item.thumbnail?.generated);
             return { ...item, thumbnail: { status: "ready", generated: thumbnail } };
           })
@@ -1055,7 +1251,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       .catch((error) => {
         setItems((current) =>
           current.map((item) =>
-            item.id === target.id
+            item.id === targetId
               ? {
                   ...item,
                   thumbnail: {
@@ -1067,7 +1263,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
           )
         );
       });
-  }, [items, open]);
+  }, [idleThumbnailTargetKey]);
 
   function handleModeChange(nextMode: UploadMode) {
     if (uploadBusy || mode === nextMode) return;
@@ -1076,6 +1272,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
 
   function handleSourceUrlChange(value: string) {
     setSourceUrl(value);
+    urlRuntimeStore.reset();
     setUrlUpload((current) => {
       cleanupTemporaryHlsUpload(current);
       cleanupTemporaryMagnetUpload(current);
@@ -1536,11 +1733,6 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     });
   }
 
-  function extractFirstUrl(value: string): string | undefined {
-    const match = value.match(/(?:https?:\/\/|magnet:\?)[^\s<>"']+/i);
-    return match?.[0];
-  }
-
   function validateSourceUrl(value: string): string | undefined {
     const normalized = value.trim();
 
@@ -1607,13 +1799,14 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     setItems([]);
 
     if (task.kind === "url-multipart") {
+      seedUploadRuntimeStore(urlRuntimeStore, retryFailureProgress(task.retry, "刷新后待继续"));
       setUrlUpload({
         status: "error",
         message: "检测到未完成的 URL 上传，可点击继续完成",
         retry: task.retry,
         fileNameOverride: task.fileNameOverride,
         conflictAction: task.retry.conflictAction,
-        progress: retryFailureProgress(task.retry, "刷新后待继续")
+        progress: undefined
       });
       window.setTimeout(() => {
         void retryUrlMultipart(task.retry);
@@ -1629,12 +1822,13 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         retry: task.retry,
         ...(task.variantId ? { variantId: task.variantId } : {})
       };
+      seedUploadRuntimeStore(urlRuntimeStore, hlsRetryFailureProgress(task.retry, "刷新后待继续"));
       setUrlUpload({
         status: "error",
         message: "检测到未完成的 HLS 上传，可点击继续完成",
         fileNameOverride: task.fileNameOverride,
         conflictAction: task.retry.conflictAction,
-        progress: hlsRetryFailureProgress(task.retry, "刷新后待继续"),
+        progress: undefined,
         hls: hlsState
       });
       window.setTimeout(() => {
@@ -1649,10 +1843,15 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   }
 
   async function restoreAndResumeMagnetUpload(task: PersistedMagnetUploadTask) {
+    seedUploadRuntimeStore(urlRuntimeStore, {
+      completed: 0,
+      total: Math.max(1, task.selectedIndexes.length),
+      label: "读取磁力任务状态"
+    });
     setUrlUpload({
       status: "uploading",
       message: "正在恢复磁力导入任务",
-      progress: { completed: 0, total: Math.max(1, task.selectedIndexes.length), label: "读取磁力任务状态" },
+      progress: undefined,
       magnet: {
         selectedIndexes: task.selectedIndexes,
         ...(task.uploads ? { uploads: task.uploads } : {})
@@ -1661,18 +1860,22 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
 
     try {
       const response = await getMagnetUploadStatus(task.importId);
+      seedUploadRuntimeStore(
+        urlRuntimeStore,
+        response.magnet.status === "ready"
+          ? undefined
+          : { completed: 0, total: Math.max(1, task.selectedIndexes.length), label: magnetStatusProgressLabel("继续磁力任务", response.magnet) }
+      );
       setUrlUpload((current) => ({
         ...current,
         status: response.magnet.status === "ready" ? "pending" : "uploading",
         message: response.magnet.status === "ready" ? "磁力文件已解析，点击上传继续导入" : "已恢复磁力导入任务",
-        progress: response.magnet.status === "ready"
-          ? undefined
-          : { completed: 0, total: Math.max(1, task.selectedIndexes.length), label: magnetStatusProgressLabel("继续磁力任务", response.magnet) },
-        magnet: {
+        progress: undefined,
+        magnet: mergeMagnetState(current.magnet, {
           import: response.magnet,
           selectedIndexes: task.selectedIndexes,
           ...(task.uploads ? { uploads: task.uploads } : {})
-        }
+        })
       }));
 
       if (response.magnet.status !== "ready" && response.magnet.status !== "done" && response.magnet.status !== "failed" && response.magnet.status !== "cancelled") {
@@ -1922,21 +2125,24 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         label: "正在停止上传，保留已完成分片"
       });
     } else if (task.kind === "url") {
-      setUrlUpload((current) => ({
-        ...current,
-        progress: current.progress
-          ? { ...current.progress, label: magnetImportId ? "正在停止导入并取消 aria2 下载" : "正在停止导入，保留已完成分片" }
-          : { completed: 0, total: 1, label: magnetImportId ? "正在停止导入并取消 aria2 下载" : "正在停止导入" }
-      }));
+      updateUrlProgress({
+        completed: urlRuntimeStore.getSnapshot().progress?.completed ?? 0,
+        total: urlRuntimeStore.getSnapshot().progress?.total ?? 1,
+        failed: urlRuntimeStore.getSnapshot().progress?.failed,
+        label: magnetImportId ? "正在停止导入并取消 aria2 下载" : "正在停止导入，保留已完成分片"
+      });
     }
   }
 
   function currentItemCompletedChunks(id: string): number {
-    return items.find((item) => item.id === id)?.chunks?.filter((chunk) => chunk.status === "completed").length ?? 0;
+    const item = itemsRef.current.find((current) => current.id === id);
+    const chunks = item?.runtimeStore?.getSnapshot().chunks ?? item?.chunks;
+    return chunks?.filter((chunk) => chunk.status === "completed").length ?? 0;
   }
 
   function currentItemChunkCount(id: string): number {
-    return items.find((item) => item.id === id)?.chunks?.length ?? 1;
+    const item = itemsRef.current.find((current) => current.id === id);
+    return (item?.runtimeStore?.getSnapshot().chunks ?? item?.chunks)?.length ?? 1;
   }
 
   async function preflightLocalItems(targets: QueueItem[]): Promise<boolean> {
@@ -2127,7 +2333,10 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       setItems((current) =>
         current.map((item) =>
           item.id === target.id
-            ? { ...item, status: "uploading", message: undefined, progress: undefined, conflict: undefined }
+            ? (() => {
+                resetUploadRuntimeStore(item.runtimeStore);
+                return { ...item, status: "uploading", message: undefined, progress: undefined, chunks: undefined, conflict: undefined };
+              })()
             : item
         )
       );
@@ -2138,6 +2347,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         const thumbnail = await resolveLocalThumbnailForUpload(target);
         await uploadLocalMultipart(target, fileName, thumbnail, task);
         successCount += 1;
+        seedUploadRuntimeStore(target.runtimeStore!, null, null);
         setItems((current) =>
           current.map((item) =>
             item.id === target.id
@@ -2146,6 +2356,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
                   status: "done",
                   message: undefined,
                   progress: undefined,
+                  chunks: undefined,
                   retry: undefined,
                   conflict: undefined,
                   conflictAction: "error",
@@ -2159,24 +2370,28 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         const stopped = (error instanceof MultipartChunkUploadError && error.stopped) || task.cancelled || isAbortError(error);
         const conflict = fileNameConflictFromError(error);
         const message = stopped ? "已停止" : error instanceof ApiError ? error.message : error instanceof Error ? error.message : "上传失败";
+        const retryProgress = retry && !conflict
+          ? retryFailureProgress(retry, stopped ? "已停止，可重试未完成分片" : "分片上传失败，可手动重试")
+          : undefined;
         setItems((current) =>
           current.map((item) =>
             item.id === target.id
-              ? {
-                  ...item,
-                  status: "error",
-                  message: conflict ? undefined : message,
-                  retry: conflict ? undefined : retry,
-                  conflict,
-                  fileNameOverride: conflict
-                    ? conflict.fileName === item.file.name ? undefined : conflict.fileName
-                    : item.fileNameOverride,
-                  conflictAction: "error",
-                  editingFileName: conflict ? false : item.editingFileName,
-                  progress: retry && !conflict
-                    ? retryFailureProgress(retry, stopped ? "已停止，可重试未完成分片" : "分片上传失败，可手动重试")
-                    : undefined
-                }
+              ? (() => {
+                  seedUploadRuntimeStore(item.runtimeStore!, retryProgress, item.runtimeStore?.getSnapshot().chunks ?? item.chunks);
+                  return {
+                    ...item,
+                    status: "error",
+                    message: conflict ? undefined : message,
+                    retry: conflict ? undefined : retry,
+                    conflict,
+                    fileNameOverride: conflict
+                      ? conflict.fileName === item.file.name ? undefined : conflict.fileName
+                      : item.fileNameOverride,
+                    conflictAction: "error",
+                    editingFileName: conflict ? false : item.editingFileName,
+                    progress: undefined
+                  };
+                })()
               : item
           )
         );
@@ -2231,13 +2446,8 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     };
     persistLocalUploadTask(target, initialRetry);
 
-    setItems((current) =>
-      current.map((item) =>
-        item.id === target.id
-          ? { ...item, chunks: createUploadChunkStates(upload.size, upload.chunk_size, upload.chunk_count) }
-          : item
-      )
-    );
+    const initialChunks = createUploadChunkStates(upload.size, upload.chunk_size, upload.chunk_count);
+    seedUploadRuntimeStore(target.runtimeStore!, undefined, initialChunks);
 
     const result = await runConcurrentChunks({
       total: upload.chunk_count,
@@ -2274,11 +2484,12 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       );
     }
 
-    updateItemProgress(target.id, {
+    const completeProgress = {
       completed: upload.chunk_count,
       total: upload.chunk_count,
       label: upload.direct_access === false ? "正在生成文件索引" : "正在生成访问链接"
-    });
+    };
+    updateItemProgress(target.id, completeProgress);
     await completeUploadOrRetryLater({
       kind: "local",
       uploadId: upload.id,
@@ -2356,12 +2567,12 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     let generated: GeneratedThumbnail | undefined;
 
     try {
-      setUrlUpload((current) => ({
-        ...current,
-        progress: current.progress
-          ? { ...current.progress, label: `正在生成 ${upload.file_name} 缩略图` }
-          : current.progress
-      }));
+      updateUrlProgress({
+        completed: urlRuntimeStore.getSnapshot().progress?.completed ?? 0,
+        total: urlRuntimeStore.getSnapshot().progress?.total ?? 1,
+        failed: urlRuntimeStore.getSnapshot().progress?.failed,
+        label: `正在生成 ${upload.file_name} 缩略图`
+      });
       generated = await generateThumbnailFromRemoteSource({
         kind: "video",
         url: magnetThumbnailSourceUrl(importId, fileIndex),
@@ -2382,10 +2593,15 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     task: UploadAbortContext
   ) {
     const syncedRetry = await refreshMultipartRetryState(retry);
+    seedUploadRuntimeStore(
+      target.runtimeStore!,
+      undefined,
+      prepareRetryChunks(target.runtimeStore?.getSnapshot().chunks ?? target.chunks, syncedRetry)
+    );
     setItems((current) =>
       current.map((item) =>
         item.id === target.id
-          ? { ...item, chunks: prepareRetryChunks(item.chunks, syncedRetry), retry: syncedRetry }
+          ? { ...item, retry: syncedRetry }
           : item
       )
     );
@@ -2721,27 +2937,42 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   }
 
   function updateItemProgress(id: string, progress: ChunkProgress) {
-    setItems((current) => current.map((item) => (item.id === id ? { ...item, progress } : item)));
+    const target = itemsRef.current.find((item) => item.id === id);
+    if (!target?.runtimeStore) return;
+    target.runtimeStore.setState((current) => {
+      if (chunkProgressEqual(current.progress, progress)) {
+        return current;
+      }
+      return { ...current, progress };
+    });
   }
 
   function updateItemChunk(id: string, chunkIndex: number, patch: Partial<UploadChunkState>) {
-    setItems((current) =>
-      current.map((item) =>
-        item.id === id
-          ? {
-              ...item,
-              chunks: updateChunkStates(item.chunks, chunkIndex, patch)
-            }
-          : item
-      )
-    );
+    const target = itemsRef.current.find((item) => item.id === id);
+    if (!target?.runtimeStore) return;
+    target.runtimeStore.setState((current) => {
+      const chunks = updateChunkStates(current.chunks, chunkIndex, patch);
+      return chunks === current.chunks ? current : { ...current, chunks };
+    });
   }
 
   function updateUrlChunk(chunkIndex: number, patch: Partial<UploadChunkState>) {
-    setUrlUpload((current) => ({
-      ...current,
-      chunks: updateChunkStates(current.chunks, chunkIndex, patch)
-    }));
+    urlRuntimeStore.setState((current) => {
+      const chunks = updateChunkStates(current.chunks, chunkIndex, patch);
+      return chunks === current.chunks ? current : { ...current, chunks };
+    });
+  }
+
+  function updateUrlProgress(progress: ChunkProgress) {
+    urlRuntimeStore.setState((current) => {
+      if (chunkProgressEqual(current.progress, progress)) {
+        return current;
+      }
+      return {
+        ...current,
+        progress
+      };
+    });
   }
 
   function updateUrlChunkFromHlsSegment(segment: HlsSegment, missingChunks: number[]) {
@@ -2795,12 +3026,13 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
 
     const task = startUploadTask("url");
     setSubmitting(true);
+    seedUploadRuntimeStore(urlRuntimeStore, { completed: 0, total: 1, label: "探测远程文件" });
     setUrlUpload((current) => ({
       ...current,
       status: "uploading",
       message: undefined,
       conflict: undefined,
-      progress: { completed: 0, total: 1, label: "探测远程文件" }
+      progress: undefined
     }));
 
     try {
@@ -2831,10 +3063,12 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         };
         persistUrlMultipartUploadTask(initialRetry, fileNameOverride);
         const thumbnail = await resolveUrlThumbnailForUpload(upload.thumbnail_source);
+        const initialChunks = createUploadChunkStates(upload.size, upload.chunk_size, upload.chunk_count);
+        seedUploadRuntimeStore(urlRuntimeStore, undefined, initialChunks);
         setUrlUpload((current) => ({
           ...current,
           status: "uploading",
-          chunks: createUploadChunkStates(upload.size, upload.chunk_size, upload.chunk_count)
+          progress: undefined
         }));
         const result = await runConcurrentChunks({
           total: upload.chunk_count,
@@ -2843,13 +3077,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
           concurrency: effectiveUploadConcurrency,
           task,
           requestTimeoutMs: URL_CHUNK_REQUEST_TIMEOUT_MS,
-          onProgress: (progress) => {
-            setUrlUpload((current) => ({
-              ...current,
-              status: "uploading",
-              progress
-            }));
-          },
+          onProgress: updateUrlProgress,
           onChunkState: updateUrlChunk,
           onChunk: async (index, signal) => {
             await uploadUrlMultipartChunk(upload.id, index, signal);
@@ -2876,14 +3104,16 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
           );
         }
 
+        const completeProgress = {
+          completed: upload.chunk_count,
+          total: upload.chunk_count,
+          label: upload.direct_access === false ? "正在生成文件索引" : "正在生成访问链接"
+        };
+        seedUploadRuntimeStore(urlRuntimeStore, completeProgress, urlRuntimeStore.getSnapshot().chunks);
         setUrlUpload((current) => ({
           ...current,
           status: "uploading",
-          progress: {
-            completed: upload.chunk_count,
-            total: upload.chunk_count,
-            label: upload.direct_access === false ? "正在生成文件索引" : "正在生成访问链接"
-          }
+          progress: undefined
         }));
         await completeUploadOrRetryLater({
           kind: "url",
@@ -2900,11 +3130,13 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       } else {
         throw new ApiError(500, "URL 上传初始化未返回分片会话", "InvalidUploadMode");
       }
+      seedUploadRuntimeStore(urlRuntimeStore, null, null);
       setUrlUpload((current) => ({
         ...current,
         status: "done",
         message: "已从 URL 上传",
         progress: undefined,
+        chunks: undefined,
         retry: undefined,
         conflict: undefined,
         conflictAction: "error",
@@ -2932,10 +3164,15 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         fileNameOverride: conflict?.suggestedName ?? current.fileNameOverride,
         conflictAction: "error",
         editingFileName: conflict ? true : current.editingFileName,
-        progress: retry && !conflict
-          ? retryFailureProgress(retry, stopped ? "已停止，可重试未完成分片" : "分片导入失败，可手动重试")
-          : undefined
+        progress: undefined
       }));
+      seedUploadRuntimeStore(
+        urlRuntimeStore,
+        retry && !conflict
+          ? retryFailureProgress(retry, stopped ? "已停止，可重试未完成分片" : "分片导入失败，可手动重试")
+          : null,
+        retry && !conflict ? urlRuntimeStore.getSnapshot().chunks : null
+      );
       if (retry && !conflict && !stopped) {
         persistUrlMultipartUploadTask(retry, normalizedFileNameOverride(urlUpload.fileNameOverride));
       }
@@ -2951,13 +3188,15 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   async function submitMagnetUpload() {
     const task = startUploadTask("url");
     setSubmitting(true);
+    const initialProgress = { completed: 0, total: 1, label: urlUpload.magnet?.import ? "准备磁力导入" : "解析磁力链接" };
+    seedUploadRuntimeStore(urlRuntimeStore, initialProgress);
     setUrlUpload((current) => ({
       ...current,
       status: "uploading",
       message: undefined,
       retry: undefined,
       conflict: undefined,
-      progress: { completed: 0, total: 1, label: current.magnet?.import ? "准备磁力导入" : "解析磁力链接" }
+      progress: undefined
     }));
 
     try {
@@ -2979,6 +3218,10 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         const parsedMagnet = magnet;
         selectedIndexes = selectedMagnetIndexesForResume(parsedMagnet, maxMultipartBytes);
         persistMagnetUploadTask(parsedMagnet.id, selectedIndexes);
+        const parsedProgress = parsedMagnet.status === "ready" || parsedMagnet.status === "failed" || parsedMagnet.status === "cancelled"
+          ? null
+          : { completed: 0, total: 1, label: magnetStatusProgressLabel("继续磁力任务", parsedMagnet) };
+        seedUploadRuntimeStore(urlRuntimeStore, parsedProgress);
         setUrlUpload((current) => ({
           ...current,
           status: parsedMagnet.status === "ready" ? "pending" : parsedMagnet.status === "failed" || parsedMagnet.status === "cancelled" ? "error" : "uploading",
@@ -2987,14 +3230,12 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
             : parsedMagnet.status === "failed" || parsedMagnet.status === "cancelled"
               ? parsedMagnet.error_message || "磁力链接解析失败"
               : "检测到已有磁力任务，准备继续",
-          progress: parsedMagnet.status === "ready" || parsedMagnet.status === "failed" || parsedMagnet.status === "cancelled"
-            ? undefined
-            : { completed: 0, total: 1, label: magnetStatusProgressLabel("继续磁力任务", parsedMagnet) },
-          magnet: {
+          progress: undefined,
+          magnet: mergeMagnetState(current.magnet, {
             import: parsedMagnet,
             selectedIndexes,
             fileDecisions: {}
-          }
+          })
         }));
         if (parsedMagnet.status !== "ready") {
           if (parsedMagnet.status === "failed" || parsedMagnet.status === "cancelled") {
@@ -3040,16 +3281,18 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       }));
       persistMagnetUploadTask(magnet.id, selectedIndexes, uploads);
 
+      const waitingProgress = { completed: 0, total: uploads.length, label: "等待磁力文件下载完成" };
+      seedUploadRuntimeStore(urlRuntimeStore, waitingProgress);
       setUrlUpload((current) => ({
         ...current,
         status: "uploading",
         message: `aria2 正在下载 ${uploads.length} 个文件`,
-        progress: { completed: 0, total: uploads.length, label: "等待磁力文件下载完成" },
-        magnet: {
+        progress: undefined,
+        magnet: mergeMagnetState(current.magnet, {
           import: magnet,
           selectedIndexes,
           uploads
-        }
+        })
       }));
 
       magnet = await waitForMagnetStatus(
@@ -3062,13 +3305,14 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         throw new Error(magnet.error_message || "磁力文件下载失败");
       }
       if (magnet.status === "done") {
+        seedUploadRuntimeStore(urlRuntimeStore, null, null);
         setUrlUpload((current) => ({
           ...current,
           status: "done",
           message: "磁力任务已完成",
           progress: undefined,
           chunks: undefined,
-          magnet: current.magnet ? { ...current.magnet, import: magnet, uploads } : { import: magnet, selectedIndexes, uploads }
+          magnet: mergeMagnetState(current.magnet, current.magnet ? { ...current.magnet, import: magnet, uploads } : { import: magnet, selectedIndexes, uploads })
         }));
         onUploaded(uploads.length);
         clearCurrentPersistedTask();
@@ -3087,17 +3331,19 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
           continue;
         }
 
+        const initialChunks = createUploadChunkStates(upload.size, upload.chunk_size, upload.chunk_count);
+        const importProgress = {
+          completed: completedFiles,
+          total: uploads.length,
+          label: `导入文件 ${completedFiles + 1}/${uploads.length}`
+        };
+        seedUploadRuntimeStore(urlRuntimeStore, importProgress, initialChunks);
         setUrlUpload((current) => ({
           ...current,
           status: "uploading",
           message: `正在导入 ${upload.file_name}`,
-          chunks: createUploadChunkStates(upload.size, upload.chunk_size, upload.chunk_count),
-          progress: {
-            completed: completedFiles,
-            total: uploads.length,
-            label: `导入文件 ${completedFiles + 1}/${uploads.length}`
-          },
-          magnet: current.magnet ? { ...current.magnet, import: magnet, uploads } : { import: magnet, selectedIndexes, uploads }
+          progress: undefined,
+          magnet: mergeMagnetState(current.magnet, current.magnet ? { ...current.magnet, import: magnet, uploads } : { import: magnet, selectedIndexes, uploads })
         }));
 
         const result = await runConcurrentChunks({
@@ -3108,16 +3354,12 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
           task,
           requestTimeoutMs: URL_CHUNK_REQUEST_TIMEOUT_MS,
           onProgress: (progress) => {
-            setUrlUpload((current) => ({
-              ...current,
-              status: "uploading",
-              progress: {
-                completed: progress.completed,
-                total: progress.total,
-                failed: progress.failed,
-                label: `${completedFiles + 1}/${uploads.length} · ${progress.label}`
-              }
-            }));
+            updateUrlProgress({
+              completed: progress.completed,
+              total: progress.total,
+              failed: progress.failed,
+              label: `${completedFiles + 1}/${uploads.length} · ${progress.label}`
+            });
           },
           onChunkState: updateUrlChunk,
           onChunk: async (index, signal) => {
@@ -3134,12 +3376,11 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
           throw new Error("已停止");
         }
 
-        setUrlUpload((current) => ({
-          ...current,
-          progress: current.progress
-            ? { ...current.progress, label: `正在生成 ${upload.file_name} 文件索引` }
-            : current.progress
-        }));
+        updateUrlProgress({
+          completed: upload.chunk_count,
+          total: upload.chunk_count,
+          label: `${completedFiles + 1}/${uploads.length} · 正在生成 ${upload.file_name} 文件索引`
+        });
         await runAbortableUploadRequest(task, URL_CHUNK_REQUEST_TIMEOUT_MS, (signal) =>
           completeMagnetMultipartUpload(magnet!.id, fileIndex, thumbnail, signal, conflictAction)
         );
@@ -3147,18 +3388,19 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       }
 
       const latest = await getMagnetUploadStatus(magnet.id, task.abortController.signal);
+      seedUploadRuntimeStore(urlRuntimeStore, null, null);
       setUrlUpload((current) => ({
         ...current,
         status: "done",
         message: `已导入 ${completedFiles} 个磁力文件`,
         progress: undefined,
         chunks: undefined,
-        magnet: {
+        magnet: mergeMagnetState(current.magnet, {
           ...(current.magnet ?? { selectedIndexes }),
           import: latest.magnet,
           selectedIndexes,
           uploads
-        }
+        })
       }));
       clearCurrentPersistedTask();
       onUploaded(completedFiles);
@@ -3182,6 +3424,9 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         conflictAction: "error",
         progress: undefined
       }));
+      if (conflict || !urlUploadRef.current.magnet?.import) {
+        seedUploadRuntimeStore(urlRuntimeStore, null, null);
+      }
       if (!stopped && urlUploadRef.current.magnet?.import) {
         persistMagnetUploadTask(
           urlUploadRef.current.magnet.import.id,
@@ -3229,18 +3474,12 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
           throw new Error(`${label}状态确认失败：${errorMessage(error)}`);
         }
 
-        setUrlUpload((current) => ({
+        const retryLabel = `${label}状态确认失败，自动重试 ${transientFailures}/${MAGNET_STATUS_MAX_TRANSIENT_FAILURES}：${errorMessage(error)}`;
+        urlRuntimeStore.setState((current) => ({
           ...current,
           progress: current.progress
-            ? {
-                ...current.progress,
-                label: `${label}状态确认失败，自动重试 ${transientFailures}/${MAGNET_STATUS_MAX_TRANSIENT_FAILURES}：${errorMessage(error)}`
-              }
-            : {
-                completed: 0,
-                total: 1,
-                label: `${label}状态确认失败，自动重试 ${transientFailures}/${MAGNET_STATUS_MAX_TRANSIENT_FAILURES}：${errorMessage(error)}`
-              }
+            ? { ...current.progress, label: retryLabel }
+            : { completed: 0, total: 1, label: retryLabel }
         }));
 
         if (Date.now() >= deadline) {
@@ -3251,30 +3490,29 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         continue;
       }
 
-      setUrlUpload((current) => {
-        const progressLabel = magnetStatusProgressLabel(label, magnet);
-        const nextProgress = current.progress
+      const progressLabel = magnetStatusProgressLabel(label, magnet);
+      urlRuntimeStore.setState((current) => ({
+        ...current,
+        progress: current.progress
           ? { ...current.progress, label: progressLabel }
-          : { completed: 0, total: 1, label: progressLabel };
+          : { completed: 0, total: 1, label: progressLabel }
+      }));
+
+      setUrlUpload((current) => {
         const nextMagnet = current.magnet
           ? { ...current.magnet, import: magnet }
           : { import: magnet, selectedIndexes: selectedMagnetIndexesForResume(magnet, maxMultipartBytes) };
 
         if (
-          current.progress?.label === nextProgress.label &&
-          current.progress?.completed === nextProgress.completed &&
-          current.progress?.total === nextProgress.total &&
-          current.progress?.failed === nextProgress.failed &&
           current.magnet?.import &&
-          magnetImportRuntimeKey(current.magnet.import) === magnetImportRuntimeKey(magnet)
+          magnetImportStructureKey(current.magnet.import) === magnetImportStructureKey(magnet)
         ) {
           return current;
         }
 
         return {
           ...current,
-          magnet: nextMagnet,
-          progress: nextProgress
+          magnet: mergeMagnetState(current.magnet, nextMagnet)
         };
       });
 
@@ -3302,13 +3540,14 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     let completionRetry: HlsRetryState | undefined;
 
     setSubmitting(true);
+    seedUploadRuntimeStore(urlRuntimeStore, { completed: 0, total: 1, label: "探测 HLS 播放列表" });
     setUrlUpload((current) => ({
       ...current,
       status: "uploading",
       message: undefined,
       retry: undefined,
       conflict: undefined,
-      progress: { completed: 0, total: 1, label: "探测 HLS 播放列表" }
+      progress: undefined
     }));
 
     try {
@@ -3324,6 +3563,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
           variantId = probe.variants[0]?.id;
           probe = (await probeHlsUpload(normalizedSourceUrl, variantId, sourceHeaders, task.abortController.signal)).hls;
         } else if (!variantId) {
+          urlRuntimeStore.reset();
           setUrlUpload((current) => ({
             ...current,
             status: "pending",
@@ -3348,11 +3588,13 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       const fileName = normalizedFileNameOverride(urlUpload.fileNameOverride) ?? probe.file_name;
       const conflictAction = urlUpload.conflictAction ?? "error";
 
+      const createHlsTaskProgress = { completed: 0, total: probe.media?.segment_count ?? 1, label: "创建 HLS 上传任务" };
+      seedUploadRuntimeStore(urlRuntimeStore, createHlsTaskProgress);
       setUrlUpload((current) => ({
         ...current,
         status: "uploading",
         message: hlsProbeSummary(probe),
-        progress: { completed: 0, total: probe.media?.segment_count ?? 1, label: "创建 HLS 上传任务" },
+        progress: undefined,
         hls: {
           probe,
           ...(selectedVariantId ? { variantId: selectedVariantId } : {})
@@ -3374,12 +3616,14 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
 
       completionRetry = hlsRetryFromStatus(asset, segments, conflictAction);
       persistHlsUploadTask(completionRetry, fileName, selectedVariantId);
+      const initialChunks = createHlsSegmentStates(segments);
+      const startProgress = { completed: 0, total: asset.segment_count, label: `开始导入 HLS 片段（${effectiveUploadConcurrency} 并发）` };
+      seedUploadRuntimeStore(urlRuntimeStore, startProgress, initialChunks);
       setUrlUpload((current) => ({
         ...current,
         status: "uploading",
         message: `HLS 视频 · ${asset.segment_count} 个片段`,
-        chunks: createHlsSegmentStates(segments),
-        progress: { completed: 0, total: asset.segment_count, label: `开始导入 HLS 片段（${effectiveUploadConcurrency} 并发）` },
+        progress: undefined,
         hls: {
           probe,
           assetId: asset.id,
@@ -3396,13 +3640,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         concurrency: effectiveUploadConcurrency,
         task,
         requestTimeoutMs: HLS_SEGMENT_REQUEST_TIMEOUT_MS,
-        onProgress: (progress) => {
-          setUrlUpload((current) => ({
-            ...current,
-            status: "uploading",
-            progress
-          }));
-        },
+        onProgress: updateUrlProgress,
         onChunkState: updateUrlChunk,
         onChunk: async (index, signal) => {
           await uploadHlsSegmentFully(asset.id, index, previewPlaylistUrl, asset.file_name, signal);
@@ -3429,10 +3667,12 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         failedSegments: []
       });
       persistHlsUploadTask(completionRetry, fileName, selectedVariantId);
+      const indexProgress = { completed: asset.segment_count, total: asset.segment_count, label: "正在生成 HLS 文件索引" };
+      seedUploadRuntimeStore(urlRuntimeStore, indexProgress, urlRuntimeStore.getSnapshot().chunks);
       setUrlUpload((current) => ({
         ...current,
         status: "uploading",
-        progress: { completed: asset.segment_count, total: asset.segment_count, label: "正在生成 HLS 文件索引" }
+        progress: undefined
       }));
       const thumbnail = await resolveHlsThumbnailForUpload(previewPlaylistUrl, asset.file_name);
       await runAbortableUploadRequest(task, HLS_SEGMENT_REQUEST_TIMEOUT_MS, (signal) =>
@@ -3443,6 +3683,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         status: "done",
         message: "已导入 HLS 视频",
         progress: undefined,
+        chunks: undefined,
         retry: undefined,
         conflict: undefined,
         conflictAction: "error",
@@ -3463,6 +3704,10 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
             ? uploadError.message
             : "HLS 上传失败";
 
+      const retryProgress = retry && !conflict
+        ? hlsRetryFailureProgress(retry, stopped ? "已停止，可重试未完成 HLS 片段" : "HLS 片段导入失败，可手动重试")
+        : undefined;
+      seedUploadRuntimeStore(urlRuntimeStore, retryProgress, urlRuntimeStore.getSnapshot().chunks);
       setUrlUpload((current) => ({
         ...current,
         status: "error",
@@ -3472,9 +3717,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         fileNameOverride: conflict?.suggestedName ?? current.fileNameOverride,
         conflictAction: "error",
         editingFileName: conflict ? true : current.editingFileName,
-        progress: retry && !conflict
-          ? hlsRetryFailureProgress(retry, stopped ? "已停止，可重试未完成 HLS 片段" : "HLS 片段导入失败，可手动重试")
-          : undefined,
+        progress: undefined,
         hls: retry
           ? {
               ...(current.hls ?? {}),
@@ -3504,14 +3747,16 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     persistHlsUploadTask(syncedRetry, normalizedFileNameOverride(urlUpload.fileNameOverride), urlUpload.hls?.variantId);
 
     setSubmitting(true);
+    const hlsRetryProgress = hlsRetryFailureProgress(syncedRetry, "准备重试失败 HLS 片段");
+    const hlsRetryChunks = prepareHlsRetryChunks(urlRuntimeStore.getSnapshot().chunks ?? urlUpload.chunks, syncedRetry);
+    seedUploadRuntimeStore(urlRuntimeStore, hlsRetryProgress, hlsRetryChunks);
     setUrlUpload((current) => ({
       ...current,
       status: "uploading",
       message: "准备重试 HLS 片段",
       retry: undefined,
       conflict: undefined,
-      progress: hlsRetryFailureProgress(syncedRetry, "准备重试失败 HLS 片段"),
-      chunks: prepareHlsRetryChunks(current.chunks, syncedRetry),
+      progress: undefined,
       hls: {
         ...(current.hls ?? {}),
         assetId: syncedRetry.assetId,
@@ -3532,13 +3777,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
           concurrency: effectiveUploadConcurrency,
           task,
           requestTimeoutMs: HLS_SEGMENT_REQUEST_TIMEOUT_MS,
-          onProgress: (progress) => {
-            setUrlUpload((current) => ({
-              ...current,
-              status: "uploading",
-              progress
-            }));
-          },
+          onProgress: updateUrlProgress,
           onChunkState: updateUrlChunk,
           onChunk: async (index, signal) => {
             await uploadHlsSegmentFully(syncedRetry.assetId, index, syncedRetry.previewPlaylistUrl, syncedRetry.fileName, signal);
@@ -3570,8 +3809,13 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       setUrlUpload((current) => ({
         ...current,
         status: "uploading",
-        progress: { completed: syncedRetry.segmentCount, total: syncedRetry.segmentCount, label: "正在生成 HLS 文件索引" }
+        progress: undefined
       }));
+      updateUrlProgress({
+        completed: syncedRetry.segmentCount,
+        total: syncedRetry.segmentCount,
+        label: "正在生成 HLS 文件索引"
+      });
       const thumbnail = await resolveHlsThumbnailForUpload(syncedRetry.previewPlaylistUrl, syncedRetry.fileName);
       await runAbortableUploadRequest(task, HLS_SEGMENT_REQUEST_TIMEOUT_MS, (signal) =>
         completeHlsUpload(syncedRetry.assetId, thumbnail, signal, conflictAction)
@@ -3581,6 +3825,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         status: "done",
         message: "已导入 HLS 视频",
         progress: undefined,
+        chunks: undefined,
         retry: undefined,
         conflict: undefined,
         conflictAction: "error",
@@ -3603,9 +3848,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         fileNameOverride: conflict?.suggestedName ?? current.fileNameOverride,
         conflictAction: "error",
         editingFileName: conflict ? true : current.editingFileName,
-        progress: nextRetry && !conflict
-          ? hlsRetryFailureProgress(nextRetry, stopped ? "已停止，可重试未完成 HLS 片段" : "HLS 片段导入失败，可手动重试")
-          : undefined,
+        progress: undefined,
         hls: {
           ...(current.hls ?? {}),
           assetId: nextRetry.assetId,
@@ -3831,11 +4074,13 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     const syncedRetry = await refreshMultipartRetryState(retry);
     persistUrlMultipartUploadTask(syncedRetry, normalizedFileNameOverride(urlUpload.fileNameOverride));
     setSubmitting(true);
+    const retryStartProgress = retryFailureProgress(syncedRetry, "准备重试失败分片");
+    const retryChunks = prepareRetryChunks(urlRuntimeStore.getSnapshot().chunks ?? urlUpload.chunks, syncedRetry);
+    seedUploadRuntimeStore(urlRuntimeStore, retryStartProgress, retryChunks);
     setUrlUpload((current) => ({
       ...current,
       status: "uploading",
-      progress: retryFailureProgress(syncedRetry, "准备重试失败分片"),
-      chunks: prepareRetryChunks(current.chunks, syncedRetry),
+      progress: undefined,
       retry: syncedRetry
     }));
 
@@ -3849,14 +4094,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         concurrency: effectiveUploadConcurrency,
         task,
         requestTimeoutMs: URL_CHUNK_REQUEST_TIMEOUT_MS,
-        onProgress: (progress) => {
-          setUrlUpload((current) => ({
-            ...current,
-            status: "uploading",
-            progress,
-            retry: syncedRetry
-          }));
-        },
+        onProgress: updateUrlProgress,
         onChunkState: updateUrlChunk,
         onChunk: async (index, signal) => {
           await uploadUrlMultipartChunk(syncedRetry.uploadId, index, signal);
@@ -3877,14 +4115,16 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         );
       }
 
+      const completeProgress = {
+        completed: syncedRetry.chunkCount,
+        total: syncedRetry.chunkCount,
+        label: syncedRetry.directAccess === false ? "正在生成文件索引" : "正在生成访问链接"
+      };
+      seedUploadRuntimeStore(urlRuntimeStore, completeProgress, urlRuntimeStore.getSnapshot().chunks);
       setUrlUpload((current) => ({
         ...current,
         status: "uploading",
-        progress: {
-          completed: syncedRetry.chunkCount,
-          total: syncedRetry.chunkCount,
-          label: syncedRetry.directAccess === false ? "正在生成文件索引" : "正在生成访问链接"
-        }
+        progress: undefined
       }));
       const thumbnail = urlUpload.thumbnail?.status === "ready"
         ? thumbnailStatePayload(urlUpload.thumbnail)
@@ -3900,6 +4140,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         status: "done",
         message: "已从 URL 上传",
         progress: undefined,
+        chunks: undefined,
         retry: undefined,
         conflictAction: "error",
         editingFileName: false
@@ -3910,12 +4151,14 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       const nextRetry = uploadError instanceof MultipartChunkUploadError ? uploadError.retry : syncedRetry;
       const stopped = (uploadError instanceof MultipartChunkUploadError && uploadError.stopped) || task.cancelled || isAbortError(uploadError);
       const message = stopped ? "已停止" : uploadError instanceof Error ? uploadError.message : "URL 分片重试失败";
+      const retryProgress = retryFailureProgress(nextRetry, stopped ? "已停止，可重试未完成分片" : "分片导入失败，可手动重试");
+      seedUploadRuntimeStore(urlRuntimeStore, retryProgress, urlRuntimeStore.getSnapshot().chunks);
       setUrlUpload((current) => ({
         ...current,
         status: "error",
         message,
         retry: nextRetry,
-        progress: retryFailureProgress(nextRetry, stopped ? "已停止，可重试未完成分片" : "分片导入失败，可手动重试")
+        progress: undefined
       }));
       if (nextRetry && !stopped) {
         persistUrlMultipartUploadTask(nextRetry, normalizedFileNameOverride(urlUpload.fileNameOverride));
@@ -3939,10 +4182,16 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
 
     const task = startUploadTask("local", id);
     setSubmitting(true);
+    const retryStartProgress = retryFailureProgress(target.retry, "准备重试失败分片");
+    seedUploadRuntimeStore(
+      target.runtimeStore!,
+      retryStartProgress,
+      prepareRetryChunks(target.runtimeStore?.getSnapshot().chunks ?? target.chunks, target.retry)
+    );
     setItems((current) =>
       current.map((item) =>
         item.id === id
-          ? { ...item, status: "uploading", message: undefined, progress: retryFailureProgress(target.retry!, "准备重试失败分片") }
+          ? { ...item, status: "uploading", message: undefined, progress: undefined }
           : item
       )
     );
@@ -3958,6 +4207,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
                 status: "done",
                 message: undefined,
                 progress: undefined,
+                chunks: undefined,
                 retry: undefined,
                 conflictAction: "error",
                 editingFileName: false
@@ -3970,19 +4220,29 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       const retry = error instanceof MultipartChunkUploadError ? error.retry : target.retry;
       const stopped = (error instanceof MultipartChunkUploadError && error.stopped) || task.cancelled || isAbortError(error);
       const message = stopped ? "已停止" : error instanceof Error ? error.message : "分片重试失败";
-      setItems((current) =>
-        current.map((item) =>
-          item.id === id
-            ? {
-                ...item,
-                status: "error",
-                message,
-                retry,
-                progress: retryFailureProgress(retry, stopped ? "已停止，可重试未完成分片" : "分片上传失败，可手动重试")
-              }
+      const retryProgress = retryFailureProgress(retry, stopped ? "已停止，可重试未完成分片" : "分片上传失败，可手动重试");
+        setItems((current) =>
+          current.map((item) =>
+            item.id === id
+              ? (() => {
+                  seedUploadRuntimeStore(item.runtimeStore!, retryProgress, item.runtimeStore?.getSnapshot().chunks ?? item.chunks);
+                return {
+                  ...item,
+                  status: "error",
+                  message,
+                  retry,
+                  progress: undefined,
+                  chunks: undefined
+                };
+              })()
             : item
         )
       );
+      if (retry && !stopped) {
+        seedUploadRuntimeStore(target.runtimeStore!, retryProgress, target.runtimeStore?.getSnapshot().chunks ?? target.chunks);
+      } else {
+        seedUploadRuntimeStore(target.runtimeStore!, null, null);
+      }
       if (!stopped) {
         onError(message);
       }
@@ -4269,6 +4529,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
                   <QueueRow
                     key={item.id}
                     item={item}
+                    runtimeStore={item.runtimeStore!}
                     targetDirectoryPath={effectiveDirectoryPath(item, uploadDirectoryPath)}
                     onRemove={() => removeItem(item.id)}
                     onRetry={item.retry ? () => void retryItemFailedChunks(item.id) : undefined}
@@ -4291,120 +4552,23 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
           </>
         ) : (
           <div className="flex flex-col gap-3 rounded-xl border border-border bg-background p-4">
-            <div className="flex flex-col gap-1.5">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <label htmlFor="upload-source-url" className="text-xs font-medium text-muted">
-                  粘贴文件 URL 或磁力链接
-                </label>
-                {!isMagnetSource ? (
-                  <button
-                    type="button"
-                    disabled={uploadBusy}
-                    className="rounded-md px-1.5 py-1 text-xs font-medium text-primary-strong transition-colors hover:bg-primary-soft hover:text-primary disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:focus-ring"
-                    onClick={openCurlImport}
-                  >
-                    从 cURL 解析
-                  </button>
-                ) : null}
-              </div>
-              <Input
-                id="upload-source-url"
-                type="text"
-                placeholder="https://example.com/report.pdf 或 magnet:?xt=urn:btih:..."
-                value={sourceUrl}
-                disabled={uploadBusy}
-                invalid={urlUpload.status === "error"}
-                leadingIcon={<ClipboardPaste size={15} />}
-                inputClassName="!text-sm !text-muted"
-                onChange={(event) => handleSourceUrlChange(event.target.value)}
-                onPaste={(event) => {
-                  const pasted = event.clipboardData.getData("text");
-                  const pastedUrl = extractFirstUrl(pasted);
-                  if (pastedUrl) {
-                    event.preventDefault();
-                    handleSourceUrlChange(pastedUrl);
-                  }
-                }}
-              />
-              <p className="text-xs leading-5 text-muted">
-                URL 导入要求远端支持 Range；磁力导入会先由 aria2 下载选中文件，再分片转存到 Telegram。
-              </p>
-            </div>
+            <UrlSourceEditor
+              sourceUrl={sourceUrl}
+              uploadBusy={uploadBusy}
+              invalid={urlUpload.status === "error"}
+              isMagnetSource={isMagnetSource}
+              onSourceUrlChange={handleSourceUrlChange}
+              onOpenCurlImport={openCurlImport}
+            />
 
-            {!isMagnetSource ? (
-            <div className="flex flex-col gap-2">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <label className="text-xs font-medium text-muted">
-                  请求头（可选）
-                </label>
-                <button
-                  type="button"
-                  disabled={uploadBusy}
-                  className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs font-medium text-primary-strong transition-colors hover:bg-primary-soft hover:text-primary disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:focus-ring"
-                  onClick={addSourceHeaderRow}
-                >
-                  <Plus size={13} />
-                  新增请求头
-                </button>
-              </div>
-              <div className="rounded-xl border border-border bg-surface/70 p-2 shadow-card">
-                {sourceHeaderRows.length > 0 ? (
-                  <div className="flex flex-col gap-2">
-                    {sourceHeaderRows.map((row, index) => (
-                      <div
-                        key={row.id}
-                        className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(8rem,0.38fr)_minmax(12rem,1fr)_2rem]"
-                      >
-                        <Input
-                          aria-label={`请求头 ${index + 1} 名称`}
-                          placeholder="referer"
-                          value={row.name}
-                          disabled={uploadBusy}
-                          className="!h-9 !px-2 !shadow-none"
-                          inputClassName="font-mono !text-[13px] !text-muted"
-                          onChange={(event) => updateSourceHeaderRow(row.id, { name: event.target.value })}
-                        />
-                        <Input
-                          aria-label={`请求头 ${index + 1} 值`}
-                          placeholder="https://example.com/"
-                          value={row.value}
-                          disabled={uploadBusy}
-                          className="!h-9 !px-2 !shadow-none"
-                          inputClassName="font-mono !text-[13px] !text-muted"
-                          onChange={(event) => updateSourceHeaderRow(row.id, { value: event.target.value })}
-                        />
-                        <button
-                          type="button"
-                          aria-label={`删除请求头 ${row.name || index + 1}`}
-                          title="删除请求头"
-                          disabled={uploadBusy}
-                          className="grid size-9 place-items-center rounded-lg text-muted transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:focus-ring"
-                          onClick={() => removeSourceHeaderRow(row.id)}
-                        >
-                          <Trash2 size={14} />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="flex min-h-10 items-center justify-between gap-3 rounded-lg bg-background/70 px-3 py-2 text-xs text-subtle">
-                    <span>暂无自定义请求头，可从 cURL 解析或手动新增。</span>
-                    <button
-                      type="button"
-                      disabled={uploadBusy}
-                      className="shrink-0 font-medium text-primary-strong transition-colors hover:text-primary disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:focus-ring"
-                      onClick={addSourceHeaderRow}
-                    >
-                      新增
-                    </button>
-                  </div>
-                )}
-              </div>
-              <p className="text-xs leading-5 text-muted">
-                key 会自动保存为小写。服务端会自动设置 Range；不要填写 Range、Host、Content-Length 等连接控制头。
-              </p>
-            </div>
-            ) : null}
+            <SourceHeadersEditor
+              rows={sourceHeaderRows}
+              hidden={isMagnetSource}
+              uploadBusy={uploadBusy}
+              onAdd={addSourceHeaderRow}
+              onUpdate={updateSourceHeaderRow}
+              onRemove={removeSourceHeaderRow}
+            />
 
             {normalizedSourceUrl ? (
               <UrlUploadRow
@@ -4413,6 +4577,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
                 message={urlUpload.message}
                 progress={urlUpload.progress}
                 chunks={urlUpload.chunks}
+                runtimeStore={urlRuntimeStore}
                 fileNameOverride={urlUpload.fileNameOverride}
                 editingFileName={urlUpload.editingFileName}
                 conflict={urlUpload.conflict}
@@ -4596,7 +4761,9 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
 function createUploadTaskSnapshot(params: {
   mode: UploadMode;
   items: QueueItem[];
+  localRuntime: Map<string, UploadRuntimeState>;
   urlUpload: UrlUploadState;
+  urlRuntime: UploadRuntimeState;
   queuedUrlTasks: QueuedUrlUploadTask[];
   sourceUrl: string;
   uploadDirectoryPath: string;
@@ -4609,7 +4776,9 @@ function createUploadTaskSnapshot(params: {
 }): UploadTaskSnapshot | null {
   const activeItemId = params.activeUploadKind === "url" ? "url" : params.activeUploadItemId;
   const localItems: UploadTaskSnapshotItem[] = params.items.map((item) => {
-    const progressPercent = uploadTaskProgressPercent(item.status, item.progress);
+    const runtime = params.localRuntime.get(item.id);
+    const progress = runtime?.progress ?? item.progress;
+    const progressPercent = uploadTaskProgressPercent(item.status, progress);
     return {
       id: item.id,
       kind: "local",
@@ -4619,7 +4788,7 @@ function createUploadTaskSnapshot(params: {
         : `${params.uploadDirectoryPath} · ${formatCompactBytes(item.file.size)}`,
       status: item.status,
       progressPercent,
-      progressLabel: item.progress?.label ?? item.message,
+      progressLabel: progress?.label ?? item.message,
       canStop: params.activeUploadKind === "local" && params.activeUploadItemId === item.id && !params.stopRequested,
       canDelete: !(params.activeUploadKind === "local" && params.activeUploadItemId === item.id)
     };
@@ -4628,6 +4797,7 @@ function createUploadTaskSnapshot(params: {
   const hasUrlTask = Boolean(
     params.sourceUrl ||
     params.urlUpload.status !== "pending" ||
+    params.urlRuntime.progress ||
     params.urlUpload.progress ||
     params.urlUpload.retry ||
     params.urlUpload.hls?.retry ||
@@ -4640,8 +4810,8 @@ function createUploadTaskSnapshot(params: {
         title: params.sourceUrl ? remoteFileLabel(params.sourceUrl) : "远程上传任务",
         description: params.sourceUrl || undefined,
         status: params.urlUpload.status,
-        progressPercent: uploadTaskProgressPercent(params.urlUpload.status, params.urlUpload.progress),
-        progressLabel: params.urlUpload.progress?.label ?? params.urlUpload.message,
+        progressPercent: uploadTaskProgressPercent(params.urlUpload.status, params.urlRuntime.progress ?? params.urlUpload.progress),
+        progressLabel: params.urlRuntime.progress?.label ?? params.urlUpload.progress?.label ?? params.urlUpload.message,
         canStop: params.activeUploadKind === "url" && !params.stopRequested,
         canDelete: params.activeUploadKind !== "url"
       }]
@@ -4695,6 +4865,26 @@ function uploadTaskSnapshotKey(snapshot: UploadTaskSnapshot | null): string {
       status: item.status,
       progressPercent: item.progressPercent,
       progressLabel: item.progressLabel,
+      canStop: item.canStop,
+      canDelete: item.canDelete
+    }))
+  });
+}
+
+function uploadTaskSnapshotStructureKey(snapshot: UploadTaskSnapshot | null): string {
+  if (!snapshot) {
+    return "empty";
+  }
+
+  return JSON.stringify({
+    running: snapshot.running,
+    stopRequested: snapshot.stopRequested,
+    activeItemId: snapshot.activeItemId,
+    summary: snapshot.summary,
+    items: snapshot.items.map((item) => ({
+      id: item.id,
+      kind: item.kind,
+      status: item.status,
       canStop: item.canStop,
       canDelete: item.canDelete
     }))
@@ -5479,22 +5669,83 @@ function magnetDownloadProgressLabel(magnet: MagnetImport): string | null {
   return `${formatBytes(completed)}/${formatBytes(total)} · ${progress >= 10 ? progress.toFixed(0) : progress.toFixed(1)}%${speed}`;
 }
 
-function magnetImportRuntimeKey(magnet: MagnetImport): string {
+function magnetImportStructureKey(magnet: MagnetImport): string {
   return JSON.stringify({
     status: magnet.status,
     error: magnet.error_message ?? "",
     aria2Status: magnet.aria2_status ?? "",
-    completedBytes: magnet.download_completed_bytes ?? 0,
     totalBytes: magnet.download_total_bytes ?? 0,
-    progress: Math.round((magnet.download_progress ?? 0) * 1000),
-    speed: Math.round((magnet.download_speed_bytes_per_second ?? 0) / 1024),
+    metadataCompletedAt: magnet.metadata_completed_at ?? "",
+    downloadStartedAt: magnet.download_started_at ?? "",
+    downloadCompletedAt: magnet.download_completed_at ?? "",
+    completedAt: magnet.completed_at ?? "",
+    fileCount: magnet.file_count,
+    totalSize: magnet.total_size ?? 0,
     files: magnet.files.map((file) => [
       file.file_index,
+      file.path,
+      file.file_name,
+      file.relative_directory_path ?? "",
+      file.size,
+      file.mime_type,
+      file.chunk_size,
+      file.chunk_count,
       file.selected,
       file.status,
       file.upload_id ?? "",
       file.error_message ?? ""
     ])
+  });
+}
+
+function magnetStateEqual(left: MagnetUrlState | undefined, right: MagnetUrlState | undefined): boolean {
+  if (left === right) {
+    return true;
+  }
+  if (!left || !right) {
+    return false;
+  }
+
+  const leftImportKey = left.import ? magnetImportStructureKey(left.import) : "";
+  const rightImportKey = right.import ? magnetImportStructureKey(right.import) : "";
+  return leftImportKey === rightImportKey &&
+    numberArrayEqual(left.selectedIndexes, right.selectedIndexes) &&
+    magnetUploadsEqual(left.uploads, right.uploads) &&
+    left.fileDecisions === right.fileDecisions;
+}
+
+function mergeMagnetState(current: MagnetUrlState | undefined, next: MagnetUrlState): MagnetUrlState {
+  return magnetStateEqual(current, next) ? current! : next;
+}
+
+function numberArrayEqual(left: number[] | undefined, right: number[] | undefined): boolean {
+  if (left === right) {
+    return true;
+  }
+  if (!left || !right || left.length !== right.length) {
+    return false;
+  }
+  return left.every((value, index) => value === right[index]);
+}
+
+function magnetUploadsEqual(left: MagnetUploadEntry[] | undefined, right: MagnetUploadEntry[] | undefined): boolean {
+  if (left === right) {
+    return true;
+  }
+  if (!left || !right || left.length !== right.length) {
+    return false;
+  }
+  return left.every((entry, index) => {
+    const next = right[index];
+    return entry.fileIndex === next.fileIndex &&
+      entry.targetDirectoryPath === next.targetDirectoryPath &&
+      entry.conflictAction === next.conflictAction &&
+      entry.upload.id === next.upload.id &&
+      entry.upload.file_name === next.upload.file_name &&
+      entry.upload.size === next.upload.size &&
+      entry.upload.chunk_size === next.upload.chunk_size &&
+      entry.upload.chunk_count === next.upload.chunk_count &&
+      entry.upload.direct_access === next.upload.direct_access;
   });
 }
 
@@ -5805,7 +6056,49 @@ function updateChunkStates(
     return chunks;
   }
 
-  return chunks.map((chunk) => (chunk.index === chunkIndex ? { ...chunk, ...patch } : chunk));
+  let changed = false;
+  const next = chunks.map((chunk) => {
+    if (chunk.index !== chunkIndex) {
+      return chunk;
+    }
+
+    const patched = { ...chunk, ...patch };
+    if (uploadChunkStateEqual(chunk, patched)) {
+      return chunk;
+    }
+
+    changed = true;
+    return patched;
+  });
+
+  return changed ? next : chunks;
+}
+
+function chunkProgressEqual(left: ChunkProgress | undefined, right: ChunkProgress | undefined): boolean {
+  if (left === right) {
+    return true;
+  }
+  if (!left || !right) {
+    return false;
+  }
+
+  return left.completed === right.completed &&
+    left.total === right.total &&
+    left.label === right.label &&
+    left.failed === right.failed;
+}
+
+function uploadRuntimeStateEqual(left: UploadRuntimeState, right: UploadRuntimeState): boolean {
+  return chunkProgressEqual(left.progress, right.progress) &&
+    left.chunks === right.chunks;
+}
+
+function uploadChunkStateEqual(left: UploadChunkState, right: UploadChunkState): boolean {
+  return left.index === right.index &&
+    left.size === right.size &&
+    left.status === right.status &&
+    left.attempts === right.attempts &&
+    left.errorMessage === right.errorMessage;
 }
 
 function expectedUploadChunkSize(size: number, chunkSize: number, chunkCount: number, chunkIndex: number): number {
@@ -5930,6 +6223,7 @@ function FolderTreeNodeRow({ node, depth }: { node: FolderTreeNode; depth: numbe
 
 interface QueueRowProps {
   item: QueueItem;
+  runtimeStore: UploadRuntimeStore;
   targetDirectoryPath: string;
   onRemove: () => void;
   onRetry?: () => void;
@@ -5947,8 +6241,9 @@ interface QueueRowProps {
   disabled: boolean;
 }
 
-function QueueRow({
+const QueueRow = memo(function QueueRow({
   item,
+  runtimeStore,
   targetDirectoryPath,
   onRemove,
   onRetry,
@@ -5968,7 +6263,7 @@ function QueueRow({
   const status = item.status;
   const fileName = item.fileNameOverride ?? item.file.name;
   return (
-    <div className="flex flex-col gap-2 rounded-xl border border-border bg-surface px-3 py-2.5">
+    <div className="[contain:layout_paint] flex flex-col gap-2 rounded-xl border border-border bg-surface px-3 py-2.5">
       <div className="flex items-start gap-3">
         <span className="self-center">
           <UploadThumbnailVisual
@@ -5998,10 +6293,16 @@ function QueueRow({
               本地路径：{item.relativePath}
             </p>
           ) : null}
-          {item.progress ? <ProgressBar progress={item.progress} /> : null}
+          <LocalUploadRuntimeDetails
+            runtimeStore={runtimeStore}
+            fallbackProgress={item.progress}
+            fallbackChunks={item.chunks}
+            expanded={Boolean(item.chunksExpanded)}
+            onToggleChunks={onToggleChunks}
+          />
         </div>
         <div className="flex shrink-0 flex-wrap items-center justify-end gap-0.5 self-center">
-          <QueueStateBadge item={item} multipart={Boolean(item.progress)} />
+          <QueueStateBadge item={item} multipart={Boolean(item.progress || item.chunks)} />
           <CompactConflictActions
             conflict={item.conflict}
             disabled={disabled}
@@ -6047,12 +6348,47 @@ function QueueRow({
           </button>
         </div>
       </div>
-      {item.chunks ? (
-        <UploadChunkPanel chunks={item.chunks} expanded={Boolean(item.chunksExpanded)} onToggle={onToggleChunks} />
-      ) : null}
     </div>
   );
-}
+}, queueRowPropsEqual);
+
+const LocalUploadRuntimeDetails = memo(function LocalUploadRuntimeDetails({
+  runtimeStore,
+  fallbackProgress,
+  fallbackChunks,
+  expanded,
+  onToggleChunks
+}: {
+  runtimeStore: UploadRuntimeStore;
+  fallbackProgress?: ChunkProgress;
+  fallbackChunks?: UploadChunkState[];
+  expanded: boolean;
+  onToggleChunks: () => void;
+}) {
+  const runtime = useSyncExternalStore(
+    runtimeStore.subscribe,
+    runtimeStore.getSnapshot,
+    runtimeStore.getSnapshot
+  );
+  const progress = runtime.progress ?? fallbackProgress;
+  const chunks = runtime.chunks ?? fallbackChunks;
+
+  return (
+    <>
+      {progress ? <ProgressBar progress={progress} /> : null}
+      {chunks ? (
+        <div className="mt-2">
+          <UploadChunkPanel chunks={chunks} expanded={expanded} onToggle={onToggleChunks} />
+        </div>
+      ) : null}
+    </>
+  );
+}, (previous, next) =>
+  previous.runtimeStore === next.runtimeStore &&
+  chunkProgressEqual(previous.fallbackProgress, next.fallbackProgress) &&
+  previous.fallbackChunks === next.fallbackChunks &&
+  previous.expanded === next.expanded
+);
 
 interface UrlUploadRowProps {
   url: string;
@@ -6061,6 +6397,7 @@ interface UrlUploadRowProps {
   progress?: ChunkProgress;
   onClear: () => void;
   chunks?: UploadChunkState[];
+  runtimeStore: UploadRuntimeStore;
   fileNameOverride?: string;
   editingFileName?: boolean;
   conflict?: FileNameConflictState;
@@ -6091,12 +6428,179 @@ interface UrlUploadRowProps {
   disabled: boolean;
 }
 
-function UrlUploadRow({
+interface UrlSourceEditorProps {
+  sourceUrl: string;
+  uploadBusy: boolean;
+  invalid: boolean;
+  isMagnetSource: boolean;
+  onSourceUrlChange: (value: string) => void;
+  onOpenCurlImport: () => void;
+}
+
+const UrlSourceEditor = memo(function UrlSourceEditor({
+  sourceUrl,
+  uploadBusy,
+  invalid,
+  isMagnetSource,
+  onSourceUrlChange,
+  onOpenCurlImport
+}: UrlSourceEditorProps) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <label htmlFor="upload-source-url" className="text-xs font-medium text-muted">
+          粘贴文件 URL 或磁力链接
+        </label>
+        {!isMagnetSource ? (
+          <button
+            type="button"
+            disabled={uploadBusy}
+            className="rounded-md px-1.5 py-1 text-xs font-medium text-primary-strong transition-colors hover:bg-primary-soft hover:text-primary disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:focus-ring"
+            onClick={onOpenCurlImport}
+          >
+            从 cURL 解析
+          </button>
+        ) : null}
+      </div>
+      <Input
+        id="upload-source-url"
+        type="text"
+        placeholder="https://example.com/report.pdf 或 magnet:?xt=urn:btih:..."
+        value={sourceUrl}
+        disabled={uploadBusy}
+        invalid={invalid}
+        leadingIcon={<ClipboardPaste size={15} />}
+        inputClassName="!text-sm !text-muted"
+        onChange={(event) => onSourceUrlChange(event.target.value)}
+        onPaste={(event) => {
+          const pasted = event.clipboardData.getData("text");
+          const pastedUrl = extractFirstUrl(pasted);
+          if (pastedUrl) {
+            event.preventDefault();
+            onSourceUrlChange(pastedUrl);
+          }
+        }}
+      />
+      <p className="text-xs leading-5 text-muted">
+        URL 导入要求远端支持 Range；磁力导入会先由 aria2 下载选中文件，再分片转存到 Telegram。
+      </p>
+    </div>
+  );
+}, (previous, next) =>
+  previous.sourceUrl === next.sourceUrl &&
+  previous.uploadBusy === next.uploadBusy &&
+  previous.invalid === next.invalid &&
+  previous.isMagnetSource === next.isMagnetSource
+);
+
+interface SourceHeadersEditorProps {
+  rows: SourceHeaderRow[];
+  hidden: boolean;
+  uploadBusy: boolean;
+  onAdd: () => void;
+  onUpdate: (id: string, patch: Partial<Pick<SourceHeaderRow, "name" | "value">>) => void;
+  onRemove: (id: string) => void;
+}
+
+const SourceHeadersEditor = memo(function SourceHeadersEditor({
+  rows,
+  hidden,
+  uploadBusy,
+  onAdd,
+  onUpdate,
+  onRemove
+}: SourceHeadersEditorProps) {
+  if (hidden) {
+    return null;
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <label className="text-xs font-medium text-muted">
+          请求头（可选）
+        </label>
+        <button
+          type="button"
+          disabled={uploadBusy}
+          className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs font-medium text-primary-strong transition-colors hover:bg-primary-soft hover:text-primary disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:focus-ring"
+          onClick={onAdd}
+        >
+          <Plus size={13} />
+          新增请求头
+        </button>
+      </div>
+      <div className="rounded-xl border border-border bg-surface/70 p-2 shadow-card">
+        {rows.length > 0 ? (
+          <div className="flex flex-col gap-2">
+            {rows.map((row, index) => (
+              <div
+                key={row.id}
+                className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(8rem,0.38fr)_minmax(12rem,1fr)_2rem]"
+              >
+                <Input
+                  aria-label={`请求头 ${index + 1} 名称`}
+                  placeholder="referer"
+                  value={row.name}
+                  disabled={uploadBusy}
+                  className="!h-9 !px-2 !shadow-none"
+                  inputClassName="font-mono !text-[13px] !text-muted"
+                  onChange={(event) => onUpdate(row.id, { name: event.target.value })}
+                />
+                <Input
+                  aria-label={`请求头 ${index + 1} 值`}
+                  placeholder="https://example.com/"
+                  value={row.value}
+                  disabled={uploadBusy}
+                  className="!h-9 !px-2 !shadow-none"
+                  inputClassName="font-mono !text-[13px] !text-muted"
+                  onChange={(event) => onUpdate(row.id, { value: event.target.value })}
+                />
+                <button
+                  type="button"
+                  aria-label={`删除请求头 ${row.name || index + 1}`}
+                  title="删除请求头"
+                  disabled={uploadBusy}
+                  className="grid size-9 place-items-center rounded-lg text-muted transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:focus-ring"
+                  onClick={() => onRemove(row.id)}
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="flex min-h-10 items-center justify-between gap-3 rounded-lg bg-background/70 px-3 py-2 text-xs text-subtle">
+            <span>暂无自定义请求头，可从 cURL 解析或手动新增。</span>
+            <button
+              type="button"
+              disabled={uploadBusy}
+              className="shrink-0 font-medium text-primary-strong transition-colors hover:text-primary disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:focus-ring"
+              onClick={onAdd}
+            >
+              新增
+            </button>
+          </div>
+        )}
+      </div>
+      <p className="text-xs leading-5 text-muted">
+        key 会自动保存为小写。服务端会自动设置 Range；不要填写 Range、Host、Content-Length 等连接控制头。
+      </p>
+    </div>
+  );
+}, (previous, next) =>
+  previous.rows === next.rows &&
+  previous.hidden === next.hidden &&
+  previous.uploadBusy === next.uploadBusy
+);
+
+const UrlUploadRow = memo(function UrlUploadRow({
   url,
   status,
   message,
   progress,
   chunks,
+  runtimeStore,
   fileNameOverride,
   editingFileName,
   conflict,
@@ -6130,118 +6634,272 @@ function UrlUploadRow({
   const isMagnet = isLikelyMagnetUrl(url);
   const fileName = isMagnet ? (magnet?.import?.name ?? "磁力链接") : fileNameOverride ?? remoteFileLabel(url);
   return (
-    <div className="flex flex-col gap-2 rounded-xl border border-border bg-surface px-3 py-2.5">
-      <div className="flex items-start gap-3">
-        <span className="self-center">
-          <UploadThumbnailVisual
-            thumbnail={thumbnail}
-            fallback={
-              <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-primary-soft text-primary-strong">
-                <Link2 size={16} />
-              </span>
-            }
-          />
-        </span>
-        <div className="min-w-0 flex-1">
-          {isMagnet ? (
-            <p className="truncate text-sm font-semibold text-foreground" title={fileName}>{fileName}</p>
-          ) : (
-            <EditableFileName
-              value={fileName}
-              originalValue={remoteFileLabel(url)}
-              editing={Boolean(editingFileName)}
-              conflict={conflict}
-              disabled={disabled || status === "uploading" || status === "done"}
-              onChange={onFileNameChange}
-              onEditingChange={onFileNameEditingChange}
-            />
-          )}
-          <p className="truncate text-xs text-muted">
-            {url}
-            {thumbnailHint(thumbnail) ? <span> · {thumbnailHint(thumbnail)}</span> : null}
-            {message ? <span className={status === "error" ? "text-danger" : "text-success"}> · {message}</span> : null}
-          </p>
-          {hls?.probe ? (
-            <HlsUploadDetails
-              hls={hls}
-              disabled={disabled || status === "uploading" || status === "done"}
-              onVariantChange={onHlsVariantChange}
-            />
-          ) : null}
-          {magnet?.import ? (
-            <MagnetUploadDetails
-              magnet={magnet}
-              maxMultipartBytes={maxMultipartBytes}
-              directoryPath={directoryPath}
-              disabled={disabled || status === "uploading" || status === "done"}
-              onToggle={onMagnetFileToggle}
-              onSelectAll={onMagnetSelectAll}
-              onClearSelection={onMagnetClearSelection}
-              onFileNameChange={onMagnetFileNameChange}
-              onFileNameEditingChange={onMagnetFileNameEditingChange}
-              onRenameConflict={onMagnetRenameConflict}
-              onOverwriteConflict={onMagnetOverwriteConflict}
-              onOverwriteAllConflicts={onMagnetOverwriteAllConflicts}
-            />
-          ) : null}
-          {progress ? <ProgressBar progress={progress} /> : null}
-          <ConflictResolutionActions
-            conflict={conflict}
-            disabled={disabled}
-            onRename={onRenameConflict}
-            onOverwrite={onOverwriteConflict}
-          />
-        </div>
-        <div className="flex shrink-0 flex-wrap items-center justify-end gap-0.5 self-center">
-          {!isMagnet ? (
-            <ThumbnailPicker
-              disabled={disabled || status === "uploading"}
-              onChange={onThumbnailChange}
-              onUrl={onThumbnailUrl}
-              onRemove={onThumbnailRemove}
-              hasThumbnail={thumbnail?.status === "ready"}
-            />
-          ) : null}
-          {onRetry ? (
-            <button
-              type="button"
-              onClick={onRetry}
-              disabled={disabled}
-              className="h-6 shrink-0 rounded-md border border-primary/30 px-2 text-[11px] font-medium text-primary-strong transition-colors hover:bg-primary-soft disabled:pointer-events-none disabled:opacity-40"
-            >
-              {hls?.retry
-                ? hls.retry.failedSegments.length === 0 ? "继续完成上传" : "重试 HLS 片段"
-                : progress && progress.failed === 0 ? "继续完成上传" : "重试失败分片"}
-            </button>
-          ) : null}
-          {onStop && status === "uploading" ? (
-            <button
-              type="button"
-              onClick={onStop}
-              disabled={stopping}
-              className="h-6 shrink-0 rounded-md border border-danger/30 px-2 text-[11px] font-medium text-danger transition-colors hover:bg-danger-soft disabled:pointer-events-none disabled:opacity-40"
-            >
-              {stopping ? "正在停止" : "停止导入"}
-            </button>
-          ) : null}
-          <StatusBadge status={status} multipart={Boolean(progress)} />
-          <button
-            type="button"
-            aria-label="清空 URL"
-            onClick={onClear}
-            disabled={disabled || status === "uploading"}
-            className="grid size-6 place-items-center rounded-md text-subtle transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-40"
-          >
-            {status === "done" ? <CheckCircle2 size={13} className="text-success" /> : <X size={13} />}
-          </button>
-        </div>
-      </div>
-      {chunks ? <UploadChunkList chunks={chunks} title={hls ? "HLS 片段明细" : "分片明细"} /> : null}
+    <div className="[contain:layout_paint] flex flex-col gap-2 rounded-xl border border-border bg-surface px-3 py-2.5">
+      <UrlUploadHeader
+        url={url}
+        status={status}
+        message={message}
+        fileName={fileName}
+        fileNameOverride={fileNameOverride}
+        editingFileName={editingFileName}
+        conflict={conflict}
+        hls={hls}
+        magnet={magnet}
+        maxMultipartBytes={maxMultipartBytes}
+        directoryPath={directoryPath}
+        thumbnail={thumbnail}
+        hasProgress={Boolean(progress)}
+        retryComplete={progress ? progress.failed === 0 : false}
+        isMagnet={isMagnet}
+        disabled={disabled}
+        stopping={stopping}
+        onClear={onClear}
+        onRetry={onRetry}
+        onStop={onStop}
+        onFileNameChange={onFileNameChange}
+        onFileNameEditingChange={onFileNameEditingChange}
+        onHlsVariantChange={onHlsVariantChange}
+        onMagnetFileToggle={onMagnetFileToggle}
+        onMagnetSelectAll={onMagnetSelectAll}
+        onMagnetClearSelection={onMagnetClearSelection}
+        onMagnetFileNameChange={onMagnetFileNameChange}
+        onMagnetFileNameEditingChange={onMagnetFileNameEditingChange}
+        onMagnetRenameConflict={onMagnetRenameConflict}
+        onMagnetOverwriteConflict={onMagnetOverwriteConflict}
+        onMagnetOverwriteAllConflicts={onMagnetOverwriteAllConflicts}
+        onRenameConflict={onRenameConflict}
+        onOverwriteConflict={onOverwriteConflict}
+        onThumbnailChange={onThumbnailChange}
+        onThumbnailUrl={onThumbnailUrl}
+        onThumbnailRemove={onThumbnailRemove}
+      />
+      <UrlUploadRuntimeDetails
+        runtimeStore={runtimeStore}
+        fallbackProgress={progress}
+        fallbackChunks={chunks}
+        chunkTitle={hls ? "HLS 片段明细" : "分片明细"}
+      />
     </div>
   );
+}, urlUploadRowPropsEqual);
+
+interface UrlUploadHeaderProps {
+  url: string;
+  status: ItemStatus;
+  message?: string;
+  fileName: string;
+  fileNameOverride?: string;
+  editingFileName?: boolean;
+  conflict?: FileNameConflictState;
+  hls?: HlsUrlState;
+  magnet?: MagnetUrlState;
+  maxMultipartBytes: number;
+  directoryPath: string;
+  thumbnail?: UploadThumbnailState;
+  hasProgress: boolean;
+  retryComplete: boolean;
+  isMagnet: boolean;
+  disabled: boolean;
+  stopping?: boolean;
+  onClear: () => void;
+  onRetry?: () => void;
+  onStop?: () => void;
+  onFileNameChange: (value: string) => void;
+  onFileNameEditingChange: (editing: boolean) => void;
+  onHlsVariantChange: (variantId: string) => void;
+  onMagnetFileToggle: (fileIndex: number, selected: boolean) => void;
+  onMagnetSelectAll: () => void;
+  onMagnetClearSelection: () => void;
+  onMagnetFileNameChange: (fileIndex: number, value: string) => void;
+  onMagnetFileNameEditingChange: (fileIndex: number, editing: boolean) => void;
+  onMagnetRenameConflict: (fileIndex: number) => void;
+  onMagnetOverwriteConflict: (fileIndex: number) => void;
+  onMagnetOverwriteAllConflicts: () => void;
+  onRenameConflict?: () => void;
+  onOverwriteConflict?: () => void;
+  onThumbnailChange: (file: File) => void;
+  onThumbnailUrl: () => void;
+  onThumbnailRemove: () => void;
 }
 
-function HlsUploadDetails({
+const UrlUploadHeader = memo(function UrlUploadHeader({
+  url,
+  status,
+  message,
+  fileName,
+  editingFileName,
+  conflict,
+  hls,
+  magnet,
+  maxMultipartBytes,
+  directoryPath,
+  thumbnail,
+  hasProgress,
+  retryComplete,
+  isMagnet,
+  disabled,
+  stopping,
+  onClear,
+  onRetry,
+  onStop,
+  onFileNameChange,
+  onFileNameEditingChange,
+  onHlsVariantChange,
+  onMagnetFileToggle,
+  onMagnetSelectAll,
+  onMagnetClearSelection,
+  onMagnetFileNameChange,
+  onMagnetFileNameEditingChange,
+  onMagnetRenameConflict,
+  onMagnetOverwriteConflict,
+  onMagnetOverwriteAllConflicts,
+  onRenameConflict,
+  onOverwriteConflict,
+  onThumbnailChange,
+  onThumbnailUrl,
+  onThumbnailRemove
+}: UrlUploadHeaderProps) {
+  return (
+    <div className="flex items-start gap-3">
+      <span className="self-center">
+        <UploadThumbnailVisual
+          thumbnail={thumbnail}
+          fallback={
+            <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-primary-soft text-primary-strong">
+              <Link2 size={16} />
+            </span>
+          }
+        />
+      </span>
+      <div className="min-w-0 flex-1">
+        {isMagnet ? (
+          <p className="truncate text-sm font-semibold text-foreground" title={fileName}>{fileName}</p>
+        ) : (
+          <EditableFileName
+            value={fileName}
+            originalValue={remoteFileLabel(url)}
+            editing={Boolean(editingFileName)}
+            conflict={conflict}
+            disabled={disabled || status === "uploading" || status === "done"}
+            onChange={onFileNameChange}
+            onEditingChange={onFileNameEditingChange}
+          />
+        )}
+        <p className="truncate text-xs text-muted">
+          {url}
+          {thumbnailHint(thumbnail) ? <span> · {thumbnailHint(thumbnail)}</span> : null}
+          {message ? <span className={status === "error" ? "text-danger" : "text-success"}> · {message}</span> : null}
+        </p>
+        {hls?.probe ? (
+          <HlsUploadDetails
+            hls={hls}
+            disabled={disabled || status === "uploading" || status === "done"}
+            onVariantChange={onHlsVariantChange}
+          />
+        ) : null}
+        {magnet?.import ? (
+          <MagnetUploadDetails
+            magnet={magnet}
+            maxMultipartBytes={maxMultipartBytes}
+            directoryPath={directoryPath}
+            disabled={disabled || status === "uploading" || status === "done"}
+            onToggle={onMagnetFileToggle}
+            onSelectAll={onMagnetSelectAll}
+            onClearSelection={onMagnetClearSelection}
+            onFileNameChange={onMagnetFileNameChange}
+            onFileNameEditingChange={onMagnetFileNameEditingChange}
+            onRenameConflict={onMagnetRenameConflict}
+            onOverwriteConflict={onMagnetOverwriteConflict}
+            onOverwriteAllConflicts={onMagnetOverwriteAllConflicts}
+          />
+        ) : null}
+        <ConflictResolutionActions
+          conflict={conflict}
+          disabled={disabled}
+          onRename={onRenameConflict}
+          onOverwrite={onOverwriteConflict}
+        />
+      </div>
+      <div className="flex shrink-0 flex-wrap items-center justify-end gap-0.5 self-center">
+        {!isMagnet ? (
+          <ThumbnailPicker
+            disabled={disabled || status === "uploading"}
+            onChange={onThumbnailChange}
+            onUrl={onThumbnailUrl}
+            onRemove={onThumbnailRemove}
+            hasThumbnail={thumbnail?.status === "ready"}
+          />
+        ) : null}
+        {onRetry ? (
+          <button
+            type="button"
+            onClick={onRetry}
+            disabled={disabled}
+            className="h-6 shrink-0 rounded-md border border-primary/30 px-2 text-[11px] font-medium text-primary-strong transition-colors hover:bg-primary-soft disabled:pointer-events-none disabled:opacity-40"
+          >
+            {hls?.retry
+              ? hls.retry.failedSegments.length === 0 ? "继续完成上传" : "重试 HLS 片段"
+              : retryComplete ? "继续完成上传" : "重试失败分片"}
+          </button>
+        ) : null}
+        {onStop && status === "uploading" ? (
+          <button
+            type="button"
+            onClick={onStop}
+            disabled={stopping}
+            className="h-6 shrink-0 rounded-md border border-danger/30 px-2 text-[11px] font-medium text-danger transition-colors hover:bg-danger-soft disabled:pointer-events-none disabled:opacity-40"
+          >
+            {stopping ? "正在停止" : "停止导入"}
+          </button>
+        ) : null}
+        <StatusBadge status={status} multipart={hasProgress} />
+        <button
+          type="button"
+          aria-label="清空 URL"
+          onClick={onClear}
+          disabled={disabled || status === "uploading"}
+          className="grid size-6 place-items-center rounded-md text-subtle transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-40"
+        >
+          {status === "done" ? <CheckCircle2 size={13} className="text-success" /> : <X size={13} />}
+        </button>
+      </div>
+    </div>
+  );
+}, urlUploadHeaderPropsEqual);
+
+const UrlUploadRuntimeDetails = memo(function UrlUploadRuntimeDetails({
+  runtimeStore,
+  fallbackProgress,
+  fallbackChunks,
+  chunkTitle
+}: {
+  runtimeStore: UploadRuntimeStore;
+  fallbackProgress?: ChunkProgress;
+  fallbackChunks?: UploadChunkState[];
+  chunkTitle: string;
+}) {
+  const runtime = useSyncExternalStore(
+    runtimeStore.subscribe,
+    runtimeStore.getSnapshot,
+    runtimeStore.getSnapshot
+  );
+  const progress = runtime.progress ?? fallbackProgress;
+  const chunks = runtime.chunks ?? fallbackChunks;
+
+  return (
+    <>
+      {progress ? <ProgressBar progress={progress} /> : null}
+      {chunks ? <UploadChunkList chunks={chunks} title={chunkTitle} /> : null}
+    </>
+  );
+}, (previous, next) =>
+  previous.runtimeStore === next.runtimeStore &&
+  chunkProgressEqual(previous.fallbackProgress, next.fallbackProgress) &&
+  previous.fallbackChunks === next.fallbackChunks &&
+  previous.chunkTitle === next.chunkTitle
+);
+
+const HlsUploadDetails = memo(function HlsUploadDetails({
   hls,
   disabled,
   onVariantChange
@@ -6294,9 +6952,9 @@ function HlsUploadDetails({
       ) : null}
     </div>
   );
-}
+}, hlsUploadDetailsPropsEqual);
 
-function MagnetUploadDetails({
+const MagnetUploadDetails = memo(function MagnetUploadDetails({
   magnet,
   maxMultipartBytes,
   directoryPath,
@@ -6328,13 +6986,37 @@ function MagnetUploadDetails({
     return null;
   }
 
-  const validFiles = info.files.filter((file) => !file.file_name.startsWith("[METADATA]"));
-  const selected = new Set(magnet.selectedIndexes);
+  const validFiles = useMemo(
+    () => info.files.filter((file) => !file.file_name.startsWith("[METADATA]")),
+    [info.files]
+  );
+  const selected = useMemo(() => new Set(magnet.selectedIndexes), [magnet.selectedIndexes]);
   const decisions = magnet.fileDecisions ?? {};
-  const selectedFiles = validFiles.filter((file) => selected.has(file.file_index));
-  const selectedBytes = selectedFiles.reduce((total, file) => total + file.size, 0);
-  const uploadableCount = validFiles.filter((file) => file.size <= maxMultipartBytes).length;
-  const selectedConflictCount = selectedFiles.filter((file) => Boolean(decisions[file.file_index]?.conflict)).length;
+  const magnetStats = useMemo(
+    () => {
+      let selectedCount = 0;
+      let selectedBytes = 0;
+      let uploadableCount = 0;
+      let selectedConflictCount = 0;
+
+      for (const file of validFiles) {
+        if (file.size <= maxMultipartBytes) {
+          uploadableCount += 1;
+        }
+        if (!selected.has(file.file_index)) {
+          continue;
+        }
+        selectedCount += 1;
+        selectedBytes += file.size;
+        if (decisions[file.file_index]?.conflict) {
+          selectedConflictCount += 1;
+        }
+      }
+
+      return { selectedCount, selectedBytes, uploadableCount, selectedConflictCount };
+    },
+    [decisions, maxMultipartBytes, selected, validFiles]
+  );
 
   if (info.status === "probing" && validFiles.length === 0) {
     return (
@@ -6348,16 +7030,16 @@ function MagnetUploadDetails({
   }
 
   return (
-    <div className="mt-2 flex flex-col gap-2 rounded-lg border border-border bg-background/70 p-2">
+    <div className="[contain:layout_paint] mt-2 flex flex-col gap-2 rounded-lg border border-border bg-background/70 p-2">
       <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted">
         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
           <HlsMetaPill tone="strong">Magnet</HlsMetaPill>
           <HlsMetaPill>{magnetStatusLabel(info.status)}</HlsMetaPill>
           <HlsMetaPill>{validFiles.length} 个文件</HlsMetaPill>
-          <HlsMetaPill>已选 {selectedFiles.length} 个 · {formatBytes(selectedBytes)}</HlsMetaPill>
+          <HlsMetaPill>已选 {magnetStats.selectedCount} 个 · {formatBytes(magnetStats.selectedBytes)}</HlsMetaPill>
         </div>
         <div className="flex shrink-0 items-center gap-1">
-          {selectedConflictCount > 0 ? (
+          {magnetStats.selectedConflictCount > 0 ? (
             <button
               type="button"
               disabled={disabled}
@@ -6365,11 +7047,11 @@ function MagnetUploadDetails({
               onClick={onOverwriteAllConflicts}
             >
               全部覆盖冲突
-            </button>
+          </button>
           ) : null}
           <button
             type="button"
-            disabled={disabled || uploadableCount === 0}
+            disabled={disabled || magnetStats.uploadableCount === 0}
             className="rounded-md px-1.5 py-1 font-medium text-primary-strong transition-colors hover:bg-primary-soft disabled:pointer-events-none disabled:opacity-50"
             onClick={onSelectAll}
           >
@@ -6377,7 +7059,7 @@ function MagnetUploadDetails({
           </button>
           <button
             type="button"
-            disabled={disabled || selectedFiles.length === 0}
+            disabled={disabled || magnetStats.selectedCount === 0}
             className="rounded-md px-1.5 py-1 font-medium text-muted transition-colors hover:bg-surface disabled:pointer-events-none disabled:opacity-50"
             onClick={onClearSelection}
           >
@@ -6388,75 +7070,28 @@ function MagnetUploadDetails({
       {info.error_message ? (
         <p className="rounded-md bg-danger-soft px-2 py-1.5 text-xs text-danger">{info.error_message}</p>
       ) : null}
-      <div className="max-h-60 overflow-auto rounded-lg border border-border bg-surface">
+      <div className="[contain:layout_paint] max-h-60 overflow-auto rounded-lg border border-border bg-surface">
         {validFiles.length > 0 ? (
           <div className="divide-y divide-border">
             {validFiles.map((file) => {
               const tooLarge = file.size > maxMultipartBytes;
               const isSelected = selected.has(file.file_index);
               const decision = decisions[file.file_index];
-              const targetDirectoryPath = magnetTargetDirectoryPath(directoryPath, file);
-              const targetFileName = effectiveMagnetFileName(file, decision);
-              const editorFileName = decision?.editingFileName
-                ? decision.fileNameOverride ?? file.file_name
-                : targetFileName;
-              const disabledRow = disabled || tooLarge;
               return (
-                <div
+                <MagnetFileRow
                   key={file.file_index}
-                  className={cn(
-                    "grid grid-cols-[1.25rem_minmax(0,1fr)_auto] items-center gap-2 px-2.5 py-2 text-xs",
-                    disabledRow ? "opacity-60" : "hover:bg-background"
-                  )}
-                >
-                  <input
-                    type="checkbox"
-                    checked={isSelected}
-                    disabled={disabledRow}
-                    onChange={(event) => onToggle(file.file_index, event.currentTarget.checked)}
-                    className="size-4 accent-[var(--color-primary)]"
-                  />
-                  <div className="min-w-0">
-                    {isSelected && !tooLarge ? (
-                      <EditableFileName
-                        value={editorFileName}
-                        originalValue={file.file_name}
-                        editing={Boolean(decision?.editingFileName)}
-                        conflict={decision?.conflict}
-                        disabled={disabled}
-                        onChange={(value) => onFileNameChange(file.file_index, value)}
-                        onEditingChange={(editing) => onFileNameEditingChange(file.file_index, editing)}
-                      />
-                    ) : (
-                      <span className="block truncate font-medium text-foreground" title={file.path}>{file.path}</span>
-                    )}
-                    <p className="truncate text-[11px] text-muted">
-                      {tooLarge ? (
-                        <span className="text-danger">超过 {formatBytes(maxMultipartBytes)} 上限</span>
-                      ) : (
-                        <>
-                          <span>{file.mime_type}</span>
-                          <span> · 目标 {targetDirectoryPath === "/" ? "/" : `${targetDirectoryPath}/`}{targetFileName}</span>
-                          {decision?.conflict ? <span className="text-warning"> · 目标已有同名文件</span> : null}
-                          {!decision?.conflict && decision?.conflictAction === "overwrite" ? <span className="text-warning"> · 将覆盖</span> : null}
-                          {!decision?.conflict && decision?.fileNameOverride ? <span className="text-primary-strong"> · 已改名</span> : null}
-                        </>
-                      )}
-                    </p>
-                    {file.relative_directory_path ? (
-                      <p className="truncate text-[11px] text-subtle" title={file.path}>磁力路径：{file.path}</p>
-                    ) : null}
-                  </div>
-                  <span className="flex shrink-0 items-center gap-1">
-                    <CompactConflictActions
-                      conflict={isSelected ? decision?.conflict : undefined}
-                      disabled={disabled}
-                      onRename={() => onRenameConflict(file.file_index)}
-                      onOverwrite={() => onOverwriteConflict(file.file_index)}
-                    />
-                    <span className="font-mono text-[11px] text-muted">{formatBytes(file.size)}</span>
-                  </span>
-                </div>
+                  file={file}
+                  decision={decision}
+                  directoryPath={directoryPath}
+                  maxMultipartBytes={maxMultipartBytes}
+                  disabled={disabled}
+                  selected={isSelected}
+                  onToggle={onToggle}
+                  onFileNameChange={onFileNameChange}
+                  onFileNameEditingChange={onFileNameEditingChange}
+                  onRenameConflict={onRenameConflict}
+                  onOverwriteConflict={onOverwriteConflict}
+                />
               );
             })}
           </div>
@@ -6466,7 +7101,107 @@ function MagnetUploadDetails({
       </div>
     </div>
   );
+}, magnetUploadDetailsPropsEqual);
+
+interface MagnetFileRowProps {
+  file: MagnetImportFile;
+  decision?: MagnetFileDecision;
+  directoryPath: string;
+  maxMultipartBytes: number;
+  disabled: boolean;
+  selected: boolean;
+  onToggle: (fileIndex: number, selected: boolean) => void;
+  onFileNameChange: (fileIndex: number, value: string) => void;
+  onFileNameEditingChange: (fileIndex: number, editing: boolean) => void;
+  onRenameConflict: (fileIndex: number) => void;
+  onOverwriteConflict: (fileIndex: number) => void;
 }
+
+const MagnetFileRow = memo(function MagnetFileRow({
+  file,
+  decision,
+  directoryPath,
+  maxMultipartBytes,
+  disabled,
+  selected,
+  onToggle,
+  onFileNameChange,
+  onFileNameEditingChange,
+  onRenameConflict,
+  onOverwriteConflict
+}: MagnetFileRowProps) {
+  const tooLarge = file.size > maxMultipartBytes;
+  const targetDirectoryPath = magnetTargetDirectoryPath(directoryPath, file);
+  const targetFileName = effectiveMagnetFileName(file, decision);
+  const editorFileName = decision?.editingFileName
+    ? decision.fileNameOverride ?? file.file_name
+    : targetFileName;
+  const disabledRow = disabled || tooLarge;
+
+  return (
+    <div
+      className={cn(
+        "[contain:layout_paint] grid grid-cols-[1.25rem_minmax(0,1fr)_auto] items-center gap-2 px-2.5 py-2 text-xs",
+        disabledRow ? "opacity-60" : "hover:bg-background"
+      )}
+    >
+      <input
+        type="checkbox"
+        checked={selected}
+        disabled={disabledRow}
+        onChange={(event) => onToggle(file.file_index, event.currentTarget.checked)}
+        className="size-4 accent-[var(--color-primary)]"
+      />
+      <div className="min-w-0">
+        {selected && !tooLarge ? (
+          <EditableFileName
+            value={editorFileName}
+            originalValue={file.file_name}
+            editing={Boolean(decision?.editingFileName)}
+            conflict={decision?.conflict}
+            disabled={disabled}
+            onChange={(value) => onFileNameChange(file.file_index, value)}
+            onEditingChange={(editing) => onFileNameEditingChange(file.file_index, editing)}
+          />
+        ) : (
+          <span className="block truncate font-medium text-foreground" title={file.path}>{file.path}</span>
+        )}
+        <p className="truncate text-[11px] text-muted">
+          {tooLarge ? (
+            <span className="text-danger">超过 {formatBytes(maxMultipartBytes)} 上限</span>
+          ) : (
+            <>
+              <span>{file.mime_type}</span>
+              <span> · 目标 {targetDirectoryPath === "/" ? "/" : `${targetDirectoryPath}/`}{targetFileName}</span>
+              {decision?.conflict ? <span className="text-warning"> · 目标已有同名文件</span> : null}
+              {!decision?.conflict && decision?.conflictAction === "overwrite" ? <span className="text-warning"> · 将覆盖</span> : null}
+              {!decision?.conflict && decision?.fileNameOverride ? <span className="text-primary-strong"> · 已改名</span> : null}
+            </>
+          )}
+        </p>
+        {file.relative_directory_path ? (
+          <p className="truncate text-[11px] text-subtle" title={file.path}>磁力路径：{file.path}</p>
+        ) : null}
+      </div>
+      <span className="flex shrink-0 items-center gap-1">
+        <CompactConflictActions
+          conflict={selected ? decision?.conflict : undefined}
+          disabled={disabled}
+          onRename={() => onRenameConflict(file.file_index)}
+          onOverwrite={() => onOverwriteConflict(file.file_index)}
+        />
+        <span className="font-mono text-[11px] text-muted">{formatBytes(file.size)}</span>
+      </span>
+    </div>
+  );
+}, (previous, next) =>
+  previous.file === next.file &&
+  previous.decision === next.decision &&
+  previous.directoryPath === next.directoryPath &&
+  previous.maxMultipartBytes === next.maxMultipartBytes &&
+  previous.disabled === next.disabled &&
+  previous.selected === next.selected
+);
 
 function HlsMetaPill({
   children,
@@ -6935,7 +7670,7 @@ function EditableFileName({
   );
 }
 
-function UploadChunkPanel({
+const UploadChunkPanel = memo(function UploadChunkPanel({
   chunks,
   expanded,
   onToggle
@@ -6944,12 +7679,10 @@ function UploadChunkPanel({
   expanded: boolean;
   onToggle: () => void;
 }) {
-  const completed = chunks.filter((chunk) => chunk.status === "completed").length;
-  const failed = chunks.filter((chunk) => chunk.status === "failed").length;
-  const uploading = chunks.filter((chunk) => chunk.status === "uploading").length;
+  const stats = useMemo(() => uploadChunkStats(chunks), [chunks]);
 
   return (
-    <div className="rounded-lg border border-border bg-background/70 p-2">
+    <div className="[contain:layout_paint] rounded-lg border border-border bg-background/70 p-2">
       <button
         type="button"
         onClick={onToggle}
@@ -6958,9 +7691,9 @@ function UploadChunkPanel({
         <span className="inline-flex min-w-0 items-center gap-1.5">
           <Layers3 size={13} className="shrink-0 text-primary-strong" />
           <span className="truncate">
-            分片：{completed}/{chunks.length} 完成
-            {uploading > 0 ? ` · ${uploading} 上传中` : ""}
-            {failed > 0 ? ` · ${failed} 失败` : ""}
+            分片：{stats.completed}/{chunks.length} 完成
+            {stats.uploading > 0 ? ` · ${stats.uploading} 上传中` : ""}
+            {stats.failed > 0 ? ` · ${stats.failed} 失败` : ""}
           </span>
         </span>
         <span className="shrink-0 font-medium text-primary-strong">
@@ -6970,23 +7703,24 @@ function UploadChunkPanel({
       {expanded ? <UploadChunkList chunks={chunks} /> : null}
     </div>
   );
-}
+});
 
-function UploadChunkList({ chunks, title = "分片明细" }: { chunks: UploadChunkState[]; title?: string }) {
-  const completed = chunks.filter((chunk) => chunk.status === "completed").length;
-  const failed = chunks.filter((chunk) => chunk.status === "failed").length;
-  const uploading = chunks.filter((chunk) => chunk.status === "uploading").length;
+const UploadChunkList = memo(function UploadChunkList({ chunks, title = "分片明细" }: { chunks: UploadChunkState[]; title?: string }) {
+  const stats = useMemo(() => uploadChunkStats(chunks), [chunks]);
   const MAX_RENDERABLE_CHUNKS = 100;
   const shouldLimitRender = chunks.length > MAX_RENDERABLE_CHUNKS;
-  const visibleChunks = shouldLimitRender ? chunks.filter((chunk) => chunk.status === "uploading" || chunk.status === "failed") : chunks;
+  const visibleChunks = useMemo(
+    () => shouldLimitRender ? chunks.filter((chunk) => chunk.status === "uploading" || chunk.status === "failed") : chunks,
+    [chunks, shouldLimitRender]
+  );
 
   return (
-    <div className="mt-2 border-t border-border pt-2">
+    <div className="[contain:layout_paint] mt-2 border-t border-border pt-2">
       <div className="mb-2 flex items-center justify-between gap-3 text-[11px] text-muted">
         <span>
-          {title}：{completed}/{chunks.length} 完成
-          {uploading > 0 ? ` · ${uploading} 上传中` : ""}
-          {failed > 0 ? ` · ${failed} 失败` : ""}
+          {title}：{stats.completed}/{chunks.length} 完成
+          {stats.uploading > 0 ? ` · ${stats.uploading} 上传中` : ""}
+          {stats.failed > 0 ? ` · ${stats.failed} 失败` : ""}
         </span>
         {shouldLimitRender ? <span>仅显示上传中和失败的分片</span> : <span>每片状态实时更新</span>}
       </div>
@@ -7022,6 +7756,22 @@ function UploadChunkList({ chunks, title = "分片明细" }: { chunks: UploadChu
       )}
     </div>
   );
+});
+
+function uploadChunkStats(chunks: UploadChunkState[]): { completed: number; failed: number; uploading: number } {
+  return chunks.reduce(
+    (stats, chunk) => {
+      if (chunk.status === "completed") {
+        stats.completed += 1;
+      } else if (chunk.status === "failed") {
+        stats.failed += 1;
+      } else if (chunk.status === "uploading") {
+        stats.uploading += 1;
+      }
+      return stats;
+    },
+    { completed: 0, failed: 0, uploading: 0 }
+  );
 }
 
 function ChunkStatusIcon({ status }: { status: UploadChunkStatus }) {
@@ -7050,22 +7800,108 @@ function chunkStatusLabel(status: UploadChunkStatus): string {
   }
 }
 
-function ProgressBar({ progress }: { progress: ChunkProgress }) {
+const ProgressBar = memo(function ProgressBar({ progress }: { progress: ChunkProgress }) {
   const percent = progress.total > 0 ? Math.round((progress.completed / progress.total) * 100) : 0;
   return (
-    <div className="mt-2 flex flex-col gap-1">
+    <div className="[contain:layout_paint] mt-2 flex flex-col gap-1">
       <div className="h-1.5 overflow-hidden rounded-full bg-border">
         <div
-          className="h-full rounded-full bg-primary transition-all duration-300 ease-out"
+          className="h-full rounded-full bg-primary transition-[width] duration-300 ease-out will-change-[width]"
           style={{ width: `${Math.min(100, Math.max(0, percent))}%` }}
         />
       </div>
-      <div className="flex items-center justify-between text-[11px] text-muted">
-        <span>{progress.label}</span>
-        <span>{percent}%{progress.failed ? ` · 失败 ${progress.failed}` : ""}</span>
+      <div className="flex min-w-0 items-center justify-between gap-3 text-[11px] text-muted">
+        <span className="min-w-0 truncate" title={progress.label}>{progress.label}</span>
+        <span className="shrink-0">{percent}%{progress.failed ? ` · 失败 ${progress.failed}` : ""}</span>
       </div>
     </div>
   );
+}, (previous, next) => chunkProgressEqual(previous.progress, next.progress));
+
+function queueRowPropsEqual(previous: QueueRowProps, next: QueueRowProps): boolean {
+  return previous.item === next.item &&
+    previous.runtimeStore === next.runtimeStore &&
+    previous.targetDirectoryPath === next.targetDirectoryPath &&
+    previous.disabled === next.disabled &&
+    previous.stopping === next.stopping &&
+    Boolean(previous.onRetry) === Boolean(next.onRetry) &&
+    Boolean(previous.onStop) === Boolean(next.onStop) &&
+    Boolean(previous.onRenameConflict) === Boolean(next.onRenameConflict) &&
+    Boolean(previous.onOverwriteConflict) === Boolean(next.onOverwriteConflict) &&
+    Boolean(previous.onSkipConflict) === Boolean(next.onSkipConflict);
+}
+
+function urlUploadRowPropsEqual(previous: UrlUploadRowProps, next: UrlUploadRowProps): boolean {
+  return previous.url === next.url &&
+    previous.status === next.status &&
+    previous.message === next.message &&
+    chunkProgressEqual(previous.progress, next.progress) &&
+    previous.chunks === next.chunks &&
+    previous.fileNameOverride === next.fileNameOverride &&
+    previous.editingFileName === next.editingFileName &&
+    previous.conflict === next.conflict &&
+    previous.hls === next.hls &&
+    previous.magnet === next.magnet &&
+    previous.maxMultipartBytes === next.maxMultipartBytes &&
+    previous.directoryPath === next.directoryPath &&
+    previous.thumbnail === next.thumbnail &&
+    previous.stopping === next.stopping &&
+    previous.disabled === next.disabled &&
+    Boolean(previous.onRetry) === Boolean(next.onRetry) &&
+    Boolean(previous.onStop) === Boolean(next.onStop) &&
+    Boolean(previous.onRenameConflict) === Boolean(next.onRenameConflict) &&
+    Boolean(previous.onOverwriteConflict) === Boolean(next.onOverwriteConflict);
+}
+
+function urlUploadHeaderPropsEqual(previous: UrlUploadHeaderProps, next: UrlUploadHeaderProps): boolean {
+  return previous.url === next.url &&
+    previous.status === next.status &&
+    previous.message === next.message &&
+    previous.fileName === next.fileName &&
+    previous.fileNameOverride === next.fileNameOverride &&
+    previous.editingFileName === next.editingFileName &&
+    previous.conflict === next.conflict &&
+    previous.hls === next.hls &&
+    previous.magnet === next.magnet &&
+    previous.maxMultipartBytes === next.maxMultipartBytes &&
+    previous.directoryPath === next.directoryPath &&
+    previous.thumbnail === next.thumbnail &&
+    previous.hasProgress === next.hasProgress &&
+    previous.retryComplete === next.retryComplete &&
+    previous.isMagnet === next.isMagnet &&
+    previous.disabled === next.disabled &&
+    previous.stopping === next.stopping &&
+    Boolean(previous.onRetry) === Boolean(next.onRetry) &&
+    Boolean(previous.onStop) === Boolean(next.onStop) &&
+    Boolean(previous.onRenameConflict) === Boolean(next.onRenameConflict) &&
+    Boolean(previous.onOverwriteConflict) === Boolean(next.onOverwriteConflict);
+}
+
+function hlsUploadDetailsPropsEqual(
+  previous: { hls: HlsUrlState; disabled: boolean },
+  next: { hls: HlsUrlState; disabled: boolean }
+): boolean {
+  return previous.hls === next.hls && previous.disabled === next.disabled;
+}
+
+function magnetUploadDetailsPropsEqual(
+  previous: {
+    magnet: MagnetUrlState;
+    maxMultipartBytes: number;
+    directoryPath: string;
+    disabled: boolean;
+  },
+  next: {
+    magnet: MagnetUrlState;
+    maxMultipartBytes: number;
+    directoryPath: string;
+    disabled: boolean;
+  }
+): boolean {
+  return previous.magnet === next.magnet &&
+    previous.maxMultipartBytes === next.maxMultipartBytes &&
+    previous.directoryPath === next.directoryPath &&
+    previous.disabled === next.disabled;
 }
 
 function remoteFileLabel(value: string): string {

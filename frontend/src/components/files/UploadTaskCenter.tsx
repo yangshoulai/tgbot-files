@@ -1,3 +1,4 @@
+import { useSyncExternalStore } from "react";
 import { AlertTriangle, CheckCircle2, ChevronDown, ChevronUp, Clock3, Layers3, Square, Trash2 } from "lucide-react";
 import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
@@ -5,7 +6,8 @@ import { cn } from "../../lib/cn";
 import type { UploadTaskSnapshot, UploadTaskSnapshotItem } from "./UploadDialog";
 
 interface UploadTaskCenterProps {
-  snapshot: UploadTaskSnapshot | null;
+  getSnapshot: () => UploadTaskSnapshot | null;
+  subscribe: (listener: () => void) => () => void;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onShowDetails: () => void;
@@ -13,7 +15,9 @@ interface UploadTaskCenterProps {
   onDelete: (id: string) => void;
 }
 
-export function UploadTaskCenter({ snapshot, open, onOpenChange, onShowDetails, onStop, onDelete }: UploadTaskCenterProps) {
+export function UploadTaskCenter({ getSnapshot, subscribe, open, onOpenChange, onShowDetails, onStop, onDelete }: UploadTaskCenterProps) {
+  const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+
   if (!snapshot) return null;
 
   const hasWork = snapshot.items.some((item) => item.status === "uploading" || item.status === "pending");
@@ -111,7 +115,7 @@ function UploadTaskRow({ item, active, onDelete }: { item: UploadTaskSnapshotIte
   const Icon = status.icon;
   return (
     <div className={cn(
-      "rounded-xl border bg-surface px-3 py-2.5 shadow-card",
+      "[contain:layout_paint] rounded-xl border bg-surface px-3 py-2.5 shadow-card",
       active ? "border-primary/35" : "border-border"
     )}>
       <div className="flex items-start gap-2.5">
@@ -138,10 +142,10 @@ function UploadTaskRow({ item, active, onDelete }: { item: UploadTaskSnapshotIte
           {item.description ? (
             <p className="mt-0.5 truncate text-xs text-muted" title={item.description}>{item.description}</p>
           ) : null}
-          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-border">
+          <div className="[contain:layout_paint] mt-2 h-1.5 overflow-hidden rounded-full bg-border">
             <div
               className={cn(
-                "h-full rounded-full transition-all duration-300 ease-out",
+                "h-full rounded-full transition-[width] duration-300 ease-out will-change-[width]",
                 item.status === "error" ? "bg-danger" : item.status === "done" ? "bg-success" : "bg-primary"
               )}
               style={{ width: `${item.progressPercent}%` }}
