@@ -287,6 +287,7 @@ const MAGNET_STATUS_RETRY_DELAY_MS = 2_000;
 const FILE_NAME_CONFLICT_TOAST_MESSAGE = "上传目录已存在同名文件，请选择覆盖或改名上传";
 const CHUNK_UI_UPDATE_INTERVAL_MS = 160;
 const TASK_SNAPSHOT_UPDATE_INTERVAL_MS = 500;
+const MAX_RENDERABLE_CHUNKS = 100;
 
 class MultipartChunkUploadError extends Error {
   constructor(
@@ -3503,10 +3504,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
           ? { ...current.magnet, import: magnet }
           : { import: magnet, selectedIndexes: selectedMagnetIndexesForResume(magnet, maxMultipartBytes) };
 
-        if (
-          current.magnet?.import &&
-          magnetImportStructureKey(current.magnet.import) === magnetImportStructureKey(magnet)
-        ) {
+        if (current.magnet?.import && magnetImportStableUiKey(current.magnet.import) === magnetImportStableUiKey(magnet)) {
           return current;
         }
 
@@ -5698,6 +5696,33 @@ function magnetImportStructureKey(magnet: MagnetImport): string {
   });
 }
 
+function magnetImportStableUiKey(magnet: MagnetImport): string {
+  return JSON.stringify({
+    status: magnet.status,
+    error: magnet.error_message ?? "",
+    metadataCompletedAt: magnet.metadata_completed_at ?? "",
+    downloadStartedAt: magnet.download_started_at ?? "",
+    downloadCompletedAt: magnet.download_completed_at ?? "",
+    completedAt: magnet.completed_at ?? "",
+    fileCount: magnet.file_count,
+    totalSize: magnet.total_size ?? 0,
+    files: magnet.files.map((file) => [
+      file.file_index,
+      file.path,
+      file.file_name,
+      file.relative_directory_path ?? "",
+      file.size,
+      file.mime_type,
+      file.chunk_size,
+      file.chunk_count,
+      file.selected,
+      file.status,
+      file.upload_id ?? "",
+      file.error_message ?? ""
+    ])
+  });
+}
+
 function magnetStateEqual(left: MagnetUrlState | undefined, right: MagnetUrlState | undefined): boolean {
   if (left === right) {
     return true;
@@ -7707,10 +7732,9 @@ const UploadChunkPanel = memo(function UploadChunkPanel({
 
 const UploadChunkList = memo(function UploadChunkList({ chunks, title = "分片明细" }: { chunks: UploadChunkState[]; title?: string }) {
   const stats = useMemo(() => uploadChunkStats(chunks), [chunks]);
-  const MAX_RENDERABLE_CHUNKS = 100;
   const shouldLimitRender = chunks.length > MAX_RENDERABLE_CHUNKS;
   const visibleChunks = useMemo(
-    () => shouldLimitRender ? chunks.filter((chunk) => chunk.status === "uploading" || chunk.status === "failed") : chunks,
+    () => shouldLimitRender ? chunks.slice(0, MAX_RENDERABLE_CHUNKS) : chunks,
     [chunks, shouldLimitRender]
   );
 
@@ -7722,38 +7746,32 @@ const UploadChunkList = memo(function UploadChunkList({ chunks, title = "分片�
           {stats.uploading > 0 ? ` · ${stats.uploading} 上传中` : ""}
           {stats.failed > 0 ? ` · ${stats.failed} 失败` : ""}
         </span>
-        {shouldLimitRender ? <span>仅显示上传中和失败的分片</span> : <span>每片状态实时更新</span>}
+        {shouldLimitRender ? <span>显示前 {MAX_RENDERABLE_CHUNKS} 个分片</span> : <span>每片状态实时更新</span>}
       </div>
-      {shouldLimitRender && visibleChunks.length === 0 ? (
-        <div className="rounded-md border border-border bg-surface px-3 py-2 text-center text-xs text-muted">
-          分片过多（{chunks.length} 个），全部正常上传中
-        </div>
-      ) : (
-        <div className="grid max-h-40 gap-1 overflow-auto pr-1 scroll-thin sm:grid-cols-2">
-          {visibleChunks.map((chunk) => (
-            <div
-              key={chunk.index}
-              className={cn(
-                "flex items-center gap-2 rounded-md border px-2 py-1.5 text-xs",
-                chunk.status === "completed" && "border-success/25 bg-success-soft text-success",
-                chunk.status === "failed" && "border-danger/25 bg-danger-soft text-danger",
-                chunk.status === "uploading" && "border-primary/25 bg-primary-soft text-primary-strong",
-                chunk.status === "queued" && "border-border bg-surface text-muted"
-              )}
-              title={chunk.errorMessage}
-            >
-              <ChunkStatusIcon status={chunk.status} />
-              <span className="shrink-0 font-medium">#{chunk.index + 1}</span>
-              <span className="min-w-0 flex-1 truncate">
-                {chunkStatusLabel(chunk.status)}
-                {chunk.attempts > 0 ? ` · 第 ${chunk.attempts} 次` : ""}
-                {chunk.errorMessage ? ` · ${chunk.errorMessage}` : ""}
-              </span>
-              {chunk.size > 0 ? <span className="shrink-0 opacity-70">{formatBytes(chunk.size)}</span> : null}
-            </div>
-          ))}
-        </div>
-      )}
+      <div className="grid max-h-40 gap-1 overflow-auto pr-1 scroll-thin sm:grid-cols-2">
+        {visibleChunks.map((chunk) => (
+          <div
+            key={chunk.index}
+            className={cn(
+              "flex items-center gap-2 rounded-md border px-2 py-1.5 text-xs",
+              chunk.status === "completed" && "border-success/25 bg-success-soft text-success",
+              chunk.status === "failed" && "border-danger/25 bg-danger-soft text-danger",
+              chunk.status === "uploading" && "border-primary/25 bg-primary-soft text-primary-strong",
+              chunk.status === "queued" && "border-border bg-surface text-muted"
+            )}
+            title={chunk.errorMessage}
+          >
+            <ChunkStatusIcon status={chunk.status} />
+            <span className="shrink-0 font-medium">#{chunk.index + 1}</span>
+            <span className="min-w-0 flex-1 truncate">
+              {chunkStatusLabel(chunk.status)}
+              {chunk.attempts > 0 ? ` · 第 ${chunk.attempts} 次` : ""}
+              {chunk.errorMessage ? ` · ${chunk.errorMessage}` : ""}
+            </span>
+            {chunk.size > 0 ? <span className="shrink-0 opacity-70">{formatBytes(chunk.size)}</span> : null}
+          </div>
+        ))}
+      </div>
     </div>
   );
 });
