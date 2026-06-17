@@ -235,17 +235,20 @@ export function MediaControls({
   const cacheRanges = useMemo(() => cachedChunkRanges(cacheState), [cacheState]);
   const canChooseSubtitle = subtitles.length > 0 && Boolean(onSubtitleChange);
   const hasCacheData = Boolean(cacheState?.chunkCount);
+  const showAuxiliarySeek = !narrow && !floating;
+  const showRateControl = !tiny && !(floating && narrow);
+  const hideNativeFullscreen = floating && tiny;
 
   return (
     <div
       className={cn(
         inline ? "text-foreground" : "text-white",
         floating
-          ? "w-full rounded-[1.25rem] border border-white/10 bg-[#07110f]/78 p-2.5 shadow-[0_18px_58px_rgba(0,0,0,0.5)] ring-1 ring-white/10 backdrop-blur-2xl"
+          ? "w-full rounded-xl border border-white/10 bg-[#07110f]/82 p-2 shadow-[0_12px_34px_rgba(0,0,0,0.45)] ring-1 ring-white/10 backdrop-blur-2xl"
           : inline
             ? "rounded-2xl border border-white/80 bg-white/[0.85] p-3 shadow-[0_18px_44px_rgba(15,23,42,0.12)] ring-1 ring-border/70 backdrop-blur-md"
             : "rounded-2xl border border-white/10 bg-black/70 p-3 shadow-dialog backdrop-blur-md",
-        floating && tiny ? "rounded-2xl p-2" : null,
+        floating && tiny ? "rounded-lg p-1.5" : null,
         !floating && !inline && dense ? "p-2.5" : null,
         !floating && !inline && tiny ? "p-2" : null,
         inline && dense ? "p-3" : null,
@@ -261,8 +264,8 @@ export function MediaControls({
         onPointerCancel={stopProgressPointerSeek}
         className={cn(
           "relative cursor-pointer touch-none rounded-full",
-          floating ? "mb-2.5 h-1.5 bg-white/18 sm:h-2" : inline ? "mb-3 h-2 bg-border" : dense ? "mb-2 h-2.5 bg-white/15" : "mb-3 h-3 bg-white/15",
-          tiny && "mb-1.5 h-1.5"
+          floating ? "mb-2 h-1.5 bg-white/18" : inline ? "mb-3 h-2 bg-border" : dense ? "mb-2 h-2.5 bg-white/15" : "mb-3 h-3 bg-white/15",
+          tiny && "mb-1.5 h-1"
         )}
       >
         <div className={cn("absolute inset-y-0 left-0 rounded-full", inline ? "bg-border-strong/30" : floating ? "bg-white/18" : "bg-white/20")} style={{ width: `${bufferedPercent}%` }} />
@@ -284,7 +287,7 @@ export function MediaControls({
             className={cn(
               "rounded-full border-2",
               inline ? "border-white bg-primary shadow-[0_0_8px_rgba(16,185,129,0.4)]" : "border-black/20 bg-white shadow-[0_0_12px_rgba(255,255,255,0.6)]",
-              floating ? "h-3 w-3" : "h-4 w-4"
+              floating ? "h-2.5 w-2.5" : "h-4 w-4"
             )}
           />
         </div>
@@ -304,8 +307,8 @@ export function MediaControls({
       <div
         className={cn(
           "flex min-w-0 items-center",
-          inline || (floating && narrow) ? "flex-wrap gap-y-2" : "flex-nowrap",
-          floating ? "gap-1.5 sm:gap-2" : "gap-2",
+          inline ? "flex-wrap gap-y-2" : "flex-nowrap",
+          floating ? "gap-1.5" : "gap-2",
           tiny && "gap-1"
         )}
       >
@@ -326,7 +329,7 @@ export function MediaControls({
               <Square size={15} />
             </MediaButton>
           ) : null}
-          {!narrow ? (
+          {showAuxiliarySeek ? (
             <>
               <MediaButton
                 label="快退 10 秒"
@@ -359,8 +362,9 @@ export function MediaControls({
             "shrink-0 text-center font-mono text-xs tabular-nums",
             inline ? "text-foreground/70" : "text-white/75",
             dense ? "min-w-[5.75rem]" : "min-w-[6.75rem]",
-            floating && "min-w-[5.1rem] rounded-full bg-white/[0.06] px-2 py-1 text-white/88 ring-1 ring-white/[0.08] sm:min-w-[6.5rem]",
-            tiny && "min-w-[3.5rem] text-[11px]"
+            floating && "min-w-[5.1rem] rounded-md bg-white/[0.05] px-1.5 py-1 text-[11px] text-white/86 ring-1 ring-white/[0.07] sm:min-w-[6.5rem]",
+            floating && narrow && "min-w-0 flex-1 truncate px-1",
+            tiny && "min-w-0 flex-1 text-[10px]"
           )}
         >
           {tiny
@@ -372,9 +376,9 @@ export function MediaControls({
 
         <div className={cn(
           "ml-auto flex min-w-0 items-center",
-          floating && narrow ? "w-full shrink basis-full justify-between" : "shrink-0",
+          floating && narrow ? "shrink-0" : "shrink-0",
           inline && "max-[560px]:ml-0 max-[560px]:w-full max-[560px]:justify-between",
-          floating ? "gap-1 sm:gap-1.5" : "gap-1.5"
+          floating ? "gap-1" : "gap-1.5"
         )}>
           <MediaButton label={state.muted ? "取消静音" : "静音"} onClick={toggleMute} dense={dense} floating={floating} inline={inline} tabIndex={controlTabIndex}>
             {state.muted || state.volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
@@ -393,7 +397,7 @@ export function MediaControls({
               narrow ? "hidden" : floating ? "hidden w-16 accent-primary min-[560px]:block" : inline ? "hidden w-16 accent-primary sm:block" : dense ? "hidden w-14 accent-primary lg:block" : "hidden w-20 accent-primary md:block"
             )}
           />
-          {!tiny ? (
+          {showRateControl ? (
             <label className={cn("inline-flex shrink-0 items-center gap-1 text-xs", inline ? "text-muted" : "text-white/70")}>
               <span className={dense ? "sr-only" : "hidden xl:inline"}>倍速</span>
               <select
@@ -402,7 +406,7 @@ export function MediaControls({
                 tabIndex={controlTabIndex}
                 className={cn(
                   "border text-xs outline-none transition-colors focus-visible:focus-ring",
-                  floating ? "h-8 w-[4.25rem] rounded-full px-2 sm:w-[4.75rem] sm:px-2.5" : "rounded-md",
+                  floating ? "h-7 w-[4rem] rounded-lg px-1.5 sm:w-[4.5rem] sm:px-2" : "rounded-md",
                   inline ? "h-8 w-[4.4rem] border-border bg-surface px-2 text-foreground hover:bg-primary-soft/50" : "border-white/10 bg-white/[0.08] text-white hover:bg-white/15",
                   dense && !floating ? "h-8 w-[4.25rem] px-2" : null,
                   !dense ? "h-9 w-[4.75rem] px-2" : null
@@ -452,7 +456,7 @@ export function MediaControls({
           <MediaButton label={maximized ? "还原" : "最大化"} onClick={onToggleMaximized} dense={dense} floating={floating} inline={inline} tabIndex={controlTabIndex}>
             {maximized ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
           </MediaButton>
-          {onToggleNativeFullscreen ? (
+          {onToggleNativeFullscreen && !hideNativeFullscreen ? (
             <MediaButton label={nativeFullscreen ? "退出全屏" : "进入全屏"} onClick={onToggleNativeFullscreen} dense={dense} floating={floating} inline={inline} tabIndex={controlTabIndex}>
               {nativeFullscreen ? <Minimize size={15} /> : <Maximize size={15} />}
             </MediaButton>
@@ -571,8 +575,8 @@ function MediaButton({ label, onClick, children, emphasis = false, dense = false
         dense ? "size-8 rounded-lg px-0" : "h-9 rounded-lg px-2.5",
         floating
           ? emphasis
-            ? "size-9 rounded-full border-primary/70 bg-primary text-white shadow-[0_10px_28px_rgba(16,185,129,0.4)] hover:bg-primary-strong hover:text-white active:bg-primary-strong sm:size-10"
-            : "size-8 rounded-full border-white/10 bg-white/[0.07] text-white/88 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] hover:bg-white/[0.14] hover:text-white active:bg-white/20 sm:size-9"
+            ? "size-8 rounded-lg border-primary/70 bg-primary text-white shadow-[0_8px_20px_rgba(16,185,129,0.34)] hover:bg-primary-strong hover:text-white active:bg-primary-strong sm:size-9"
+            : "size-7 rounded-lg border-white/10 bg-white/[0.07] text-white/88 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] hover:bg-white/[0.14] hover:text-white active:bg-white/20 sm:size-8"
           : inline
             ? emphasis
               ? "border-primary bg-primary text-white shadow-[0_10px_24px_rgba(16,185,129,0.32)] hover:bg-primary-strong hover:text-white active:bg-primary-strong"

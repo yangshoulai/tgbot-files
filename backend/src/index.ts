@@ -1025,6 +1025,22 @@ async function handleAdminFiles(request: Request, env: AppEnv, username: string)
     });
   }
 
+  if (request.method === "GET" && url.pathname === "/api/admin/files/lookup") {
+    const ids = normalizeQueryIdList(url.searchParams.get("ids"), "ids");
+    const files = await Promise.all(ids.map((id) => getFileRecord(db, id)));
+    const baseUrl = getPublicBaseUrl(request, env);
+    const serialized = await Promise.all(
+      files
+        .filter((file): file is NonNullable<typeof file> => Boolean(file))
+        .map((file) => serializeFileRecord(file, baseUrl, db))
+    );
+
+    return jsonResponse({
+      ok: true,
+      files: serialized
+    });
+  }
+
   const hlsDownloadMatch = /^\/api\/admin\/files\/([^/]+)\/hls-download$/.exec(url.pathname);
   if (request.method === "GET" && hlsDownloadMatch?.[1]) {
     const file = await requireFileRecord(db, decodeURIComponent(hlsDownloadMatch[1]));
@@ -9146,6 +9162,21 @@ function normalizeFileIdList(value: unknown): string[] {
     throw new AppError(400, "InvalidBody", "file_ids must contain at most 100 ids");
   }
 
+  return ids;
+}
+
+function normalizeQueryIdList(value: string | null, fieldName: string): string[] {
+  if (!value) {
+    return [];
+  }
+
+  const ids = Array.from(new Set(value.split(",").map((item) => item.trim()).filter(Boolean)));
+  if (ids.length === 0) {
+    throw new AppError(400, "InvalidQuery", `${fieldName} must not be empty`);
+  }
+  if (ids.length > 100) {
+    throw new AppError(400, "InvalidQuery", `${fieldName} must contain at most 100 ids`);
+  }
   return ids;
 }
 

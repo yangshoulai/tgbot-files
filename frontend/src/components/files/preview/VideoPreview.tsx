@@ -624,7 +624,7 @@ export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscr
         ) : null}
         </div>
 
-        <div className="w-full bg-[#050a09]/95 p-2 sm:p-3">
+        <div className="w-full bg-[#050a09]/95 p-1.5 sm:p-2">
           <MediaControls
             mediaRef={videoRef}
             maximized={maximized}

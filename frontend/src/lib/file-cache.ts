@@ -8,7 +8,7 @@ export type FileCacheKind = "single" | "multipart" | "hls";
 export type FileManualCacheStatus = "caching" | "paused" | "waiting";
 
 const DEFAULT_FILE_CACHE_CHUNK_BYTES = 2 * 1024 * 1024;
-const DEFAULT_CACHE_REQUEST_TIMEOUT_MS = 15_000;
+const DEFAULT_CACHE_REQUEST_TIMEOUT_MS = 60_000;
 
 export interface FileCacheMetadata {
   kind: FileCacheKind;

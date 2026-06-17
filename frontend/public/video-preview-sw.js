@@ -23,6 +23,7 @@ const fileCacheSessions = new Map();
 let cacheStorageMetadataSnapshot = null;
 let cacheStorageMetadataSnapshotAt = 0;
 let cacheStorageMetadataSnapshotPromise = null;
+let cacheStorageMetadataRebuildPromise = null;
 let hotChunkCacheBytes = 0;
 
 self.addEventListener("install", (event) => {
@@ -38,6 +39,7 @@ self.addEventListener("activate", (event) => {
     void rehydrateManualFileCacheSessions().catch((error) => {
       warnPreviewCacheError("rehydrate manual cache sessions", error);
     });
+    scheduleCacheStorageMetadataRebuild();
   })());
 });
 
@@ -1561,8 +1563,8 @@ async function readPreviewCacheState(metadata) {
     }
 
     if (cachedChunks.length < chunkCount) {
-      const fallback = await readCacheStorageMetadataForFile(metadata.fileId);
-      for (const chunkIndex of fallback.cachedChunks) {
+      const fallbackCachedChunks = await readCachedChunkIndexesForMetadata(metadata, chunkCount, seen);
+      for (const chunkIndex of fallbackCachedChunks) {
         if (chunkIndex < 0 || chunkIndex >= chunkCount || seen.has(chunkIndex)) {
           continue;
         }
@@ -1612,6 +1614,34 @@ function previewCacheStateDurations(metadata, chunkCount) {
   return durations.every((duration) => Number.isFinite(duration) && duration > 0)
     ? durations
     : null;
+}
+
+async function readCachedChunkIndexesForMetadata(metadata, chunkCount, seen = new Set()) {
+  if (!Number.isSafeInteger(chunkCount) || chunkCount <= 0) {
+    return [];
+  }
+
+  const cache = await caches.open(CACHE_NAME);
+  const cachedChunks = [];
+  const tasks = [];
+  for (let index = 0; index < chunkCount; index += 1) {
+    if (seen.has(index)) {
+      continue;
+    }
+    tasks.push((async () => {
+      const cacheKey = metadata.kind === "hls"
+        ? hlsPartCacheKey(metadata.fileId, "segment", index)
+        : chunkCacheKey(metadata.fileId, index);
+      const cached = await cache.match(cacheKey);
+      if (cached) {
+        cachedChunks.push(index);
+      }
+    })());
+  }
+
+  await Promise.allSettled(tasks);
+  cachedChunks.sort((left, right) => left - right);
+  return cachedChunks;
 }
 
 function normalizePlaybackProgress(value) {
@@ -2860,6 +2890,7 @@ async function readFileCacheSummary() {
   }
 
   normalizedEntries.sort(compareFileCacheEntries);
+  scheduleCacheStorageMetadataRebuild();
 
   return {
     entries: normalizedEntries,
@@ -2929,6 +2960,7 @@ async function readCacheStorageFileSummaries() {
       sourceUrl: entry.sourceUrl || "",
       token: entry.token || "",
       cachedChunkIndexes: new Set(),
+      maxChunkIndex: -1,
       cachedBytes: 0,
       manualBytes: 0,
       autoBytes: 0,
@@ -2960,6 +2992,7 @@ async function readCacheStorageFileSummaries() {
 
     if (Number.isSafeInteger(entry.chunkIndex) && entry.chunkIndex >= 0) {
       current.cachedChunkIndexes.add(entry.chunkIndex);
+      current.maxChunkIndex = Math.max(current.maxChunkIndex, entry.chunkIndex);
       current.cachedBytes += safeSize(entry.size);
     }
 
@@ -2981,7 +3014,7 @@ async function readCacheStorageFileSummaries() {
       .sort((left, right) => left - right);
     const inferredChunkCount = entry.hasKnownChunkCount && entry.chunkCount > 0
       ? entry.chunkCount
-      : Math.max(1, cachedChunks.length + 1);
+      : Math.max(1, entry.maxChunkIndex + 1);
     const inferredChunkSize = entry.chunkSize > 0
       ? entry.chunkSize
       : inferChunkSizeFromCachedBytes(entry.cachedBytes, cachedChunks.length);
@@ -3057,12 +3090,7 @@ async function readCacheStorageMetadataEntries() {
         continue;
       }
 
-      const response = await cache.match(request);
-      if (!response) {
-        continue;
-      }
-
-      entries.push(cacheStorageEntryFromResponse(parsed, response));
+      entries.push(cacheStorageEntryFromRequest(parsed));
     }
 
     return entries;
@@ -3121,6 +3149,31 @@ function parseCacheStorageCacheKey(cacheKey) {
   return null;
 }
 
+function cacheStorageEntryFromRequest(parsed) {
+  return {
+    cacheKey: parsed.cacheKey,
+    fileId: parsed.fileId,
+    chunkIndex: parsed.chunkIndex,
+    fileName: parsed.fileId,
+    directoryPath: "/",
+    kind: parsed.partKind === "chunk" ? "single" : "hls",
+    mimeType: "application/octet-stream",
+    totalSize: 0,
+    chunkSize: 0,
+    chunkCount: 0,
+    sourceUrl: "",
+    token: "",
+    cacheSource: "auto",
+    manualCacheStatus: undefined,
+    manualStartedAt: 0,
+    partKind: parsed.partKind,
+    partIndex: parsed.partIndex,
+    size: 0,
+    createdAt: 0,
+    lastAccessed: Date.now()
+  };
+}
+
 function cacheStorageEntryFromResponse(parsed, response) {
   const headers = response.headers;
   const responseSize = safeSize(Number(headers.get("Content-Length")));
@@ -3154,6 +3207,50 @@ function cacheStorageEntryFromResponse(parsed, response) {
     createdAt: safeTime(Number(headers.get("X-Preview-Cache-Created-At"))),
     lastAccessed: safeTime(Number(headers.get("X-Preview-Cache-Last-Accessed"))) || safeTime(Number(headers.get("Date")))
   };
+}
+
+function scheduleCacheStorageMetadataRebuild() {
+  if (cacheStorageMetadataRebuildPromise) {
+    return;
+  }
+
+  cacheStorageMetadataRebuildPromise = rebuildCacheStorageMetadata()
+    .catch((error) => {
+      warnPreviewCacheError("rebuild CacheStorage metadata", error);
+    })
+    .finally(() => {
+      cacheStorageMetadataRebuildPromise = null;
+    });
+}
+
+async function rebuildCacheStorageMetadata() {
+  const cache = await caches.open(CACHE_NAME);
+  const requests = await cache.keys();
+
+  for (const request of requests) {
+    const parsed = parseCacheStorageCacheKey(request.url);
+    if (!parsed) {
+      continue;
+    }
+
+    const existing = await getChunkMetadata(parsed.cacheKey).catch(() => null);
+    if (existing && safeSize(existing.size) > 0 && safeSize(existing.totalSize) > 0 && existing.fileName && existing.fileName !== existing.fileId) {
+      continue;
+    }
+
+    const response = await cache.match(request);
+    if (!response) {
+      continue;
+    }
+
+    const entry = cacheStorageEntryFromResponse(parsed, response);
+    if (safeSize(entry.size) <= 0) {
+      continue;
+    }
+    await putChunkMetadata(entry, true);
+  }
+
+  invalidateCacheStorageMetadataSnapshot();
 }
 
 function decodeMetadataHeader(value) {

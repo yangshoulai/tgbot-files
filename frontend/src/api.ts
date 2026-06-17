@@ -187,6 +187,11 @@ export interface FileListResponse {
   direct_access_max_bytes: number;
 }
 
+export interface FileLookupResponse {
+  ok: boolean;
+  files: FileItem[];
+}
+
 export interface AdminUploadResponse {
   ok: boolean;
   file: FileItem;
@@ -719,6 +724,14 @@ export function listFiles(params: {
   }
 
   return requestJson<FileListResponse>(`/api/admin/files?${search.toString()}`);
+}
+
+export function lookupFiles(ids: string[]) {
+  const uniqueIds = Array.from(new Set(ids.map((id) => id.trim()).filter(Boolean))).slice(0, 100);
+  const search = new URLSearchParams({
+    ids: uniqueIds.join(",")
+  });
+  return requestJson<FileLookupResponse>(`/api/admin/files/lookup?${search.toString()}`);
 }
 
 export function getHlsDownloadPlan(fileId: string) {

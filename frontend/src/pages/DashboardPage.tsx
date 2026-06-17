@@ -13,6 +13,7 @@ import {
   getHlsDownloadPlan,
   listDirectories,
   listFiles,
+  lookupFiles,
   moveDirectory,
   moveEntries,
   renameDirectory,
@@ -334,9 +335,10 @@ function CacheManagerDialog({
                     const indexedFile = cacheFileIndex.get(entry.fileId);
                     const displayFileName = indexedFile?.file_name || entry.fileName;
                     const directoryPath = indexedFile?.directory_path || entry.directoryPath || "/";
+                    const displayEntry = mergeCacheEntryWithIndexedFile(entry, indexedFile);
                     const entryOperation = operation?.fileId === entry.fileId ? operation.kind : null;
-                    const progress = fileCacheProgressPercent(entry);
-                    const statusLabel = cacheEntryStatusLabel(entry);
+                    const progress = fileCacheProgressPercent(displayEntry);
+                    const statusLabel = cacheEntryStatusLabel(displayEntry);
                     const actionDisabled = Boolean(entryOperation);
 
                     return (
@@ -346,7 +348,7 @@ function CacheManagerDialog({
                             <FileVisual
                               mimeType={indexedFile?.mime_type || entry.mimeType || "application/octet-stream"}
                               fileName={displayFileName}
-                              url={cacheEntryVisualUrl(entry, indexedFile)}
+                              url={cacheEntryVisualUrl(displayEntry, indexedFile)}
                               thumbnailUrl={indexedFile?.thumbnail_url}
                               size="sm"
                               className="size-12 rounded-lg bg-surface"
@@ -371,7 +373,7 @@ function CacheManagerDialog({
                           <div className="flex min-w-0 flex-col gap-2">
                             <div className="flex items-center justify-between gap-3 text-xs">
                               <span className="font-medium text-foreground">{progress}%</span>
-                              <span className="truncate text-muted">{entry.cachedChunks}/{entry.chunkCount} 分片</span>
+                              <span className="truncate text-muted">{displayEntry.cachedChunks}/{displayEntry.chunkCount} 分片</span>
                             </div>
                             <div className="h-2 overflow-hidden rounded-full bg-border">
                               <div
@@ -383,8 +385,8 @@ function CacheManagerDialog({
                         </td>
                         <td className="px-3 py-3">
                           <div className="flex min-w-0 flex-col gap-0.5">
-                            <span className="text-sm font-medium text-foreground">{formatBytes(entry.cachedBytes)}</span>
-                            <span className="text-xs text-muted">共 {formatBytes(entry.size)}</span>
+                            <span className="text-sm font-medium text-foreground">{formatBytes(displayEntry.cachedBytes)}</span>
+                            <span className="text-xs text-muted">共 {formatBytes(displayEntry.size)}</span>
                           </div>
                         </td>
                         <td className="px-3 py-3">
@@ -532,6 +534,32 @@ function fileCacheProgressPercent(entry: FileCacheEntry): number {
     return Math.max(0, Math.min(100, Math.round((entry.cachedChunks / entry.chunkCount) * 100)));
   }
   return 0;
+}
+
+function mergeCacheEntryWithIndexedFile(entry: FileCacheEntry, indexedFile: FileItem | undefined): FileCacheEntry {
+  if (!indexedFile) return entry;
+
+  const chunkCount = indexedFile.storage_backend === "hls_package"
+    ? Math.max(1, indexedFile.hls_download?.part_count ?? indexedFile.hls_download?.segment_count ?? entry.chunkCount)
+    : indexedFile.chunk_count && indexedFile.chunk_count > 0
+      ? indexedFile.chunk_count
+      : entry.chunkCount;
+  const chunkSize = indexedFile.storage_backend === "hls_package"
+    ? Math.max(1, Math.ceil(indexedFile.size / chunkCount))
+    : indexedFile.chunk_size && indexedFile.chunk_size > 0
+      ? indexedFile.chunk_size
+      : entry.chunkSize;
+
+  return {
+    ...entry,
+    fileName: indexedFile.file_name || entry.fileName,
+    directoryPath: indexedFile.directory_path || entry.directoryPath || "/",
+    mimeType: indexedFile.mime_type || entry.mimeType,
+    size: indexedFile.size || entry.size,
+    chunkSize,
+    chunkCount,
+    sourceUrl: hasFileLinkAccess(indexedFile) ? indexedFile.file_path : entry.sourceUrl
+  };
 }
 
 function cacheEntryStatusLabel(entry: FileCacheEntry): string {
@@ -695,6 +723,31 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
     }
   }, []);
 
+  const refreshCacheFilesBySummary = useCallback(async (summary: FileCacheSummary | null) => {
+    const entries = summary?.entries ?? [];
+    if (entries.length === 0) return;
+
+    const existingIds = new Set([...cacheFiles, ...files].map((file) => file.id));
+    const missingIds = Array.from(new Set(entries.map((entry) => entry.fileId)))
+      .filter((fileId) => fileId && !existingIds.has(fileId))
+      .slice(0, 100);
+    if (missingIds.length === 0) return;
+
+    try {
+      const response = await lookupFiles(missingIds);
+      if (response.files.length === 0) return;
+      setCacheFiles((current) => {
+        const byId = new Map(current.map((file) => [file.id, file]));
+        for (const file of response.files) {
+          byId.set(file.id, file);
+        }
+        return Array.from(byId.values());
+      });
+    } catch {
+      // The cache manager can still show service-worker metadata if lookup fails.
+    }
+  }, [cacheFiles, files]);
+
   const refreshCacheFileIndex = useCallback(async () => {
     try {
       const directoryResponse = await listDirectories(true);
@@ -731,6 +784,12 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
       void refreshCacheFileIndex();
     }
   }, [cacheManagerOpen, refreshCacheFileIndex, refreshCacheSummary]);
+
+  useEffect(() => {
+    if (cacheManagerOpen) {
+      void refreshCacheFilesBySummary(cacheSummary);
+    }
+  }, [cacheManagerOpen, cacheSummary, refreshCacheFilesBySummary]);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
@@ -914,7 +973,7 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
       await requestPersistentFileCacheStorage();
       await cacheFileManually(metadata);
       await refreshCacheSummary();
-      toast.success("文件已缓存");
+      toast.success("文件已加入缓存队列");
     } catch (error) {
       toast.danger(errorMessage(error));
     } finally {
