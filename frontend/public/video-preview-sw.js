@@ -281,6 +281,7 @@ async function handleFileCacheRequest(request, event) {
   };
 
   try {
+    event.waitUntil(putFileRecordMetadata(metadata, { keepFileRecord: true }));
     const body = await createRangeStream(metadata, responseRange);
     const firstChunk = Math.floor(responseRange.start / metadata.chunkSize);
     const endChunk = Math.floor(responseRange.end / metadata.chunkSize);

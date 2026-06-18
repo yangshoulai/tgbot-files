@@ -55,13 +55,42 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
   const [serviceWorkerState, setServiceWorkerState] = useState<FilePreviewServiceWorkerState>(initialFilePreviewServiceWorkerState);
   const cachePreviewUrl = useMemo(
     () => file ? buildAutomaticFileCacheUrl(file, videoPreviewCacheBytes) : null,
-    [file, videoPreviewCacheBytes]
+    [
+      file?.chunk_count,
+      file?.chunk_size,
+      file?.directory_path,
+      file?.file_name,
+      file?.file_path,
+      file?.hls_download?.part_count,
+      file?.hls_download?.segment_count,
+      file?.id,
+      file?.mime_type,
+      file?.size,
+      file?.storage_backend,
+      file?.url,
+      videoPreviewCacheBytes
+    ]
   );
   const previewCacheMetadata = useMemo(
     () => file && preview && preview !== "video"
       ? buildFileCacheMetadata(file, videoPreviewCacheBytes, "auto")
       : null,
-    [file, preview, videoPreviewCacheBytes]
+    [
+      file?.chunk_count,
+      file?.chunk_size,
+      file?.directory_path,
+      file?.file_name,
+      file?.file_path,
+      file?.hls_download?.part_count,
+      file?.hls_download?.segment_count,
+      file?.id,
+      file?.mime_type,
+      file?.size,
+      file?.storage_backend,
+      file?.url,
+      preview,
+      videoPreviewCacheBytes
+    ]
   );
   const needsFileCachePreview = Boolean(preview && preview !== "video");
   const serviceWorkerReady = !needsFileCachePreview || serviceWorkerState.status === "controlled";
