@@ -7,6 +7,7 @@ export interface VideoPreviewServiceWorkerRegistrationResult {
   registered: boolean;
   controlled: boolean;
   needsReload: boolean;
+  updated?: boolean;
   scope?: string;
   error?: string;
 }
@@ -60,18 +61,22 @@ export async function ensureVideoPreviewServiceWorker(): Promise<VideoPreviewSer
       scope: "/"
     });
     const currentRegistration = await registration.update().catch(() => registration);
+    const hadPendingWorker = Boolean(currentRegistration.installing || currentRegistration.waiting);
 
     requestSkipWaiting(currentRegistration);
     await waitForServiceWorkerReady(VIDEO_PREVIEW_SW_READY_TIMEOUT_MS);
     requestSkipWaiting(currentRegistration);
 
-    const controlled = await waitForVideoPreviewController(VIDEO_PREVIEW_SW_CONTROL_TIMEOUT_MS);
+    const controlled = hadPendingWorker
+      ? await waitForUpdatedVideoPreviewController(VIDEO_PREVIEW_SW_CONTROL_TIMEOUT_MS)
+      : await waitForVideoPreviewController(VIDEO_PREVIEW_SW_CONTROL_TIMEOUT_MS);
 
     return {
       supported: true,
       registered: true,
       controlled,
       needsReload: !controlled,
+      updated: hadPendingWorker,
       scope: currentRegistration.scope
     };
   } catch (error) {
@@ -86,6 +91,7 @@ export async function ensureVideoPreviewServiceWorker(): Promise<VideoPreviewSer
 }
 
 function requestSkipWaiting(registration: ServiceWorkerRegistration): void {
+  registration.installing?.postMessage({ type: "SKIP_WAITING" });
   registration.waiting?.postMessage({ type: "SKIP_WAITING" });
 }
 
@@ -109,6 +115,33 @@ async function waitForVideoPreviewController(timeoutMs: number): Promise<boolean
     }, timeoutMs);
 
     const onControllerChange = () => {
+      if (!isVideoPreviewServiceWorkerControlling()) {
+        return;
+      }
+
+      cleanup();
+      resolve(true);
+    };
+
+    const cleanup = () => {
+      window.clearTimeout(timer);
+      navigator.serviceWorker.removeEventListener("controllerchange", onControllerChange);
+    };
+
+    navigator.serviceWorker.addEventListener("controllerchange", onControllerChange);
+  });
+}
+
+async function waitForUpdatedVideoPreviewController(timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let changed = false;
+    const timer = window.setTimeout(() => {
+      cleanup();
+      resolve(changed && isVideoPreviewServiceWorkerControlling());
+    }, timeoutMs);
+
+    const onControllerChange = () => {
+      changed = true;
       if (!isVideoPreviewServiceWorkerControlling()) {
         return;
       }

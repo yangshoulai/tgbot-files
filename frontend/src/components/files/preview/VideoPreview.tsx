@@ -140,10 +140,10 @@ export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscr
   const refreshServiceWorker = useCallback(async () => {
     if (isVideoPreviewServiceWorkerControlling()) {
       setServiceWorkerState({ status: "controlled" });
-      return;
+    } else {
+      setServiceWorkerState({ status: "checking" });
     }
 
-    setServiceWorkerState({ status: "checking" });
     const result = await ensureVideoPreviewServiceWorker();
 
     if (result.controlled) {
