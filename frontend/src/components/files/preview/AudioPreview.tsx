@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { FileText, Languages, Music2 } from "lucide-react";
 import { listFiles, type FileItem } from "../../../api";
-import { buildAutomaticFileCacheUrl } from "../../../lib/file-cache";
+import { buildAutomaticFileCacheUrl, buildFileCacheMetadata } from "../../../lib/file-cache";
 import { formatBytes } from "../../../utils";
 import { cn } from "../../../lib/cn";
 import type { PreviewComponentProps } from "./types";
@@ -71,6 +71,50 @@ export function AudioPreview({ file, fullscreen, previewUrl, cacheMaxBytes, onTo
 
     return () => window.clearTimeout(timeout);
   }, [failed, loading, previewUrl]);
+
+  useEffect(() => {
+    if (!previewUrl) return;
+
+    const metadata = buildFileCacheMetadata(file, cacheMaxBytes, "auto");
+    if (!metadata || metadata.size <= 0 || metadata.chunkSize <= 0) return;
+
+    const controller = new AbortController();
+    const firstChunkBytes = Math.max(1, Math.min(metadata.chunkSize, metadata.size));
+
+    fetch(previewUrl, {
+      credentials: "include",
+      headers: {
+        Range: `bytes=0-${firstChunkBytes - 1}`
+      },
+      signal: controller.signal
+    })
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error(response.statusText || `HTTP ${response.status}`);
+        }
+        await response.arrayBuffer();
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          console.warn("音频预览缓存预热失败", error);
+        }
+      });
+
+    return () => controller.abort();
+  }, [
+    cacheMaxBytes,
+    file.chunk_count,
+    file.chunk_size,
+    file.directory_path,
+    file.file_name,
+    file.file_path,
+    file.id,
+    file.mime_type,
+    file.size,
+    file.storage_backend,
+    file.url,
+    previewUrl
+  ]);
 
   useEffect(() => {
     const audio = audioRef.current;
