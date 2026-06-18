@@ -20,6 +20,7 @@ const hotChunkCache = new Map();
 const hlsPreviewSources = new Map();
 const hlsPreviewCacheSessions = new Map();
 const fileCacheSessions = new Map();
+const previewFileCacheSessions = new Map();
 let cacheStorageMetadataSnapshot = null;
 let cacheStorageMetadataSnapshotAt = 0;
 let cacheStorageMetadataSnapshotPromise = null;
@@ -322,6 +323,17 @@ async function handleFileCacheMessage(event, requestId) {
       const metadata = normalizeFileCacheMetadata(event.data.metadata);
       if (!metadata) throw new Error("文件缓存参数无效");
       result = await cacheWholeFile(metadata);
+    } else if (event.data.type === "FILE_CACHE_START_PREVIEW") {
+      const metadata = normalizeFileCacheMetadata(event.data.metadata);
+      const sessionId = normalizeSessionId(event.data.sessionId);
+      if (!metadata || !sessionId) throw new Error("文件预览缓存参数无效");
+      await startPreviewFileCacheSession(sessionId, metadata);
+      result = await readFileCacheSummary();
+    } else if (event.data.type === "FILE_CACHE_STOP_PREVIEW") {
+      const sessionId = normalizeSessionId(event.data.sessionId);
+      if (!sessionId) throw new Error("文件预览缓存会话无效");
+      await stopPreviewFileCacheSession(sessionId);
+      result = await readFileCacheSummary();
     } else if (event.data.type === "FILE_CACHE_PAUSE_FILE") {
       await pauseFileCacheSession(normalizeFileId(event.data.fileId));
       result = await readFileCacheSummary();
@@ -412,6 +424,110 @@ function createManualFileCacheSession(metadata, status, manualStartedAt) {
     promise: null
   };
   return session;
+}
+
+async function startPreviewFileCacheSession(sessionId, metadata) {
+  const existing = previewFileCacheSessions.get(sessionId);
+  const normalizedMetadata = {
+    ...metadata,
+    cacheSource: "auto",
+    cacheMaxBytes: metadata.cacheMaxBytes || DEFAULT_MAX_CACHE_BYTES
+  };
+  const metadataKey = fileCacheMetadataKey(normalizedMetadata);
+
+  if (existing && existing.metadataKey === metadataKey) {
+    existing.lastHeartbeat = Date.now();
+    if (existing.status === "caching") {
+      return;
+    }
+  } else if (existing) {
+    await stopPreviewFileCacheSession(sessionId);
+  }
+
+  const manualSession = fileCacheSessions.get(normalizedMetadata.fileId);
+  if (manualSession && (manualSession.status === "caching" || manualSession.status === "waiting")) {
+    await putFileRecordMetadata({ ...normalizedMetadata, cacheSource: "manual" }, {
+      manualStartedAt: manualSession.manualStartedAt,
+      manualCacheStatus: manualSession.status === "caching" ? undefined : "waiting"
+    });
+    return;
+  }
+
+  const existingEntry = await readFileCacheEntry(normalizedMetadata.fileId);
+  if (existingEntry?.cacheSource === "manual") {
+    return;
+  }
+
+  const session = {
+    sessionId,
+    metadata: normalizedMetadata,
+    metadataKey,
+    status: "caching",
+    controller: new AbortController(),
+    promise: null,
+    lastHeartbeat: Date.now()
+  };
+  previewFileCacheSessions.set(sessionId, session);
+  await putFileRecordMetadata(normalizedMetadata, { keepFileRecord: true });
+  session.promise = runPreviewFileCacheSession(session)
+    .catch((error) => {
+      if (session.status !== "stopped") {
+        warnPreviewCacheError(`preview cache ${session.metadata.fileId}`, error);
+      }
+    })
+    .finally(() => {
+      if (previewFileCacheSessions.get(sessionId) === session) {
+        previewFileCacheSessions.delete(sessionId);
+      }
+      session.promise = null;
+      session.controller = null;
+    });
+}
+
+async function stopPreviewFileCacheSession(sessionId) {
+  const session = previewFileCacheSessions.get(sessionId);
+  if (!session) {
+    return;
+  }
+  session.status = "stopped";
+  session.controller?.abort();
+  previewFileCacheSessions.delete(sessionId);
+  await putFileRecordMetadata(session.metadata, { keepFileRecord: true });
+}
+
+async function runPreviewFileCacheSession(session) {
+  const { metadata } = session;
+  if (metadata.kind === "hls") {
+    await cacheWholeHlsFile(metadata, session);
+    return;
+  }
+
+  const queue = createPriorityChunkQueue(metadata.chunkCount, 0);
+  await runConcurrentManualCacheWorkers(session, queue, async (chunkIndex) => {
+    throwIfPreviewFileCacheStopped(session);
+    if (await getCachedChunkResponse(metadata, chunkIndex)) {
+      return;
+    }
+    await getChunkBytes(metadata, chunkIndex, session.controller.signal);
+  });
+}
+
+function throwIfPreviewFileCacheStopped(session) {
+  if (session.status !== "caching" || session.controller.signal.aborted) {
+    throw new DOMException("文件预览缓存已停止", "AbortError");
+  }
+}
+
+function fileCacheMetadataKey(metadata) {
+  return [
+    metadata.kind,
+    metadata.fileId,
+    metadata.size,
+    metadata.chunkSize,
+    metadata.chunkCount,
+    metadata.sourceUrl || "",
+    metadata.token || ""
+  ].join(":");
 }
 
 async function runManualFileCacheSession(session) {
@@ -2642,13 +2758,14 @@ async function putFileRecordMetadata(metadata, extra = {}) {
   const existingRecord = await getChunkMetadata(recordKey).catch(() => null);
   const chunks = await getAllChunkMetadata();
   const keepManual = metadata.cacheSource === "manual" || existingRecord?.cacheSource === "manual";
+  const keepRecord = keepManual || extra.keepFileRecord === true;
   const relatedChunks = chunks.filter((chunk) => chunk?.fileId === metadata.fileId && !isFileRecordMetadata(chunk));
   const hasManualCacheStatus = Object.prototype.hasOwnProperty.call(extra, "manualCacheStatus");
   const nextManualCacheStatus = hasManualCacheStatus
     ? normalizeManualCacheStatus(extra.manualCacheStatus)
     : normalizeManualCacheStatus(metadata.manualCacheStatus) || normalizeManualCacheStatus(existingRecord?.manualCacheStatus);
 
-  if (keepManual) {
+  if (keepRecord) {
     await putChunkMetadata({
       cacheKey: recordKey,
       recordType: "file",
@@ -2663,7 +2780,7 @@ async function putFileRecordMetadata(metadata, extra = {}) {
       chunkCount: metadata.chunkCount || existingRecord?.chunkCount || 1,
       sourceUrl: metadata.sourceUrl || existingRecord?.sourceUrl || "",
       token: metadata.token || existingRecord?.token || "",
-      cacheSource: "manual",
+      cacheSource: keepManual ? "manual" : metadata.cacheSource || existingRecord?.cacheSource || "auto",
       size: 0,
       manualCacheStatus: nextManualCacheStatus,
       manualStartedAt: extra.manualStartedAt || metadata.manualStartedAt || existingRecord?.manualStartedAt,

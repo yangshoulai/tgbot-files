@@ -271,6 +271,7 @@ function CacheManagerDialog({
   onClearFile: (entry: FileCacheEntry) => void;
 }) {
   const entries = summary?.entries ?? [];
+  const hasAutomaticEntries = entries.some((entry) => entry.cacheSource !== "manual");
   const [actionEntry, setActionEntry] = useState<FileCacheEntry | null>(null);
 
   useEffect(() => {
@@ -294,7 +295,7 @@ function CacheManagerDialog({
             <Button variant="secondary" leadingIcon={<RefreshCw size={15} />} onClick={onRefresh}>
               刷新
             </Button>
-            <Button variant="secondary" leadingIcon={<Trash2 size={15} />} disabled={(summary?.autoBytes ?? 0) <= 0} onClick={onClearAutomatic}>
+            <Button variant="secondary" leadingIcon={<Trash2 size={15} />} disabled={!hasAutomaticEntries} onClick={onClearAutomatic}>
               清理自动缓存
             </Button>
             <Button variant="primary" onClick={onClose}>

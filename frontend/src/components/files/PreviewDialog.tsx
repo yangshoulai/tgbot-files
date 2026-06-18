@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Copy, Download, Maximize, Maximize2, Minimize, Minimize2 } from "lucide-react";
 import type { FileItem } from "../../api";
 import { fileKind, formatBytes, previewKind } from "../../utils";
@@ -6,7 +6,12 @@ import {
   hasFileLinkAccess,
   TEXT_PREVIEW_MAX_BYTES
 } from "../../lib/file-access";
-import { buildAutomaticFileCacheUrl } from "../../lib/file-cache";
+import {
+  buildAutomaticFileCacheUrl,
+  buildFileCacheMetadata,
+  startPreviewFileCache,
+  stopPreviewFileCache
+} from "../../lib/file-cache";
 import {
   ensureVideoPreviewServiceWorker,
   isVideoPreviewServiceWorkerControlling
@@ -43,13 +48,21 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
   const preview = file ? previewKind(file) : null;
   const kind = file ? fileKind(file) : null;
   const fullscreenTargetRef = useRef<HTMLDivElement>(null);
+  const previewCacheSessionIdRef = useRef<string | null>(null);
   const [maximized, setMaximized] = useState(false);
   const [nativeFullscreen, setNativeFullscreen] = useState(false);
   const [textState, setTextState] = useState<TextPreviewState>({ status: "idle", content: "" });
   const [serviceWorkerState, setServiceWorkerState] = useState<FilePreviewServiceWorkerState>(initialFilePreviewServiceWorkerState);
-  const cachePreviewUrl = file
-    ? buildAutomaticFileCacheUrl(file, videoPreviewCacheBytes)
-    : null;
+  const cachePreviewUrl = useMemo(
+    () => file ? buildAutomaticFileCacheUrl(file, videoPreviewCacheBytes) : null,
+    [file, videoPreviewCacheBytes]
+  );
+  const previewCacheMetadata = useMemo(
+    () => file && preview && preview !== "video"
+      ? buildFileCacheMetadata(file, videoPreviewCacheBytes, "auto")
+      : null,
+    [file, preview, videoPreviewCacheBytes]
+  );
   const needsFileCachePreview = Boolean(preview && preview !== "video");
   const serviceWorkerReady = !needsFileCachePreview || serviceWorkerState.status === "controlled";
   const fileCachePreviewMessage = needsFileCachePreview
@@ -102,6 +115,23 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
       disposed = true;
     };
   }, [file?.id, preview]);
+
+  useEffect(() => {
+    if (!file || !preview || preview === "video" || !previewCacheMetadata || !serviceWorkerReady) {
+      return;
+    }
+
+    const sessionId = `file-preview-${file.id}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    previewCacheSessionIdRef.current = sessionId;
+    void startPreviewFileCache(sessionId, previewCacheMetadata).catch(() => undefined);
+
+    return () => {
+      if (previewCacheSessionIdRef.current === sessionId) {
+        previewCacheSessionIdRef.current = null;
+      }
+      void stopPreviewFileCache(sessionId).catch(() => undefined);
+    };
+  }, [file?.id, preview, previewCacheMetadata, serviceWorkerReady]);
 
   useEffect(() => {
     if (!file || (preview !== "text" && preview !== "markdown")) {

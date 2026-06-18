@@ -186,6 +186,24 @@ export function terminateFileCache(fileId: string): Promise<FileCacheSummary> {
   }).then((summary) => normalizeFileCacheSummary(summary));
 }
 
+export function startPreviewFileCache(sessionId: string, metadata: FileCacheMetadata): Promise<FileCacheSummary> {
+  return requestFileCacheMessage<FileCacheSummary>({
+    type: "FILE_CACHE_START_PREVIEW",
+    sessionId,
+    metadata: {
+      ...metadata,
+      cacheSource: "auto"
+    }
+  }).then((summary) => normalizeFileCacheSummary(summary));
+}
+
+export function stopPreviewFileCache(sessionId: string): Promise<FileCacheSummary> {
+  return requestFileCacheMessage<FileCacheSummary>({
+    type: "FILE_CACHE_STOP_PREVIEW",
+    sessionId
+  }).then((summary) => normalizeFileCacheSummary(summary));
+}
+
 export function getFileCacheSummary(): Promise<FileCacheSummary> {
   return requestFileCacheMessage<FileCacheSummary>({
     type: "FILE_CACHE_LIST_REQUEST"
@@ -273,6 +291,8 @@ function normalizeFileCacheSummary(value: FileCacheSummary | null | undefined): 
 
 type FileCacheRequestMessage =
   | { type: "FILE_CACHE_CACHE_FILE"; metadata: FileCacheMetadata }
+  | { type: "FILE_CACHE_START_PREVIEW"; sessionId: string; metadata: FileCacheMetadata }
+  | { type: "FILE_CACHE_STOP_PREVIEW"; sessionId: string }
   | { type: "FILE_CACHE_PAUSE_FILE"; fileId: string }
   | { type: "FILE_CACHE_RESUME_FILE"; fileId: string; metadata?: FileCacheMetadata }
   | { type: "FILE_CACHE_TERMINATE_FILE"; fileId: string }
