@@ -113,10 +113,10 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
     async function refreshServiceWorker() {
       if (isVideoPreviewServiceWorkerControlling()) {
         setServiceWorkerState({ status: "controlled" });
-        return;
+      } else {
+        setServiceWorkerState({ status: "checking" });
       }
 
-      setServiceWorkerState({ status: "checking" });
       const result = await ensureVideoPreviewServiceWorker();
       if (disposed) return;
 
@@ -152,13 +152,17 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
 
     const sessionId = `file-preview-${file.id}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     previewCacheSessionIdRef.current = sessionId;
-    void startPreviewFileCache(sessionId, previewCacheMetadata).catch(() => undefined);
+    void startPreviewFileCache(sessionId, previewCacheMetadata).catch((error: unknown) => {
+      console.warn("文件预览缓存启动失败", error);
+    });
 
     return () => {
       if (previewCacheSessionIdRef.current === sessionId) {
         previewCacheSessionIdRef.current = null;
       }
-      void stopPreviewFileCache(sessionId).catch(() => undefined);
+      void stopPreviewFileCache(sessionId).catch((error: unknown) => {
+        console.warn("文件预览缓存停止失败", error);
+      });
     };
   }, [file?.id, preview, previewCacheMetadata, serviceWorkerReady]);
 
