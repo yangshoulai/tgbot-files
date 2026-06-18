@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { handleRequest, runScheduledCleanup } from "../src/index";
+import { handleRequest, runScheduledCleanup } from "../src/route";
 import type { AppDatabase, AppEnv, AppPreparedStatement, AppResult, AppResultMeta } from "../src/runtime";
-import { createSignedToken, verifySignedToken } from "../src/crypto";
+import { createSignedToken, verifySignedToken } from "../src/utils/crypto";
 import type {
   ApiKeyRecord,
   ApiKeyStatus,

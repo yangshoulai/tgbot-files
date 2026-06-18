@@ -1,4 +1,4 @@
-import { AppError } from "./http";
+import { AppError } from "../utils/http";
 
 export interface TelegramStoredFile {
   file_id: string;

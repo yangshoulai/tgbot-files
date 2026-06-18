@@ -1,5 +1,5 @@
-import { constantTimeEqual, createSignedPayload, TokenError, verifySignedPayload } from "./crypto";
-import { AppError, requireEnv } from "./http";
+import { constantTimeEqual, createSignedPayload, TokenError, verifySignedPayload } from "../utils/crypto";
+import { AppError, requireEnv } from "../utils/http";
 
 const sessionCookieName = "tgbot_admin";
 const sessionMaxAgeSeconds = 30 * 24 * 60 * 60;

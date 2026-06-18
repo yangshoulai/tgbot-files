@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { handleRequest, runScheduledCleanup } from "../index";
+import { handleRequest, runScheduledCleanup } from "../route";
 import type { AppEnv } from "../runtime";
 import { createLocalTelegramRateLimiter } from "./local-rate-limiter";
 import { createStaticAssetHandler } from "./static-assets";

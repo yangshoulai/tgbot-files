@@ -1,4 +1,4 @@
-import { AppError } from "./http";
+import { AppError } from "./utils/http";
 import type { AppDatabase, AppPreparedStatement } from "./runtime";
 
 export type StorageBackend = "telegram_single" | "telegram_multipart" | "hls_package";

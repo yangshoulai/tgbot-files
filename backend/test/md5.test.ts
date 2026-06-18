@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { md5Hex } from "../src/md5";
+import { md5Hex } from "../src/utils/md5";
 
 const encoder = new TextEncoder();
 

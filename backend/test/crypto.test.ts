@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createSignedToken, verifySignedToken } from "../src/crypto";
+import { createSignedToken, verifySignedToken } from "../src/utils/crypto";
 
 const payload = {
   v: 1 as const,

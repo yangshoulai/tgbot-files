@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildRewrittenMediaPlaylist, parseHlsPlaylist } from "../src/hls";
+import { buildRewrittenMediaPlaylist, parseHlsPlaylist } from "../src/utils/hls";
 
 describe("HLS playlist parsing", () => {
   it("parses AES-128 encryption and derives missing IV from media sequence", () => {

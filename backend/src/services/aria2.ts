@@ -1,5 +1,5 @@
-import { AppError } from "./http";
-import type { AppEnv } from "./runtime";
+import { AppError } from "../utils/http";
+import type { AppEnv } from "../runtime";
 
 export interface Aria2File {
   index: string;

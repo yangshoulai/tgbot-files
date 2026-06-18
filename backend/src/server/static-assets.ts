@@ -2,7 +2,7 @@ import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
-import { mimeTypeForFileName } from "../mime";
+import { mimeTypeForFileName } from "../utils/mime";
 import type { StaticAssetHandler } from "../runtime";
 
 export function createStaticAssetHandler(assetsDir: string): StaticAssetHandler {

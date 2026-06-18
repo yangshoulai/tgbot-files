@@ -4,7 +4,7 @@ import {
   extensionForMimeType,
   mimeTypeForFileName,
   resolveStoredMimeType
-} from "../src/mime";
+} from "../src/utils/mime";
 
 describe("MIME type detection", () => {
   it("detects WebP from RIFF WEBP bytes even when callers send octet-stream", () => {
