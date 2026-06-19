@@ -9,6 +9,9 @@ const DEFAULT_PREVIEW_PREFETCH_CONCURRENCY = 5;
 const MAX_PREVIEW_PREFETCH_CONCURRENCY = 32;
 const MAX_MANUAL_FILE_CACHE_SESSIONS = 5;
 const MAX_MANUAL_FILE_CACHE_WORKERS = 5;
+const CHUNK_FETCH_MAX_ATTEMPTS = 3;
+const CHUNK_FETCH_RETRY_BASE_DELAY_MS = 800;
+const CHUNK_FETCH_RETRY_MAX_DELAY_MS = 8_000;
 const CACHE_STORAGE_METADATA_SNAPSHOT_TTL_MS = 5_000;
 const CONTINUOUS_PREFETCH_SESSION_TTL_MS = 12_000;
 const CONTINUOUS_PREFETCH_RETRY_DELAY_MS = 3_000;
@@ -26,6 +29,7 @@ let cacheStorageMetadataSnapshotAt = 0;
 let cacheStorageMetadataSnapshotPromise = null;
 let cacheStorageMetadataRebuildPromise = null;
 let hotChunkCacheBytes = 0;
+let manualFileCacheRehydration = null;
 
 self.addEventListener("install", (event) => {
   event.waitUntil(self.skipWaiting());
@@ -37,9 +41,7 @@ self.addEventListener("activate", (event) => {
     void cleanupPreviewCache().catch((error) => {
       warnPreviewCacheError("cleanup on activate", error);
     });
-    void rehydrateManualFileCacheSessions().catch((error) => {
-      warnPreviewCacheError("rehydrate manual cache sessions", error);
-    });
+    void ensureManualFileCacheRehydrated();
     scheduleCacheStorageMetadataRebuild();
   })());
 });
@@ -47,6 +49,12 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("message", (event) => {
   if (event.data?.type === "SKIP_WAITING") {
     event.waitUntil(self.skipWaiting());
+    return;
+  }
+
+  if (event.data?.type === "CLAIM_CLIENTS") {
+    // 页面已注册但没有被接管（首次安装 / 硬刷新）时，由页面请求立即接管。
+    event.waitUntil(self.clients.claim());
     return;
   }
 
@@ -318,6 +326,9 @@ async function handleFileCacheRequest(request, event) {
 
 async function handleFileCacheMessage(event, requestId) {
   try {
+    // SW 冷启动（被浏览器终止后被消息唤醒）不会触发 activate，
+    // 在这里兜底恢复进行中的手动缓存任务。
+    await ensureManualFileCacheRehydrated();
     let result = null;
 
     if (event.data.type === "FILE_CACHE_CACHE_FILE") {
@@ -449,7 +460,7 @@ async function startPreviewFileCacheSession(sessionId, metadata) {
   if (manualSession && (manualSession.status === "caching" || manualSession.status === "waiting")) {
     await putFileRecordMetadata({ ...normalizedMetadata, cacheSource: "manual" }, {
       manualStartedAt: manualSession.manualStartedAt,
-      manualCacheStatus: manualSession.status === "caching" ? undefined : "waiting"
+      manualCacheStatus: manualSession.status
     });
     return;
   }
@@ -533,7 +544,7 @@ function fileCacheMetadataKey(metadata) {
 
 async function runManualFileCacheSession(session) {
   const { metadata } = session;
-  await putFileRecordMetadata(metadata, { manualStartedAt: session.manualStartedAt, manualCacheStatus: undefined });
+  await putFileRecordMetadata(metadata, { manualStartedAt: session.manualStartedAt, manualCacheStatus: "caching" });
   if (metadata.kind === "hls") {
     await cacheWholeHlsFile(metadata, session);
     return;
@@ -575,13 +586,28 @@ async function runConcurrentManualCacheWorkers(session, queue, loadNext) {
   await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
 }
 
+// 每个 SW 实例只恢复一次进行中的手动缓存任务。SW 被浏览器终止后再被
+// 事件唤醒（冷启动）时不会触发 activate，所以恢复必须能在任意入口惰性触发。
+function ensureManualFileCacheRehydrated() {
+  if (!manualFileCacheRehydration) {
+    manualFileCacheRehydration = rehydrateManualFileCacheSessions().catch((error) => {
+      // 恢复失败时清空 guard，下次事件可重试。
+      manualFileCacheRehydration = null;
+      warnPreviewCacheError("rehydrate manual cache sessions", error);
+    });
+  }
+  return manualFileCacheRehydration;
+}
+
 async function rehydrateManualFileCacheSessions() {
   const summary = await readFileCacheSummary();
-  const waitingEntries = summary.entries
-    .filter((entry) => entry.manualCacheStatus === "waiting" && !entry.complete)
+  // "waiting" = 排队中；"caching" = 上次被中断的进行中任务。两者都应继续，
+  // 只有用户主动暂停的 "paused" 才保持停止。
+  const resumableEntries = summary.entries
+    .filter((entry) => (entry.manualCacheStatus === "waiting" || entry.manualCacheStatus === "caching") && !entry.complete)
     .sort((left, right) => safeTime(left.manualStartedAt) - safeTime(right.manualStartedAt));
 
-  for (const entry of waitingEntries) {
+  for (const entry of resumableEntries) {
     if (fileCacheSessions.has(entry.fileId)) {
       continue;
     }
@@ -647,9 +673,9 @@ async function startManualFileCacheSession(session) {
     manualStartedAt: session.manualStartedAt,
     cacheSource: "manual",
     cacheMaxBytes: Number.MAX_SAFE_INTEGER,
-    manualCacheStatus: undefined
+    manualCacheStatus: "caching"
   };
-  await putFileRecordMetadata(session.metadata, { manualStartedAt: session.manualStartedAt, manualCacheStatus: undefined });
+  await putFileRecordMetadata(session.metadata, { manualStartedAt: session.manualStartedAt, manualCacheStatus: "caching" });
   session.promise = runManualFileCacheSession(session)
     .catch(async (error) => {
       if (session.status !== "paused") {
@@ -959,15 +985,39 @@ async function fetchAndCacheHlsPart({ fileId, partKind, partIndex, sourceUrl, ca
   return createHlsPartResponse(result.bytes, result.contentType);
 }
 
-async function fetchAndCacheHlsPartBytes({ fileId, partKind, partIndex, sourceUrl, cacheMaxBytes, cacheKey, cacheSource = "auto", metadata = null, signal = null }) {
-  const response = await fetch(sourceUrl, { credentials: "omit", signal: signal || undefined });
-  if (!response.ok) {
-    throw new Error(`HLS ${partKind} ${partIndex} preview load failed (HTTP ${response.status})`);
-  }
+async function fetchHlsPartBytesWithRetry({ partKind, partIndex, sourceUrl, signal }) {
+  let attempt = 0;
+  for (;;) {
+    attempt += 1;
+    if (signal?.aborted) {
+      throw new DOMException("文件缓存已停止", "AbortError");
+    }
 
-  const bytes = await response.arrayBuffer();
+    try {
+      const response = await fetch(sourceUrl, { credentials: "omit", signal: signal || undefined });
+      if (!response.ok) {
+        if (shouldRetryChunkStatus(response.status) && attempt < CHUNK_FETCH_MAX_ATTEMPTS) {
+          await delayBeforeChunkRetry(attempt, signal);
+          continue;
+        }
+        throw permanentCacheError(`HLS ${partKind} ${partIndex} preview load failed (HTTP ${response.status})`);
+      }
+
+      const bytes = await response.arrayBuffer();
+      const contentType = response.headers.get("Content-Type") || "application/octet-stream";
+      return { bytes, contentType };
+    } catch (error) {
+      if (isAbortError(error) || error?.permanent || attempt >= CHUNK_FETCH_MAX_ATTEMPTS) {
+        throw error;
+      }
+      await delayBeforeChunkRetry(attempt, signal);
+    }
+  }
+}
+
+async function fetchAndCacheHlsPartBytes({ fileId, partKind, partIndex, sourceUrl, cacheMaxBytes, cacheKey, cacheSource = "auto", metadata = null, signal = null }) {
+  const { bytes, contentType } = await fetchHlsPartBytesWithRetry({ partKind, partIndex, sourceUrl, signal });
   const now = Date.now();
-  const contentType = response.headers.get("Content-Type") || "application/octet-stream";
 
   if (cacheSource !== "manual") {
     await cleanupPreviewCache(bytes.byteLength, cacheMaxBytes);
@@ -2318,24 +2368,92 @@ async function getChunkBytes(metadata, chunkIndex, signal = null) {
   return load;
 }
 
+function isAbortError(error) {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+function permanentCacheError(message) {
+  const error = new Error(message);
+  error.permanent = true;
+  return error;
+}
+
+function shouldRetryChunkStatus(status) {
+  return status === 408 || status === 429 || status >= 500;
+}
+
+function abortableDelay(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("已中断", "AbortError"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      cleanup();
+      reject(new DOMException("已中断", "AbortError"));
+    };
+    function cleanup() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function delayBeforeChunkRetry(attempt, signal) {
+  const delay = Math.min(CHUNK_FETCH_RETRY_MAX_DELAY_MS, CHUNK_FETCH_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1));
+  await abortableDelay(delay, signal);
+}
+
+// 分片下载带退避重试：瞬时错误（网络抖动 / 429 / 5xx / 大小不匹配）会重试，
+// 主动中断（用户暂停 / 终止）与永久性错误（其它 4xx）立即放弃。
+async function fetchChunkBytesWithRetry(metadata, chunkIndex, expectedSize, signal) {
+  let attempt = 0;
+  for (;;) {
+    attempt += 1;
+    if (signal?.aborted) {
+      throw new DOMException("文件缓存已停止", "AbortError");
+    }
+
+    try {
+      const response = await fetch(chunkSourceUrl(metadata, chunkIndex), {
+        signal: signal || undefined,
+        credentials: "omit",
+        headers: metadata.kind === "single"
+          ? { Range: chunkRangeHeader(metadata, chunkIndex, 0, expectedSize) }
+          : undefined
+      });
+
+      if (!response.ok) {
+        if (shouldRetryChunkStatus(response.status) && attempt < CHUNK_FETCH_MAX_ATTEMPTS) {
+          await delayBeforeChunkRetry(attempt, signal);
+          continue;
+        }
+        throw permanentCacheError(`分片 ${chunkIndex + 1} 预览加载失败（HTTP ${response.status}）`);
+      }
+
+      const bytes = await response.arrayBuffer();
+      if (bytes.byteLength !== expectedSize) {
+        throw new Error(`分片 ${chunkIndex + 1} 大小不匹配`);
+      }
+
+      return bytes;
+    } catch (error) {
+      if (isAbortError(error) || error?.permanent || attempt >= CHUNK_FETCH_MAX_ATTEMPTS) {
+        throw error;
+      }
+      await delayBeforeChunkRetry(attempt, signal);
+    }
+  }
+}
+
 async function fetchAndCacheChunkBytes(metadata, chunkIndex, signal = null) {
   const expectedSize = expectedChunkSize(metadata, chunkIndex);
-  const response = await fetch(chunkSourceUrl(metadata, chunkIndex), {
-    signal: signal || undefined,
-    credentials: "omit",
-    headers: metadata.kind === "single"
-      ? { Range: chunkRangeHeader(metadata, chunkIndex, 0, expectedSize) }
-      : undefined
-  });
-
-  if (!response.ok) {
-    throw new Error(`分片 ${chunkIndex + 1} 预览加载失败（HTTP ${response.status}）`);
-  }
-
-  const bytes = await response.arrayBuffer();
-  if (bytes.byteLength !== expectedSize) {
-    throw new Error(`分片 ${chunkIndex + 1} 大小不匹配`);
-  }
+  const bytes = await fetchChunkBytesWithRetry(metadata, chunkIndex, expectedSize, signal);
 
   putHotChunkBytes(metadata, chunkIndex, bytes);
 

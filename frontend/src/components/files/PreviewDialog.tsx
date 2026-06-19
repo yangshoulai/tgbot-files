@@ -140,8 +140,21 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
 
     void refreshServiceWorker();
 
+    // 新版本 SW 接管（controllerchange）时清除"未接管"提示，避免部署后停留在需手动刷新的状态。
+    const onControllerChange = () => {
+      if (!disposed && isVideoPreviewServiceWorkerControlling()) {
+        setServiceWorkerState({ status: "controlled" });
+      }
+    };
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.addEventListener("controllerchange", onControllerChange);
+    }
+
     return () => {
       disposed = true;
+      if ("serviceWorker" in navigator) {
+        navigator.serviceWorker.removeEventListener("controllerchange", onControllerChange);
+      }
     };
   }, [file?.id, preview]);
 
