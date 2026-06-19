@@ -133,140 +133,129 @@ import {
   URL_CHUNK_REQUEST_TIMEOUT_MS
 } from "./upload/constants";
 
-let counter = 0;
-
-function makeItem(file: File, options: { relativePath?: string } = {}): QueueItem {
-  counter += 1;
-  const relativePath = normalizeRelativePath(options.relativePath);
-  const relativeDirectoryPath = relativeDirectoryPathFor(relativePath);
-
-  return {
-    id: `${Date.now()}-${counter}`,
-    file,
-    runtimeStore: createUploadRuntimeStore(),
-    ...(relativePath ? { relativePath } : {}),
-    ...(relativeDirectoryPath ? { relativeDirectoryPath } : {}),
-    status: "pending",
-    thumbnail: canAutoGenerateThumbnail(file) ? { status: "idle" } : undefined
-  };
-}
-
-function makeSourceHeaderRow(name = "", value = ""): SourceHeaderRow {
-  counter += 1;
-  return {
-    id: `source-header-${Date.now()}-${counter}`,
-    name: normalizeHeaderKeyInput(name),
-    value
-  };
-}
-
-function makeQueuedUrlUploadTask(sourceUrl: string, directoryPath: string, remark: string): QueuedUrlUploadTask {
-  counter += 1;
-  return {
-    id: `queued-url-${Date.now()}-${counter}`,
-    sourceUrl,
-    directoryPath,
-    remark
-  };
-}
-
-function isLocalItemAwaitingDecision(item: QueueItem): boolean {
-  return item.status === "pending" || item.status === "error";
-}
-
-function isUploadableLocalItem(item: QueueItem): boolean {
-  return isLocalItemAwaitingDecision(item) && !item.conflict;
-}
-
-function normalizeUploadConcurrency(value: number): number {
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    return DEFAULT_UPLOAD_CONCURRENCY;
-  }
-  return value;
-}
-
-function sourceHeaderRowsFromHeaders(headers?: SourceRequestHeaders): SourceHeaderRow[] {
-  if (!headers) return [];
-  return Object.entries(headers).map(([name, value]) => makeSourceHeaderRow(name, value));
-}
-
-function extractFirstUrl(value: string): string | undefined {
-  const match = value.match(/(?:https?:\/\/|magnet:\?)[^\s<>"']+/i);
-  return match?.[0];
-}
-
-function makePlaceholderLocalItem(task: PersistedLocalUploadTask): QueueItem {
-  const file = new File([], task.fileName, {
-    type: task.mimeType || "application/octet-stream",
-    lastModified: task.lastModified
-  });
-  const item = makeItem(file, { relativePath: task.relativePath });
-  const retryProgress = retryFailureProgress(task.retry, "等待重新选择本地文件");
-  seedUploadRuntimeStore(item.runtimeStore!, retryProgress);
-  return {
-    ...item,
-    status: "error",
-    message: `刷新后需要重新选择同一个文件：${task.fileName}`,
-    retry: task.retry,
-    progress: retryProgress,
-    thumbnail: undefined,
-    recoveredLocalPlaceholder: true
-  };
-}
-
-function createUploadRuntimeStore(initialState: UploadRuntimeState = {}): UploadRuntimeStore {
-  let state = initialState;
-  const listeners = new Set<() => void>();
-
-  const notify = () => {
-    listeners.forEach((listener) => listener());
-  };
-
-  return {
-    getSnapshot: () => state,
-    subscribe: (listener) => {
-      listeners.add(listener);
-      return () => listeners.delete(listener);
-    },
-    setState: (updater) => {
-      const next = updater(state);
-      if (uploadRuntimeStateEqual(state, next)) {
-        return state;
-      }
-      state = next;
-      notify();
-      return state;
-    },
-    reset: () => {
-      if (uploadRuntimeStateEqual(state, {})) {
-        return;
-      }
-      state = {};
-      notify();
-    }
-  };
-}
-
-function seedUploadRuntimeStore(
-  store: UploadRuntimeStore,
-  progress?: ChunkProgress | null,
-  chunks?: UploadChunkState[] | null
-): void {
-  store.setState((current) => ({
-    ...(progress === undefined && current.progress ? { progress: current.progress } : {}),
-    ...(progress ? { progress } : {}),
-    ...(chunks === undefined && current.chunks ? { chunks: current.chunks } : {}),
-    ...(chunks ? { chunks } : {})
-  }));
-}
-
-function resetUploadRuntimeStore(store: UploadRuntimeStore | undefined): void {
-  store?.reset();
-}
-
-function localRuntimeSnapshot(items: QueueItem[]): Map<string, UploadRuntimeState> {
-  return new Map(items.map((item) => [item.id, item.runtimeStore?.getSnapshot() ?? {}]));
-}
+import {
+  extractFirstUrl,
+  isLocalItemAwaitingDecision,
+  isUploadableLocalItem,
+  makeItem,
+  makePlaceholderLocalItem,
+  makeQueuedUrlUploadTask,
+  makeSourceHeaderRow,
+  sourceHeaderRowsFromHeaders
+} from "./upload/item-factories";
+import {
+  createUploadRuntimeStore,
+  localRuntimeSnapshot,
+  normalizeUploadConcurrency,
+  resetUploadRuntimeStore,
+  seedUploadRuntimeStore
+} from "./upload/runtime-store";
+import {
+  chunkProgressEqual,
+  magnetStateEqual,
+  magnetUploadsEqual,
+  mergeMagnetState,
+  numberArrayEqual,
+  uploadChunkStateEqual,
+  uploadRuntimeStateEqual
+} from "./upload/equality";
+import {
+  chunkRange,
+  createUploadChunkStates,
+  expectedUploadChunkSize,
+  prepareRetryChunks,
+  retryFailureProgress,
+  updateChunkStates
+} from "./upload/chunk-math";
+import {
+  abortUploadTask,
+  delay,
+  errorMessage,
+  isAbortError,
+  isRetryableChunkUploadError,
+  isRetryableMagnetStatusError,
+  retryDelayMs
+} from "./upload/abort-retry";
+import {
+  curlImportSummary,
+  isBlockedSourceHeaderName,
+  normalizeHeaderKeyInput,
+  parseRemoteThumbnailInput,
+  parseSourceHeaderRows,
+  sourceHeaderRowsFromCurlHeaders
+} from "./upload/curl-headers";
+import { isVideoUploadCandidate } from "./upload/filetype";
+import { generatedThumbnailPayload, thumbnailStatePayload } from "./upload/thumbnail-helpers";
+import {
+  effectiveDirectoryPath,
+  effectiveFileName,
+  fileNameConflictFromError,
+  fileNameConflictFromPreflight,
+  normalizedFileNameOverride,
+  stringDetail,
+  suggestAlternativeFileName
+} from "./upload/filename-conflict";
+import {
+  browserRelativePath,
+  collectDroppedFiles,
+  joinDirectoryPath,
+  normalizeRelativePath,
+  readDroppedDirectoryEntries,
+  readDroppedEntry,
+  readDroppedFile,
+  relativeDirectoryPathFor
+} from "./upload/dropped-files";
+import {
+  defaultMagnetSelectedIndexes,
+  effectiveMagnetFileName,
+  isLikelyMagnetUrl,
+  magnetDownloadProgressLabel,
+  magnetFileNameOverrideValue,
+  magnetFileUploadOptions,
+  magnetImportStableUiKey,
+  magnetImportStructureKey,
+  magnetStatusLabel,
+  magnetStatusProgressLabel,
+  magnetTargetDirectoryPath,
+  resetMagnetDecisionsForDirectoryChange,
+  selectedMagnetIndexesForResume
+} from "./upload/magnet-helpers";
+import {
+  cleanupTemporaryHlsUpload,
+  createHlsSegmentStates,
+  formatHlsDuration,
+  hlsProbeSummary,
+  hlsRetryFailureProgress,
+  hlsRetryFromStatus,
+  hlsSegmentChunkMessage,
+  hlsSegmentChunkStatus,
+  hlsVariantLabel,
+  isLikelyHlsUrl,
+  prepareHlsRetryChunks,
+  withoutHlsRetry
+} from "./upload/hls-helpers";
+import {
+  buildFolderTree,
+  countFolderTreeDirectories,
+  folderNodeStatusClass,
+  folderNodeStatusLabel,
+  sortFolderTree,
+  type FolderTreeNode
+} from "./upload/folder-tree";
+import {
+  createUploadTaskSnapshot,
+  currentVisiblePersistedTaskIds,
+  persistedTaskDescription,
+  persistedTaskProgress,
+  persistedTaskSnapshotItem,
+  persistedTaskStatusToItemStatus,
+  persistedTaskTitle,
+  queuedUrlTaskSnapshotItem,
+  remoteFileLabel,
+  uploadTaskProgressPercent,
+  uploadTaskSnapshotKey,
+  uploadTaskSnapshotStructureKey
+} from "./upload/snapshot";
 
 export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(function UploadDialog({
   open,
@@ -4591,811 +4580,6 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   );
 });
 
-function createUploadTaskSnapshot(params: {
-  mode: UploadMode;
-  items: QueueItem[];
-  localRuntime: Map<string, UploadRuntimeState>;
-  urlUpload: UrlUploadState;
-  urlRuntime: UploadRuntimeState;
-  queuedUrlTasks: QueuedUrlUploadTask[];
-  sourceUrl: string;
-  uploadDirectoryPath: string;
-  activeUploadKind: "local" | "url" | null;
-  activeUploadItemId: string | null;
-  activePersistedTaskId: string | null;
-  stopRequested: boolean;
-  running: boolean;
-  persistedTasks: PersistedUploadTask[];
-}): UploadTaskSnapshot | null {
-  const activeItemId = params.activeUploadKind === "url" ? "url" : params.activeUploadItemId;
-  const localItems: UploadTaskSnapshotItem[] = params.items.map((item) => {
-    const runtime = params.localRuntime.get(item.id);
-    const progress = runtime?.progress ?? item.progress;
-    const progressPercent = uploadTaskProgressPercent(item.status, progress);
-    return {
-      id: item.id,
-      kind: "local",
-      title: effectiveFileName(item),
-      description: item.relativePath
-        ? `${effectiveDirectoryPath(item, params.uploadDirectoryPath)} · ${formatCompactBytes(item.file.size)}`
-        : `${params.uploadDirectoryPath} · ${formatCompactBytes(item.file.size)}`,
-      status: item.status,
-      progressPercent,
-      progressLabel: progress?.label ?? item.message,
-      canStop: params.activeUploadKind === "local" && params.activeUploadItemId === item.id && !params.stopRequested,
-      canDelete: !(params.activeUploadKind === "local" && params.activeUploadItemId === item.id)
-    };
-  });
-
-  const hasUrlTask = Boolean(
-    params.sourceUrl ||
-    params.urlUpload.status !== "pending" ||
-    params.urlRuntime.progress ||
-    params.urlUpload.progress ||
-    params.urlUpload.retry ||
-    params.urlUpload.hls?.retry ||
-    params.urlUpload.magnet?.import
-  );
-  const urlItems: UploadTaskSnapshotItem[] = hasUrlTask
-    ? [{
-        id: "url",
-        kind: "url",
-        title: params.sourceUrl ? remoteFileLabel(params.sourceUrl) : "远程上传任务",
-        description: params.sourceUrl || undefined,
-        status: params.urlUpload.status,
-        progressPercent: uploadTaskProgressPercent(params.urlUpload.status, params.urlRuntime.progress ?? params.urlUpload.progress),
-        progressLabel: params.urlRuntime.progress?.label ?? params.urlUpload.progress?.label ?? params.urlUpload.message,
-        canStop: params.activeUploadKind === "url" && !params.stopRequested,
-        canDelete: params.activeUploadKind !== "url"
-      }]
-    : [];
-
-  const queuedUrlItems = params.queuedUrlTasks.map(queuedUrlTaskSnapshotItem);
-
-  const visiblePersistedIds = currentVisiblePersistedTaskIds(params.items, params.urlUpload, params.activePersistedTaskId);
-  const persistedItems = params.persistedTasks
-    .filter((task) => !visiblePersistedIds.has(task.id))
-    .map(persistedTaskSnapshotItem);
-
-  const taskItems = [...localItems, ...urlItems, ...queuedUrlItems, ...persistedItems].filter((item) =>
-    item.status !== "pending" || item.progressLabel || item.kind === params.mode
-  );
-  if (taskItems.length === 0) return null;
-
-  const summary = taskItems.reduce<UploadTaskSnapshot["summary"]>(
-    (current, item) => {
-      current.total += 1;
-      current[item.status] += 1;
-      return current;
-    },
-    { total: 0, pending: 0, uploading: 0, done: 0, error: 0, skipped: 0 }
-  );
-
-  return {
-    items: taskItems,
-    running: params.running,
-    stopRequested: params.stopRequested,
-    activeItemId,
-    summary
-  };
-}
-
-function uploadTaskSnapshotKey(snapshot: UploadTaskSnapshot | null): string {
-  if (!snapshot) {
-    return "empty";
-  }
-
-  return JSON.stringify({
-    running: snapshot.running,
-    stopRequested: snapshot.stopRequested,
-    activeItemId: snapshot.activeItemId,
-    summary: snapshot.summary,
-    items: snapshot.items.map((item) => ({
-      id: item.id,
-      kind: item.kind,
-      title: item.title,
-      description: item.description,
-      status: item.status,
-      progressPercent: item.progressPercent,
-      progressLabel: item.progressLabel,
-      canStop: item.canStop,
-      canDelete: item.canDelete
-    }))
-  });
-}
-
-function uploadTaskSnapshotStructureKey(snapshot: UploadTaskSnapshot | null): string {
-  if (!snapshot) {
-    return "empty";
-  }
-
-  return JSON.stringify({
-    running: snapshot.running,
-    stopRequested: snapshot.stopRequested,
-    activeItemId: snapshot.activeItemId,
-    summary: snapshot.summary,
-    items: snapshot.items.map((item) => ({
-      id: item.id,
-      kind: item.kind,
-      status: item.status,
-      canStop: item.canStop,
-      canDelete: item.canDelete
-    }))
-  });
-}
-
-function queuedUrlTaskSnapshotItem(task: QueuedUrlUploadTask): UploadTaskSnapshotItem {
-  return {
-    id: task.id,
-    kind: "url",
-    title: remoteFileLabel(task.sourceUrl),
-    description: `${task.directoryPath} · ${task.sourceUrl}`,
-    status: "pending",
-    progressPercent: 0,
-    progressLabel: "等待上传",
-    canStop: false,
-    canDelete: true
-  };
-}
-
-function uploadTaskProgressPercent(status: ItemStatus, progress?: ChunkProgress): number {
-  if (progress?.total) {
-    return Math.min(100, Math.max(0, Math.round((progress.completed / progress.total) * 100)));
-  }
-  if (status === "done") return 100;
-  return 0;
-}
-
-function persistedTaskSnapshotItem(task: PersistedUploadTask): UploadTaskSnapshotItem {
-  const status = persistedTaskStatusToItemStatus(task.status);
-  const progress = persistedTaskProgress(task);
-  return {
-    id: task.id,
-    kind: task.kind === "local" ? "local" : "url",
-    title: persistedTaskTitle(task),
-    description: persistedTaskDescription(task),
-    status,
-    progressPercent: progress.percent,
-    progressLabel: progress.label,
-    canStop: false,
-    canDelete: true
-  };
-}
-
-function currentVisiblePersistedTaskIds(
-  items: QueueItem[],
-  urlUpload: UrlUploadState,
-  activePersistedTaskId: string | null
-): Set<string> {
-  const ids = new Set<string>();
-  if (activePersistedTaskId) {
-    ids.add(activePersistedTaskId);
-  }
-  for (const item of items) {
-    if (item.retry?.kind === "local") {
-      ids.add(makePersistedTaskId("local", item.retry.uploadId));
-    }
-  }
-  if (urlUpload.retry?.kind === "url") {
-    ids.add(makePersistedTaskId("url-multipart", urlUpload.retry.uploadId));
-  }
-  const hlsAssetId = urlUpload.hls?.retry?.assetId ?? urlUpload.hls?.assetId;
-  if (hlsAssetId) {
-    ids.add(makePersistedTaskId("hls", hlsAssetId));
-  }
-  if (urlUpload.magnet?.import) {
-    ids.add(makePersistedTaskId("magnet", urlUpload.magnet.import.id));
-  }
-  return ids;
-}
-
-function persistedTaskStatusToItemStatus(status: PersistedUploadTask["status"]): ItemStatus {
-  switch (status) {
-    case "running":
-      return "pending";
-    case "done":
-      return "done";
-    case "cancelled":
-      return "skipped";
-    case "failed":
-    case "waiting-file":
-      return "error";
-    default:
-      return "pending";
-  }
-}
-
-function persistedTaskTitle(task: PersistedUploadTask): string {
-  switch (task.kind) {
-    case "local":
-      return task.fileName;
-    case "hls":
-      return task.retry.fileName;
-    case "magnet":
-      return remoteFileLabel(task.sourceUrl);
-    case "url-multipart":
-      return task.fileNameOverride || remoteFileLabel(task.sourceUrl);
-  }
-}
-
-function persistedTaskDescription(task: PersistedUploadTask): string {
-  switch (task.kind) {
-    case "local":
-      return `${task.directoryPath} · ${formatCompactBytes(task.size)}`;
-    case "hls":
-      return `${task.directoryPath} · HLS · ${task.retry.segmentCount} 个片段`;
-    case "magnet":
-      return `${task.directoryPath} · 磁力任务 · ${task.selectedIndexes.length} 个文件`;
-    case "url-multipart":
-      return `${task.directoryPath} · ${formatCompactBytes(task.retry.size)}`;
-  }
-}
-
-function persistedTaskProgress(task: PersistedUploadTask): { percent: number; label: string } {
-  if (task.kind === "hls") {
-    const total = Math.max(1, task.retry.segmentCount);
-    return {
-      percent: Math.round((task.retry.completedSegments.length / total) * 100),
-      label: task.status === "waiting-file" ? "等待操作" : `已完成 ${task.retry.completedSegments.length}/${total} 个片段`
-    };
-  }
-
-  if (task.kind === "magnet") {
-    return {
-      percent: task.status === "done" ? 100 : 0,
-      label: task.status === "queued" ? "等待恢复磁力任务" : "磁力任务待处理"
-    };
-  }
-
-  const total = Math.max(1, task.retry.chunkCount);
-  return {
-    percent: Math.round((task.retry.completedChunks.length / total) * 100),
-    label: task.kind === "local" && task.status === "waiting-file"
-      ? "等待重新选择本地文件"
-      : `已完成 ${task.retry.completedChunks.length}/${total} 个分片`
-  };
-}
-
-function abortUploadTask(task: UploadAbortContext | null) {
-  if (!task) {
-    return;
-  }
-
-  task.cancelled = true;
-  task.abortController.abort();
-  for (const controller of task.controllers) {
-    controller.abort();
-  }
-  task.controllers.clear();
-}
-
-function isRetryableChunkUploadError(error: unknown): boolean {
-  if (!(error instanceof ApiError)) {
-    return true;
-  }
-
-  return error.status === 408 || error.status === 429 || error.status >= 500;
-}
-
-function isAbortError(error: unknown): boolean {
-  return error instanceof DOMException && error.name === "AbortError";
-}
-
-function isRetryableMagnetStatusError(error: unknown): boolean {
-  if (isAbortError(error)) {
-    return true;
-  }
-
-  if (error instanceof ApiError) {
-    return error.status === 408 ||
-      error.status === 429 ||
-      error.status === 500 ||
-      error.status === 502 ||
-      error.status === 503 ||
-      error.status === 504;
-  }
-
-  return error instanceof Error;
-}
-
-function errorMessage(error: unknown): string {
-  if (isAbortError(error)) {
-    return "请求已中止或超时";
-  }
-
-  if (error instanceof Error && error.message.trim()) {
-    return error.message;
-  }
-
-  return "上传失败";
-}
-
-function sourceHeaderRowsFromCurlHeaders(headers: Record<string, string>): {
-  rows: SourceHeaderRow[];
-  headerCount: number;
-  skippedHeaders: string[];
-} {
-  const rows: SourceHeaderRow[] = [];
-  const skippedHeaders: string[] = [];
-  const skipped = new Set<string>();
-
-  const addSkipped = (name: string) => {
-    const label = name || "空名称";
-    const lowerName = label.toLowerCase();
-    if (!skipped.has(lowerName)) {
-      skipped.add(lowerName);
-      skippedHeaders.push(label);
-    }
-  };
-
-  for (const [rawName, rawValue] of Object.entries(headers)) {
-    const name = normalizeHeaderKeyInput(rawName);
-    const value = rawValue.trim();
-
-    if (!value) {
-      continue;
-    }
-
-    if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name) || /[\r\n]/.test(value) || isBlockedSourceHeaderName(name)) {
-      addSkipped(rawName.trim());
-      continue;
-    }
-
-    rows.push(makeSourceHeaderRow(name, value));
-  }
-
-  return {
-    rows,
-    headerCount: rows.length,
-    skippedHeaders
-  };
-}
-
-function curlImportSummary(headerCount: number, warnings: string[]): string {
-  const base = headerCount > 0
-    ? `已从 cURL 填入 URL 和 ${headerCount} 个请求头`
-    : "已从 cURL 填入 URL";
-  const visibleWarnings = warnings.slice(0, 2);
-  const warningText = visibleWarnings.length > 0 ? `；${visibleWarnings.join("；")}` : "";
-  const overflowText = warnings.length > visibleWarnings.length
-    ? `；另有 ${warnings.length - visibleWarnings.length} 条提示`
-    : "";
-
-  return `${base}${warningText}${overflowText}`;
-}
-
-function parseRemoteThumbnailInput(input: string): { url: string; headers?: SourceRequestHeaders; summary: string } {
-  const text = input.trim();
-  if (!text) {
-    throw new Error("请输入缩略图 URL 或 cURL 命令");
-  }
-
-  if (/^(?:[$>]\s*)?curl(?:\.exe)?\b/i.test(text)) {
-    const parsed = parseCurlCommand(text);
-    const headerResult = sourceHeaderRowsFromCurlHeaders(parsed.headers);
-    const headers = parseSourceHeaderRows(headerResult.rows);
-    const warnings = [...parsed.warnings];
-    if (headerResult.skippedHeaders.length > 0) {
-      warnings.push(`已忽略 ${headerResult.skippedHeaders.length} 个不支持的请求头`);
-    }
-
-    return {
-      url: parsed.url,
-      ...(headers ? { headers } : {}),
-      summary: curlImportSummary(headerResult.headerCount, warnings).replace("URL", "缩略图 URL")
-    };
-  }
-
-  let url: URL;
-  try {
-    url = new URL(text);
-  } catch {
-    throw new Error("缩略图 URL 必须是完整的 http/https 地址");
-  }
-
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error("缩略图 URL 必须使用 http 或 https");
-  }
-
-  return {
-    url: url.toString(),
-    summary: "URL 缩略图"
-  };
-}
-
-function parseSourceHeaderRows(rows: SourceHeaderRow[]): SourceRequestHeaders | undefined {
-  const headers: SourceRequestHeaders = {};
-  const seen = new Set<string>();
-
-  for (const [index, row] of rows.entries()) {
-    const name = normalizeHeaderKeyInput(row.name);
-    const headerValue = row.value.trim();
-    const hasName = name.length > 0;
-    const hasValue = headerValue.length > 0;
-
-    if (!hasName && !hasValue) {
-      continue;
-    }
-
-    if (!hasName) {
-      throw new Error(`第 ${index + 1} 个请求头缺少 key`);
-    }
-
-    if (!hasValue) {
-      throw new Error(`请求头 ${name} 缺少 value`);
-    }
-
-    if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name)) {
-      throw new Error(`请求头 key 无效：${row.name || `第 ${index + 1} 行`}`);
-    }
-
-    if (isBlockedSourceHeaderName(name)) {
-      throw new Error(`不允许自定义请求头：${name}`);
-    }
-
-    if (/[\r\n]/.test(headerValue)) {
-      throw new Error(`请求头 ${name} 的 value 不能包含换行`);
-    }
-
-    if (seen.has(name)) {
-      throw new Error(`请求头 ${name} 重复`);
-    }
-
-    seen.add(name);
-    headers[name] = headerValue;
-  }
-
-  return Object.keys(headers).length > 0 ? headers : undefined;
-}
-
-function normalizeHeaderKeyInput(value: string): string {
-  return value.trim().toLowerCase();
-}
-
-function isBlockedSourceHeaderName(name: string): boolean {
-  const lowerName = name.toLowerCase();
-  return lowerName === "host" ||
-    lowerName === "range" ||
-    lowerName === "content-length" ||
-    lowerName === "connection" ||
-    lowerName === "keep-alive" ||
-    lowerName === "proxy-authenticate" ||
-    lowerName === "proxy-authorization" ||
-    lowerName === "te" ||
-    lowerName === "trailer" ||
-    lowerName === "transfer-encoding" ||
-    lowerName === "upgrade" ||
-    lowerName === "accept-encoding" ||
-    lowerName === "cf-connecting-ip" ||
-    lowerName === "cf-ipcountry" ||
-    lowerName === "cf-ray" ||
-    lowerName === "cf-visitor" ||
-    lowerName === "true-client-ip" ||
-    lowerName === "x-forwarded-for" ||
-    lowerName === "x-forwarded-host" ||
-    lowerName === "x-forwarded-proto" ||
-    lowerName === "x-real-ip";
-}
-
-function retryDelayMs(failedAttempt: number, error: unknown): number {
-  const retryAfterSeconds = error instanceof ApiError
-    ? Number(error.details?.telegram_retry_after_seconds)
-    : Number.NaN;
-
-  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
-    return Math.min(retryAfterSeconds * 1000, 5 * 60 * 1000);
-  }
-
-  return MULTIPART_UPLOAD_RETRY_DELAY_MS * failedAttempt;
-}
-
-function delay(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(new DOMException("Aborted", "AbortError"));
-      return;
-    }
-
-    const onAbort = () => {
-      window.clearTimeout(timeoutId);
-      reject(new DOMException("Aborted", "AbortError"));
-    };
-    const timeoutId = window.setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
-function effectiveFileName(item: QueueItem): string {
-  return normalizedFileNameOverride(item.fileNameOverride) ?? item.file.name;
-}
-
-function effectiveDirectoryPath(item: QueueItem, baseDirectoryPath: string): string {
-  return joinDirectoryPath(baseDirectoryPath, item.relativeDirectoryPath);
-}
-
-function effectiveMagnetFileName(file: MagnetImportFile, decision: MagnetFileDecision | undefined): string {
-  return normalizedFileNameOverride(decision?.fileNameOverride) ?? file.file_name;
-}
-
-function magnetTargetDirectoryPath(baseDirectoryPath: string, file: MagnetImportFile): string {
-  return joinDirectoryPath(baseDirectoryPath, file.relative_directory_path ?? undefined);
-}
-
-function magnetFileNameOverrideValue(file: MagnetImportFile, value: string): string | undefined {
-  if (value.trim().length === 0) {
-    return value;
-  }
-
-  return value.trim() === file.file_name ? undefined : value;
-}
-
-function resetMagnetDecisionsForDirectoryChange(
-  decisions: Record<number, MagnetFileDecision> | undefined
-): Record<number, MagnetFileDecision> | undefined {
-  if (!decisions) {
-    return undefined;
-  }
-
-  const next: Record<number, MagnetFileDecision> = {};
-  for (const [key, decision] of Object.entries(decisions)) {
-    const { conflict: _conflict, conflictAction: _conflictAction, editingFileName: _editingFileName, ...rest } = decision;
-    if (Object.keys(rest).length > 0) {
-      next[Number(key)] = rest;
-    }
-  }
-
-  return Object.keys(next).length > 0 ? next : undefined;
-}
-
-function magnetFileUploadOptions(
-  magnet: MagnetImport,
-  selectedIndexes: number[],
-  decisions: Record<number, MagnetFileDecision>
-): MagnetFileUploadOption[] {
-  const selected = new Set(selectedIndexes);
-  return magnet.files
-    .filter((file) => selected.has(file.file_index))
-    .map((file) => {
-      const decision = decisions[file.file_index];
-      const fileName = effectiveMagnetFileName(file, decision);
-      return {
-        file_index: file.file_index,
-        ...(fileName !== file.file_name ? { file_name: fileName } : {}),
-        ...(decision?.conflictAction === "overwrite" ? { on_conflict: "overwrite" as const } : {})
-      };
-    });
-}
-
-interface WebkitFileSystemEntryLike {
-  isFile: boolean;
-  isDirectory: boolean;
-  name: string;
-}
-
-interface WebkitFileSystemFileEntryLike extends WebkitFileSystemEntryLike {
-  isFile: true;
-  file: (success: (file: File) => void, failure?: (error: DOMException) => void) => void;
-}
-
-interface WebkitFileSystemDirectoryEntryLike extends WebkitFileSystemEntryLike {
-  isDirectory: true;
-  createReader: () => {
-    readEntries: (
-      success: (entries: WebkitFileSystemEntryLike[]) => void,
-      failure?: (error: DOMException) => void
-    ) => void;
-  };
-}
-
-interface OptionalWebkitEntryGetter {
-  webkitGetAsEntry?: () => WebkitFileSystemEntryLike | null;
-}
-
-async function collectDroppedFiles(dataTransfer: DataTransfer): Promise<DroppedFileEntry[]> {
-  const entries = Array.from(dataTransfer.items ?? [])
-    .map((item) => {
-      const getter = (item as unknown as OptionalWebkitEntryGetter).webkitGetAsEntry;
-      return typeof getter === "function" ? getter.call(item) : null;
-    })
-    .filter((entry): entry is WebkitFileSystemEntryLike => Boolean(entry));
-
-  if (entries.length === 0) {
-    return [];
-  }
-
-  const nested = await Promise.all(entries.map((entry) => readDroppedEntry(entry, "")));
-  return nested.flat();
-}
-
-async function readDroppedEntry(entry: WebkitFileSystemEntryLike, parentPath: string): Promise<DroppedFileEntry[]> {
-  if (entry.isFile) {
-    const file = await readDroppedFile(entry as WebkitFileSystemFileEntryLike);
-    return [{
-      file,
-      ...(parentPath ? { relativePath: normalizeRelativePath(`${parentPath}/${file.name}`) } : {})
-    }];
-  }
-
-  if (!entry.isDirectory) {
-    return [];
-  }
-
-  const directory = entry as WebkitFileSystemDirectoryEntryLike;
-  const directoryPath = parentPath ? `${parentPath}/${directory.name}` : directory.name;
-  const children = await readDroppedDirectoryEntries(directory);
-  const nested = await Promise.all(children.map((child) => readDroppedEntry(child, directoryPath)));
-  return nested.flat();
-}
-
-function readDroppedFile(entry: WebkitFileSystemFileEntryLike): Promise<File> {
-  return new Promise((resolve, reject) => {
-    entry.file(resolve, reject);
-  });
-}
-
-async function readDroppedDirectoryEntries(directory: WebkitFileSystemDirectoryEntryLike): Promise<WebkitFileSystemEntryLike[]> {
-  const reader = directory.createReader();
-  const entries: WebkitFileSystemEntryLike[] = [];
-
-  while (true) {
-    const batch = await new Promise<WebkitFileSystemEntryLike[]>((resolve, reject) => {
-      reader.readEntries(resolve, reject);
-    });
-    if (batch.length === 0) {
-      break;
-    }
-    entries.push(...batch);
-  }
-
-  return entries;
-}
-
-function browserRelativePath(file: File): string | undefined {
-  const value = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
-  return normalizeRelativePath(value);
-}
-
-function normalizeRelativePath(value: string | undefined): string | undefined {
-  if (!value) return undefined;
-
-  const segments = value
-    .replace(/\\/g, "/")
-    .split("/")
-    .map((segment) => segment.trim())
-    .filter((segment) => segment && segment !== "." && segment !== "..");
-
-  return segments.length > 0 ? segments.join("/") : undefined;
-}
-
-function relativeDirectoryPathFor(relativePath: string | undefined): string | undefined {
-  if (!relativePath) return undefined;
-  const segments = relativePath.split("/").filter(Boolean);
-  if (segments.length <= 1) return undefined;
-  return segments.slice(0, -1).join("/");
-}
-
-function joinDirectoryPath(baseDirectoryPath: string, relativeDirectoryPath: string | undefined): string {
-  const base = baseDirectoryPath === "/" ? "" : baseDirectoryPath.replace(/\/+$/g, "");
-  const relative = relativeDirectoryPath?.replace(/^\/+|\/+$/g, "");
-
-  if (!relative) {
-    return base || "/";
-  }
-
-  return `${base}/${relative}`.replace(/\/+/g, "/") || "/";
-}
-
-function normalizedFileNameOverride(value: string | undefined): string | undefined {
-  const normalized = value?.trim();
-  return normalized || undefined;
-}
-
-function generatedThumbnailPayload(thumbnail: GeneratedThumbnail): ThumbnailUploadPayload {
-  return {
-    blob: thumbnail.blob,
-    fileName: thumbnail.fileName,
-    ...(thumbnail.width ? { width: thumbnail.width } : {}),
-    ...(thumbnail.height ? { height: thumbnail.height } : {})
-  };
-}
-
-function thumbnailStatePayload(thumbnail: UploadThumbnailState | undefined): ThumbnailUploadPayload | undefined {
-  if (thumbnail?.status !== "ready") {
-    return undefined;
-  }
-
-  if (thumbnail.generated) {
-    return generatedThumbnailPayload(thumbnail.generated);
-  }
-
-  if (thumbnail.remote) {
-    return {
-      sourceUrl: thumbnail.remote.url,
-      ...(thumbnail.remote.headers ? { sourceHeaders: thumbnail.remote.headers } : {})
-    };
-  }
-
-  return undefined;
-}
-
-function isVideoUploadCandidate(upload: Pick<MultipartUpload, "mime_type" | "file_name">): boolean {
-  return upload.mime_type.toLowerCase().startsWith("video/") || /\.(mp4|m4v|mov|webm|ogv)$/i.test(upload.file_name);
-}
-
-function fileNameConflictFromError(error: unknown): FileNameConflictState | undefined {
-  if (!(error instanceof ApiError) || error.status !== 409 || error.error !== "FileNameConflict") {
-    return undefined;
-  }
-
-  const fileName = stringDetail(error.details, "file_name") || "同名文件";
-  return {
-    fileName,
-    suggestedName: stringDetail(error.details, "suggested_name") || suggestAlternativeFileName(fileName),
-    directoryPath: stringDetail(error.details, "directory_path") || "/",
-    source: stringDetail(error.details, "source") === "file" ? "file" : undefined
-  };
-}
-
-function fileNameConflictFromPreflight(entry: UploadPreflightResultEntry): FileNameConflictState {
-  return {
-    fileName: entry.file_name,
-    suggestedName: entry.suggested_name || suggestAlternativeFileName(entry.file_name),
-    directoryPath: entry.directory_path,
-    source: entry.source,
-    message: entry.message
-  };
-}
-
-function stringDetail(details: Record<string, unknown> | undefined, key: string): string | undefined {
-  const value = details?.[key];
-  return typeof value === "string" && value.trim() ? value : undefined;
-}
-
-function suggestAlternativeFileName(fileName: string): string {
-  const match = /^(.*?)(\.[^./\\]{1,12})$/.exec(fileName);
-  const base = match?.[1] || fileName;
-  const extension = match?.[2] || "";
-
-  return `${base} (1)${extension}`;
-}
-
-function chunkRange(count: number): number[] {
-  return Array.from({ length: count }, (_, index) => index);
-}
-
-function retryFailureProgress(retry: MultipartRetryState, label: string): ChunkProgress {
-  return {
-    completed: retry.completedChunks.length,
-    total: retry.chunkCount,
-    failed: retry.failedChunks.length,
-    label: `${label}（失败 ${retry.failedChunks.length} 个）`
-  };
-}
-
-function cleanupTemporaryHlsUpload(state: UrlUploadState): void {
-  if (state.status === "done") {
-    return;
-  }
-
-  const assetId = state.hls?.assetId ?? state.hls?.retry?.assetId;
-  if (!assetId) {
-    return;
-  }
-
-  void getHlsUploadStatus(assetId)
-    .then((response) => {
-      if (response.hls.asset.status === "done" || response.hls.asset.final_file_id) {
-        return undefined;
-      }
-      return cancelHlsUpload(assetId);
-    })
-    .catch(() => undefined);
-}
-
 function cleanupTemporaryMagnetUpload(state: UrlUploadState): void {
   const importId = unfinishedMagnetImportId(state);
   if (!importId) {
@@ -5423,338 +4607,6 @@ function unfinishedMagnetImportId(state: UrlUploadState): string | undefined {
   return magnet.id;
 }
 
-function withoutHlsRetry(state: HlsUrlState): HlsUrlState {
-  const { retry: _retry, ...rest } = state;
-  return rest;
-}
-
-function isLikelyMagnetUrl(value: string): boolean {
-  return value.trim().toLowerCase().startsWith("magnet:?");
-}
-
-function defaultMagnetSelectedIndexes(files: MagnetImportFile[], maxMultipartBytes: number): number[] {
-  return files
-    .filter((file) => file.size > 0 && file.size <= maxMultipartBytes)
-    .map((file) => file.file_index)
-    .sort((left, right) => left - right);
-}
-
-function selectedMagnetIndexesForResume(magnet: MagnetImport, maxMultipartBytes: number): number[] {
-  const selected = magnet.files
-    .filter((file) => file.selected && file.size > 0 && file.size <= maxMultipartBytes)
-    .map((file) => file.file_index)
-    .sort((left, right) => left - right);
-
-  return selected.length > 0 ? selected : defaultMagnetSelectedIndexes(magnet.files, maxMultipartBytes);
-}
-
-function magnetStatusLabel(status: MagnetImport["status"]): string {
-  switch (status) {
-    case "probing":
-      return "解析中";
-    case "ready":
-      return "已解析";
-    case "downloading":
-      return "下载中";
-    case "downloaded":
-      return "已下载";
-    case "importing":
-      return "导入中";
-    case "done":
-      return "已完成";
-    case "failed":
-      return "失败";
-    case "cancelled":
-      return "已取消";
-    default:
-      return status;
-  }
-}
-
-function magnetStatusProgressLabel(label: string, magnet: MagnetImport, selectedCount?: number): string {
-  const status = magnetStatusLabel(magnet.status);
-  const fileCount = selectedCount ?? (magnet.file_count || magnet.files.length);
-  const size = selectedCount === undefined && magnet.total_size ? ` · ${formatBytes(magnet.total_size)}` : "";
-  const download = magnetDownloadProgressLabel(magnet);
-  return `${label} · ${status}${download ? ` · ${download}` : ""}${fileCount > 0 ? ` · ${fileCount} 个文件${size}` : ""}`;
-}
-
-function magnetDownloadProgressLabel(magnet: MagnetImport): string | null {
-  const total = magnet.download_total_bytes;
-  const completed = magnet.download_completed_bytes;
-  if (
-    typeof total !== "number" ||
-    typeof completed !== "number" ||
-    !Number.isFinite(total) ||
-    !Number.isFinite(completed) ||
-    total <= 0
-  ) {
-    return null;
-  }
-
-  const progress = typeof magnet.download_progress === "number"
-    ? Math.min(100, Math.max(0, magnet.download_progress * 100))
-    : Math.min(100, Math.max(0, (completed / total) * 100));
-  const speed = magnet.download_speed_bytes_per_second && magnet.download_speed_bytes_per_second > 0
-    ? ` · ${formatBytes(magnet.download_speed_bytes_per_second)}/s`
-    : "";
-
-  return `${formatBytes(completed)}/${formatBytes(total)} · ${progress >= 10 ? progress.toFixed(0) : progress.toFixed(1)}%${speed}`;
-}
-
-function magnetImportStructureKey(magnet: MagnetImport): string {
-  return JSON.stringify({
-    status: magnet.status,
-    error: magnet.error_message ?? "",
-    aria2Status: magnet.aria2_status ?? "",
-    totalBytes: magnet.download_total_bytes ?? 0,
-    metadataCompletedAt: magnet.metadata_completed_at ?? "",
-    downloadStartedAt: magnet.download_started_at ?? "",
-    downloadCompletedAt: magnet.download_completed_at ?? "",
-    completedAt: magnet.completed_at ?? "",
-    fileCount: magnet.file_count,
-    totalSize: magnet.total_size ?? 0,
-    files: magnet.files.map((file) => [
-      file.file_index,
-      file.path,
-      file.file_name,
-      file.relative_directory_path ?? "",
-      file.size,
-      file.mime_type,
-      file.chunk_size,
-      file.chunk_count,
-      file.selected,
-      file.status,
-      file.upload_id ?? "",
-      file.error_message ?? ""
-    ])
-  });
-}
-
-function magnetImportStableUiKey(magnet: MagnetImport): string {
-  return JSON.stringify({
-    status: magnet.status,
-    error: magnet.error_message ?? "",
-    metadataCompletedAt: magnet.metadata_completed_at ?? "",
-    downloadStartedAt: magnet.download_started_at ?? "",
-    downloadCompletedAt: magnet.download_completed_at ?? "",
-    completedAt: magnet.completed_at ?? "",
-    fileCount: magnet.file_count,
-    totalSize: magnet.total_size ?? 0,
-    files: magnet.files.map((file) => [
-      file.file_index,
-      file.path,
-      file.file_name,
-      file.relative_directory_path ?? "",
-      file.size,
-      file.mime_type,
-      file.chunk_size,
-      file.chunk_count,
-      file.selected,
-      file.status,
-      file.upload_id ?? "",
-      file.error_message ?? ""
-    ])
-  });
-}
-
-function magnetStateEqual(left: MagnetUrlState | undefined, right: MagnetUrlState | undefined): boolean {
-  if (left === right) {
-    return true;
-  }
-  if (!left || !right) {
-    return false;
-  }
-
-  const leftImportKey = left.import ? magnetImportStructureKey(left.import) : "";
-  const rightImportKey = right.import ? magnetImportStructureKey(right.import) : "";
-  return leftImportKey === rightImportKey &&
-    numberArrayEqual(left.selectedIndexes, right.selectedIndexes) &&
-    magnetUploadsEqual(left.uploads, right.uploads) &&
-    left.fileDecisions === right.fileDecisions;
-}
-
-function mergeMagnetState(current: MagnetUrlState | undefined, next: MagnetUrlState): MagnetUrlState {
-  return magnetStateEqual(current, next) ? current! : next;
-}
-
-function numberArrayEqual(left: number[] | undefined, right: number[] | undefined): boolean {
-  if (left === right) {
-    return true;
-  }
-  if (!left || !right || left.length !== right.length) {
-    return false;
-  }
-  return left.every((value, index) => value === right[index]);
-}
-
-function magnetUploadsEqual(left: MagnetUploadEntry[] | undefined, right: MagnetUploadEntry[] | undefined): boolean {
-  if (left === right) {
-    return true;
-  }
-  if (!left || !right || left.length !== right.length) {
-    return false;
-  }
-  return left.every((entry, index) => {
-    const next = right[index];
-    return entry.fileIndex === next.fileIndex &&
-      entry.targetDirectoryPath === next.targetDirectoryPath &&
-      entry.conflictAction === next.conflictAction &&
-      entry.upload.id === next.upload.id &&
-      entry.upload.file_name === next.upload.file_name &&
-      entry.upload.size === next.upload.size &&
-      entry.upload.chunk_size === next.upload.chunk_size &&
-      entry.upload.chunk_count === next.upload.chunk_count &&
-      entry.upload.direct_access === next.upload.direct_access;
-  });
-}
-
-function isLikelyHlsUrl(value: string): boolean {
-  try {
-    const url = new URL(value);
-    return /\.m3u8$/i.test(url.pathname) || url.pathname.toLowerCase().includes(".m3u8");
-  } catch {
-    return /\.m3u8(?:[?#]|$)/i.test(value);
-  }
-}
-
-function hlsRetryFromStatus(
-  asset: HlsAsset,
-  segments: HlsSegment[],
-  conflictAction: FileNameConflictAction
-): HlsRetryState {
-  const completedSegments = segments
-    .filter((segment) => segment.status === "done")
-    .map((segment) => segment.segment_index)
-    .sort((left, right) => left - right);
-  const completedSet = new Set(completedSegments);
-  const failedSegments = chunkRange(asset.segment_count)
-    .filter((index) => !completedSet.has(index));
-
-  return {
-    assetId: asset.id,
-    fileName: asset.file_name,
-    segmentCount: asset.segment_count,
-    previewPlaylistUrl: asset.preview_playlist_url,
-    conflictAction,
-    completedSegments,
-    failedSegments
-  };
-}
-
-function hlsRetryFailureProgress(retry: HlsRetryState, label: string): ChunkProgress {
-  return {
-    completed: retry.completedSegments.length,
-    total: retry.segmentCount,
-    failed: retry.failedSegments.length,
-    label: retry.failedSegments.length > 0
-      ? `${label}（失败 ${retry.failedSegments.length} 个片段）`
-      : label
-  };
-}
-
-function createHlsSegmentStates(segments: HlsSegment[]): UploadChunkState[] {
-  return segments.map((segment) => ({
-    index: segment.segment_index,
-    size: segment.size ?? 0,
-    status: hlsSegmentChunkStatus(segment),
-    attempts: segment.attempts,
-    ...(hlsSegmentChunkMessage(segment, segment.missing_chunks) ? { errorMessage: hlsSegmentChunkMessage(segment, segment.missing_chunks) } : {})
-  }));
-}
-
-function prepareHlsRetryChunks(chunks: UploadChunkState[] | undefined, retry: HlsRetryState): UploadChunkState[] {
-  const completed = new Set(retry.completedSegments);
-  const failed = new Set(retry.failedSegments);
-  const source = chunks ?? Array.from({ length: retry.segmentCount }, (_, index) => ({
-    index,
-    size: 0,
-    status: "queued" as UploadChunkStatus,
-    attempts: 0
-  }));
-
-  return source.map((chunk) => {
-    if (completed.has(chunk.index)) {
-      return { ...chunk, status: "completed", errorMessage: undefined };
-    }
-    if (failed.has(chunk.index)) {
-      return { ...chunk, status: "queued", errorMessage: undefined };
-    }
-    return { ...chunk, status: "queued", errorMessage: undefined };
-  });
-}
-
-function hlsSegmentChunkStatus(segment: HlsSegment): UploadChunkStatus {
-  switch (segment.status) {
-    case "done":
-      return "completed";
-    case "failed":
-      return "failed";
-    case "importing":
-      return "uploading";
-    default:
-      return "queued";
-  }
-}
-
-function hlsSegmentChunkMessage(segment: HlsSegment, missingChunks: number[]): string | undefined {
-  if (segment.status === "done") {
-    return undefined;
-  }
-
-  if (segment.status === "failed") {
-    return segment.error_message || "HLS 片段导入失败";
-  }
-
-  if (segment.storage_backend === "telegram_multipart" && segment.chunk_count) {
-    const uploaded = segment.uploaded_chunks.length;
-    return missingChunks.length > 0
-      ? `大 HLS 片段 · 内部分片 ${uploaded}/${segment.chunk_count}`
-      : "大 HLS 片段 · 等待合成";
-  }
-
-  return segment.error_message ?? undefined;
-}
-
-function hlsProbeSummary(probe: HlsProbeInfo): string {
-  if (probe.media) {
-    return `HLS VOD · ${probe.media.segment_count} 个片段 · ${formatHlsDuration(probe.media.duration)}`;
-  }
-
-  if (probe.kind === "master") {
-    return `HLS master · ${probe.variants.length} 个 variant`;
-  }
-
-  return "HLS 播放列表";
-}
-
-function formatHlsDuration(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds <= 0) {
-    return "未知时长";
-  }
-
-  const total = Math.round(seconds);
-  const hours = Math.floor(total / 3600);
-  const minutes = Math.floor((total % 3600) / 60);
-  const rest = total % 60;
-
-  if (hours > 0) {
-    return `${hours}小时${minutes.toString().padStart(2, "0")}分`;
-  }
-
-  return `${minutes}分${rest.toString().padStart(2, "0")}秒`;
-}
-
-function hlsVariantLabel(variant: HlsProbeInfo["variants"][number]): string {
-  const parts = [
-    variant.resolution,
-    variant.bandwidth ? `${Math.round(variant.bandwidth / 1000)}kbps` : undefined,
-    variant.codecs
-  ].filter(Boolean);
-
-  return parts.length > 0 ? parts.join(" · ") : variant.id;
-}
-
 function sameOriginAdminUrl(value: string): string {
   if (typeof window === "undefined") {
     return value;
@@ -5770,199 +4622,6 @@ function sameOriginAdminUrl(value: string): string {
   }
 
   return value;
-}
-
-function buildFolderTree(items: QueueItem[]): FolderTreeNode {
-  const root: FolderTreeNode = {
-    name: "root",
-    path: "/",
-    kind: "directory",
-    children: new Map()
-  };
-
-  for (const item of items) {
-    const relativePath = item.relativePath;
-    if (!relativePath) continue;
-
-    const segments = relativePath.split("/").filter(Boolean);
-    let current = root;
-    let currentPath = "";
-
-    segments.forEach((segment, index) => {
-      const isFile = index === segments.length - 1;
-      currentPath = `${currentPath}/${segment}`;
-      const key = `${isFile ? "file" : "dir"}:${segment}`;
-      let child = current.children.get(key);
-
-      if (!child) {
-        child = {
-          name: isFile ? effectiveFileName(item) : segment,
-          path: currentPath,
-          kind: isFile ? "file" : "directory",
-          children: new Map()
-        };
-        current.children.set(key, child);
-      }
-
-      if (isFile) {
-        child.name = effectiveFileName(item);
-        child.status = item.status;
-        child.conflict = Boolean(item.conflict);
-        child.conflictAction = item.conflictAction;
-        child.renamed = Boolean(item.fileNameOverride);
-      }
-
-      current = child;
-    });
-  }
-
-  sortFolderTree(root);
-  return root;
-}
-
-function sortFolderTree(node: FolderTreeNode): void {
-  const sorted = Array.from(node.children.entries()).sort(([, left], [, right]) => {
-    if (left.kind !== right.kind) {
-      return left.kind === "directory" ? -1 : 1;
-    }
-    return left.name.localeCompare(right.name, undefined, { sensitivity: "base" });
-  });
-
-  node.children = new Map(sorted);
-  for (const child of node.children.values()) {
-    sortFolderTree(child);
-  }
-}
-
-function countFolderTreeDirectories(node: FolderTreeNode): number {
-  let count = node.kind === "directory" && node.path !== "/" ? 1 : 0;
-  for (const child of node.children.values()) {
-    count += countFolderTreeDirectories(child);
-  }
-  return count;
-}
-
-function folderNodeStatusClass(node: FolderTreeNode, isFile: boolean): string {
-  if (!isFile) return "bg-primary";
-
-  if (node.conflict) return "bg-warning";
-  if (node.conflictAction === "overwrite") return "bg-warning";
-  if (node.renamed) return "bg-primary";
-
-  switch (node.status) {
-    case "done":
-      return "bg-success";
-    case "error":
-      return "bg-warning";
-    case "skipped":
-      return "bg-subtle";
-    case "uploading":
-      return "bg-primary";
-    default:
-      return "bg-border-strong";
-  }
-}
-
-function folderNodeStatusLabel(node: FolderTreeNode): string {
-  if (node.conflict) return "冲突";
-  if (node.conflictAction === "overwrite") return "覆盖";
-  if (node.renamed) return "改名";
-
-  switch (node.status) {
-    case "done":
-      return "完成";
-    case "error":
-      return "待处理";
-    case "skipped":
-      return "忽略";
-    case "uploading":
-      return "上传中";
-    default:
-      return "待上传";
-  }
-}
-
-function createUploadChunkStates(size: number, chunkSize: number, chunkCount: number): UploadChunkState[] {
-  return Array.from({ length: chunkCount }, (_, index) => ({
-    index,
-    size: expectedUploadChunkSize(size, chunkSize, chunkCount, index),
-    status: "queued",
-    attempts: 0
-  }));
-}
-
-function prepareRetryChunks(chunks: UploadChunkState[] | undefined, retry: MultipartRetryState): UploadChunkState[] {
-  const failed = new Set(retry.failedChunks);
-  const completed = new Set(retry.completedChunks);
-  const source = chunks ?? createUploadChunkStates(retry.size, retry.chunkSize, retry.chunkCount);
-
-  return source.map((chunk) => {
-    if (completed.has(chunk.index)) {
-      return { ...chunk, status: "completed", errorMessage: undefined };
-    }
-    if (failed.has(chunk.index)) {
-      return { ...chunk, status: "queued", errorMessage: undefined };
-    }
-    return chunk;
-  });
-}
-
-function updateChunkStates(
-  chunks: UploadChunkState[] | undefined,
-  chunkIndex: number,
-  patch: Partial<UploadChunkState>
-): UploadChunkState[] | undefined {
-  if (!chunks) {
-    return chunks;
-  }
-
-  let changed = false;
-  const next = chunks.map((chunk) => {
-    if (chunk.index !== chunkIndex) {
-      return chunk;
-    }
-
-    const patched = { ...chunk, ...patch };
-    if (uploadChunkStateEqual(chunk, patched)) {
-      return chunk;
-    }
-
-    changed = true;
-    return patched;
-  });
-
-  return changed ? next : chunks;
-}
-
-function chunkProgressEqual(left: ChunkProgress | undefined, right: ChunkProgress | undefined): boolean {
-  if (left === right) {
-    return true;
-  }
-  if (!left || !right) {
-    return false;
-  }
-
-  return left.completed === right.completed &&
-    left.total === right.total &&
-    left.label === right.label &&
-    left.failed === right.failed;
-}
-
-function uploadRuntimeStateEqual(left: UploadRuntimeState, right: UploadRuntimeState): boolean {
-  return chunkProgressEqual(left.progress, right.progress) &&
-    left.chunks === right.chunks;
-}
-
-function uploadChunkStateEqual(left: UploadChunkState, right: UploadChunkState): boolean {
-  return left.index === right.index &&
-    left.size === right.size &&
-    left.status === right.status &&
-    left.attempts === right.attempts &&
-    left.errorMessage === right.errorMessage;
-}
-
-function expectedUploadChunkSize(size: number, chunkSize: number, chunkCount: number, chunkIndex: number): number {
-  return chunkIndex === chunkCount - 1 ? size - chunkSize * chunkIndex : chunkSize;
 }
 
 function ConflictSummary({
@@ -6005,17 +4664,6 @@ function ConflictSummary({
       </div>
     </div>
   );
-}
-
-interface FolderTreeNode {
-  name: string;
-  path: string;
-  kind: "directory" | "file";
-  status?: ItemStatus;
-  conflict?: boolean;
-  conflictAction?: FileNameConflictAction;
-  renamed?: boolean;
-  children: Map<string, FolderTreeNode>;
 }
 
 function FolderUploadTree({ items, baseDirectoryPath }: { items: QueueItem[]; baseDirectoryPath: string }) {
@@ -7760,16 +6408,6 @@ function magnetUploadDetailsPropsEqual(
     previous.maxMultipartBytes === next.maxMultipartBytes &&
     previous.directoryPath === next.directoryPath &&
     previous.disabled === next.disabled;
-}
-
-function remoteFileLabel(value: string): string {
-  try {
-    const url = new URL(value);
-    const segment = url.pathname.split("/").filter(Boolean).at(-1);
-    return segment ? decodeURIComponent(segment) : url.hostname;
-  } catch {
-    return "远程文件";
-  }
 }
 
 function StatusBadge({ status, multipart }: { status: ItemStatus; multipart?: boolean }) {
