@@ -114,43 +114,26 @@ export type {
   UploadTaskSnapshotStatus
 } from "./upload/types";
 
+import {
+  CHUNK_UI_UPDATE_INTERVAL_MS,
+  DEFAULT_UPLOAD_CONCURRENCY,
+  FILE_NAME_CONFLICT_TOAST_MESSAGE,
+  HLS_SEGMENT_REQUEST_TIMEOUT_MS,
+  HlsSegmentUploadError,
+  LOCAL_CHUNK_REQUEST_TIMEOUT_MS,
+  MAGNET_DOWNLOAD_TIMEOUT_MS,
+  MAGNET_STATUS_MAX_TRANSIENT_FAILURES,
+  MAGNET_STATUS_POLL_MS,
+  MAGNET_STATUS_RETRY_DELAY_MS,
+  MAX_RENDERABLE_CHUNKS,
+  MULTIPART_UPLOAD_MAX_ATTEMPTS,
+  MULTIPART_UPLOAD_RETRY_DELAY_MS,
+  MultipartChunkUploadError,
+  TASK_SNAPSHOT_UPDATE_INTERVAL_MS,
+  URL_CHUNK_REQUEST_TIMEOUT_MS
+} from "./upload/constants";
+
 let counter = 0;
-const DEFAULT_UPLOAD_CONCURRENCY = 5;
-const MULTIPART_UPLOAD_MAX_ATTEMPTS = 3;
-const MULTIPART_UPLOAD_RETRY_DELAY_MS = 800;
-const LOCAL_CHUNK_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
-const URL_CHUNK_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
-const HLS_SEGMENT_REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
-const MAGNET_STATUS_POLL_MS = 2_000;
-const MAGNET_DOWNLOAD_TIMEOUT_MS = 24 * 60 * 60 * 1000;
-const MAGNET_STATUS_MAX_TRANSIENT_FAILURES = 5;
-const MAGNET_STATUS_RETRY_DELAY_MS = 2_000;
-const FILE_NAME_CONFLICT_TOAST_MESSAGE = "上传目录已存在同名文件，请选择覆盖或改名上传";
-const CHUNK_UI_UPDATE_INTERVAL_MS = 160;
-const TASK_SNAPSHOT_UPDATE_INTERVAL_MS = 500;
-const MAX_RENDERABLE_CHUNKS = 100;
-
-class MultipartChunkUploadError extends Error {
-  constructor(
-    message: string,
-    public readonly retry: MultipartRetryState,
-    public readonly stopped = false
-  ) {
-    super(message);
-    this.name = "MultipartChunkUploadError";
-  }
-}
-
-class HlsSegmentUploadError extends Error {
-  constructor(
-    message: string,
-    public readonly retry: HlsRetryState,
-    public readonly stopped = false
-  ) {
-    super(message);
-    this.name = "HlsSegmentUploadError";
-  }
-}
 
 function makeItem(file: File, options: { relativePath?: string } = {}): QueueItem {
   counter += 1;
