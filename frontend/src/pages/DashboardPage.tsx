@@ -1,49 +1,33 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, ChevronRight, Database, FolderInput, FolderPlus, LayoutGrid, List, PanelLeftClose, PanelLeftOpen, Pencil, RefreshCw, Search, Trash2 } from "lucide-react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { ArrowUp, ChevronRight, Database, FolderInput, FolderPlus, LayoutGrid, List, PanelLeftClose, PanelLeftOpen, RefreshCw, Search, Trash2 } from "lucide-react";
 import {
   ApiError,
   DirectoryItem,
   FileItem,
-  HlsDownloadPart,
   SessionResponse,
   createDirectory,
   deleteEntries,
   deleteDirectory,
   deleteFile,
-  getHlsDownloadPlan,
   listDirectories,
   listFiles,
-  lookupFiles,
   moveDirectory,
   moveEntries,
   renameDirectory,
   updateFileMetadata
 } from "../api";
 import { formatBytes, sumFileSize } from "../utils";
-import { cn } from "../lib/cn";
 import { useToast } from "../lib/toast";
 import { useConfirm } from "../lib/confirm";
 import {
-  buildFileCacheMetadata,
-  buildFileCacheUrl,
-  cacheFileManually,
-  canCacheFile,
-  clearAutomaticFileCache,
   clearFileCache,
   clearFilesCache,
-  getFileCacheSummary,
   pauseFileCache,
-  requestPersistentFileCacheStorage,
-  resumeFileCache,
-  terminateFileCache,
-  type FileCacheEntry,
-  type FileCacheSummary
+  terminateFileCache
 } from "../lib/file-cache";
 import { Input } from "../components/ui/Input";
 import { IconButton } from "../components/ui/IconButton";
 import { Button } from "../components/ui/Button";
-import { Modal } from "../components/ui/Modal";
-import { Textarea } from "../components/ui/Textarea";
 import { Spinner } from "../components/ui/Spinner";
 import { Segmented } from "../components/ui/Segmented";
 import { MetricsRow, Metric } from "../components/files/MetricsRow";
@@ -53,25 +37,14 @@ import { ThumbnailPreviewDialog } from "../components/files/ThumbnailPreviewDial
 import { ThumbnailEditDialog } from "../components/files/ThumbnailEditDialog";
 import { FileDetailDialog } from "../components/files/FileDetailDialog";
 import { DirectoryTree } from "../components/files/DirectoryTree";
-import { CacheManagerDialog, type CacheOperation } from "../components/files/cache/CacheManagerDialog";
-import {
-  AcceleratedDownloadDialog,
-  type AcceleratedChunkState,
-  type AcceleratedDownloadState
-} from "../components/files/AcceleratedDownloadDialog";
-import {
-  type MultipartDownloadFile,
-  type NativeFileWritableStream,
-  canUseAcceleratedDownload,
-  createWritableFile,
-  downloadAcceleratedPart,
-  downloadMultipartChunk,
-  extractSignedFileToken,
-  expectedMultipartChunkSize,
-  isAbortError,
-  supportsNativeFileSave
-} from "../lib/accelerated-download";
-import { canUseHlsAcceleratedDownload, hasFileLinkAccess, type LinkAccessibleFile } from "../lib/file-access";
+import { CacheManagerDialog } from "../components/files/cache/CacheManagerDialog";
+import { AcceleratedDownloadDialog } from "../components/files/AcceleratedDownloadDialog";
+import { EditFileDialog } from "../components/files/EditFileDialog";
+import { CreateDirectoryDialog } from "../components/files/CreateDirectoryDialog";
+import { DirectoryMoveDialog } from "../components/files/DirectoryMoveDialog";
+import { DirectoryRenameDialog } from "../components/files/DirectoryRenameDialog";
+import { MoveEntriesDialog } from "../components/files/MoveEntriesDialog";
+import { hasFileLinkAccess } from "../lib/file-access";
 import {
   compareDirectoryItems,
   compareFileItems,
@@ -83,7 +56,8 @@ import {
   type FileTypeFilter,
   type SortDirection
 } from "../lib/file-list";
-import { isVideoPreviewServiceWorkerControlling } from "../lib/video-preview-service-worker";
+import { useAcceleratedDownload } from "./dashboard/use-accelerated-download";
+import { useFileCacheManager } from "./dashboard/use-file-cache-manager";
 
 const FILE_LAYOUT_STORAGE_KEY = "tgbot-files-layout-mode";
 
@@ -110,41 +84,6 @@ const FILE_TYPE_OPTIONS: Array<{ value: FileTypeFilter; label: string }> = [
   { value: "other", label: "其他" }
 ];
 
-interface AcceleratedDownloadPartTask {
-  index: number;
-  size: number;
-  offset: number;
-  download: (
-    signal: AbortSignal,
-    onProgress: (downloadedBytes: number) => void
-  ) => Promise<ArrayBuffer>;
-}
-
-interface HlsAcceleratedDownloadContext {
-  fileId: string;
-  fileName: string;
-  directoryPath: string;
-  mimeType: string;
-  totalSize: number;
-  chunkCount: number;
-}
-
-interface AcceleratedDownloadTask {
-  fileId: string;
-  fileName: string;
-  writable: NativeFileWritableStream;
-  concurrency: number;
-  parts: AcceleratedDownloadPartTask[];
-  queue: number[];
-  running: Set<number>;
-  completed: Set<number>;
-  failed: Set<number>;
-  controllers: Map<number, AbortController>;
-  writeChain: Promise<void>;
-  cancelled: boolean;
-  finalized: boolean;
-}
-
 function FileListBusyOverlay({ label }: { label: string }) {
   return (
     <div className="absolute inset-0 z-10 grid place-items-center rounded-2xl bg-surface/75 px-4 backdrop-blur-[2px] animate-fade-in">
@@ -169,7 +108,6 @@ function FileListBusyOverlay({ label }: { label: string }) {
 function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryChange, onUploadToDirectory }: DashboardPageProps) {
   const toast = useToast();
   const confirm = useConfirm();
-  const acceleratedDownloadTaskRef = useRef<AcceleratedDownloadTask | null>(null);
 
   const [files, setFiles] = useState<FileItem[]>([]);
   const [directories, setDirectories] = useState<DirectoryItem[]>([]);
@@ -212,11 +150,31 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
   const [directoryRenameName, setDirectoryRenameName] = useState("");
   const [renamingDirectorySaving, setRenamingDirectorySaving] = useState(false);
   const [directoryPanelVisible, setDirectoryPanelVisible] = useState(true);
-  const [acceleratedDownload, setAcceleratedDownload] = useState<AcceleratedDownloadState | null>(null);
-  const [cacheSummary, setCacheSummary] = useState<FileCacheSummary | null>(null);
-  const [cacheFiles, setCacheFiles] = useState<FileItem[]>([]);
-  const [cacheManagerOpen, setCacheManagerOpen] = useState(false);
-  const [cacheOperation, setCacheOperation] = useState<CacheOperation>(null);
+  const {
+    acceleratedDownload,
+    setAcceleratedDownload,
+    onAcceleratedDownload,
+    retryAcceleratedChunk,
+    retryFailedAcceleratedChunks,
+    cancelAcceleratedDownload
+  } = useAcceleratedDownload({ session, toast });
+  const {
+    cacheSummary,
+    setCacheSummary,
+    cacheManagerOpen,
+    setCacheManagerOpen,
+    cacheOperation,
+    setCacheOperation,
+    cacheFileIndex,
+    refreshCacheSummary,
+    onCacheFile,
+    onPauseFileCache,
+    onResumeFileCache,
+    onTerminateFileCache,
+    resumeFileCacheById,
+    onClearFileCache,
+    onClearAutomaticCache
+  } = useFileCacheManager({ files, session, toast });
   const listBusyLabel = operationLabel ?? (loading ? "正在加载目录内容..." : undefined);
   const isListBusy = Boolean(listBusyLabel);
 
@@ -260,57 +218,6 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
     }
   }, [toast]);
 
-  const refreshCacheSummary = useCallback(async () => {
-    try {
-      setCacheSummary(await getFileCacheSummary());
-    } catch {
-      setCacheSummary(null);
-    }
-  }, []);
-
-  const refreshCacheFilesBySummary = useCallback(async (summary: FileCacheSummary | null) => {
-    const entries = summary?.entries ?? [];
-    if (entries.length === 0) return;
-
-    const existingIds = new Set([...cacheFiles, ...files].map((file) => file.id));
-    const missingIds = Array.from(new Set(entries.map((entry) => entry.fileId)))
-      .filter((fileId) => fileId && !existingIds.has(fileId))
-      .slice(0, 100);
-    if (missingIds.length === 0) return;
-
-    try {
-      const response = await lookupFiles(missingIds);
-      if (response.files.length === 0) return;
-      setCacheFiles((current) => {
-        const byId = new Map(current.map((file) => [file.id, file]));
-        for (const file of response.files) {
-          byId.set(file.id, file);
-        }
-        return Array.from(byId.values());
-      });
-    } catch {
-      // The cache manager can still show service-worker metadata if lookup fails.
-    }
-  }, [cacheFiles, files]);
-
-  const refreshCacheFileIndex = useCallback(async () => {
-    try {
-      const directoryResponse = await listDirectories(true);
-      const directoryPaths = Array.from(new Set(["/", ...directoryResponse.directories.map((directory) => directory.path)]));
-      const responses = await Promise.all(directoryPaths.map((dir) =>
-        listFiles({
-          q: "",
-          dir,
-          all: true,
-          type: "all"
-        })
-      ));
-      setCacheFiles(responses.flatMap((response) => response.files));
-    } catch {
-      setCacheFiles([]);
-    }
-  }, []);
-
   useEffect(() => {
     void loadFiles();
   }, [loadFiles]);
@@ -318,31 +225,6 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
   useEffect(() => {
     void loadDirectoryOptions();
   }, [loadDirectoryOptions]);
-
-  useEffect(() => {
-    void refreshCacheSummary();
-  }, [refreshCacheSummary]);
-
-  useEffect(() => {
-    if (cacheManagerOpen) {
-      void refreshCacheSummary();
-      void refreshCacheFileIndex();
-    }
-  }, [cacheManagerOpen, refreshCacheFileIndex, refreshCacheSummary]);
-
-  useEffect(() => {
-    if (cacheManagerOpen) {
-      void refreshCacheFilesBySummary(cacheSummary);
-    }
-  }, [cacheManagerOpen, cacheSummary, refreshCacheFilesBySummary]);
-
-  useEffect(() => {
-    const intervalId = window.setInterval(() => {
-      void refreshCacheSummary();
-    }, 2500);
-
-    return () => window.clearInterval(intervalId);
-  }, [refreshCacheSummary]);
 
   useEffect(() => {
     onDirectoryChange(currentDirPath);
@@ -503,100 +385,6 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
       toast.danger(errorMessage(error));
     } finally {
       setCreatingDir(false);
-    }
-  }
-
-  async function onCacheFile(file: FileItem) {
-    const metadata = buildFileCacheMetadata(file, session.video_preview_cache_bytes, "manual");
-    if (!metadata || !canCacheFile(file)) {
-      toast.danger("该文件缺少可缓存的访问链接");
-      return;
-    }
-
-    setCacheOperation({ fileId: file.id, kind: "cache" });
-    try {
-      await requestPersistentFileCacheStorage();
-      await cacheFileManually(metadata);
-      await refreshCacheSummary();
-      toast.success("文件已加入缓存队列");
-    } catch (error) {
-      toast.danger(errorMessage(error));
-    } finally {
-      setCacheOperation(null);
-    }
-  }
-
-  async function onPauseFileCache(file: FileItem) {
-    setCacheOperation({ fileId: file.id, kind: "pause" });
-    try {
-      setCacheSummary(await pauseFileCache(file.id));
-      toast.success("缓存已暂停");
-    } catch (error) {
-      toast.danger(errorMessage(error));
-    } finally {
-      setCacheOperation(null);
-    }
-  }
-
-  async function onResumeFileCache(file: FileItem) {
-    setCacheOperation({ fileId: file.id, kind: "resume" });
-    try {
-      await requestPersistentFileCacheStorage();
-      const metadata = buildFileCacheMetadata(file, Number.MAX_SAFE_INTEGER, "manual");
-      setCacheSummary(await resumeFileCache(file.id, metadata ?? undefined));
-      toast.success("缓存已继续");
-    } catch (error) {
-      toast.danger(errorMessage(error));
-    } finally {
-      setCacheOperation(null);
-    }
-  }
-
-  async function onTerminateFileCache(file: FileItem) {
-    setCacheOperation({ fileId: file.id, kind: "terminate" });
-    try {
-      setCacheSummary(await terminateFileCache(file.id));
-      toast.success("缓存已终止");
-    } catch (error) {
-      toast.danger(errorMessage(error));
-    } finally {
-      setCacheOperation(null);
-    }
-  }
-
-  async function resumeFileCacheById(fileId: string) {
-    setCacheOperation({ fileId, kind: "resume" });
-    try {
-      await requestPersistentFileCacheStorage();
-      const indexedFile = cacheFileIndex.get(fileId);
-      const metadata = indexedFile ? buildFileCacheMetadata(indexedFile, Number.MAX_SAFE_INTEGER, "manual") : null;
-      setCacheSummary(await resumeFileCache(fileId, metadata ?? undefined));
-      toast.success("缓存已继续");
-    } catch (error) {
-      toast.danger(errorMessage(error));
-    } finally {
-      setCacheOperation(null);
-    }
-  }
-
-  async function onClearFileCache(file: FileItem) {
-    setCacheOperation({ fileId: file.id, kind: "clear" });
-    try {
-      setCacheSummary(await clearFileCache(file.id));
-      toast.success("缓存已清除");
-    } catch (error) {
-      toast.danger(errorMessage(error));
-    } finally {
-      setCacheOperation(null);
-    }
-  }
-
-  async function onClearAutomaticCache() {
-    try {
-      setCacheSummary(await clearAutomaticFileCache());
-      toast.success("自动缓存已清理");
-    } catch (error) {
-      toast.danger(errorMessage(error));
     }
   }
 
@@ -846,554 +634,6 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
     copyText(file.url);
   }
 
-  async function onAcceleratedDownload(file: FileItem) {
-    if (acceleratedDownloadTaskRef.current) {
-      toast.info("已有加速下载任务进行中，请先完成或取消当前任务");
-      return;
-    }
-
-    const isMultipart = canUseAcceleratedDownload(file);
-    const isHls = canUseHlsAcceleratedDownload(file);
-    const isHlsPackage = file.storage_backend === "hls_package";
-    const linkFile = hasFileLinkAccess(file) ? file : null;
-
-    if (isHlsPackage && !isHls) {
-      toast.info("该 HLS 文件暂不支持加速下载");
-      return;
-    }
-
-    if (!isMultipart && !isHls && !linkFile) {
-      toast.info("该文件暂无可下载链接");
-      return;
-    }
-
-    if (!supportsNativeFileSave()) {
-      toast.info("当前浏览器不支持加速下载，请使用支持本地文件保存的浏览器");
-      return;
-    }
-
-    let fileName = file.file_name;
-    let totalBytes = file.size;
-    let parts: AcceleratedDownloadPartTask[];
-    const downloadConcurrency = session.upload_concurrency;
-
-    try {
-      if (isMultipart) {
-        const token = extractSignedFileToken(file.file_path) || (linkFile ? extractSignedFileToken(linkFile.url) : null);
-        if (!token) {
-          if (!linkFile) {
-            toast.info("无法解析分片下载 token，且该文件暂无可下载链接");
-            return;
-          }
-          parts = createSingleFileAcceleratedParts(linkFile);
-        } else {
-          parts = createMultipartAcceleratedParts(file, token);
-        }
-      } else if (isHls) {
-        const plan = (await getHlsDownloadPlan(file.id)).hls_download;
-        fileName = plan.file_name;
-        totalBytes = plan.total_size;
-        parts = createHlsAcceleratedParts(plan.parts, {
-          fileId: file.id,
-          fileName: file.file_name,
-          directoryPath: file.directory_path || "/",
-          mimeType: file.mime_type || "application/vnd.apple.mpegurl",
-          totalSize: plan.total_size,
-          chunkCount: plan.part_count
-        });
-      } else {
-        if (!linkFile) {
-          toast.info("该文件暂无可下载链接");
-          return;
-        }
-        parts = createSingleFileAcceleratedParts(linkFile);
-      }
-    } catch (error) {
-      toast.danger(errorMessage(error));
-      return;
-    }
-
-    setAcceleratedDownload({
-      fileId: file.id,
-      fileName,
-      status: "preparing",
-      concurrency: downloadConcurrency,
-      totalBytes,
-      chunks: createInitialAcceleratedChunks(parts)
-    });
-
-    let writable: Awaited<ReturnType<typeof createWritableFile>>;
-    try {
-      writable = await createWritableFile(fileName);
-    } catch (error) {
-      setAcceleratedDownload(null);
-      if (!isAbortError(error)) {
-        toast.danger(errorMessage(error));
-      }
-      return;
-    }
-
-    const task: AcceleratedDownloadTask = {
-      fileId: file.id,
-      fileName,
-      writable,
-      concurrency: downloadConcurrency,
-      parts,
-      queue: parts.map((part) => part.index),
-      running: new Set(),
-      completed: new Set(),
-      failed: new Set(),
-      controllers: new Map(),
-      writeChain: Promise.resolve(),
-      cancelled: false,
-      finalized: false
-    };
-
-    acceleratedDownloadTaskRef.current = task;
-    setAcceleratedDownload((current) =>
-      current?.fileId === task.fileId
-        ? { ...current, status: "downloading" }
-        : current
-    );
-    startAcceleratedQueuedChunks(task);
-  }
-
-  function startAcceleratedQueuedChunks(task: AcceleratedDownloadTask) {
-    if (task.cancelled || task.finalized) {
-      return;
-    }
-
-    while (task.running.size < task.concurrency && task.queue.length > 0) {
-      const chunkIndex = task.queue.shift();
-      if (chunkIndex === undefined || task.running.has(chunkIndex) || task.completed.has(chunkIndex)) {
-        continue;
-      }
-
-      task.failed.delete(chunkIndex);
-      task.running.add(chunkIndex);
-      void runAcceleratedChunk(task, chunkIndex);
-    }
-
-    updateAcceleratedOverallStatus(task);
-  }
-
-  async function runAcceleratedChunk(task: AcceleratedDownloadTask, chunkIndex: number) {
-    const part = task.parts[chunkIndex];
-    if (!part) {
-      task.failed.add(chunkIndex);
-      updateAcceleratedChunk(task.fileId, chunkIndex, (chunk) => ({
-        ...chunk,
-        status: "failed",
-        errorMessage: "下载 part 不存在"
-      }));
-      return;
-    }
-
-    const controller = new AbortController();
-    task.controllers.set(chunkIndex, controller);
-    updateAcceleratedChunk(task.fileId, chunkIndex, (chunk) => ({
-      ...chunk,
-      status: "downloading",
-      downloadedBytes: 0,
-      attempts: chunk.attempts + 1,
-      errorMessage: undefined
-    }));
-
-    try {
-      const bytes = await part.download(controller.signal, (downloadedBytes) => {
-        updateAcceleratedChunk(task.fileId, chunkIndex, (chunk) =>
-          chunk.downloadedBytes === downloadedBytes
-            ? chunk
-            : {
-                ...chunk,
-                downloadedBytes
-              }
-        );
-      });
-
-      if (task.cancelled) {
-        return;
-      }
-
-      await writeAcceleratedChunk(task, chunkIndex, bytes);
-
-      if (task.cancelled) {
-        return;
-      }
-
-      task.failed.delete(chunkIndex);
-      task.completed.add(chunkIndex);
-      updateAcceleratedChunk(task.fileId, chunkIndex, (chunk) => ({
-        ...chunk,
-        status: "completed",
-        downloadedBytes: chunk.size,
-        errorMessage: undefined
-      }));
-      await finalizeAcceleratedDownloadIfReady(task);
-    } catch (error) {
-      if (!task.cancelled) {
-        task.failed.add(chunkIndex);
-        updateAcceleratedChunk(task.fileId, chunkIndex, (chunk) => ({
-          ...chunk,
-          status: "failed",
-          errorMessage: errorMessage(error)
-        }));
-      }
-    } finally {
-      task.controllers.delete(chunkIndex);
-      task.running.delete(chunkIndex);
-      if (!task.cancelled && !task.finalized) {
-        startAcceleratedQueuedChunks(task);
-      }
-    }
-  }
-
-  function writeAcceleratedChunk(
-    task: AcceleratedDownloadTask,
-    chunkIndex: number,
-    bytes: ArrayBuffer
-  ): Promise<void> {
-    const part = task.parts[chunkIndex];
-    if (!part) {
-      return Promise.reject(new Error("下载 part 不存在"));
-    }
-
-    const writeOperation = task.writeChain.then(() =>
-      task.writable.write({
-        type: "write",
-        position: part.offset,
-        data: bytes
-      })
-    );
-
-    task.writeChain = writeOperation.catch(() => undefined);
-    return writeOperation;
-  }
-
-  async function finalizeAcceleratedDownloadIfReady(task: AcceleratedDownloadTask) {
-    if (task.finalized || task.cancelled || task.completed.size !== task.parts.length) {
-      return;
-    }
-
-    task.finalized = true;
-    setAcceleratedDownload((current) =>
-      current?.fileId === task.fileId ? { ...current, status: "finalizing" } : current
-    );
-
-    try {
-      await task.writeChain;
-      await task.writable.close();
-      if (acceleratedDownloadTaskRef.current === task) {
-        acceleratedDownloadTaskRef.current = null;
-      }
-      setAcceleratedDownload((current) =>
-        current?.fileId === task.fileId ? { ...current, status: "completed" } : current
-      );
-      toast.success("加速下载完成");
-    } catch (error) {
-      if (acceleratedDownloadTaskRef.current === task) {
-        acceleratedDownloadTaskRef.current = null;
-      }
-      setAcceleratedDownload((current) =>
-        current?.fileId === task.fileId
-          ? {
-              ...current,
-              status: "error",
-              errorMessage: errorMessage(error)
-            }
-          : current
-      );
-      toast.danger(errorMessage(error));
-    }
-  }
-
-  function retryAcceleratedChunk(chunkIndex: number) {
-    const task = acceleratedDownloadTaskRef.current;
-    if (!task || task.cancelled || task.finalized || task.running.has(chunkIndex) || task.completed.has(chunkIndex)) {
-      return;
-    }
-
-    task.failed.delete(chunkIndex);
-    if (!task.queue.includes(chunkIndex)) {
-      task.queue.unshift(chunkIndex);
-    }
-    updateAcceleratedChunk(task.fileId, chunkIndex, (chunk) => ({
-      ...chunk,
-      status: "queued",
-      downloadedBytes: 0,
-      errorMessage: undefined
-    }));
-    startAcceleratedQueuedChunks(task);
-  }
-
-  function retryFailedAcceleratedChunks() {
-    const task = acceleratedDownloadTaskRef.current;
-    if (!task || task.cancelled || task.finalized) {
-      return;
-    }
-
-    const failedChunks = Array.from(task.failed).sort((left, right) => left - right);
-    if (failedChunks.length === 0) {
-      return;
-    }
-
-    for (const chunkIndex of failedChunks) {
-      if (task.running.has(chunkIndex) || task.completed.has(chunkIndex) || task.queue.includes(chunkIndex)) {
-        continue;
-      }
-      task.queue.push(chunkIndex);
-      updateAcceleratedChunk(task.fileId, chunkIndex, (chunk) => ({
-        ...chunk,
-        status: "queued",
-        downloadedBytes: 0,
-        errorMessage: undefined
-      }));
-    }
-    task.failed.clear();
-    startAcceleratedQueuedChunks(task);
-  }
-
-  function cancelAcceleratedDownload() {
-    const task = acceleratedDownloadTaskRef.current;
-    if (!task) {
-      setAcceleratedDownload((current) =>
-        current && current.status === "preparing" ? { ...current, status: "cancelled" } : current
-      );
-      return;
-    }
-
-    task.cancelled = true;
-    task.queue = [];
-    for (const controller of task.controllers.values()) {
-      controller.abort();
-    }
-    task.controllers.clear();
-    task.running.clear();
-    acceleratedDownloadTaskRef.current = null;
-    void task.writeChain
-      .catch(() => undefined)
-      .finally(async () => {
-        try {
-          await task.writable.abort?.("cancelled");
-        } catch {
-          // 忽略取消写入时的浏览器实现差异。
-        }
-      });
-    setAcceleratedDownload((current) =>
-      current?.fileId === task.fileId ? { ...current, status: "cancelled" } : current
-    );
-    toast.info("下载已取消");
-  }
-
-  function updateAcceleratedChunk(
-    fileId: string,
-    chunkIndex: number,
-    updater: (chunk: AcceleratedChunkState) => AcceleratedChunkState
-  ) {
-    setAcceleratedDownload((current) => {
-      if (!current || current.fileId !== fileId) {
-        return current;
-      }
-
-      let changed = false;
-      const chunks = current.chunks.map((chunk) => {
-        if (chunk.index !== chunkIndex) {
-          return chunk;
-        }
-
-        const nextChunk = updater(chunk);
-        if (nextChunk !== chunk) {
-          changed = true;
-        }
-        return nextChunk;
-      });
-
-      return changed ? { ...current, chunks } : current;
-    });
-  }
-
-  function updateAcceleratedOverallStatus(task: AcceleratedDownloadTask) {
-    setAcceleratedDownload((current) => {
-      if (!current || current.fileId !== task.fileId || task.finalized || task.cancelled) {
-        return current;
-      }
-
-      const nextStatus = task.running.size > 0 || task.queue.length > 0
-        ? "downloading"
-        : task.failed.size > 0
-          ? "partial_failed"
-          : current.status;
-
-      if (nextStatus !== current.status) {
-        return { ...current, status: nextStatus };
-      }
-
-      return current;
-    });
-  }
-
-  function createMultipartAcceleratedParts(file: MultipartDownloadFile, token: string): AcceleratedDownloadPartTask[] {
-    const cacheUrl = isVideoPreviewServiceWorkerControlling()
-      ? buildFileCacheUrl(buildFileCacheMetadata(file, session.video_preview_cache_bytes, "auto"))
-      : null;
-
-    return Array.from({ length: file.chunk_count }, (_, index) => ({
-      index,
-      size: expectedMultipartChunkSize(file, index),
-      offset: index * file.chunk_size,
-      download: (signal, onProgress) =>
-        cacheUrl
-          ? downloadAcceleratedPart({
-              url: cacheUrl,
-              expectedSize: expectedMultipartChunkSize(file, index),
-              label: `分片 ${index + 1}`,
-              signal,
-              headers: { Range: `bytes=${index * file.chunk_size}-${index * file.chunk_size + expectedMultipartChunkSize(file, index) - 1}` },
-              onProgress: (progress) => onProgress(progress.downloadedBytes)
-            })
-          : downloadMultipartChunk({
-              file,
-              token,
-              chunkIndex: index,
-              signal,
-              onProgress: (progress) => onProgress(progress.downloadedBytes)
-            })
-    }));
-  }
-
-  function createSingleFileAcceleratedParts(file: LinkAccessibleFile): AcceleratedDownloadPartTask[] {
-    const cacheUrl = isVideoPreviewServiceWorkerControlling()
-      ? buildFileCacheUrl(buildFileCacheMetadata(file, session.video_preview_cache_bytes, "auto"))
-      : null;
-
-    return [{
-      index: 0,
-      size: file.size,
-      offset: 0,
-      download: (signal, onProgress) =>
-        downloadAcceleratedPart({
-          url: cacheUrl || file.url,
-          expectedSize: file.size,
-          label: "文件",
-          signal,
-          onProgress: (progress) => onProgress(progress.downloadedBytes)
-        })
-    }];
-  }
-
-  function createHlsAcceleratedParts(parts: HlsDownloadPart[], context: HlsAcceleratedDownloadContext): AcceleratedDownloadPartTask[] {
-    const fullSegments = new Map<number, { offset: number; size: number; url: string }>();
-    for (const part of parts) {
-      if (part.kind === "segment" && part.segment_index !== null && part.chunk_index === null) {
-        const path = sameOriginPath(part.url);
-        if (path) {
-          fullSegments.set(part.segment_index, {
-            offset: part.offset,
-            size: part.size,
-            url: path
-          });
-        }
-      }
-    }
-
-    return parts.map((part) => ({
-      index: part.index,
-      size: part.size,
-      offset: part.offset,
-      download: (signal, onProgress) =>
-        downloadAcceleratedPart({
-          url: hlsAcceleratedPartCacheUrl(part, context, fullSegments) || part.url,
-          expectedSize: part.size,
-          label: part.kind === "init" || part.segment_index === null
-            ? "HLS 初始化片段"
-            : part.chunk_index === null
-              ? `HLS 片段 ${part.segment_index + 1}`
-              : `HLS 片段 ${part.segment_index + 1} / 分片 ${part.chunk_index + 1}`,
-          signal,
-          headers: hlsAcceleratedPartCacheHeaders(part, fullSegments),
-          onProgress: (progress) => onProgress(progress.downloadedBytes)
-        })
-    }));
-  }
-
-  function hlsAcceleratedPartCacheUrl(part: HlsDownloadPart, context: HlsAcceleratedDownloadContext, fullSegments: Map<number, { offset: number; size: number; url: string }>): string | null {
-    if (!isVideoPreviewServiceWorkerControlling()) {
-      return null;
-    }
-
-    const fullSegment = part.kind === "segment" && part.chunk_index !== null && part.segment_index !== null
-      ? fullSegments.get(part.segment_index)
-      : null;
-    if (part.kind === "segment" && part.chunk_index !== null && !fullSegment) {
-      return null;
-    }
-
-    const sourceUrl = sameOriginPath(part.url);
-    if (!sourceUrl) {
-      return null;
-    }
-
-    const partKind = part.kind === "init" || part.segment_index === null ? "init" : "segment";
-    const partIndex = partKind === "init" ? 0 : part.segment_index;
-    if (partIndex === null || !Number.isSafeInteger(partIndex) || partIndex < 0) {
-      return null;
-    }
-
-    const params = new URLSearchParams({
-      source: sourceUrl,
-      cache_max: String(session.video_preview_cache_bytes),
-      prefetch_concurrency: String(Math.max(1, Math.min(session.upload_concurrency, 32))),
-      file_name: context.fileName,
-      directory_path: context.directoryPath,
-      mime: context.mimeType,
-      size: String(context.totalSize),
-      chunk_size: String(part.size),
-      chunk_count: String(context.chunkCount),
-      cache_source: "auto"
-    });
-
-    if (fullSegment) {
-      params.set("full_source", fullSegment.url);
-      params.set("full_size", String(fullSegment.size));
-    }
-
-    return `/__video-preview/hls-part/${encodeURIComponent(context.fileId)}/${partKind}/${partIndex}?${params.toString()}`;
-  }
-
-  function hlsAcceleratedPartCacheHeaders(part: HlsDownloadPart, fullSegments: Map<number, { offset: number; size: number; url: string }>): HeadersInit | undefined {
-    const fullSegment = part.kind === "segment" && part.chunk_index !== null && part.segment_index !== null
-      ? fullSegments.get(part.segment_index)
-      : null;
-    if (!fullSegment) {
-      return undefined;
-    }
-
-    const start = part.offset - fullSegment.offset;
-    return { Range: `bytes=${start}-${start + part.size - 1}` };
-  }
-
-  function sameOriginPath(url: string): string | null {
-    try {
-      const parsed = new URL(url, window.location.origin);
-      if (parsed.origin !== window.location.origin) {
-        return null;
-      }
-      return `${parsed.pathname}${parsed.search}`;
-    } catch {
-      return null;
-    }
-  }
-
-  function createInitialAcceleratedChunks(parts: AcceleratedDownloadPartTask[]): AcceleratedChunkState[] {
-    return parts.map((part) => ({
-      index: part.index,
-      size: part.size,
-      downloadedBytes: 0,
-      status: "queued",
-      attempts: 0
-    }));
-  }
-
   function toggleFileSelected(file: FileItem, selected: boolean) {
     setSelectedFileIds((current) => {
       const next = new Set(current);
@@ -1425,10 +665,6 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
   const sortedDirectories = useMemo(
     () => [...directories].sort((left, right) => compareDirectoryItems(left, right, sortKey, sortDirection)),
     [directories, sortDirection, sortKey]
-  );
-  const cacheFileIndex = useMemo(
-    () => new Map([...cacheFiles, ...files].map((file) => [file.id, file])),
-    [cacheFiles, files]
   );
 
   function changeSort(nextKey: FileSortKey) {
@@ -1833,357 +1069,77 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
         }}
       />
 
-      <Modal
-        open={Boolean(editingFile)}
-        onClose={() => {
-          if (!savingFile) setEditingFile(null);
-        }}
-        title="编辑文件信息"
-        description="修改备注不会影响链接；修改文件名会生成新的后台链接，旧链接仍可继续访问。"
-        footer={
-          <>
-            <Button variant="secondary" disabled={savingFile} onClick={() => setEditingFile(null)}>
-              取消
-            </Button>
-            <Button type="submit" form="edit-file-form" variant="primary" loading={savingFile}>
-              保存
-            </Button>
-          </>
-        }
-      >
-        <form
-          id="edit-file-form"
-          className="flex flex-col gap-4"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void onSaveFileMetadata();
-          }}
-        >
-          <div className="flex flex-col gap-1.5">
-            <label htmlFor="edit-file-name" className="text-xs font-medium text-muted">
-              文件名
-            </label>
-            <Input
-              id="edit-file-name"
-              value={editFileName}
-              maxLength={180}
-              disabled={savingFile}
-              onChange={(event) => setEditFileName(event.target.value)}
-            />
-          </div>
-          <div className="flex flex-col gap-1.5">
-            <label htmlFor="edit-file-remark" className="text-xs font-medium text-muted">
-              备注
-            </label>
-            <Textarea
-              id="edit-file-remark"
-              value={editRemark}
-              maxLength={1000}
-              disabled={savingFile}
-              placeholder="补充说明，留空则清除备注"
-              onChange={(event) => setEditRemark(event.target.value)}
-            />
-          </div>
-          {editingFile && editFileName.trim() && editFileName.trim() !== editingFile.file_name ? (
-            <p className="rounded-xl border border-warning/25 bg-warning-soft px-3 py-2 text-xs leading-5 text-warning">
-              保存后，列表里复制的新链接会使用新文件名；已经分享出去的旧链接不会失效。
-            </p>
-          ) : null}
-        </form>
-      </Modal>
+      <EditFileDialog
+        editingFile={editingFile}
+        editFileName={editFileName}
+        editRemark={editRemark}
+        savingFile={savingFile}
+        onClose={() => setEditingFile(null)}
+        onChangeFileName={setEditFileName}
+        onChangeRemark={setEditRemark}
+        onSubmit={() => void onSaveFileMetadata()}
+      />
 
-      <Modal
+      <CreateDirectoryDialog
         open={createDirOpen}
+        creatingDir={creatingDir}
+        createDirParentPath={createDirParentPath}
+        newDirName={newDirName}
+        directoryOptions={directoryOptions}
         onClose={() => {
-          if (!creatingDir) {
-            setCreateDirOpen(false);
-            setNewDirName("");
-            setCreateDirParentPath("/");
-          }
+          setCreateDirOpen(false);
+          setNewDirName("");
+          setCreateDirParentPath("/");
         }}
-        title="新建目录"
-        description="选择上级目录后创建新的虚拟子目录；默认创建在根目录。"
-        size="lg"
-        footer={
-          <>
-            <Button
-              variant="secondary"
-              disabled={creatingDir}
-              onClick={() => {
-                setCreateDirOpen(false);
-                setCreateDirParentPath("/");
-              }}
-            >
-              取消
-            </Button>
-            <Button
-              type="submit"
-              form="create-directory-form"
-              variant="primary"
-              loading={creatingDir}
-              leadingIcon={<FolderPlus size={16} />}
-            >
-              创建
-            </Button>
-          </>
-        }
-      >
-        <form
-          id="create-directory-form"
-          className="flex flex-col gap-4"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void onCreateDirectory();
-          }}
-        >
-          <div className="flex flex-col gap-1.5">
-            <span className="text-xs font-medium text-muted">
-              上级目录
-            </span>
-            <DirectoryTree
-              id="create-directory-parent"
-              ariaLabel="新目录上级目录"
-              value={createDirParentPath}
-              directories={directoryOptions}
-              disabled={creatingDir}
-              onChange={setCreateDirParentPath}
-              treeClassName="max-h-[min(30rem,64dvh)]"
-            />
-          </div>
-          <div className="flex flex-col gap-1.5">
-            <label htmlFor="directory-name" className="text-xs font-medium text-muted">
-              目录名称
-            </label>
-            <Input
-              id="directory-name"
-              value={newDirName}
-              placeholder="例如 photos"
-              maxLength={80}
-              disabled={creatingDir}
-              onChange={(event) => setNewDirName(event.target.value)}
-            />
-          </div>
-        </form>
-      </Modal>
-
-      <Modal
-        open={Boolean(movingDirectory)}
-        onClose={() => {
-          if (!movingDirectorySaving) setMovingDirectory(null);
+        onCancel={() => {
+          setCreateDirOpen(false);
+          setCreateDirParentPath("/");
         }}
-        title="移动目录"
-        description={
-          movingDirectory
-            ? `将 ${movingDirectory.path} 移动到目标目录下，目录名保持为 ${movingDirectory.name}`
-            : undefined
-        }
-        size="lg"
-        footer={
-          <>
-            <Button variant="secondary" disabled={movingDirectorySaving} onClick={() => setMovingDirectory(null)}>
-              取消
-            </Button>
-            <Button
-              type="submit"
-              form="move-directory-form"
-              variant="primary"
-              loading={movingDirectorySaving}
-              leadingIcon={<FolderInput size={16} />}
-            >
-              移动目录
-            </Button>
-          </>
-        }
-      >
-        <form
-          id="move-directory-form"
-          className="flex flex-col gap-3"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void onMoveDirectory();
-          }}
-        >
-          <div className="flex flex-col gap-1.5">
-            <span className="text-xs font-medium text-muted">
-              目标父目录
-            </span>
-            <DirectoryTree
-              id="move-directory-target"
-              ariaLabel="目标父目录"
-              value={directoryMoveTargetPath}
-              directories={directoryMoveTargets}
-              disabled={movingDirectorySaving}
-              onChange={setDirectoryMoveTargetPath}
-              treeClassName="max-h-[min(30rem,64dvh)]"
-            />
-          </div>
-          {movingDirectory ? (
-            <p className="rounded-xl border border-border bg-background px-3 py-2 text-xs leading-5 text-muted">
-              会递归更新该目录、所有子目录和其中所有文件索引的虚拟路径；文件公开链接不会变化。
-            </p>
-          ) : null}
-        </form>
-      </Modal>
+        onChangeParentPath={setCreateDirParentPath}
+        onChangeName={setNewDirName}
+        onSubmit={() => void onCreateDirectory()}
+      />
 
-      <Modal
-        open={Boolean(renamingDirectory)}
-        onClose={() => {
-          if (!renamingDirectorySaving) setRenamingDirectory(null);
-        }}
-        title="重命名目录"
-        description={
-          renamingDirectory
-            ? `重命名 ${renamingDirectory.path}，会递归更新子目录和文件索引路径`
-            : undefined
-        }
-        footer={
-          <>
-            <Button variant="secondary" disabled={renamingDirectorySaving} onClick={() => setRenamingDirectory(null)}>
-              取消
-            </Button>
-            <Button
-              type="submit"
-              form="rename-directory-form"
-              variant="primary"
-              loading={renamingDirectorySaving}
-              leadingIcon={<Pencil size={16} />}
-            >
-              保存
-            </Button>
-          </>
-        }
-      >
-        <form
-          id="rename-directory-form"
-          className="flex flex-col gap-3"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void onRenameDirectory();
-          }}
-        >
-          <div className="flex flex-col gap-1.5">
-            <label htmlFor="rename-directory-name" className="text-xs font-medium text-muted">
-              新目录名称
-            </label>
-            <Input
-              id="rename-directory-name"
-              value={directoryRenameName}
-              maxLength={80}
-              disabled={renamingDirectorySaving}
-              placeholder="例如 photos"
-              onChange={(event) => setDirectoryRenameName(event.target.value)}
-            />
-          </div>
-          <p className="rounded-xl border border-border bg-background px-3 py-2 text-xs leading-5 text-muted">
-            文件公开链接不会变化；如果同级目录已存在相同名称，保存会被拒绝。
-          </p>
-        </form>
-      </Modal>
+      <DirectoryMoveDialog
+        movingDirectory={movingDirectory}
+        movingDirectorySaving={movingDirectorySaving}
+        directoryMoveTargetPath={directoryMoveTargetPath}
+        directoryMoveTargets={directoryMoveTargets}
+        onClose={() => setMovingDirectory(null)}
+        onChangeTargetPath={setDirectoryMoveTargetPath}
+        onSubmit={() => void onMoveDirectory()}
+      />
 
-      <Modal
+      <DirectoryRenameDialog
+        renamingDirectory={renamingDirectory}
+        renamingDirectorySaving={renamingDirectorySaving}
+        directoryRenameName={directoryRenameName}
+        onClose={() => setRenamingDirectory(null)}
+        onChangeName={setDirectoryRenameName}
+        onSubmit={() => void onRenameDirectory()}
+      />
+
+      <MoveEntriesDialog
         open={moveOpen}
+        movingFiles={movingFiles}
+        moveFileIds={moveFileIds}
+        moveDirectoryIds={moveDirectoryIds}
+        moveCreateNew={moveCreateNew}
+        moveNewDirName={moveNewDirName}
+        moveNewParentPath={moveNewParentPath}
+        moveTargetPath={moveTargetPath}
+        bulkMoveTargets={bulkMoveTargets}
         onClose={() => {
-          if (!movingFiles) {
-            setMoveOpen(false);
-            setMoveFileIds([]);
-            setMoveDirectoryIds([]);
-          }
+          setMoveOpen(false);
+          setMoveFileIds([]);
+          setMoveDirectoryIds([]);
         }}
-        title="移动项目"
-        description={`将 ${moveDirectoryIds.length} 个目录、${moveFileIds.length} 个文件移动到其他目录`}
-        size="lg"
-        footer={
-          <>
-            <Button
-              variant="secondary"
-              disabled={movingFiles}
-              onClick={() => {
-                setMoveOpen(false);
-                setMoveFileIds([]);
-                setMoveDirectoryIds([]);
-              }}
-            >
-              取消
-            </Button>
-            <Button
-              type="submit"
-              form="move-files-form"
-              variant="primary"
-              loading={movingFiles}
-              leadingIcon={<FolderInput size={16} />}
-            >
-              移动
-            </Button>
-          </>
-        }
-      >
-        <form
-          id="move-files-form"
-          className="flex flex-col gap-4"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void onMoveSelected();
-          }}
-        >
-          <label className="flex items-center gap-2 text-sm font-medium text-foreground">
-            <input
-              type="checkbox"
-              checked={moveCreateNew}
-              disabled={movingFiles}
-              onChange={(event) => setMoveCreateNew(event.target.checked)}
-              className="size-4 rounded border-border text-primary accent-primary focus-visible:outline-none focus-visible:focus-ring"
-            />
-            移动到新目录
-          </label>
-
-          {moveCreateNew ? (
-            <div className="flex flex-col gap-3">
-              <div className="flex flex-col gap-1.5">
-                <label htmlFor="move-new-name" className="text-xs font-medium text-muted">
-                  新目录名称
-                </label>
-                <Input
-                  id="move-new-name"
-                  value={moveNewDirName}
-                  placeholder="例如 2026"
-                  maxLength={80}
-                  disabled={movingFiles}
-                  onChange={(event) => setMoveNewDirName(event.target.value)}
-                />
-              </div>
-              <div className="flex flex-col gap-1.5">
-                <span className="text-xs font-medium text-muted">
-                  父目录
-                </span>
-                <DirectoryTree
-                  id="move-new-parent"
-                  ariaLabel="父目录"
-                  value={moveNewParentPath}
-                  directories={bulkMoveTargets}
-                  disabled={movingFiles}
-                  onChange={setMoveNewParentPath}
-                  treeClassName="max-h-[min(30rem,62dvh)]"
-                />
-              </div>
-            </div>
-          ) : (
-            <div className="flex flex-col gap-1.5">
-              <span className="text-xs font-medium text-muted">
-                目标目录
-              </span>
-              <DirectoryTree
-                id="move-target"
-                ariaLabel="目标目录"
-                value={moveTargetPath}
-                directories={bulkMoveTargets}
-                disabled={movingFiles}
-                onChange={setMoveTargetPath}
-                treeClassName="max-h-[min(30rem,64dvh)]"
-              />
-            </div>
-          )}
-        </form>
-      </Modal>
+        onChangeCreateNew={setMoveCreateNew}
+        onChangeNewDirName={setMoveNewDirName}
+        onChangeNewParentPath={setMoveNewParentPath}
+        onChangeTargetPath={setMoveTargetPath}
+        onSubmit={() => void onMoveSelected()}
+      />
     </div>
   );
 }
