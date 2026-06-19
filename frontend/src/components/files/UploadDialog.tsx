@@ -76,202 +76,43 @@ import {
   type GeneratedThumbnail
 } from "../../lib/thumbnail";
 
-interface UploadDialogProps {
-  open: boolean;
-  initialFiles: File[];
-  maxBytes: number;
-  maxMultipartBytes: number;
-  uploadConcurrency: number;
-  directoryPath: string;
-  onClose: () => void;
-  onUploaded: (uploadedCount: number) => void;
-  onError: (message: string) => void;
-  onTaskSnapshotChange?: (snapshot: UploadTaskSnapshot | null) => void;
-}
+import type {
+  ChunkProgress,
+  ChunkQueueResult,
+  DroppedFileEntry,
+  FileNameConflictState,
+  HlsUrlState,
+  ItemStatus,
+  MagnetFileDecision,
+  MagnetUrlState,
+  QueueItem,
+  QueuedUrlUploadTask,
+  RemoteThumbnailInput,
+  SourceHeaderRow,
+  ThumbnailUrlPickerTarget,
+  UploadAbortContext,
+  UploadChunkState,
+  UploadChunkStatus,
+  UploadDialogHandle,
+  UploadDialogProps,
+  UploadMode,
+  UploadRuntimeState,
+  UploadRuntimeStore,
+  UploadTaskSnapshot,
+  UploadTaskSnapshotItem,
+  UploadTaskSnapshotStatus,
+  UploadThumbnailState,
+  UploadThumbnailStatus,
+  UrlUploadState
+} from "./upload/types";
 
-export type UploadTaskSnapshotStatus = "pending" | "uploading" | "done" | "error" | "skipped";
-
-export interface UploadTaskSnapshotItem {
-  id: string;
-  kind: "local" | "url";
-  title: string;
-  description?: string;
-  status: UploadTaskSnapshotStatus;
-  progressPercent: number;
-  progressLabel?: string;
-  canStop: boolean;
-  canDelete: boolean;
-}
-
-export interface UploadTaskSnapshot {
-  items: UploadTaskSnapshotItem[];
-  running: boolean;
-  stopRequested: boolean;
-  activeItemId: string | null;
-  summary: {
-    total: number;
-    pending: number;
-    uploading: number;
-    done: number;
-    error: number;
-    skipped: number;
-  };
-}
-
-export interface UploadDialogHandle {
-  stopCurrentUpload: () => void;
-  hasActiveUpload: () => boolean;
-  clearSettledTasks: () => void;
-  deleteTask: (id: string) => void;
-  resumeLocalFile: (file: File) => void;
-}
-
-export type ItemStatus = "pending" | "uploading" | "done" | "error" | "skipped";
-type UploadMode = "file" | "url";
-type UploadChunkStatus = "queued" | "uploading" | "completed" | "failed";
-
-interface DroppedFileEntry {
-  file: File;
-  relativePath?: string;
-}
-
-interface ChunkProgress {
-  completed: number;
-  total: number;
-  label: string;
-  failed?: number;
-}
-
-interface UploadChunkState {
-  index: number;
-  size: number;
-  status: UploadChunkStatus;
-  attempts: number;
-  errorMessage?: string;
-}
-
-interface SourceHeaderRow {
-  id: string;
-  name: string;
-  value: string;
-}
-
-interface HlsUrlState {
-  probe?: HlsProbeInfo;
-  variantId?: string;
-  assetId?: string;
-  segmentCount?: number;
-  previewPlaylistUrl?: string;
-  retry?: HlsRetryState;
-}
-
-interface MagnetFileDecision {
-  fileNameOverride?: string;
-  editingFileName?: boolean;
-  conflict?: FileNameConflictState;
-  conflictAction?: FileNameConflictAction;
-}
-
-interface MagnetUrlState {
-  import?: MagnetImport;
-  selectedIndexes: number[];
-  fileDecisions?: Record<number, MagnetFileDecision>;
-  uploads?: MagnetUploadEntry[];
-}
-
-interface FileNameConflictState {
-  fileName: string;
-  suggestedName: string;
-  directoryPath: string;
-  source?: "file" | "batch";
-  message?: string;
-}
-
-interface QueueItem {
-  id: string;
-  file: File;
-  relativePath?: string;
-  relativeDirectoryPath?: string;
-  status: ItemStatus;
-  message?: string;
-  progress?: ChunkProgress;
-  chunks?: UploadChunkState[];
-  retry?: MultipartRetryState;
-  fileNameOverride?: string;
-  editingFileName?: boolean;
-  conflict?: FileNameConflictState;
-  conflictAction?: FileNameConflictAction;
-  thumbnail?: UploadThumbnailState;
-  chunksExpanded?: boolean;
-  recoveredLocalPlaceholder?: boolean;
-  runtimeStore?: UploadRuntimeStore;
-}
-
-interface UrlUploadState {
-  status: ItemStatus;
-  message?: string;
-  progress?: ChunkProgress;
-  chunks?: UploadChunkState[];
-  retry?: MultipartRetryState;
-  fileNameOverride?: string;
-  editingFileName?: boolean;
-  conflict?: FileNameConflictState;
-  conflictAction?: FileNameConflictAction;
-  thumbnail?: UploadThumbnailState;
-  hls?: HlsUrlState;
-  magnet?: MagnetUrlState;
-}
-
-interface UploadRuntimeState {
-  progress?: ChunkProgress;
-  chunks?: UploadChunkState[];
-}
-
-interface UploadRuntimeStore {
-  getSnapshot: () => UploadRuntimeState;
-  subscribe: (listener: () => void) => () => void;
-  setState: (updater: (current: UploadRuntimeState) => UploadRuntimeState) => UploadRuntimeState;
-  reset: () => void;
-}
-
-interface QueuedUrlUploadTask {
-  id: string;
-  sourceUrl: string;
-  directoryPath: string;
-  remark: string;
-}
-
-type UploadThumbnailStatus = "idle" | "generating" | "ready" | "failed" | "removed";
-
-interface UploadThumbnailState {
-  status: UploadThumbnailStatus;
-  generated?: GeneratedThumbnail;
-  remote?: RemoteThumbnailInput;
-  message?: string;
-}
-
-interface RemoteThumbnailInput {
-  url: string;
-  headers?: SourceRequestHeaders;
-}
-
-type ThumbnailUrlPickerTarget =
-  | { kind: "item"; id: string }
-  | { kind: "url" };
-
-interface ChunkQueueResult {
-  completedChunks: number[];
-  failedChunks: number[];
-  cancelled: boolean;
-}
-
-interface UploadAbortContext {
-  kind: "local" | "url";
-  itemId?: string;
-  abortController: AbortController;
-  controllers: Set<AbortController>;
-  cancelled: boolean;
-}
+export type {
+  ItemStatus,
+  UploadDialogHandle,
+  UploadTaskSnapshot,
+  UploadTaskSnapshotItem,
+  UploadTaskSnapshotStatus
+} from "./upload/types";
 
 let counter = 0;
 const DEFAULT_UPLOAD_CONCURRENCY = 5;
