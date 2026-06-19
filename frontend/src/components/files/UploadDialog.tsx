@@ -266,6 +266,22 @@ import { ConflictSummary } from "./upload/components/ConflictControls";
 import { FolderUploadTree } from "./upload/components/FolderUploadTree";
 import { QueueRow } from "./upload/components/QueueRow";
 import { UrlUploadRow, UrlSourceEditor, SourceHeadersEditor } from "./upload/components/UrlUploadRow";
+import type { UploadEngineContext } from "./upload/engine-context";
+import {
+  retryItemFailedChunks,
+  updateItemProgress,
+  uploadLocalMultipart
+} from "./upload/local-engine";
+import {
+  retryUrlMultipart,
+  submitUrlUpload,
+  updateUrlProgress
+} from "./upload/url-engine";
+import { submitMagnetUpload } from "./upload/magnet-engine";
+import {
+  retryHlsUpload,
+  sameOriginAdminUrl
+} from "./upload/hls-engine";
 
 export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(function UploadDialog({
   open,
@@ -739,7 +755,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     }
 
     setQueuedUrlPreparedTaskId(null);
-    void submitUrlUpload();
+    void submitUrlUpload(buildEngineContext());
     queuedUrlLaunchingRef.current = false;
   }, [activeUploadKind, checkingConflicts, mode, normalizedSourceUrl, queuedUrlPreparedTaskId, submitting]);
 
@@ -1006,7 +1022,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     }
 
     setPendingMagnetResume(false);
-    void submitMagnetUpload();
+    void submitMagnetUpload(buildEngineContext());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingMagnetResume, sourceUrl, urlUpload.magnet?.import?.id, urlUpload.magnet?.import?.status]);
 
@@ -1633,7 +1649,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         progress: undefined
       });
       window.setTimeout(() => {
-        void retryUrlMultipart(task.retry);
+        void retryUrlMultipart(buildEngineContext(), task.retry);
       }, 0);
       return;
     }
@@ -1656,7 +1672,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         hls: hlsState
       });
       window.setTimeout(() => {
-        void retryHlsUpload(task.retry);
+        void retryHlsUpload(buildEngineContext(), task.retry);
       }, 0);
       return;
     }
@@ -1943,13 +1959,13 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     abortUploadTask(task);
 
     if (task.kind === "local" && task.itemId) {
-      updateItemProgress(task.itemId, {
+      updateItemProgress(buildEngineContext(), task.itemId, {
         completed: currentItemCompletedChunks(task.itemId),
         total: currentItemChunkCount(task.itemId),
         label: "正在停止上传，保留已完成分片"
       });
     } else if (task.kind === "url") {
-      updateUrlProgress({
+      updateUrlProgress(buildEngineContext(), {
         completed: urlRuntimeStore.getSnapshot().progress?.completed ?? 0,
         total: urlRuntimeStore.getSnapshot().progress?.total ?? 1,
         failed: urlRuntimeStore.getSnapshot().progress?.failed,
@@ -2120,7 +2136,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     event.preventDefault();
     if (uploadBusy) return;
     if (mode === "url") {
-      await submitUrlUpload();
+      await submitUrlUpload(buildEngineContext());
       return;
     }
     if (items.length === 0) {
@@ -2169,7 +2185,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       try {
         const fileName = effectiveFileName(target);
         const thumbnail = await resolveLocalThumbnailForUpload(target);
-        await uploadLocalMultipart(target, fileName, thumbnail, task);
+        await uploadLocalMultipart(buildEngineContext(), target, fileName, thumbnail, task);
         successCount += 1;
         seedUploadRuntimeStore(target.runtimeStore!, null, null);
         setItems((current) =>
@@ -2236,100 +2252,6 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     }
   }
 
-  async function uploadLocalMultipart(
-    target: QueueItem,
-    fileName: string,
-    thumbnail: ThumbnailUploadPayload | undefined,
-    task: UploadAbortContext
-  ) {
-    if (target.retry?.kind === "local") {
-      await retryLocalMultipart(target, target.retry, thumbnail, task);
-      return;
-    }
-
-    const conflictAction = target.conflictAction ?? "error";
-    const init = await initMultipartUpload({
-      file_name: fileName,
-      mime_type: target.file.type || "application/octet-stream",
-      size: target.file.size,
-      directory_path: effectiveDirectoryPath(target, uploadDirectoryPath),
-      ...(conflictAction !== "error" ? { on_conflict: conflictAction } : {}),
-      ...(remark.trim() ? { remark: remark.trim() } : {})
-    }, task.abortController.signal);
-    const upload = init.upload;
-    const initialRetry: MultipartRetryState = {
-      kind: "local",
-      uploadId: upload.id,
-      size: upload.size,
-      chunkSize: upload.chunk_size,
-      chunkCount: upload.chunk_count,
-      directAccess: upload.direct_access !== false,
-      conflictAction,
-      completedChunks: [],
-      failedChunks: chunkRange(upload.chunk_count)
-    };
-    persistLocalUploadTask(target, initialRetry);
-
-    const initialChunks = createUploadChunkStates(upload.size, upload.chunk_size, upload.chunk_count);
-    seedUploadRuntimeStore(target.runtimeStore!, undefined, initialChunks);
-
-    const result = await runConcurrentChunks({
-      total: upload.chunk_count,
-      concurrency: effectiveUploadConcurrency,
-      taskLabel: "上传分片",
-      doneLabel: "已上传",
-      task,
-      requestTimeoutMs: LOCAL_CHUNK_REQUEST_TIMEOUT_MS,
-      onProgress: (progress) => updateItemProgress(target.id, progress),
-      onChunkState: (index, patch) => updateItemChunk(target.id, index, patch),
-      onChunk: async (index, signal) => {
-        const start = index * upload.chunk_size;
-        const end = Math.min(target.file.size, start + upload.chunk_size);
-        await uploadMultipartChunk(upload.id, index, target.file.slice(start, end), signal);
-      }
-    });
-
-    if (result.failedChunks.length > 0 || result.cancelled) {
-      const retry = await refreshMultipartRetryState({
-        kind: "local",
-        uploadId: upload.id,
-        size: upload.size,
-        chunkSize: upload.chunk_size,
-        chunkCount: upload.chunk_count,
-        directAccess: upload.direct_access !== false,
-          conflictAction,
-          completedChunks: result.completedChunks,
-          failedChunks: result.failedChunks
-        });
-      persistLocalUploadTask(target, retry);
-      throw new MultipartChunkUploadError(
-        result.cancelled ? "已停止，可重试未完成分片" : `有 ${result.failedChunks.length} 个分片上传失败，可手动重试`,
-        retry,
-        result.cancelled
-      );
-    }
-
-    const completeProgress = {
-      completed: upload.chunk_count,
-      total: upload.chunk_count,
-      label: upload.direct_access === false ? "正在生成文件索引" : "正在生成访问链接"
-    };
-    updateItemProgress(target.id, completeProgress);
-    await completeUploadOrRetryLater({
-      kind: "local",
-      uploadId: upload.id,
-      size: upload.size,
-      chunkSize: upload.chunk_size,
-      chunkCount: upload.chunk_count,
-      directAccess: upload.direct_access !== false,
-      conflictAction,
-      thumbnail,
-      task,
-      timeoutMs: LOCAL_CHUNK_REQUEST_TIMEOUT_MS
-    });
-    clearCurrentPersistedTask();
-  }
-
   async function resolveLocalThumbnailForUpload(target: QueueItem): Promise<ThumbnailUploadPayload | undefined> {
     if (target.thumbnail?.status === "ready") {
       return thumbnailStatePayload(target.thumbnail);
@@ -2392,7 +2314,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     let generated: GeneratedThumbnail | undefined;
 
     try {
-      updateUrlProgress({
+      updateUrlProgress(buildEngineContext(), {
         completed: urlRuntimeStore.getSnapshot().progress?.completed ?? 0,
         total: urlRuntimeStore.getSnapshot().progress?.total ?? 1,
         failed: urlRuntimeStore.getSnapshot().progress?.failed,
@@ -2411,1108 +2333,10 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     }
   }
 
-  async function retryLocalMultipart(
-    target: QueueItem,
-    retry: MultipartRetryState,
-    thumbnail: ThumbnailUploadPayload | undefined,
-    task: UploadAbortContext
-  ) {
-    const syncedRetry = await refreshMultipartRetryState(retry);
-    seedUploadRuntimeStore(
-      target.runtimeStore!,
-      undefined,
-      prepareRetryChunks(target.runtimeStore?.getSnapshot().chunks ?? target.chunks, syncedRetry)
-    );
-    setItems((current) =>
-      current.map((item) =>
-        item.id === target.id
-          ? { ...item, retry: syncedRetry }
-          : item
-      )
-    );
-
-    const result = await runConcurrentChunks({
-      total: syncedRetry.chunkCount,
-      concurrency: effectiveUploadConcurrency,
-      chunkIndexes: syncedRetry.failedChunks,
-      completedChunks: syncedRetry.completedChunks,
-      taskLabel: "重试上传分片",
-      doneLabel: "已上传",
-      task,
-      requestTimeoutMs: LOCAL_CHUNK_REQUEST_TIMEOUT_MS,
-      onProgress: (progress) => updateItemProgress(target.id, progress),
-      onChunkState: (index, patch) => updateItemChunk(target.id, index, patch),
-      onChunk: async (index, signal) => {
-        const start = index * syncedRetry.chunkSize;
-        const end = Math.min(target.file.size, start + syncedRetry.chunkSize);
-        await uploadMultipartChunk(syncedRetry.uploadId, index, target.file.slice(start, end), signal);
-      }
-    });
-
-    if (result.failedChunks.length > 0 || result.cancelled) {
-      const nextRetry = await refreshMultipartRetryState({
-        ...syncedRetry,
-        completedChunks: result.completedChunks,
-        failedChunks: result.failedChunks
-      });
-      persistLocalUploadTask(target, nextRetry);
-      throw new MultipartChunkUploadError(
-        result.cancelled ? "已停止，可重试未完成分片" : `仍有 ${result.failedChunks.length} 个分片上传失败，可继续手动重试`,
-        nextRetry,
-        result.cancelled
-      );
-    }
-
-    updateItemProgress(target.id, {
-      completed: syncedRetry.chunkCount,
-      total: syncedRetry.chunkCount,
-      label: syncedRetry.directAccess === false ? "正在生成文件索引" : "正在生成访问链接"
-    });
-    await completeUploadOrRetryLater({
-      ...syncedRetry,
-      thumbnail,
-      task,
-      timeoutMs: LOCAL_CHUNK_REQUEST_TIMEOUT_MS
-    });
-    clearCurrentPersistedTask();
-  }
-
-  function updateItemProgress(id: string, progress: ChunkProgress) {
-    const target = itemsRef.current.find((item) => item.id === id);
-    if (!target?.runtimeStore) return;
-    target.runtimeStore.setState((current) => {
-      if (chunkProgressEqual(current.progress, progress)) {
-        return current;
-      }
-      return { ...current, progress };
-    });
-  }
-
-  function updateItemChunk(id: string, chunkIndex: number, patch: Partial<UploadChunkState>) {
-    const target = itemsRef.current.find((item) => item.id === id);
-    if (!target?.runtimeStore) return;
-    target.runtimeStore.setState((current) => {
-      const chunks = updateChunkStates(current.chunks, chunkIndex, patch);
-      return chunks === current.chunks ? current : { ...current, chunks };
-    });
-  }
-
-  function updateUrlChunk(chunkIndex: number, patch: Partial<UploadChunkState>) {
-    urlRuntimeStore.setState((current) => {
-      const chunks = updateChunkStates(current.chunks, chunkIndex, patch);
-      return chunks === current.chunks ? current : { ...current, chunks };
-    });
-  }
-
-  function updateUrlProgress(progress: ChunkProgress) {
-    urlRuntimeStore.setState((current) => {
-      if (chunkProgressEqual(current.progress, progress)) {
-        return current;
-      }
-      return {
-        ...current,
-        progress
-      };
-    });
-  }
-
-  function updateUrlChunkFromHlsSegment(segment: HlsSegment, missingChunks: number[]) {
-    updateUrlChunk(segment.segment_index, {
-      size: segment.size ?? 0,
-      status: hlsSegmentChunkStatus(segment),
-      attempts: segment.attempts,
-      errorMessage: hlsSegmentChunkMessage(segment, missingChunks)
-    });
-  }
-
   function toggleItemChunks(id: string) {
     setItems((current) =>
       current.map((item) => (item.id === id ? { ...item, chunksExpanded: !item.chunksExpanded } : item))
     );
-  }
-
-  async function submitUrlUpload() {
-    if (urlUpload.hls?.retry) {
-      await retryHlsUpload(urlUpload.hls.retry);
-      return;
-    }
-
-    if (urlUpload.retry?.kind === "url") {
-      await retryUrlMultipart(urlUpload.retry);
-      return;
-    }
-
-    const error = validateSourceUrl(sourceUrl);
-    if (error) {
-      setUrlUpload({ status: "error", message: error });
-      onError(error);
-      return;
-    }
-
-    if (isLikelyMagnetUrl(normalizedSourceUrl)) {
-      await submitMagnetUpload();
-      return;
-    }
-
-    const sourceHeadersResult = readSourceHeadersForUpload();
-    if (!sourceHeadersResult.ok) {
-      return;
-    }
-    const sourceHeaders = sourceHeadersResult.headers;
-
-    if (isLikelyHlsUrl(normalizedSourceUrl) || urlUpload.hls?.probe) {
-      await submitHlsUpload(sourceHeaders);
-      return;
-    }
-
-    const task = startUploadTask("url");
-    setSubmitting(true);
-    seedUploadRuntimeStore(urlRuntimeStore, { completed: 0, total: 1, label: "探测远程文件" });
-    setUrlUpload((current) => ({
-      ...current,
-      status: "uploading",
-      message: undefined,
-      conflict: undefined,
-      progress: undefined
-    }));
-
-    try {
-      const fileNameOverride = normalizedFileNameOverride(urlUpload.fileNameOverride);
-      const conflictAction = urlUpload.conflictAction ?? "error";
-      const init = await initUrlMultipartUpload(
-        normalizedSourceUrl,
-        remark.trim() || undefined,
-        uploadDirectoryPath,
-        true,
-        fileNameOverride,
-        conflictAction,
-        sourceHeaders,
-        task.abortController.signal
-      );
-      if (init.mode === "multipart" && init.upload) {
-        const upload = init.upload;
-        const initialRetry: MultipartRetryState = {
-          kind: "url",
-          uploadId: upload.id,
-          size: upload.size,
-          chunkSize: upload.chunk_size,
-          chunkCount: upload.chunk_count,
-          directAccess: upload.direct_access !== false,
-          conflictAction,
-          completedChunks: [],
-          failedChunks: chunkRange(upload.chunk_count)
-        };
-        persistUrlMultipartUploadTask(initialRetry, fileNameOverride);
-        const thumbnail = await resolveUrlThumbnailForUpload(upload.thumbnail_source);
-        const initialChunks = createUploadChunkStates(upload.size, upload.chunk_size, upload.chunk_count);
-        seedUploadRuntimeStore(urlRuntimeStore, undefined, initialChunks);
-        setUrlUpload((current) => ({
-          ...current,
-          status: "uploading",
-          progress: undefined
-        }));
-        const result = await runConcurrentChunks({
-          total: upload.chunk_count,
-          taskLabel: "导入分片",
-          doneLabel: "已导入",
-          concurrency: effectiveUploadConcurrency,
-          task,
-          requestTimeoutMs: URL_CHUNK_REQUEST_TIMEOUT_MS,
-          onProgress: updateUrlProgress,
-          onChunkState: updateUrlChunk,
-          onChunk: async (index, signal) => {
-            await uploadUrlMultipartChunk(upload.id, index, signal);
-          }
-        });
-
-        if (result.failedChunks.length > 0 || result.cancelled) {
-          const retry = await refreshMultipartRetryState({
-            kind: "url",
-            uploadId: upload.id,
-            size: upload.size,
-            chunkSize: upload.chunk_size,
-            chunkCount: upload.chunk_count,
-            directAccess: upload.direct_access !== false,
-            conflictAction,
-            completedChunks: result.completedChunks,
-            failedChunks: result.failedChunks
-          });
-          persistUrlMultipartUploadTask(retry, fileNameOverride);
-          throw new MultipartChunkUploadError(
-            result.cancelled ? "已停止，可重试未完成分片" : `有 ${result.failedChunks.length} 个分片导入失败，可手动重试`,
-            retry,
-            result.cancelled
-          );
-        }
-
-        const completeProgress = {
-          completed: upload.chunk_count,
-          total: upload.chunk_count,
-          label: upload.direct_access === false ? "正在生成文件索引" : "正在生成访问链接"
-        };
-        seedUploadRuntimeStore(urlRuntimeStore, completeProgress, urlRuntimeStore.getSnapshot().chunks);
-        setUrlUpload((current) => ({
-          ...current,
-          status: "uploading",
-          progress: undefined
-        }));
-        await completeUploadOrRetryLater({
-          kind: "url",
-          uploadId: upload.id,
-          size: upload.size,
-          chunkSize: upload.chunk_size,
-          chunkCount: upload.chunk_count,
-          directAccess: upload.direct_access !== false,
-          conflictAction,
-          thumbnail,
-          task,
-          timeoutMs: URL_CHUNK_REQUEST_TIMEOUT_MS
-        });
-      } else {
-        throw new ApiError(500, "URL 上传初始化未返回分片会话", "InvalidUploadMode");
-      }
-      seedUploadRuntimeStore(urlRuntimeStore, null, null);
-      setUrlUpload((current) => ({
-        ...current,
-        status: "done",
-        message: "已从 URL 上传",
-        progress: undefined,
-        chunks: undefined,
-        retry: undefined,
-        conflict: undefined,
-        conflictAction: "error",
-        editingFileName: false
-      }));
-      clearCurrentPersistedTask();
-      onUploaded(1);
-    } catch (uploadError) {
-      const retry = uploadError instanceof MultipartChunkUploadError ? uploadError.retry : undefined;
-      const stopped = (uploadError instanceof MultipartChunkUploadError && uploadError.stopped) || task.cancelled || isAbortError(uploadError);
-      const conflict = fileNameConflictFromError(uploadError);
-      const message = stopped
-        ? "已停止"
-        : uploadError instanceof ApiError
-          ? uploadError.message
-          : uploadError instanceof Error
-            ? uploadError.message
-            : "URL 上传失败";
-      setUrlUpload((current) => ({
-        ...current,
-        status: "error",
-        message: conflict ? undefined : message,
-        retry: conflict ? undefined : retry,
-        conflict,
-        fileNameOverride: conflict?.suggestedName ?? current.fileNameOverride,
-        conflictAction: "error",
-        editingFileName: conflict ? true : current.editingFileName,
-        progress: undefined
-      }));
-      seedUploadRuntimeStore(
-        urlRuntimeStore,
-        retry && !conflict
-          ? retryFailureProgress(retry, stopped ? "已停止，可重试未完成分片" : "分片导入失败，可手动重试")
-          : null,
-        retry && !conflict ? urlRuntimeStore.getSnapshot().chunks : null
-      );
-      if (retry && !conflict && !stopped) {
-        persistUrlMultipartUploadTask(retry, normalizedFileNameOverride(urlUpload.fileNameOverride));
-      }
-      if (!stopped) {
-        onError(conflict ? FILE_NAME_CONFLICT_TOAST_MESSAGE : message);
-      }
-    } finally {
-      finishUploadTask(task);
-      setSubmitting(false);
-    }
-  }
-
-  async function submitMagnetUpload() {
-    const task = startUploadTask("url");
-    setSubmitting(true);
-    const initialProgress = { completed: 0, total: 1, label: urlUpload.magnet?.import ? "准备磁力导入" : "解析磁力链接" };
-    seedUploadRuntimeStore(urlRuntimeStore, initialProgress);
-    setUrlUpload((current) => ({
-      ...current,
-      status: "uploading",
-      message: undefined,
-      retry: undefined,
-      conflict: undefined,
-      progress: undefined
-    }));
-
-    try {
-      let magnet = urlUpload.magnet?.import;
-      let selectedIndexes = urlUpload.magnet?.selectedIndexes ?? [];
-
-      if (!magnet || magnet.status === "failed" || magnet.status === "cancelled" || magnet.status === "probing") {
-        magnet = magnet && magnet.status === "probing"
-          ? magnet
-          : (await probeMagnetUpload(normalizedSourceUrl, task.abortController.signal)).magnet;
-        if (magnet.status === "probing") {
-          magnet = await waitForMagnetStatus(
-            magnet.id,
-            task,
-            (current) => current.status !== "probing",
-            "解析磁力文件列表"
-          );
-        }
-        const parsedMagnet = magnet;
-        selectedIndexes = selectedMagnetIndexesForResume(parsedMagnet, maxMultipartBytes);
-        persistMagnetUploadTask(parsedMagnet.id, selectedIndexes);
-        const parsedProgress = parsedMagnet.status === "ready" || parsedMagnet.status === "failed" || parsedMagnet.status === "cancelled"
-          ? null
-          : { completed: 0, total: 1, label: magnetStatusProgressLabel("继续磁力任务", parsedMagnet, selectedIndexes.length) };
-        seedUploadRuntimeStore(urlRuntimeStore, parsedProgress);
-        setUrlUpload((current) => ({
-          ...current,
-          status: parsedMagnet.status === "ready" ? "pending" : parsedMagnet.status === "failed" || parsedMagnet.status === "cancelled" ? "error" : "uploading",
-          message: parsedMagnet.status === "ready"
-            ? `已解析 ${parsedMagnet.files.length} 个文件，请选择要导入的文件后再次点击上传`
-            : parsedMagnet.status === "failed" || parsedMagnet.status === "cancelled"
-              ? parsedMagnet.error_message || "磁力链接解析失败"
-              : "检测到已有磁力任务，准备继续",
-          progress: undefined,
-          magnet: mergeMagnetState(current.magnet, {
-            import: parsedMagnet,
-            selectedIndexes,
-            fileDecisions: {}
-          })
-        }));
-        if (parsedMagnet.status !== "ready") {
-          if (parsedMagnet.status === "failed" || parsedMagnet.status === "cancelled") {
-            throw new Error(parsedMagnet.error_message || "磁力链接解析失败");
-          }
-        } else {
-          await preflightMagnetSelection(parsedMagnet, selectedIndexes, {});
-          return;
-        }
-      }
-
-      if (selectedIndexes.length === 0 && magnet) {
-        selectedIndexes = selectedMagnetIndexesForResume(magnet, maxMultipartBytes);
-      }
-      if (selectedIndexes.length === 0) {
-        throw new Error("请选择至少一个磁力文件");
-      }
-
-      const currentMagnetState = urlUploadRef.current.magnet;
-      const currentDecisions = currentMagnetState?.fileDecisions ?? {};
-      if (!(await preflightMagnetSelection(magnet, selectedIndexes, currentDecisions))) {
-        return;
-      }
-      const fileOptions = magnetFileUploadOptions(magnet, selectedIndexes, currentDecisions);
-      const conflictActionByFileIndex = new Map<number, FileNameConflictAction>(
-        fileOptions.map((option) => [option.file_index, option.on_conflict ?? "error"])
-      );
-
-      const init = await initMagnetUpload({
-        import_id: magnet.id,
-        file_indexes: selectedIndexes,
-        file_options: fileOptions,
-        directory_path: uploadDirectoryPath,
-        ...(urlUpload.conflictAction && urlUpload.conflictAction !== "error" ? { on_conflict: urlUpload.conflictAction } : {}),
-        ...(remark.trim() ? { remark: remark.trim() } : {})
-      }, task.abortController.signal);
-      magnet = init.magnet;
-      const uploads = init.uploads.map((entry) => ({
-        fileIndex: entry.file_index,
-        upload: entry.upload,
-        targetDirectoryPath: entry.target_directory_path,
-        conflictAction: conflictActionByFileIndex.get(entry.file_index) ?? "error"
-      }));
-      persistMagnetUploadTask(magnet.id, selectedIndexes, uploads);
-
-      const waitingProgress = { completed: 0, total: uploads.length, label: "等待磁力文件下载完成" };
-      seedUploadRuntimeStore(urlRuntimeStore, waitingProgress);
-      setUrlUpload((current) => ({
-        ...current,
-        status: "uploading",
-        message: `aria2 正在下载 ${uploads.length} 个文件`,
-        progress: undefined,
-        magnet: mergeMagnetState(current.magnet, {
-          import: magnet,
-          selectedIndexes,
-          uploads
-        })
-      }));
-
-      magnet = await waitForMagnetStatus(
-        magnet.id,
-        task,
-        (current) => current.status === "downloaded" || current.status === "importing" || current.status === "done" || current.status === "failed" || current.status === "cancelled",
-        "下载磁力文件",
-        {
-          selectedCount: uploads.length,
-          syncUiState: false
-        }
-      );
-      if (magnet.status === "failed" || magnet.status === "cancelled") {
-        throw new Error(magnet.error_message || "磁力文件下载失败");
-      }
-      if (magnet.status === "done") {
-        seedUploadRuntimeStore(urlRuntimeStore, null, null);
-        setUrlUpload((current) => ({
-          ...current,
-          status: "done",
-          message: "磁力任务已完成",
-          progress: undefined,
-          chunks: undefined,
-          magnet: mergeMagnetState(current.magnet, current.magnet ? { ...current.magnet, import: magnet, uploads } : { import: magnet, selectedIndexes, uploads })
-        }));
-        onUploaded(uploads.length);
-        clearCurrentPersistedTask();
-        return;
-      }
-
-      let completedFiles = 0;
-      for (const entry of uploads) {
-        const { upload, fileIndex, conflictAction } = entry;
-        if (task.cancelled) {
-          throw new Error("已停止");
-        }
-        const magnetFile = magnet.files.find((file) => file.file_index === fileIndex);
-        if (magnetFile?.status === "done") {
-          completedFiles += 1;
-          continue;
-        }
-
-        const initialChunks = createUploadChunkStates(upload.size, upload.chunk_size, upload.chunk_count);
-        const importProgress = {
-          completed: completedFiles,
-          total: uploads.length,
-          label: `导入文件 ${completedFiles + 1}/${uploads.length}`
-        };
-        seedUploadRuntimeStore(urlRuntimeStore, importProgress, initialChunks);
-        setUrlUpload((current) => ({
-          ...current,
-          status: "uploading",
-          message: `正在导入 ${upload.file_name}`,
-          progress: undefined,
-          magnet: mergeMagnetState(current.magnet, current.magnet ? { ...current.magnet, import: magnet, uploads } : { import: magnet, selectedIndexes, uploads })
-        }));
-
-        const result = await runConcurrentChunks({
-          total: upload.chunk_count,
-          taskLabel: `导入 ${upload.file_name}`,
-          doneLabel: `已导入 ${upload.file_name}`,
-          concurrency: effectiveUploadConcurrency,
-          task,
-          requestTimeoutMs: URL_CHUNK_REQUEST_TIMEOUT_MS,
-          onProgress: (progress) => {
-            updateUrlProgress({
-              completed: progress.completed,
-              total: progress.total,
-              failed: progress.failed,
-              label: `${completedFiles + 1}/${uploads.length} · ${progress.label}`
-            });
-          },
-          onChunkState: updateUrlChunk,
-          onChunk: async (index, signal) => {
-            await uploadMagnetMultipartChunk(magnet!.id, fileIndex, index, signal);
-          }
-        });
-
-        if (result.failedChunks.length > 0 || result.cancelled) {
-          throw new Error(result.cancelled ? "已停止，可重新发起磁力导入" : `${upload.file_name} 有 ${result.failedChunks.length} 个分片导入失败`);
-        }
-
-        const thumbnail = await resolveMagnetThumbnailForUpload(magnet!.id, fileIndex, upload);
-        if (task.cancelled) {
-          throw new Error("已停止");
-        }
-
-        updateUrlProgress({
-          completed: upload.chunk_count,
-          total: upload.chunk_count,
-          label: `${completedFiles + 1}/${uploads.length} · 正在生成 ${upload.file_name} 文件索引`
-        });
-        await runAbortableUploadRequest(task, URL_CHUNK_REQUEST_TIMEOUT_MS, (signal) =>
-          completeMagnetMultipartUpload(magnet!.id, fileIndex, thumbnail, signal, conflictAction)
-        );
-        completedFiles += 1;
-      }
-
-      const latest = await getMagnetUploadStatus(magnet.id, task.abortController.signal);
-      seedUploadRuntimeStore(urlRuntimeStore, null, null);
-      setUrlUpload((current) => ({
-        ...current,
-        status: "done",
-        message: `已导入 ${completedFiles} 个磁力文件`,
-        progress: undefined,
-        chunks: undefined,
-        magnet: mergeMagnetState(current.magnet, {
-          ...(current.magnet ?? { selectedIndexes }),
-          import: latest.magnet,
-          selectedIndexes,
-          uploads
-        })
-      }));
-      clearCurrentPersistedTask();
-      onUploaded(completedFiles);
-    } catch (uploadError) {
-      const stopped = task.cancelled || isAbortError(uploadError);
-      const conflict = fileNameConflictFromError(uploadError);
-      const message = stopped
-        ? "已停止"
-        : conflict
-          ? "磁力文件与目标目录已有文件重名，请换目录或先处理同名文件"
-          : uploadError instanceof ApiError
-            ? uploadError.message
-            : uploadError instanceof Error
-              ? uploadError.message
-              : "磁力导入失败";
-      setUrlUpload((current) => ({
-        ...current,
-        status: "error",
-        message: conflict ? undefined : message,
-        conflict,
-        conflictAction: "error",
-        progress: undefined
-      }));
-      if (conflict || !urlUploadRef.current.magnet?.import) {
-        seedUploadRuntimeStore(urlRuntimeStore, null, null);
-      }
-      if (!stopped && urlUploadRef.current.magnet?.import) {
-        persistMagnetUploadTask(
-          urlUploadRef.current.magnet.import.id,
-          urlUploadRef.current.magnet.selectedIndexes,
-          urlUploadRef.current.magnet.uploads
-        );
-      }
-      if (!stopped) {
-        onError(message);
-      }
-    } finally {
-      finishUploadTask(task);
-      setSubmitting(false);
-    }
-  }
-
-  async function waitForMagnetStatus(
-    importId: string,
-    task: UploadAbortContext,
-    isDone: (current: MagnetImport) => boolean,
-    label: string,
-    options: {
-      selectedCount?: number;
-      syncUiState?: boolean;
-    } = {}
-  ): Promise<MagnetImport> {
-    const deadline = Date.now() + MAGNET_DOWNLOAD_TIMEOUT_MS;
-    let transientFailures = 0;
-
-    while (true) {
-      if (task.cancelled) {
-        throw new Error("已停止");
-      }
-
-      let magnet: MagnetImport;
-      try {
-        const response = await runAbortableUploadRequest(task, URL_CHUNK_REQUEST_TIMEOUT_MS, (signal) =>
-          getMagnetUploadStatus(importId, signal)
-        );
-        magnet = response.magnet;
-        transientFailures = 0;
-      } catch (error) {
-        if (task.cancelled || !isRetryableMagnetStatusError(error)) {
-          throw error;
-        }
-
-        transientFailures += 1;
-        if (transientFailures > MAGNET_STATUS_MAX_TRANSIENT_FAILURES) {
-          throw new Error(`${label}状态确认失败：${errorMessage(error)}`);
-        }
-
-        const retryLabel = `${label}状态确认失败，自动重试 ${transientFailures}/${MAGNET_STATUS_MAX_TRANSIENT_FAILURES}：${errorMessage(error)}`;
-        urlRuntimeStore.setState((current) => ({
-          ...current,
-          progress: current.progress
-            ? { ...current.progress, label: retryLabel }
-            : { completed: 0, total: 1, label: retryLabel }
-        }));
-
-        if (Date.now() >= deadline) {
-          throw new Error(`${label}超时`);
-        }
-
-        await delay(MAGNET_STATUS_RETRY_DELAY_MS * transientFailures, task.abortController.signal);
-        continue;
-      }
-
-      const progressLabel = magnetStatusProgressLabel(label, magnet, options.selectedCount);
-      urlRuntimeStore.setState((current) => ({
-        ...current,
-        progress: current.progress
-          ? { ...current.progress, label: progressLabel }
-          : { completed: 0, total: 1, label: progressLabel }
-      }));
-
-      if (options.syncUiState !== false || isDone(magnet)) {
-        setUrlUpload((current) => {
-          const nextMagnet = current.magnet
-            ? { ...current.magnet, import: magnet }
-            : { import: magnet, selectedIndexes: selectedMagnetIndexesForResume(magnet, maxMultipartBytes) };
-
-          if (current.magnet?.import && magnetImportStableUiKey(current.magnet.import) === magnetImportStableUiKey(magnet)) {
-            return current;
-          }
-
-          return {
-            ...current,
-            magnet: mergeMagnetState(current.magnet, nextMagnet)
-          };
-        });
-      }
-
-      if (isDone(magnet)) {
-        return magnet;
-      }
-
-      if (Date.now() >= deadline) {
-        throw new Error(`${label}超时`);
-      }
-
-      await delay(MAGNET_STATUS_POLL_MS, task.abortController.signal);
-    }
-  }
-
-  async function submitHlsUpload(sourceHeaders?: SourceRequestHeaders) {
-    const error = validateSourceUrl(sourceUrl);
-    if (error) {
-      setUrlUpload({ status: "error", message: error });
-      onError(error);
-      return;
-    }
-
-    const task = startUploadTask("url");
-    let completionRetry: HlsRetryState | undefined;
-
-    setSubmitting(true);
-    seedUploadRuntimeStore(urlRuntimeStore, { completed: 0, total: 1, label: "探测 HLS 播放列表" });
-    setUrlUpload((current) => ({
-      ...current,
-      status: "uploading",
-      message: undefined,
-      retry: undefined,
-      conflict: undefined,
-      progress: undefined
-    }));
-
-    try {
-      let probe = urlUpload.hls?.probe;
-      let variantId = urlUpload.hls?.variantId;
-
-      if (!probe || (probe.kind === "master" && variantId && probe.selected_variant_id !== variantId)) {
-        probe = (await probeHlsUpload(normalizedSourceUrl, variantId, sourceHeaders, task.abortController.signal)).hls;
-      }
-
-      if (probe.kind === "master" && !probe.media) {
-        if (probe.variants.length === 1) {
-          variantId = probe.variants[0]?.id;
-          probe = (await probeHlsUpload(normalizedSourceUrl, variantId, sourceHeaders, task.abortController.signal)).hls;
-        } else if (!variantId) {
-          urlRuntimeStore.reset();
-          setUrlUpload((current) => ({
-            ...current,
-            status: "pending",
-            message: "检测到多码率 HLS，请先选择一个 variant",
-            progress: undefined,
-            chunks: undefined,
-            hls: { probe }
-          }));
-          return;
-        } else {
-          probe = (await probeHlsUpload(normalizedSourceUrl, variantId, sourceHeaders, task.abortController.signal)).hls;
-        }
-      }
-
-      if (probe.kind === "master" && !probe.media) {
-        throw new Error("请选择一个可导入的 HLS variant");
-      }
-
-      const selectedVariantId = probe.kind === "master"
-        ? probe.selected_variant_id ?? variantId
-        : undefined;
-      const fileName = normalizedFileNameOverride(urlUpload.fileNameOverride) ?? probe.file_name;
-      const conflictAction = urlUpload.conflictAction ?? "error";
-
-      const createHlsTaskProgress = { completed: 0, total: probe.media?.segment_count ?? 1, label: "创建 HLS 上传任务" };
-      seedUploadRuntimeStore(urlRuntimeStore, createHlsTaskProgress);
-      setUrlUpload((current) => ({
-        ...current,
-        status: "uploading",
-        message: hlsProbeSummary(probe),
-        progress: undefined,
-        hls: {
-          probe,
-          ...(selectedVariantId ? { variantId: selectedVariantId } : {})
-        }
-      }));
-
-      const init = await initHlsUpload({
-        url: normalizedSourceUrl,
-        ...(selectedVariantId ? { variant_id: selectedVariantId } : {}),
-        file_name: fileName,
-        directory_path: uploadDirectoryPath,
-        ...(sourceHeaders ? { headers: sourceHeaders } : {}),
-        ...(remark.trim() ? { remark: remark.trim() } : {}),
-        ...(conflictAction !== "error" ? { on_conflict: conflictAction } : {})
-      }, task.abortController.signal);
-      const asset = init.hls.asset;
-      const segments = init.hls.segments;
-      const previewPlaylistUrl = sameOriginAdminUrl(asset.preview_playlist_url);
-
-      completionRetry = hlsRetryFromStatus(asset, segments, conflictAction);
-      persistHlsUploadTask(completionRetry, fileName, selectedVariantId);
-      const initialChunks = createHlsSegmentStates(segments);
-      const startProgress = { completed: 0, total: asset.segment_count, label: `开始导入 HLS 片段（${effectiveUploadConcurrency} 并发）` };
-      seedUploadRuntimeStore(urlRuntimeStore, startProgress, initialChunks);
-      setUrlUpload((current) => ({
-        ...current,
-        status: "uploading",
-        message: `HLS 视频 · ${asset.segment_count} 个片段`,
-        progress: undefined,
-        hls: {
-          probe,
-          assetId: asset.id,
-          segmentCount: asset.segment_count,
-          previewPlaylistUrl,
-          ...(selectedVariantId ? { variantId: selectedVariantId } : {})
-        }
-      }));
-
-      const result = await runConcurrentChunks({
-        total: asset.segment_count,
-        taskLabel: "导入 HLS 片段",
-        doneLabel: "已导入 HLS 片段",
-        concurrency: effectiveUploadConcurrency,
-        task,
-        requestTimeoutMs: HLS_SEGMENT_REQUEST_TIMEOUT_MS,
-        onProgress: updateUrlProgress,
-        onChunkState: updateUrlChunk,
-        onChunk: async (index, signal) => {
-          await uploadHlsSegmentFully(asset.id, index, previewPlaylistUrl, asset.file_name, signal);
-        }
-      });
-
-      if (result.failedChunks.length > 0 || result.cancelled) {
-        const retry = await refreshHlsRetryState({
-          ...completionRetry,
-          completedSegments: result.completedChunks,
-          failedSegments: result.failedChunks
-        });
-        persistHlsUploadTask(retry, fileName, selectedVariantId);
-        throw new HlsSegmentUploadError(
-          result.cancelled ? "已停止，可重试未完成 HLS 片段" : `有 ${result.failedChunks.length} 个 HLS 片段导入失败，可手动重试`,
-          retry,
-          result.cancelled
-        );
-      }
-
-      completionRetry = await refreshHlsRetryState({
-        ...completionRetry,
-        completedSegments: chunkRange(asset.segment_count),
-        failedSegments: []
-      });
-      persistHlsUploadTask(completionRetry, fileName, selectedVariantId);
-      const indexProgress = { completed: asset.segment_count, total: asset.segment_count, label: "正在生成 HLS 文件索引" };
-      seedUploadRuntimeStore(urlRuntimeStore, indexProgress, urlRuntimeStore.getSnapshot().chunks);
-      setUrlUpload((current) => ({
-        ...current,
-        status: "uploading",
-        progress: undefined
-      }));
-      const thumbnail = await resolveHlsThumbnailForUpload(previewPlaylistUrl, asset.file_name);
-      await runAbortableUploadRequest(task, HLS_SEGMENT_REQUEST_TIMEOUT_MS, (signal) =>
-        completeHlsUpload(asset.id, thumbnail, signal, conflictAction)
-      );
-      setUrlUpload((current) => ({
-        ...current,
-        status: "done",
-        message: "已导入 HLS 视频",
-        progress: undefined,
-        chunks: undefined,
-        retry: undefined,
-        conflict: undefined,
-        conflictAction: "error",
-        editingFileName: false,
-        hls: current.hls ? withoutHlsRetry(current.hls) : current.hls
-      }));
-      clearCurrentPersistedTask();
-      onUploaded(1);
-    } catch (uploadError) {
-      const retry = uploadError instanceof HlsSegmentUploadError ? uploadError.retry : completionRetry;
-      const stopped = (uploadError instanceof HlsSegmentUploadError && uploadError.stopped) || task.cancelled || isAbortError(uploadError);
-      const conflict = fileNameConflictFromError(uploadError);
-      const message = stopped
-        ? "已停止"
-        : uploadError instanceof ApiError
-          ? uploadError.message
-          : uploadError instanceof Error
-            ? uploadError.message
-            : "HLS 上传失败";
-
-      const retryProgress = retry && !conflict
-        ? hlsRetryFailureProgress(retry, stopped ? "已停止，可重试未完成 HLS 片段" : "HLS 片段导入失败，可手动重试")
-        : undefined;
-      seedUploadRuntimeStore(urlRuntimeStore, retryProgress, urlRuntimeStore.getSnapshot().chunks);
-      setUrlUpload((current) => ({
-        ...current,
-        status: "error",
-        message: conflict ? undefined : message,
-        retry: undefined,
-        conflict,
-        fileNameOverride: conflict?.suggestedName ?? current.fileNameOverride,
-        conflictAction: "error",
-        editingFileName: conflict ? true : current.editingFileName,
-        progress: undefined,
-        hls: retry
-          ? {
-              ...(current.hls ?? {}),
-              assetId: retry.assetId,
-              segmentCount: retry.segmentCount,
-              previewPlaylistUrl: retry.previewPlaylistUrl,
-              retry
-            }
-          : current.hls
-      }));
-      if (retry && !conflict && !stopped) {
-        persistHlsUploadTask(retry, normalizedFileNameOverride(urlUpload.fileNameOverride), urlUpload.hls?.variantId);
-      }
-      if (!stopped) {
-        onError(conflict ? FILE_NAME_CONFLICT_TOAST_MESSAGE : message);
-      }
-    } finally {
-      finishUploadTask(task);
-      setSubmitting(false);
-    }
-  }
-
-  async function retryHlsUpload(retry: HlsRetryState) {
-    const task = startUploadTask("url");
-    const conflictAction = urlUpload.conflictAction ?? retry.conflictAction;
-    let syncedRetry = await refreshHlsRetryState({ ...retry, conflictAction });
-    persistHlsUploadTask(syncedRetry, normalizedFileNameOverride(urlUpload.fileNameOverride), urlUpload.hls?.variantId);
-
-    setSubmitting(true);
-    const hlsRetryProgress = hlsRetryFailureProgress(syncedRetry, "准备重试失败 HLS 片段");
-    const hlsRetryChunks = prepareHlsRetryChunks(urlRuntimeStore.getSnapshot().chunks ?? urlUpload.chunks, syncedRetry);
-    seedUploadRuntimeStore(urlRuntimeStore, hlsRetryProgress, hlsRetryChunks);
-    setUrlUpload((current) => ({
-      ...current,
-      status: "uploading",
-      message: "准备重试 HLS 片段",
-      retry: undefined,
-      conflict: undefined,
-      progress: undefined,
-      hls: {
-        ...(current.hls ?? {}),
-        assetId: syncedRetry.assetId,
-        segmentCount: syncedRetry.segmentCount,
-        previewPlaylistUrl: syncedRetry.previewPlaylistUrl,
-        retry: syncedRetry
-      }
-    }));
-
-    try {
-      if (syncedRetry.failedSegments.length > 0) {
-        const result = await runConcurrentChunks({
-          total: syncedRetry.segmentCount,
-          chunkIndexes: syncedRetry.failedSegments,
-          completedChunks: syncedRetry.completedSegments,
-          taskLabel: "重试 HLS 片段",
-          doneLabel: "已导入 HLS 片段",
-          concurrency: effectiveUploadConcurrency,
-          task,
-          requestTimeoutMs: HLS_SEGMENT_REQUEST_TIMEOUT_MS,
-          onProgress: updateUrlProgress,
-          onChunkState: updateUrlChunk,
-          onChunk: async (index, signal) => {
-            await uploadHlsSegmentFully(syncedRetry.assetId, index, syncedRetry.previewPlaylistUrl, syncedRetry.fileName, signal);
-          }
-        });
-
-        if (result.failedChunks.length > 0 || result.cancelled) {
-          const nextRetry = await refreshHlsRetryState({
-            ...syncedRetry,
-            completedSegments: result.completedChunks,
-            failedSegments: result.failedChunks
-          });
-          persistHlsUploadTask(nextRetry, normalizedFileNameOverride(urlUpload.fileNameOverride), urlUpload.hls?.variantId);
-          throw new HlsSegmentUploadError(
-            result.cancelled ? "已停止，可重试未完成 HLS 片段" : `仍有 ${result.failedChunks.length} 个 HLS 片段导入失败，可继续手动重试`,
-            nextRetry,
-            result.cancelled
-          );
-        }
-
-        syncedRetry = await refreshHlsRetryState({
-          ...syncedRetry,
-          completedSegments: result.completedChunks,
-          failedSegments: []
-        });
-        persistHlsUploadTask(syncedRetry, normalizedFileNameOverride(urlUpload.fileNameOverride), urlUpload.hls?.variantId);
-      }
-
-      setUrlUpload((current) => ({
-        ...current,
-        status: "uploading",
-        progress: undefined
-      }));
-      updateUrlProgress({
-        completed: syncedRetry.segmentCount,
-        total: syncedRetry.segmentCount,
-        label: "正在生成 HLS 文件索引"
-      });
-      const thumbnail = await resolveHlsThumbnailForUpload(syncedRetry.previewPlaylistUrl, syncedRetry.fileName);
-      await runAbortableUploadRequest(task, HLS_SEGMENT_REQUEST_TIMEOUT_MS, (signal) =>
-        completeHlsUpload(syncedRetry.assetId, thumbnail, signal, conflictAction)
-      );
-      setUrlUpload((current) => ({
-        ...current,
-        status: "done",
-        message: "已导入 HLS 视频",
-        progress: undefined,
-        chunks: undefined,
-        retry: undefined,
-        conflict: undefined,
-        conflictAction: "error",
-        editingFileName: false,
-        hls: current.hls ? withoutHlsRetry(current.hls) : current.hls
-      }));
-      clearCurrentPersistedTask();
-      onUploaded(1);
-    } catch (uploadError) {
-      const nextRetry = uploadError instanceof HlsSegmentUploadError ? uploadError.retry : syncedRetry;
-      const stopped = (uploadError instanceof HlsSegmentUploadError && uploadError.stopped) || task.cancelled || isAbortError(uploadError);
-      const conflict = fileNameConflictFromError(uploadError);
-      const message = stopped ? "已停止" : uploadError instanceof Error ? uploadError.message : "HLS 片段重试失败";
-      setUrlUpload((current) => ({
-        ...current,
-        status: "error",
-        message: conflict ? undefined : message,
-        retry: undefined,
-        conflict,
-        fileNameOverride: conflict?.suggestedName ?? current.fileNameOverride,
-        conflictAction: "error",
-        editingFileName: conflict ? true : current.editingFileName,
-        progress: undefined,
-        hls: {
-          ...(current.hls ?? {}),
-          assetId: nextRetry.assetId,
-          segmentCount: nextRetry.segmentCount,
-          previewPlaylistUrl: nextRetry.previewPlaylistUrl,
-          retry: nextRetry
-        }
-      }));
-      if (nextRetry && !conflict && !stopped) {
-        persistHlsUploadTask(nextRetry, normalizedFileNameOverride(urlUpload.fileNameOverride), urlUpload.hls?.variantId);
-      }
-      if (!stopped) {
-        onError(conflict ? FILE_NAME_CONFLICT_TOAST_MESSAGE : message);
-      }
-    } finally {
-      finishUploadTask(task);
-      setSubmitting(false);
-    }
-  }
-
-  async function uploadHlsSegmentFully(
-    assetId: string,
-    segmentIndex: number,
-    previewPlaylistUrl: string,
-    fileName: string,
-    signal: AbortSignal
-  ) {
-    let response = await importHlsSegment(assetId, segmentIndex, signal);
-    updateUrlChunkFromHlsSegment(response.segment, response.missing_chunks);
-
-    if (response.segment.storage_backend === "telegram_multipart") {
-      response = await importHlsSegmentMultipartChunks(assetId, segmentIndex, response, signal);
-    }
-
-    if (response.segment.status !== "done") {
-      throw new Error(response.segment.error_message || `HLS 片段 ${segmentIndex + 1} 未完成`);
-    }
-
-    updateUrlChunkFromHlsSegment(response.segment, []);
-
-    if (segmentIndex === 0) {
-      void maybeGenerateHlsThumbnail(previewPlaylistUrl, fileName);
-    }
-  }
-
-  async function importHlsSegmentMultipartChunks(
-    assetId: string,
-    segmentIndex: number,
-    initialResponse: Awaited<ReturnType<typeof importHlsSegment>>,
-    signal: AbortSignal
-  ): Promise<Awaited<ReturnType<typeof importHlsSegment>>> {
-    let response = initialResponse;
-    let segment = response.segment;
-    const chunkCount = segment.chunk_count ?? Math.max(response.uploaded_chunks.length + response.missing_chunks.length, 1);
-
-    if (!segment.chunk_count || segment.chunk_count <= 0) {
-      throw new Error(`HLS 片段 ${segmentIndex + 1} 缺少内部 chunk 信息`);
-    }
-
-    for (const chunkIndex of response.missing_chunks) {
-      response = await importHlsSegmentChunkWithRetry(assetId, segmentIndex, chunkIndex, chunkCount, response.uploaded_chunks.length, signal);
-      segment = response.segment;
-      updateUrlChunkFromHlsSegment(segment, response.missing_chunks);
-    }
-
-    if (response.missing_chunks.length > 0) {
-      throw new Error(`HLS 片段 ${segmentIndex + 1} 仍有 ${response.missing_chunks.length} 个内部 chunk 未完成`);
-    }
-
-    updateUrlChunk(segmentIndex, {
-      status: "uploading",
-      errorMessage: "正在合成大 HLS 片段"
-    });
-    return completeHlsSegment(assetId, segmentIndex, signal);
-  }
-
-  async function importHlsSegmentChunkWithRetry(
-    assetId: string,
-    segmentIndex: number,
-    chunkIndex: number,
-    chunkCount: number,
-    completedBefore: number,
-    signal: AbortSignal
-  ): Promise<Awaited<ReturnType<typeof importHlsSegmentChunk>>> {
-    for (let attempt = 1; attempt <= MULTIPART_UPLOAD_MAX_ATTEMPTS; attempt += 1) {
-      if (signal.aborted) {
-        throw new DOMException("Aborted", "AbortError");
-      }
-
-      updateUrlChunk(segmentIndex, {
-        status: "uploading",
-        attempts: attempt,
-        errorMessage: `大 HLS 片段内部分片 ${completedBefore + 1}/${chunkCount}（#${chunkIndex + 1}，第 ${attempt}/${MULTIPART_UPLOAD_MAX_ATTEMPTS} 次）`
-      });
-
-      try {
-        return await importHlsSegmentChunk(assetId, segmentIndex, chunkIndex, signal);
-      } catch (error) {
-        const canRetry = attempt < MULTIPART_UPLOAD_MAX_ATTEMPTS && isRetryableChunkUploadError(error);
-        if (!canRetry) {
-          throw new Error(`HLS 片段 ${segmentIndex + 1} 的内部分片 ${chunkIndex + 1} 导入失败：${errorMessage(error)}`);
-        }
-        await delay(retryDelayMs(attempt, error), signal);
-      }
-    }
-
-    throw new Error(`HLS 片段 ${segmentIndex + 1} 的内部分片 ${chunkIndex + 1} 导入失败`);
-  }
-
-  async function refreshHlsRetryState(retry: HlsRetryState): Promise<HlsRetryState> {
-    try {
-      const status = await getHlsUploadStatus(retry.assetId);
-      return hlsRetryFromStatus(status.hls.asset, status.hls.segments, retry.conflictAction);
-    } catch {
-      return retry;
-    }
   }
 
   async function maybeGenerateHlsThumbnail(previewPlaylistUrl: string, fileName: string) {
@@ -3617,187 +2441,41 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     return promise;
   }
 
-  async function retryUrlMultipart(retry: MultipartRetryState) {
-    const task = startUploadTask("url");
-    const syncedRetry = await refreshMultipartRetryState(retry);
-    persistUrlMultipartUploadTask(syncedRetry, normalizedFileNameOverride(urlUpload.fileNameOverride));
-    setSubmitting(true);
-    const retryStartProgress = retryFailureProgress(syncedRetry, "准备重试失败分片");
-    const retryChunks = prepareRetryChunks(urlRuntimeStore.getSnapshot().chunks ?? urlUpload.chunks, syncedRetry);
-    seedUploadRuntimeStore(urlRuntimeStore, retryStartProgress, retryChunks);
-    setUrlUpload((current) => ({
-      ...current,
-      status: "uploading",
-      progress: undefined,
-      retry: syncedRetry
-    }));
-
-    try {
-      const result = await runConcurrentChunks({
-        total: syncedRetry.chunkCount,
-        chunkIndexes: syncedRetry.failedChunks,
-        completedChunks: syncedRetry.completedChunks,
-        taskLabel: "重试导入分片",
-        doneLabel: "已导入",
-        concurrency: effectiveUploadConcurrency,
-        task,
-        requestTimeoutMs: URL_CHUNK_REQUEST_TIMEOUT_MS,
-        onProgress: updateUrlProgress,
-        onChunkState: updateUrlChunk,
-        onChunk: async (index, signal) => {
-          await uploadUrlMultipartChunk(syncedRetry.uploadId, index, signal);
-        }
-      });
-
-      if (result.failedChunks.length > 0 || result.cancelled) {
-        const nextRetry = await refreshMultipartRetryState({
-          ...syncedRetry,
-          completedChunks: result.completedChunks,
-          failedChunks: result.failedChunks
-        });
-        persistUrlMultipartUploadTask(nextRetry, normalizedFileNameOverride(urlUpload.fileNameOverride));
-        throw new MultipartChunkUploadError(
-          result.cancelled ? "已停止，可重试未完成分片" : `仍有 ${result.failedChunks.length} 个分片导入失败，可继续手动重试`,
-          nextRetry,
-          result.cancelled
-        );
-      }
-
-      const completeProgress = {
-        completed: syncedRetry.chunkCount,
-        total: syncedRetry.chunkCount,
-        label: syncedRetry.directAccess === false ? "正在生成文件索引" : "正在生成访问链接"
-      };
-      seedUploadRuntimeStore(urlRuntimeStore, completeProgress, urlRuntimeStore.getSnapshot().chunks);
-      setUrlUpload((current) => ({
-        ...current,
-        status: "uploading",
-        progress: undefined
-      }));
-      const thumbnail = urlUpload.thumbnail?.status === "ready"
-        ? thumbnailStatePayload(urlUpload.thumbnail)
-        : undefined;
-      await completeUploadOrRetryLater({
-        ...syncedRetry,
-        thumbnail,
-        task,
-        timeoutMs: URL_CHUNK_REQUEST_TIMEOUT_MS
-      });
-      setUrlUpload((current) => ({
-        ...current,
-        status: "done",
-        message: "已从 URL 上传",
-        progress: undefined,
-        chunks: undefined,
-        retry: undefined,
-        conflictAction: "error",
-        editingFileName: false
-      }));
-      clearCurrentPersistedTask();
-      onUploaded(1);
-    } catch (uploadError) {
-      const nextRetry = uploadError instanceof MultipartChunkUploadError ? uploadError.retry : syncedRetry;
-      const stopped = (uploadError instanceof MultipartChunkUploadError && uploadError.stopped) || task.cancelled || isAbortError(uploadError);
-      const message = stopped ? "已停止" : uploadError instanceof Error ? uploadError.message : "URL 分片重试失败";
-      const retryProgress = retryFailureProgress(nextRetry, stopped ? "已停止，可重试未完成分片" : "分片导入失败，可手动重试");
-      seedUploadRuntimeStore(urlRuntimeStore, retryProgress, urlRuntimeStore.getSnapshot().chunks);
-      setUrlUpload((current) => ({
-        ...current,
-        status: "error",
-        message,
-        retry: nextRetry,
-        progress: undefined
-      }));
-      if (nextRetry && !stopped) {
-        persistUrlMultipartUploadTask(nextRetry, normalizedFileNameOverride(urlUpload.fileNameOverride));
-      }
-      if (!stopped) {
-        onError(message);
-      }
-    } finally {
-      finishUploadTask(task);
-      setSubmitting(false);
-    }
-  }
-
-  async function retryItemFailedChunks(id: string) {
-    if (uploadBusy) return;
-
-    const target = items.find((item) => item.id === id);
-    if (!target?.retry || target.retry.kind !== "local") {
-      return;
-    }
-
-    const task = startUploadTask("local", id);
-    setSubmitting(true);
-    const retryStartProgress = retryFailureProgress(target.retry, "准备重试失败分片");
-    seedUploadRuntimeStore(
-      target.runtimeStore!,
-      retryStartProgress,
-      prepareRetryChunks(target.runtimeStore?.getSnapshot().chunks ?? target.chunks, target.retry)
-    );
-    setItems((current) =>
-      current.map((item) =>
-        item.id === id
-          ? { ...item, status: "uploading", message: undefined, progress: undefined }
-          : item
-      )
-    );
-
-    try {
-      const thumbnail = await resolveLocalThumbnailForUpload(target);
-      await retryLocalMultipart(target, target.retry, thumbnail, task);
-      setItems((current) =>
-        current.map((item) =>
-          item.id === id
-            ? {
-                ...item,
-                status: "done",
-                message: undefined,
-                progress: undefined,
-                chunks: undefined,
-                retry: undefined,
-                conflictAction: "error",
-                editingFileName: false
-              }
-            : item
-        )
-      );
-      onUploaded(1);
-    } catch (error) {
-      const retry = error instanceof MultipartChunkUploadError ? error.retry : target.retry;
-      const stopped = (error instanceof MultipartChunkUploadError && error.stopped) || task.cancelled || isAbortError(error);
-      const message = stopped ? "已停止" : error instanceof Error ? error.message : "分片重试失败";
-      const retryProgress = retryFailureProgress(retry, stopped ? "已停止，可重试未完成分片" : "分片上传失败，可手动重试");
-        setItems((current) =>
-          current.map((item) =>
-            item.id === id
-              ? (() => {
-                  seedUploadRuntimeStore(item.runtimeStore!, retryProgress, item.runtimeStore?.getSnapshot().chunks ?? item.chunks);
-                return {
-                  ...item,
-                  status: "error",
-                  message,
-                  retry,
-                  progress: undefined,
-                  chunks: undefined
-                };
-              })()
-            : item
-        )
-      );
-      if (retry && !stopped) {
-        seedUploadRuntimeStore(target.runtimeStore!, retryProgress, target.runtimeStore?.getSnapshot().chunks ?? target.chunks);
-      } else {
-        seedUploadRuntimeStore(target.runtimeStore!, null, null);
-      }
-      if (!stopped) {
-        onError(message);
-      }
-    } finally {
-      finishUploadTask(task);
-      setSubmitting(false);
-    }
+  function buildEngineContext(): UploadEngineContext {
+    return {
+      items,
+      urlUpload,
+      sourceUrl,
+      normalizedSourceUrl,
+      remark,
+      uploadDirectoryPath,
+      effectiveUploadConcurrency,
+      maxMultipartBytes,
+      uploadBusy,
+      itemsRef,
+      urlUploadRef,
+      urlRuntimeStore,
+      setItems,
+      setUrlUpload,
+      setSubmitting,
+      onError,
+      onUploaded,
+      startUploadTask,
+      finishUploadTask,
+      validateSourceUrl,
+      readSourceHeadersForUpload,
+      persistLocalUploadTask,
+      persistUrlMultipartUploadTask,
+      persistHlsUploadTask,
+      persistMagnetUploadTask,
+      clearCurrentPersistedTask,
+      preflightMagnetSelection,
+      resolveLocalThumbnailForUpload,
+      resolveUrlThumbnailForUpload,
+      resolveMagnetThumbnailForUpload,
+      resolveHlsThumbnailForUpload,
+      maybeGenerateHlsThumbnail
+    };
   }
 
   async function handleDropFiles(event: React.DragEvent<HTMLLabelElement>) {
@@ -4081,7 +2759,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
                     runtimeStore={item.runtimeStore!}
                     targetDirectoryPath={effectiveDirectoryPath(item, uploadDirectoryPath)}
                     onRemove={() => removeItem(item.id)}
-                    onRetry={item.retry ? () => void retryItemFailedChunks(item.id) : undefined}
+                    onRetry={item.retry ? () => void retryItemFailedChunks(buildEngineContext(), item.id) : undefined}
                     onStop={activeUploadKind === "local" && activeUploadItemId === item.id ? stopCurrentUpload : undefined}
                     stopping={stopRequested && activeUploadKind === "local" && activeUploadItemId === item.id}
                     onFileNameChange={(value) => updateItemFileName(item.id, value)}
@@ -4137,9 +2815,9 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
                 onClear={() => handleSourceUrlChange("")}
                 onRetry={
                   urlUpload.hls?.retry
-                    ? () => void retryHlsUpload(urlUpload.hls!.retry!)
+                    ? () => void retryHlsUpload(buildEngineContext(), urlUpload.hls!.retry!)
                     : urlUpload.retry
-                      ? () => void retryUrlMultipart(urlUpload.retry!)
+                      ? () => void retryUrlMultipart(buildEngineContext(), urlUpload.retry!)
                       : undefined
                 }
                 onStop={activeUploadKind === "url" ? stopCurrentUpload : undefined}
@@ -4334,19 +3012,3 @@ function unfinishedMagnetImportId(state: UrlUploadState): string | undefined {
   return magnet.id;
 }
 
-function sameOriginAdminUrl(value: string): string {
-  if (typeof window === "undefined") {
-    return value;
-  }
-
-  try {
-    const url = new URL(value, window.location.origin);
-    if (url.pathname.startsWith("/api/admin/")) {
-      return `${url.pathname}${url.search}${url.hash}`;
-    }
-  } catch {
-    return value;
-  }
-
-  return value;
-}
