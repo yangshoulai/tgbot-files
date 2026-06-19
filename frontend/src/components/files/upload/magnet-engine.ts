@@ -32,7 +32,7 @@ import {
   selectedMagnetIndexesForResume
 } from "./magnet-helpers";
 import type { UploadAbortContext } from "./types";
-import { updateUrlChunk, updateUrlProgress } from "./url-engine";
+import { updateUrlChunk, updateUrlProgress } from "./engine-updates";
 
 export async function submitMagnetUpload(ctx: UploadEngineContext) {
   const task = ctx.startUploadTask("url");

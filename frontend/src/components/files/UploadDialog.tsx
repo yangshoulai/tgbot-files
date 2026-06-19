@@ -274,9 +274,9 @@ import {
 } from "./upload/local-engine";
 import {
   retryUrlMultipart,
-  submitUrlUpload,
-  updateUrlProgress
+  submitUrlUpload
 } from "./upload/url-engine";
+import { updateUrlProgress } from "./upload/engine-updates";
 import { submitMagnetUpload } from "./upload/magnet-engine";
 import {
   retryHlsUpload,

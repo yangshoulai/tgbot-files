@@ -34,7 +34,7 @@ import {
   prepareHlsRetryChunks,
   withoutHlsRetry
 } from "./hls-helpers";
-import { updateUrlChunk, updateUrlChunkFromHlsSegment, updateUrlProgress } from "./url-engine";
+import { updateUrlChunk, updateUrlChunkFromHlsSegment, updateUrlProgress } from "./engine-updates";
 
 export function sameOriginAdminUrl(value: string): string {
   if (typeof window === "undefined") {
