@@ -176,12 +176,34 @@ async function handleVideoPreviewRequest(request, event) {
 }
 
 async function handleHlsPlaylistRequest(metadata, event) {
+  // 优先用已缓存的 m3u8：已缓存的 HLS 无需联网拉取播放列表即可立即起播，
+  // 避免源站（Telegram 签名链接）慢/抖动时卡在"视频加载中"。
+  const cachedText = await readCachedHlsPlaylistText(metadata.fileId);
+  if (cachedText) {
+    const rewritten = rewriteHlsPlaylist(cachedText, metadata);
+    hlsPreviewSources.set(metadata.fileId, rewritten.sources);
+    event.waitUntil(prioritizeHlsPreviewCache(metadata.fileId, 0, metadata.cacheMaxBytes, metadata.prefetchConcurrency));
+    return new Response(rewritten.text, {
+      headers: {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+        "X-Preview-Cache": "hls-playlist-cache"
+      }
+    });
+  }
+
   const response = await fetch(metadata.sourceUrl, { credentials: "omit" });
   if (!response.ok) {
     return new Response(`HLS playlist load failed (${response.status})`, { status: 502 });
   }
 
   const playlistText = await response.text();
+  // 若该文件已被手动缓存（分片在册但 m3u8 还没持久化，例如旧版本缓存的），
+  // 顺带把 m3u8 存下来，让历史手动缓存下次也能秒开；清理同样走 deleteFileCache。
+  const existingEntry = await readFileCacheEntry(metadata.fileId).catch(() => null);
+  if (existingEntry?.cacheSource === "manual") {
+    event.waitUntil(writeCachedHlsPlaylistText(metadata.fileId, playlistText));
+  }
   const rewritten = rewriteHlsPlaylist(playlistText, metadata);
   hlsPreviewSources.set(metadata.fileId, rewritten.sources);
   event.waitUntil(prioritizeHlsPreviewCache(metadata.fileId, 0, metadata.cacheMaxBytes, metadata.prefetchConcurrency));
@@ -804,6 +826,8 @@ async function cacheWholeHlsFile(metadata, session) {
   }
 
   const playlistText = await response.text();
+  // 手动缓存时一并持久化 m3u8，后续预览可离线秒开（清理在 deleteFileCache 中处理）。
+  await writeCachedHlsPlaylistText(metadata.fileId, playlistText);
   const rewritten = rewriteHlsPlaylist(playlistText, metadata);
   hlsPreviewSources.set(metadata.fileId, rewritten.sources);
   const queue = createHlsPriorityQueue(rewritten.sources, 0);
@@ -1203,6 +1227,50 @@ function hlsChunkIndex(partKind, partIndex) {
 
 function hlsPartCacheKey(fileId, partKind, partIndex) {
   return `${self.location.origin}/__preview-cache/hls/${encodeURIComponent(fileId)}/${partKind}/${partIndex}`;
+}
+
+// HLS 播放列表（.m3u8）按 fileId 单独缓存，使"已缓存"的 HLS 无需再次联网拉取 m3u8 即可秒开。
+// 注意该 key 不会被 parseCacheStorageCacheKey 识别，因此不会计入用量统计，
+// 也不会被 cleanupPreviewCache 回收；其清理在 deleteFileCache 中显式处理。
+function hlsPlaylistCacheKey(fileId) {
+  return `${self.location.origin}/__preview-cache/hls-playlist/${encodeURIComponent(fileId)}`;
+}
+
+async function readCachedHlsPlaylistText(fileId) {
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    const cached = await cache.match(hlsPlaylistCacheKey(fileId));
+    return cached ? await cached.text() : null;
+  } catch (error) {
+    warnPreviewCacheError(`read hls playlist ${fileId}`, error);
+    return null;
+  }
+}
+
+async function writeCachedHlsPlaylistText(fileId, playlistText) {
+  if (typeof playlistText !== "string" || !playlistText.trim()) {
+    return;
+  }
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    await cache.put(hlsPlaylistCacheKey(fileId), new Response(playlistText, {
+      headers: {
+        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+        "Cache-Control": "no-store"
+      }
+    }));
+  } catch (error) {
+    warnPreviewCacheError(`write hls playlist ${fileId}`, error);
+  }
+}
+
+async function deleteCachedHlsPlaylist(fileId) {
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    await cache.delete(hlsPlaylistCacheKey(fileId));
+  } catch (error) {
+    warnPreviewCacheError(`delete hls playlist ${fileId}`, error);
+  }
 }
 
 function markHlsPartMetadataForManualCache(metadata, partKind, partIndex, response) {
@@ -3530,6 +3598,7 @@ async function deleteFileCache(fileId) {
   }
 
   await deleteCacheStorageEntriesForFile(normalizedFileId);
+  await deleteCachedHlsPlaylist(normalizedFileId);
 }
 
 async function clearAutomaticCacheEntries() {

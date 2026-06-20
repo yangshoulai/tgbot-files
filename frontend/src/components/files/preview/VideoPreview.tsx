@@ -38,6 +38,8 @@ const VIDEO_LOADING_INDICATOR_DELAY_MS = 360;
 const VIDEO_PREVIEW_PROGRESS_REPORT_MIN_INTERVAL_MS = 900;
 const VIDEO_PREVIEW_CACHE_STATE_POLL_MS = 1_200;
 const SUBTITLE_PREVIEW_TIMEOUT_MS = 20_000;
+const HLS_MAX_FATAL_RECOVERIES = 3;
+const HLS_FATAL_RECOVERY_RESET_MS = 30_000;
 
 export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscreen, onToggleNativeFullscreen, videoPreviewCacheBytes, videoPreviewConcurrency }: VideoPreviewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -483,11 +485,47 @@ export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscr
       }
     });
     hlsRef.current = hls;
+
+    // hls.js 官方建议：致命的网络/媒体错误先尝试自恢复，不要直接判失败。
+    // 之前任何 fatal 错误都立即 setFailed(true)，导致播放途中一次抖动就永久停住。
+    let networkRecoveries = 0;
+    let mediaRecoveries = 0;
+    let lastRecoveryAt = 0;
     hls.on(Hls.Events.ERROR, (_event, data) => {
-      if (data.fatal) {
-        hideLoading();
-        setFailed(true);
+      if (!data.fatal) {
+        return;
       }
+
+      const now = Date.now();
+      if (now - lastRecoveryAt > HLS_FATAL_RECOVERY_RESET_MS) {
+        // 已稳定播放一段时间后再次出错，重置计数，避免长视频偶发错误过早判失败。
+        networkRecoveries = 0;
+        mediaRecoveries = 0;
+      }
+      lastRecoveryAt = now;
+
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRecoveries < HLS_MAX_FATAL_RECOVERIES) {
+        networkRecoveries += 1;
+        showLoading(true);
+        try {
+          hls?.startLoad();
+          return;
+        } catch {
+          // 自恢复失败，落到下方判失败。
+        }
+      } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries < HLS_MAX_FATAL_RECOVERIES) {
+        mediaRecoveries += 1;
+        showLoading(true);
+        try {
+          hls?.recoverMediaError();
+          return;
+        } catch {
+          // 自恢复失败，落到下方判失败。
+        }
+      }
+
+      hideLoading();
+      setFailed(true);
     });
     hls.loadSource(videoSrc);
     hls.attachMedia(video);
