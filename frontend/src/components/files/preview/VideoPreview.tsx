@@ -40,15 +40,20 @@ const VIDEO_PREVIEW_CACHE_STATE_POLL_MS = 1_200;
 const SUBTITLE_PREVIEW_TIMEOUT_MS = 20_000;
 const HLS_MAX_FATAL_RECOVERIES = 3;
 const HLS_FATAL_RECOVERY_RESET_MS = 30_000;
+const VIDEO_MEDIA_ERROR_MAX_RECOVERIES = 2;
+const VIDEO_MEDIA_ERROR_RECOVERY_RESET_MS = 30_000;
+const VIDEO_MEDIA_ERROR_RECOVERY_DELAY_MS = 700;
 
 export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscreen, onToggleNativeFullscreen, videoPreviewCacheBytes, videoPreviewConcurrency }: VideoPreviewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const frameRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<Hls | null>(null);
   const loadingTimerRef = useRef<number | null>(null);
+  const videoSrcRef = useRef<string | null>(null);
   const previewCacheSessionIdRef = useRef(`video-preview-${file.id}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   const playbackProgressReportRef = useRef({ sentAt: 0, marker: -1, currentTime: -1 });
   const initialPlaybackAttemptRef = useRef<"pending" | "playing" | "blocked">("pending");
+  const mediaErrorRecoveryRef = useRef({ count: 0, lastAt: 0 });
   const [ratio, setRatio] = useState(() => initialAspectRatio(file));
   const [controlsDensity, setControlsDensity] = useState<MediaControlsDensity>("regular");
   const [serviceWorkerState, setServiceWorkerState] = useState<VideoPreviewServiceWorkerState>(initialVideoPreviewServiceWorkerState);
@@ -99,6 +104,8 @@ export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscr
     return chunkIndex !== null && cachedChunkSet.has(chunkIndex);
   }, [cacheState, cachedChunkSet, previewMetadata]);
 
+  const isPreviewFullyCached = useCallback(() => isVideoPreviewFullyCached(cacheState), [cacheState]);
+
   const reportPlaybackProgress = useCallback((video: HTMLVideoElement, immediate = false) => {
     if (!previewMetadata) return;
 
@@ -138,6 +145,10 @@ export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscr
   useEffect(() => {
     setRatio(initialAspectRatio(file));
   }, [file.id, file.thumbnail_height, file.thumbnail_width]);
+
+  useEffect(() => {
+    videoSrcRef.current = videoSrc;
+  }, [videoSrc]);
 
   const refreshServiceWorker = useCallback(async () => {
     if (isVideoPreviewServiceWorkerControlling()) {
@@ -192,13 +203,13 @@ export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscr
   }, [clearLoadingTimer]);
 
   const maybeShowLoading = useCallback((video: HTMLVideoElement, immediate = false) => {
-    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA || isCurrentPlaybackPositionCached(video)) {
+    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA || isPreviewFullyCached() || isCurrentPlaybackPositionCached(video)) {
       hideLoading();
       return;
     }
 
     showLoading(immediate);
-  }, [hideLoading, isCurrentPlaybackPositionCached, showLoading]);
+  }, [hideLoading, isCurrentPlaybackPositionCached, isPreviewFullyCached, showLoading]);
 
   const attemptInitialPlayback = useCallback((video: HTMLVideoElement) => {
     if (initialPlaybackAttemptRef.current !== "pending" || failed) {
@@ -271,6 +282,59 @@ export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscr
     return true;
   }, [isHlsPackage, showLoading, videoSrc]);
 
+  const recoverFromMediaError = useCallback((video: HTMLVideoElement) => {
+    if (!videoSrc || (isHlsPackage && hlsRef.current)) {
+      return false;
+    }
+
+    const recoverySrc = videoSrc;
+    const now = Date.now();
+    if (now - mediaErrorRecoveryRef.current.lastAt > VIDEO_MEDIA_ERROR_RECOVERY_RESET_MS) {
+      mediaErrorRecoveryRef.current = { count: 0, lastAt: now };
+    }
+
+    if (mediaErrorRecoveryRef.current.count >= VIDEO_MEDIA_ERROR_MAX_RECOVERIES) {
+      return false;
+    }
+
+    const resumeAt = Number.isFinite(video.currentTime) && video.currentTime > 0
+      ? video.currentTime
+      : 0;
+
+    mediaErrorRecoveryRef.current = {
+      count: mediaErrorRecoveryRef.current.count + 1,
+      lastAt: now
+    };
+    setFailed(false);
+    showLoading(true);
+    initialPlaybackAttemptRef.current = "pending";
+
+    window.setTimeout(() => {
+      if (videoRef.current !== video || videoSrcRef.current !== recoverySrc) return;
+
+      const restorePlayback = () => {
+        if (resumeAt > 0 && Number.isFinite(video.duration) && video.duration > resumeAt) {
+          video.currentTime = resumeAt;
+        }
+        void video.play().catch(() => undefined);
+      };
+
+      video.addEventListener("loadedmetadata", restorePlayback, { once: true });
+      video.load();
+      void video.play().catch(() => undefined);
+
+      window.setTimeout(() => {
+        if (videoRef.current === video && videoSrcRef.current === recoverySrc && video.error) {
+          video.removeEventListener("loadedmetadata", restorePlayback);
+          hideLoading();
+          setFailed(true);
+        }
+      }, 10_000);
+    }, VIDEO_MEDIA_ERROR_RECOVERY_DELAY_MS);
+
+    return true;
+  }, [hideLoading, isHlsPackage, showLoading, videoSrc]);
+
   useEffect(() => {
     if (videoSrc) {
       showLoading(true);
@@ -279,6 +343,7 @@ export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscr
     }
     setFailed(false);
     initialPlaybackAttemptRef.current = "pending";
+    mediaErrorRecoveryRef.current = { count: 0, lastAt: 0 };
   }, [file.id, hideLoading, showLoading, videoSrc]);
 
   useEffect(() => {
@@ -379,6 +444,15 @@ export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscr
       window.clearInterval(intervalId);
     };
   }, [previewMetadata, previewUrl]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !loading) return;
+
+    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA || isPreviewFullyCached() || isCurrentPlaybackPositionCached(video)) {
+      hideLoading();
+    }
+  }, [cacheState, hideLoading, isCurrentPlaybackPositionCached, isPreviewFullyCached, loading]);
 
   useEffect(() => {
     if (!serviceWorkerReady) {
@@ -589,7 +663,7 @@ export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscr
             playsInline
             preload="auto"
             className="h-full w-full bg-[#020403] object-contain"
-            onLoadStart={() => showLoading(true)}
+            onLoadStart={(event) => maybeShowLoading(event.currentTarget, true)}
             onWaiting={(event) => maybeShowLoading(event.currentTarget)}
             onSeeking={(event) => {
               reportPlaybackProgress(event.currentTarget, true);
@@ -619,7 +693,10 @@ export function VideoPreview({ file, maximized, onToggleMaximized, nativeFullscr
                 setFailed(false);
               }
             }}
-            onError={() => {
+            onError={(event) => {
+              if (recoverFromMediaError(event.currentTarget)) {
+                return;
+              }
               hideLoading();
               setFailed(true);
             }}
@@ -933,6 +1010,21 @@ function playbackChunkIndexForVideo(
   if (!Number.isSafeInteger(chunkCount) || chunkCount <= 0) return null;
 
   return Math.min(chunkCount - 1, Math.max(0, Math.floor(ratio * chunkCount)));
+}
+
+function isVideoPreviewFullyCached(cacheState: VideoPreviewCacheState | null): boolean {
+  const chunkCount = cacheState?.chunkCount ?? 0;
+  if (!Number.isSafeInteger(chunkCount) || chunkCount <= 0 || !Array.isArray(cacheState?.cachedChunks)) {
+    return false;
+  }
+
+  const cached = new Set(
+    cacheState.cachedChunks
+      .map((chunkIndex) => Math.floor(Number(chunkIndex)))
+      .filter((chunkIndex) => Number.isSafeInteger(chunkIndex) && chunkIndex >= 0 && chunkIndex < chunkCount)
+  );
+
+  return cached.size >= chunkCount;
 }
 
 function controlsDensityForFrame(width: number, aspectRatio: number): MediaControlsDensity {

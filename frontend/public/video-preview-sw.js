@@ -224,7 +224,6 @@ async function handleHlsPartRequest(request, event) {
   const partKind = parts[3] === "init" ? "init" : "segment";
   const partIndex = Number(parts[4] || "0");
   const sourceUrl = normalizeSameOriginSourceUrl(url.searchParams.get("source"));
-  const fullSourceUrl = normalizeSameOriginSourceUrl(url.searchParams.get("full_source"));
   const cacheMaxBytes = normalizeCacheMaxBytes(url.searchParams.get("cache_max"));
   const prefetchConcurrency = normalizePreviewPrefetchConcurrency(url.searchParams.get("prefetch_concurrency"));
   const metadata = normalizeFileCacheMetadata({
@@ -246,46 +245,24 @@ async function handleHlsPartRequest(request, event) {
   }
 
   try {
-    const range = parseRange(request.headers.get("Range"), Number(url.searchParams.get("full_size")) || Number(url.searchParams.get("chunk_size")) || 1, Number(url.searchParams.get("full_size")) || Number(url.searchParams.get("chunk_size")) || 1);
-    if (partKind === "segment" && range && fullSourceUrl) {
-      const cachedFullPart = await (await caches.open(CACHE_NAME)).match(hlsPartCacheKey(fileId, partKind, partIndex));
-      if (cachedFullPart) {
-        const bytes = await cachedFullPart.arrayBuffer();
-        const slice = bytes.slice(range.start, range.end + 1);
-        return new Response(slice, {
-          status: 206,
-          headers: {
-            "Accept-Ranges": "bytes",
-            "Cache-Control": "no-store",
-            "Content-Type": cachedFullPart.headers.get("Content-Type") || "application/octet-stream",
-            "Content-Length": String(slice.byteLength),
-            "Content-Range": `bytes ${range.start}-${range.end}/${bytes.byteLength}`,
-            "X-Preview-Cache": "hls-segment-range"
-          }
-        });
-      }
-
-      const fallback = await fetch(sourceUrl, { credentials: "omit" });
-      if (!fallback.ok) {
-        throw new Error(`HLS ${partKind} ${partIndex} preview load failed (HTTP ${fallback.status})`);
-      }
-      return new Response(fallback.body || await fallback.arrayBuffer(), {
-        status: fallback.status,
-        headers: {
-          "Cache-Control": "no-store",
-          "Content-Type": fallback.headers.get("Content-Type") || "application/octet-stream",
-          "Content-Length": fallback.headers.get("Content-Length") || String(Number(url.searchParams.get("chunk_size")) || 0),
-          "X-Preview-Cache": "hls-segment-range-miss"
-        }
-      });
-    }
-
     const response = await fetchAndCacheHlsPart({ fileId, partKind, partIndex, sourceUrl, cacheMaxBytes, metadata });
     if (partKind === "segment") {
       event.waitUntil(prioritizeHlsPreviewCache(fileId, partIndex, cacheMaxBytes, prefetchConcurrency));
       event.waitUntil(prefetchHlsSegments(fileId, partIndex + 1, prefetchConcurrency, cacheMaxBytes));
     }
-    return response;
+
+    const rangeHeader = request.headers.get("Range");
+    if (!rangeHeader) {
+      return response;
+    }
+
+    const bytes = await response.arrayBuffer();
+    const range = parseRange(rangeHeader, bytes.byteLength, bytes.byteLength);
+    if (!range) {
+      return rangeNotSatisfiable(bytes.byteLength);
+    }
+
+    return createHlsPartRangeResponse(bytes, range, response.headers.get("Content-Type") || "application/octet-stream");
   } catch (error) {
     return new Response(error instanceof Error ? error.message : "HLS preview segment failed", {
       status: 502,
@@ -1100,6 +1077,21 @@ function createHlsPartResponse(bytes, contentType) {
   });
 }
 
+function createHlsPartRangeResponse(bytes, range, contentType) {
+  const slice = bytes.slice(range.start, range.end + 1);
+  return new Response(slice, {
+    status: 206,
+    headers: {
+      "Accept-Ranges": "bytes",
+      "Cache-Control": "no-store",
+      "Content-Type": contentType,
+      "Content-Length": String(slice.byteLength),
+      "Content-Range": `bytes ${range.start}-${range.end}/${bytes.byteLength}`,
+      "X-Preview-Cache": "hls-segment-range"
+    }
+  });
+}
+
 function cacheStorageResponseHeaders({
   fileId,
   metadata = null,
@@ -1573,6 +1565,7 @@ function normalizePreviewMetadata(value) {
       fileId,
       fileName,
       sourceUrl,
+      chunkCount: Number.isSafeInteger(chunkCount) && chunkCount > 0 ? chunkCount : undefined,
       mimeType,
       cacheMaxBytes,
       cacheSource: "auto",
@@ -1782,6 +1775,7 @@ async function readPreviewCacheState(metadata) {
   if (chunkCount > 0) {
     const entries = await getAllChunkMetadata();
     const seen = new Set();
+    const cache = await caches.open(CACHE_NAME);
 
     for (const entry of entries) {
       if (entry?.fileId !== metadata.fileId) {
@@ -1790,6 +1784,15 @@ async function readPreviewCacheState(metadata) {
 
       const chunkIndex = Math.floor(Number(entry.chunkIndex));
       if (!Number.isSafeInteger(chunkIndex) || chunkIndex < 0 || chunkIndex >= chunkCount || seen.has(chunkIndex)) {
+        continue;
+      }
+
+      const cacheKey = metadata.kind === "hls"
+        ? hlsPartCacheKey(metadata.fileId, "segment", chunkIndex)
+        : chunkCacheKey(metadata.fileId, chunkIndex);
+      const cached = await cache.match(cacheKey);
+      if (!isUsableCachedChunkResponse(metadata, chunkIndex, cached)) {
+        await deleteChunk(cacheKey).catch(() => undefined);
         continue;
       }
 
@@ -1868,7 +1871,7 @@ async function readCachedChunkIndexesForMetadata(metadata, chunkCount, seen = ne
         ? hlsPartCacheKey(metadata.fileId, "segment", index)
         : chunkCacheKey(metadata.fileId, index);
       const cached = await cache.match(cacheKey);
-      if (cached) {
+      if (isUsableCachedChunkResponse(metadata, index, cached)) {
         cachedChunks.push(index);
       }
     })());
@@ -1877,6 +1880,65 @@ async function readCachedChunkIndexesForMetadata(metadata, chunkCount, seen = ne
   await Promise.allSettled(tasks);
   cachedChunks.sort((left, right) => left - right);
   return cachedChunks;
+}
+
+function isUsableCachedChunkResponse(metadata, chunkIndex, response) {
+  if (!response) {
+    return false;
+  }
+
+  if (metadata.kind === "hls") {
+    const contentLength = cachedChunkContentLength(response);
+    return contentLength === null || contentLength > 0;
+  }
+
+  const expectedSize = expectedChunkSize(metadata, chunkIndex);
+  const contentLength = cachedChunkContentLength(response);
+  return contentLength === null || contentLength === expectedSize;
+}
+
+function isUsableFileCacheEntry(entry, response) {
+  if (!response) {
+    return false;
+  }
+
+  const contentLength = cachedChunkContentLength(response);
+  if (contentLength === null) {
+    return true;
+  }
+
+  if (contentLength <= 0) {
+    return false;
+  }
+
+  const recordedSize = safeSize(entry.size);
+  if (recordedSize > 0 && contentLength !== recordedSize) {
+    return false;
+  }
+
+  if (entry.kind === "hls") {
+    return true;
+  }
+
+  const chunkIndex = Math.floor(Number(entry.chunkIndex));
+  const totalSize = safeSize(entry.totalSize);
+  const chunkSize = safeSize(entry.chunkSize);
+  const chunkCount = Math.floor(Number(entry.chunkCount));
+  if (
+    !Number.isSafeInteger(chunkIndex) ||
+    chunkIndex < 0 ||
+    !Number.isSafeInteger(chunkCount) ||
+    chunkCount <= 0 ||
+    totalSize <= 0 ||
+    chunkSize <= 0
+  ) {
+    return true;
+  }
+
+  const expectedSize = chunkIndex === chunkCount - 1
+    ? totalSize - chunkSize * chunkIndex
+    : chunkSize;
+  return expectedSize > 0 && contentLength === expectedSize;
 }
 
 function normalizePlaybackProgress(value) {
@@ -2155,8 +2217,10 @@ async function openChunkRangeSource(metadata, segment) {
     };
   }
 
-  const stream = await fetchChunkByteRange(metadata, segment);
-  return { stream };
+  const bytes = await fetchChunkByteRangeBytesWithRetry(metadata, segment);
+  return {
+    bytes: new Uint8Array(bytes)
+  };
 }
 
 async function openCachedChunkRangeSource(metadata, segment) {
@@ -2214,6 +2278,57 @@ async function fetchChunkByteRange(metadata, segment) {
   }
 
   return response.body;
+}
+
+async function fetchChunkByteRangeBytesWithRetry(metadata, segment) {
+  const expectedSize = expectedChunkSize(metadata, segment.chunkIndex);
+  if (
+    segment.start < 0 ||
+    segment.endExclusive <= segment.start ||
+    segment.endExclusive > expectedSize
+  ) {
+    throw new Error("Chunk byte range is out of range");
+  }
+
+  const expectedRangeSize = segment.endExclusive - segment.start;
+  let attempt = 0;
+
+  for (;;) {
+    attempt += 1;
+    try {
+      const response = await fetch(chunkSourceUrl(metadata, segment.chunkIndex), {
+        credentials: "omit",
+        headers: {
+          Range: chunkRangeHeader(metadata, segment.chunkIndex, segment.start, segment.endExclusive)
+        }
+      });
+
+      if (!response.ok) {
+        if (shouldRetryChunkStatus(response.status) && attempt < CHUNK_FETCH_MAX_ATTEMPTS) {
+          await delayBeforeChunkRetry(attempt);
+          continue;
+        }
+        throw permanentCacheError(`Chunk ${segment.chunkIndex + 1} preview load failed (HTTP ${response.status})`);
+      }
+
+      const requestedFullChunk = segment.start === 0 && segment.endExclusive === expectedSize;
+      if (!requestedFullChunk && response.status !== 206) {
+        throw permanentCacheError(`Chunk ${segment.chunkIndex + 1} does not support range preview`);
+      }
+
+      const bytes = await response.arrayBuffer();
+      if (bytes.byteLength !== expectedRangeSize) {
+        throw new Error(`Chunk ${segment.chunkIndex + 1} preview range size mismatch`);
+      }
+
+      return bytes;
+    } catch (error) {
+      if (error?.permanent || attempt >= CHUNK_FETCH_MAX_ATTEMPTS) {
+        throw error;
+      }
+      await delayBeforeChunkRetry(attempt);
+    }
+  }
 }
 
 async function pipeRangeSource(source, controller) {
@@ -3008,6 +3123,7 @@ async function getChunkMetadata(cacheKey) {
 
 async function readFileCacheSummary() {
   const entries = await getAllChunkMetadata();
+  const cache = await caches.open(CACHE_NAME);
   const byFile = new Map();
 
   for (const entry of entries) {
@@ -3016,6 +3132,13 @@ async function readFileCacheSummary() {
     }
 
     const isFileRecord = isFileRecordMetadata(entry);
+    if (!isFileRecord) {
+      const cached = await cache.match(entry.cacheKey);
+      if (!isUsableFileCacheEntry(entry, cached)) {
+        await (cached ? deleteChunk(entry.cacheKey) : deleteChunkMetadata(entry.cacheKey)).catch(() => undefined);
+        continue;
+      }
+    }
     const current = byFile.get(entry.fileId) || {
       fileId: entry.fileId,
       fileName: entry.fileName || entry.fileId,
