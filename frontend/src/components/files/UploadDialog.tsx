@@ -335,6 +335,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   const pendingTaskSnapshotRef = useRef<UploadTaskSnapshot | null>(null);
   const queuedUrlTasksRef = useRef(queuedUrlTasks);
   const queuedUrlLaunchingRef = useRef(false);
+  const autoStartLocalQueueRef = useRef(false);
   const activePersistedTaskIdRef = useRef<string | null>(null);
   const preserveHiddenUploadStateRef = useRef(false);
   const previousOpenRef = useRef(open);
@@ -518,29 +519,40 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     };
   }, [open]);
 
+  const shouldQueueAddedFiles = useCallback(() => Boolean(activeUploadRef.current) || submitting || checkingConflicts, [checkingConflicts, submitting]);
+
   const addFiles = useCallback((files: File[]) => {
     if (files.length === 0) return;
+    if (shouldQueueAddedFiles()) {
+      autoStartLocalQueueRef.current = true;
+    }
     setMode("file");
     setItems((current) => [...current, ...files.map((file) => makeItem(file))]);
-  }, []);
+  }, [shouldQueueAddedFiles]);
 
   const addFolderFiles = useCallback((files: File[]) => {
     if (files.length === 0) return;
+    if (shouldQueueAddedFiles()) {
+      autoStartLocalQueueRef.current = true;
+    }
     setMode("file");
     setItems((current) => [
       ...current,
       ...files.map((file) => makeItem(file, { relativePath: browserRelativePath(file) }))
     ]);
-  }, []);
+  }, [shouldQueueAddedFiles]);
 
   const addDroppedFiles = useCallback((entries: DroppedFileEntry[]) => {
     if (entries.length === 0) return;
+    if (shouldQueueAddedFiles()) {
+      autoStartLocalQueueRef.current = true;
+    }
     setMode("file");
     setItems((current) => [
       ...current,
       ...entries.map((entry) => makeItem(entry.file, { relativePath: entry.relativePath }))
     ]);
-  }, []);
+  }, [shouldQueueAddedFiles]);
 
   const handlePick = (event: ChangeEvent<HTMLInputElement>) => {
     const list = event.target.files;
@@ -717,7 +729,10 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   const queuedUrlStartBlocked = mode === "url"
     ? Boolean(normalizedSourceUrl && urlUpload.status !== "done")
     : items.some((item) => item.status === "pending" || item.status === "uploading" || item.status === "error");
-  const showQueuedUrlComposer = uploadBusy || activeUploadKind !== null || queuedUrlTasks.length > 0;
+  const activeUploadRunning = Boolean(activeUploadKind);
+  const showQueuedUrlComposer = uploadBusy || activeUploadRunning || queuedUrlTasks.length > 0;
+  const editingQueuedRemoteDraft = activeUploadRunning || submitting || checkingConflicts;
+  const visibleSourceUrl = editingQueuedRemoteDraft ? queuedUrlDraft : sourceUrl;
 
   useEffect(() => {
     if (recoveringPersistedTaskRef.current || queuedUrlLaunchingRef.current || queuedUrlPreparedTaskId) {
@@ -759,6 +774,25 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     queuedUrlLaunchingRef.current = false;
   }, [activeUploadKind, checkingConflicts, mode, normalizedSourceUrl, queuedUrlPreparedTaskId, submitting]);
 
+  useEffect(() => {
+    if (!autoStartLocalQueueRef.current) {
+      return;
+    }
+    if (activeUploadKind || submitting || checkingConflicts) {
+      return;
+    }
+
+    const targets = itemsRef.current.filter(isUploadableLocalItem);
+    if (targets.length === 0) {
+      autoStartLocalQueueRef.current = false;
+      return;
+    }
+
+    autoStartLocalQueueRef.current = false;
+    void runLocalUploadQueue(targets);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeUploadKind, checkingConflicts, items, submitting]);
+
   function launchQueuedUrlTask(task: QueuedUrlUploadTask) {
     queuedUrlLaunchingRef.current = true;
     setQueuedUrlTasks((current) => current.filter((item) => item.id !== task.id));
@@ -785,26 +819,38 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   }
 
   function addQueuedUrlTaskFromDraft() {
-    const nextUrl = queuedUrlDraft.trim();
+    addQueuedUrlTask(queuedUrlDraft.trim(), {
+      setDraftError: setQueuedUrlDraftError,
+      clearDraft: true
+    });
+  }
+
+  function addQueuedUrlTask(
+    nextUrl: string,
+    options: { setDraftError?: (message: string) => void; clearDraft?: boolean } = {}
+  ): boolean {
     const error = validateSourceUrl(nextUrl);
     if (error) {
-      setQueuedUrlDraftError(error);
-      return;
+      options.setDraftError?.(error);
+      return false;
     }
 
     const duplicateCurrent = mode === "url" && normalizedSourceUrl === nextUrl && urlUpload.status !== "done";
     const duplicateQueued = queuedUrlTasksRef.current.some((task) => task.sourceUrl === nextUrl);
     if (duplicateCurrent || duplicateQueued) {
-      setQueuedUrlDraftError("该链接已在任务列表中");
-      return;
+      options.setDraftError?.("该链接已在任务列表中");
+      return false;
     }
 
     setQueuedUrlTasks((current) => [
       ...current,
       makeQueuedUrlUploadTask(nextUrl, uploadDirectoryPath, remark.trim())
     ]);
-    setQueuedUrlDraft("");
+    if (options.clearDraft) {
+      setQueuedUrlDraft("");
+    }
     setQueuedUrlDraftError(undefined);
+    return true;
   }
 
   function removeQueuedUrlTask(id: string) {
@@ -1106,11 +1152,17 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   }, [idleThumbnailTargetKey]);
 
   function handleModeChange(nextMode: UploadMode) {
-    if (uploadBusy || mode === nextMode) return;
+    if (mode === nextMode) return;
     setMode(nextMode);
   }
 
   function handleSourceUrlChange(value: string) {
+    if (activeUploadKind || submitting || checkingConflicts) {
+      setQueuedUrlDraft(value);
+      setQueuedUrlDraftError(undefined);
+      return;
+    }
+
     setSourceUrl(value);
     urlRuntimeStore.reset();
     setUrlUpload((current) => {
@@ -2132,20 +2184,8 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     }
   }
 
-  async function onSubmit(event: FormEvent) {
-    event.preventDefault();
-    if (uploadBusy) return;
-    if (mode === "url") {
-      await submitUrlUpload(buildEngineContext());
-      return;
-    }
-    if (items.length === 0) {
-      onError("请选择要上传的文件");
-      return;
-    }
-    const targets = items.filter(isUploadableLocalItem);
-    if (targets.length === 0) {
-      onClose();
+  async function runLocalUploadQueue(targets: QueueItem[]): Promise<void> {
+    if (targets.length === 0 || activeUploadRef.current || submitting || checkingConflicts) {
       return;
     }
 
@@ -2157,11 +2197,16 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     let successCount = 0;
 
     for (const target of targets) {
-      if (target.file.size > maxMultipartBytes) {
-        const message = `文件大小不能超过 ${formatCompactBytes(maxMultipartBytes)}（当前 ${formatCompactBytes(target.file.size)}）`;
+      const latestTarget = itemsRef.current.find((item) => item.id === target.id);
+      if (!latestTarget || !isUploadableLocalItem(latestTarget)) {
+        continue;
+      }
+
+      if (latestTarget.file.size > maxMultipartBytes) {
+        const message = `文件大小不能超过 ${formatCompactBytes(maxMultipartBytes)}（当前 ${formatCompactBytes(latestTarget.file.size)}）`;
         setItems((current) =>
           current.map((item) =>
-            item.id === target.id
+            item.id === latestTarget.id
               ? { ...item, status: "error", message }
               : item
           )
@@ -2172,7 +2217,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
 
       setItems((current) =>
         current.map((item) =>
-          item.id === target.id
+          item.id === latestTarget.id
             ? (() => {
                 resetUploadRuntimeStore(item.runtimeStore);
                 return { ...item, status: "uploading", message: undefined, progress: undefined, chunks: undefined, conflict: undefined };
@@ -2181,16 +2226,16 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         )
       );
 
-      const task = startUploadTask("local", target.id);
+      const task = startUploadTask("local", latestTarget.id);
       try {
-        const fileName = effectiveFileName(target);
-        const thumbnail = await resolveLocalThumbnailForUpload(target);
-        await uploadLocalMultipart(buildEngineContext(), target, fileName, thumbnail, task);
+        const fileName = effectiveFileName(latestTarget);
+        const thumbnail = await resolveLocalThumbnailForUpload(latestTarget);
+        await uploadLocalMultipart(buildEngineContext(), latestTarget, fileName, thumbnail, task);
         successCount += 1;
-        seedUploadRuntimeStore(target.runtimeStore!, null, null);
+        seedUploadRuntimeStore(latestTarget.runtimeStore!, null, null);
         setItems((current) =>
           current.map((item) =>
-            item.id === target.id
+            item.id === latestTarget.id
               ? {
                   ...item,
                   status: "done",
@@ -2215,7 +2260,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
           : undefined;
         setItems((current) =>
           current.map((item) =>
-            item.id === target.id
+            item.id === latestTarget.id
               ? (() => {
                   seedUploadRuntimeStore(item.runtimeStore!, retryProgress, item.runtimeStore?.getSnapshot().chunks ?? item.chunks);
                   return {
@@ -2250,6 +2295,26 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     if (successCount > 0) {
       onUploaded(successCount);
     }
+  }
+
+  async function onSubmit(event: FormEvent) {
+    event.preventDefault();
+    if (uploadBusy) return;
+    if (mode === "url") {
+      await submitUrlUpload(buildEngineContext());
+      return;
+    }
+    if (items.length === 0) {
+      onError("请选择要上传的文件");
+      return;
+    }
+    const targets = items.filter(isUploadableLocalItem);
+    if (targets.length === 0) {
+      onClose();
+      return;
+    }
+
+    await runLocalUploadQueue(targets);
   }
 
   async function resolveLocalThumbnailForUpload(target: QueueItem): Promise<ThumbnailUploadPayload | undefined> {
@@ -2572,7 +2637,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
           <div className="flex flex-col gap-2 rounded-xl border border-border bg-background p-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <label htmlFor="queued-upload-url" className="text-xs font-medium text-muted">
-                新增 URL 任务
+                新增远程任务
               </label>
               {queuedUrlTasks.length > 0 ? (
                 <span className="text-xs text-muted">等待 {queuedUrlTasks.length} 个</span>
@@ -2679,12 +2744,10 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
           <>
             <label
               onDragEnter={(event) => {
-                if (uploadBusy) return;
                 event.preventDefault();
                 setDragOver(true);
               }}
               onDragOver={(event) => {
-                if (uploadBusy) return;
                 event.preventDefault();
                 setDragOver(true);
               }}
@@ -2708,7 +2771,6 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
                 ref={fileInput}
                 type="file"
                 multiple
-                disabled={uploadBusy}
                 className="absolute inset-0 cursor-pointer opacity-0"
                 onChange={handlePick}
               />
@@ -2721,7 +2783,6 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
               <Button
                 variant="secondary"
                 size="sm"
-                disabled={uploadBusy}
                 leadingIcon={<FolderOpen size={15} />}
                 onClick={() => folderInput.current?.click()}
               >
@@ -2731,7 +2792,6 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
                 ref={folderInput}
                 type="file"
                 multiple
-                disabled={uploadBusy}
                 className="hidden"
                 onChange={handlePickFolder}
               />
@@ -2740,7 +2800,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
             {conflictItemCount > 0 ? (
               <ConflictSummary
                 count={conflictItemCount}
-                disabled={uploadBusy}
+                disabled={checkingConflicts}
                 onOverwriteAll={() => resolveAllItemConflicts("overwrite")}
                 onSkipAll={() => resolveAllItemConflicts("skip")}
               />
@@ -2771,7 +2831,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
                     onThumbnailUrl={() => openThumbnailUrlPicker({ kind: "item", id: item.id })}
                     onThumbnailRemove={() => removeItemThumbnail(item.id)}
                     onToggleChunks={() => toggleItemChunks(item.id)}
-                    disabled={uploadBusy}
+                    disabled={item.status === "uploading" || item.status === "done" || item.status === "skipped"}
                   />
                 ))}
               </div>
@@ -2780,18 +2840,21 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         ) : (
           <div className="flex flex-col gap-3 rounded-xl border border-border bg-background p-4">
             <UrlSourceEditor
-              sourceUrl={sourceUrl}
-              uploadBusy={uploadBusy}
-              invalid={urlUpload.status === "error"}
+              sourceUrl={visibleSourceUrl}
+              uploadBusy={false}
+              invalid={editingQueuedRemoteDraft ? Boolean(queuedUrlDraftError) : urlUpload.status === "error"}
               isMagnetSource={isMagnetSource}
               onSourceUrlChange={handleSourceUrlChange}
               onOpenCurlImport={openCurlImport}
             />
+            {editingQueuedRemoteDraft && queuedUrlDraftError ? (
+              <p className="text-xs text-danger">{queuedUrlDraftError}</p>
+            ) : null}
 
             <SourceHeadersEditor
               rows={sourceHeaderRows}
               hidden={isMagnetSource}
-              uploadBusy={uploadBusy}
+              uploadBusy={urlUpload.status === "uploading"}
               onAdd={addSourceHeaderRow}
               onUpdate={updateSourceHeaderRow}
               onRemove={removeSourceHeaderRow}
@@ -2839,7 +2902,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
                 onThumbnailChange={(file) => void handleManualUrlThumbnail(file)}
                 onThumbnailUrl={() => openThumbnailUrlPicker({ kind: "url" })}
                 onThumbnailRemove={removeUrlThumbnail}
-                disabled={uploadBusy}
+                disabled={urlUpload.status === "uploading"}
               />
             ) : null}
           </div>
@@ -3011,4 +3074,3 @@ function unfinishedMagnetImportId(state: UrlUploadState): string | undefined {
 
   return magnet.id;
 }
-

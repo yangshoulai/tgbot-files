@@ -37,14 +37,25 @@ const TEXT_PREVIEW_TIMEOUT_MS = 30_000;
 
 interface PreviewDialogProps {
   file: FileItem | null;
+  minimized?: boolean;
   onClose: () => void;
+  onMinimize: () => void;
   onCopy: (value: string) => void;
   onAcceleratedDownload?: (file: FileItem) => void;
   videoPreviewCacheBytes: number;
   videoPreviewConcurrency: number;
 }
 
-export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, videoPreviewCacheBytes, videoPreviewConcurrency }: PreviewDialogProps) {
+export function PreviewDialog({
+  file,
+  minimized = false,
+  onClose,
+  onMinimize,
+  onCopy,
+  onAcceleratedDownload,
+  videoPreviewCacheBytes,
+  videoPreviewConcurrency
+}: PreviewDialogProps) {
   const preview = file ? previewKind(file) : null;
   const kind = file ? fileKind(file) : null;
   const fullscreenTargetRef = useRef<HTMLDivElement>(null);
@@ -298,6 +309,13 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
     onClose();
   }, [onClose]);
 
+  const minimizePreview = useCallback(() => {
+    if (document.fullscreenElement === fullscreenTargetRef.current) {
+      void document.exitFullscreen().catch(() => undefined);
+    }
+    onMinimize();
+  }, [onMinimize]);
+
   if (!file || !kind) {
     return <Modal open={false} onClose={onClose}>{null}</Modal>;
   }
@@ -310,7 +328,7 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
 
   return (
     <Modal
-      open
+      open={!minimized}
       onClose={closePreview}
       size={maximized ? "full" : "xl"}
       title={
@@ -365,6 +383,13 @@ export function PreviewDialog({ file, onClose, onCopy, onAcceleratedDownload, vi
               {nativeFullscreen ? "退出全屏" : "进入全屏"}
             </Button>
           ) : null}
+          <Button
+            variant="secondary"
+            leadingIcon={<Minimize size={15} />}
+            onClick={minimizePreview}
+          >
+            最小化
+          </Button>
           {canAccelerateDownload ? (
             <Button
               variant="primary"

@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
-import { ArrowUp, ChevronRight, Database, FolderInput, FolderPlus, LayoutGrid, List, PanelLeftClose, PanelLeftOpen, RefreshCw, Search, Trash2 } from "lucide-react";
+import { ArrowUp, ChevronRight, Database, FolderInput, FolderPlus, LayoutGrid, List, Maximize2, PanelLeftClose, PanelLeftOpen, RefreshCw, Search, Trash2, X } from "lucide-react";
 import {
   ApiError,
   DirectoryItem,
@@ -30,6 +30,7 @@ import { IconButton } from "../components/ui/IconButton";
 import { Button } from "../components/ui/Button";
 import { Spinner } from "../components/ui/Spinner";
 import { Segmented } from "../components/ui/Segmented";
+import { FileVisual } from "../components/ui/FileVisual";
 import { MetricsRow, Metric } from "../components/files/MetricsRow";
 import { FileTable } from "../components/files/FileTable";
 import { PreviewDialog } from "../components/files/PreviewDialog";
@@ -122,6 +123,7 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
   const [loading, setLoading] = useState(false);
   const [operationLabel, setOperationLabel] = useState<string | null>(null);
   const [previewFile, setPreviewFile] = useState<FileItem | null>(null);
+  const [previewMinimized, setPreviewMinimized] = useState(false);
   const [thumbnailPreviewFile, setThumbnailPreviewFile] = useState<FileItem | null>(null);
   const [thumbnailEditingFile, setThumbnailEditingFile] = useState<FileItem | null>(null);
   const [detailFile, setDetailFile] = useState<FileItem | null>(null);
@@ -177,6 +179,16 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
   } = useFileCacheManager({ files, session, toast });
   const listBusyLabel = operationLabel ?? (loading ? "正在加载目录内容..." : undefined);
   const isListBusy = Boolean(listBusyLabel);
+
+  const openPreview = useCallback((file: FileItem) => {
+    setPreviewFile(file);
+    setPreviewMinimized(false);
+  }, []);
+
+  const closePreview = useCallback(() => {
+    setPreviewFile(null);
+    setPreviewMinimized(false);
+  }, []);
 
   const changeFileLayoutMode = useCallback((mode: FileLayoutMode) => {
     setFileLayoutMode(mode);
@@ -305,7 +317,7 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
     try {
       await deleteFile(file.id);
       toast.success("索引已删除");
-      if (previewFile?.id === file.id) setPreviewFile(null);
+      if (previewFile?.id === file.id) closePreview();
       if (thumbnailPreviewFile?.id === file.id) setThumbnailPreviewFile(null);
       if (detailFile?.id === file.id) setDetailFile(null);
       setSelectedFileIds((current) => {
@@ -352,7 +364,7 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
         directory_ids: targetDirectories.map((directory) => directory.id)
       });
       toast.success(`已删除 ${result.deleted_directories} 个目录、${result.deleted_files} 个文件索引`);
-      if (previewFile && targetFiles.some((file) => file.id === previewFile.id)) setPreviewFile(null);
+      if (previewFile && targetFiles.some((file) => file.id === previewFile.id)) closePreview();
       if (thumbnailPreviewFile && targetFiles.some((file) => file.id === thumbnailPreviewFile.id)) setThumbnailPreviewFile(null);
       if (detailFile && targetFiles.some((file) => file.id === detailFile.id)) setDetailFile(null);
       setSelectedFileIds(new Set());
@@ -963,7 +975,7 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
                 onEdit={openEditDialog}
                 onEditThumbnail={setThumbnailEditingFile}
                 onMoveFile={openMoveDialog}
-                onPreview={setPreviewFile}
+                onPreview={openPreview}
                 onThumbnailPreview={setThumbnailPreviewFile}
                 onCopy={onCopy}
                 onAcceleratedDownload={(file) => void onAcceleratedDownload(file)}
@@ -982,9 +994,45 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
         </div>
       </div>
 
+      {previewFile && previewMinimized ? (
+        <div className="fixed bottom-5 right-5 z-40 flex max-w-[min(26rem,calc(100vw-2.5rem))] items-center gap-2 rounded-xl border border-border bg-background/95 px-3 py-2 shadow-dialog backdrop-blur-md">
+          <FileVisual
+            mimeType={previewFile.mime_type}
+            fileName={previewFile.file_name}
+            url={hasFileLinkAccess(previewFile) ? previewFile.file_path : undefined}
+            thumbnailUrl={previewFile.thumbnail_url}
+            size="sm"
+          />
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-sm font-medium text-foreground" title={previewFile.file_name}>
+              {previewFile.file_name}
+            </p>
+            <p className="truncate text-xs text-muted">预览已最小化</p>
+          </div>
+          <IconButton
+            size="sm"
+            variant="ghost"
+            label="打开预览"
+            onClick={() => setPreviewMinimized(false)}
+          >
+            <Maximize2 size={15} />
+          </IconButton>
+          <IconButton
+            size="sm"
+            variant="ghost"
+            label="关闭预览"
+            onClick={closePreview}
+          >
+            <X size={15} />
+          </IconButton>
+        </div>
+      ) : null}
+
       <PreviewDialog
         file={previewFile}
-        onClose={() => setPreviewFile(null)}
+        minimized={previewMinimized}
+        onClose={closePreview}
+        onMinimize={() => setPreviewMinimized(true)}
         onCopy={copyText}
         onAcceleratedDownload={(file) => void onAcceleratedDownload(file)}
         videoPreviewCacheBytes={session.video_preview_cache_bytes}
