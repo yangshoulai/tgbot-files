@@ -92,6 +92,14 @@ function formatMediaTime(seconds: number): string {
   return `${minutes}:${remainingSeconds.toString().padStart(2, "0")}`;
 }
 
+function remapDirectoryPath(path: string, oldBasePath: string, nextBasePath: string): string {
+  if (path === oldBasePath) return nextBasePath;
+  if (path.startsWith(`${oldBasePath}/`)) {
+    return `${nextBasePath}${path.slice(oldBasePath.length)}`;
+  }
+  return path;
+}
+
 const FILE_TYPE_OPTIONS: Array<{ value: FileTypeFilter; label: string }> = [
   { value: "all", label: "全部类型" },
   { value: "image", label: "图片" },
@@ -220,12 +228,12 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
   }, []);
 
   const loadFiles = useCallback(
-    async () => {
+    async (directoryPath = currentDirPath) => {
       setLoading(true);
       try {
         const response = await listFiles({
           q: query,
-          dir: currentDirPath,
+          dir: directoryPath,
           type: typeFilter,
           all: true
         });
@@ -264,7 +272,7 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
 
   useEffect(() => {
     if (uploadVersion > 0) {
-      void loadFiles();
+      void Promise.all([loadFiles(), loadDirectoryOptions()]);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [uploadVersion]);
@@ -504,10 +512,15 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
 
     setRenamingDirectorySaving(true);
     try {
+      const previousPath = renamingDirectory.path;
       const result = await renameDirectory(renamingDirectory.id, name);
+      const nextCurrentDirPath = remapDirectoryPath(currentDirPath, previousPath, result.directory.path);
       toast.success(`已重命名 ${result.renamed_directories} 个目录、更新 ${result.updated_files} 个文件索引`);
       setRenamingDirectory(null);
-      await Promise.all([loadFiles(), loadDirectoryOptions()]);
+      if (nextCurrentDirPath !== currentDirPath) {
+        setCurrentDirPath(nextCurrentDirPath);
+      }
+      await Promise.all([loadFiles(nextCurrentDirPath), loadDirectoryOptions()]);
     } catch (error) {
       toast.danger(errorMessage(error));
     } finally {
@@ -533,7 +546,9 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
     setMovingDirectorySaving(true);
     setOperationLabel("正在移动目录...");
     try {
+      const previousPath = movingDirectory.path;
       const result = await moveDirectory(movingDirectory.id, directoryMoveTargetPath);
+      const nextCurrentDirPath = remapDirectoryPath(currentDirPath, previousPath, result.directory.path);
       toast.success(`已移动 ${result.moved_directories} 个目录、${result.moved_files} 个文件索引到 ${result.directory.path}`);
       setMovingDirectory(null);
       setSelectedDirectoryIds((current) => {
@@ -541,7 +556,10 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
         next.delete(result.directory.id);
         return next;
       });
-      await Promise.all([loadFiles(), loadDirectoryOptions()]);
+      if (nextCurrentDirPath !== currentDirPath) {
+        setCurrentDirPath(nextCurrentDirPath);
+      }
+      await Promise.all([loadFiles(nextCurrentDirPath), loadDirectoryOptions()]);
     } catch (error) {
       toast.danger(errorMessage(error));
     } finally {
@@ -926,7 +944,7 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
                 variant="default"
                 label="刷新"
                 disabled={isListBusy}
-                onClick={() => void loadFiles()}
+                onClick={() => void Promise.all([loadFiles(), loadDirectoryOptions()])}
               >
                 {isListBusy ? <Spinner size={16} /> : <RefreshCw size={16} />}
               </IconButton>
