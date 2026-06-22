@@ -40,10 +40,17 @@ interface PreviewDialogProps {
   minimized?: boolean;
   onClose: () => void;
   onMinimize: () => void;
+  onMediaProgress?: (progress: PreviewMediaProgress | null) => void;
   onCopy: (value: string) => void;
   onAcceleratedDownload?: (file: FileItem) => void;
   videoPreviewCacheBytes: number;
   videoPreviewConcurrency: number;
+}
+
+export interface PreviewMediaProgress {
+  currentTime: number;
+  duration: number;
+  playing: boolean;
 }
 
 export function PreviewDialog({
@@ -51,6 +58,7 @@ export function PreviewDialog({
   minimized = false,
   onClose,
   onMinimize,
+  onMediaProgress,
   onCopy,
   onAcceleratedDownload,
   videoPreviewCacheBytes,
@@ -280,6 +288,57 @@ export function PreviewDialog({
   }, [file?.id]);
 
   useEffect(() => {
+    if (!file || !onMediaProgress) {
+      onMediaProgress?.(null);
+      return;
+    }
+
+    const target = fullscreenTargetRef.current;
+    if (!target) {
+      onMediaProgress(null);
+      return;
+    }
+
+    const syncProgress = () => {
+      const media = target.querySelector("video, audio") as HTMLMediaElement | null;
+      if (!media) {
+        onMediaProgress(null);
+        return;
+      }
+
+      const duration = Number.isFinite(media.duration) && media.duration > 0 ? media.duration : 0;
+      const currentTime = Number.isFinite(media.currentTime) && media.currentTime >= 0 ? media.currentTime : 0;
+      onMediaProgress({
+        currentTime,
+        duration,
+        playing: !media.paused && !media.ended
+      });
+    };
+
+    const attach = () => {
+      const media = target.querySelector("video, audio") as HTMLMediaElement | null;
+      if (!media) return undefined;
+      const events = ["loadedmetadata", "durationchange", "timeupdate", "play", "pause", "ended", "seeked"];
+      events.forEach((eventName) => media.addEventListener(eventName, syncProgress));
+      syncProgress();
+      return () => events.forEach((eventName) => media.removeEventListener(eventName, syncProgress));
+    };
+
+    let detach = attach();
+    const observer = new MutationObserver(() => {
+      detach?.();
+      detach = attach();
+    });
+    observer.observe(target, { childList: true, subtree: true });
+
+    return () => {
+      observer.disconnect();
+      detach?.();
+      onMediaProgress(null);
+    };
+  }, [file?.id, onMediaProgress]);
+
+  useEffect(() => {
     const onFullscreenChange = () => {
       setNativeFullscreen(document.fullscreenElement === fullscreenTargetRef.current);
     };
@@ -328,7 +387,9 @@ export function PreviewDialog({
 
   return (
     <Modal
-      open={!minimized}
+      open={Boolean(file)}
+      hidden={minimized}
+      keepMounted
       onClose={closePreview}
       size={maximized ? "full" : "xl"}
       title={

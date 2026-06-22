@@ -20,6 +20,8 @@ interface ModalProps {
   initialFocus?: "first" | "none";
   trapFocus?: boolean;
   stableRendering?: boolean;
+  keepMounted?: boolean;
+  hidden?: boolean;
   className?: string;
   bodyClassName?: string;
 }
@@ -50,6 +52,8 @@ export function Modal({
   initialFocus = "first",
   trapFocus = true,
   stableRendering = false,
+  keepMounted = false,
+  hidden = false,
   className,
   bodyClassName
 }: ModalProps) {
@@ -57,17 +61,19 @@ export function Modal({
   const descId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
 
+  const active = open && !hidden;
+
   useEffect(() => {
-    if (!open) return;
+    if (!active) return;
     const previous = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     return () => {
       document.body.style.overflow = previous;
     };
-  }, [open]);
+  }, [active]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!active) return;
     function onKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape" && closeOnEscape) {
         event.preventDefault();
@@ -91,10 +97,10 @@ export function Modal({
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, onClose, closeOnEscape, trapFocus]);
+  }, [active, onClose, closeOnEscape, trapFocus]);
 
   useEffect(() => {
-    if (!open || initialFocus === "none") return;
+    if (!active || initialFocus === "none") return;
     const handle = window.setTimeout(() => {
       const node = dialogRef.current;
       if (!node) return;
@@ -107,9 +113,9 @@ export function Modal({
       }
     }, 60);
     return () => window.clearTimeout(handle);
-  }, [open, initialFocus]);
+  }, [active, initialFocus]);
 
-  if (!open || typeof document === "undefined") return null;
+  if ((!open && !keepMounted) || typeof document === "undefined") return null;
 
   return createPortal(
     <div
@@ -122,8 +128,10 @@ export function Modal({
       className={cn(
         "fixed inset-0 z-50 flex items-end justify-center bg-foreground/30 sm:items-center",
         stableRendering ? "bg-foreground/35" : "backdrop-blur-sm animate-fade-in",
-        size === "full" ? "p-0" : "p-2 sm:p-6"
+        size === "full" ? "p-0" : "p-2 sm:p-6",
+        hidden && "pointer-events-none invisible opacity-0"
       )}
+      aria-hidden={hidden || undefined}
       data-size={size}
     >
       <div

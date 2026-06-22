@@ -33,7 +33,7 @@ import { Segmented } from "../components/ui/Segmented";
 import { FileVisual } from "../components/ui/FileVisual";
 import { MetricsRow, Metric } from "../components/files/MetricsRow";
 import { FileTable } from "../components/files/FileTable";
-import { PreviewDialog } from "../components/files/PreviewDialog";
+import { PreviewDialog, type PreviewMediaProgress } from "../components/files/PreviewDialog";
 import { ThumbnailPreviewDialog } from "../components/files/ThumbnailPreviewDialog";
 import { ThumbnailEditDialog } from "../components/files/ThumbnailEditDialog";
 import { FileDetailDialog } from "../components/files/FileDetailDialog";
@@ -73,6 +73,23 @@ interface DashboardPageProps {
 function errorMessage(error: unknown): string {
   if (error instanceof ApiError || error instanceof Error) return error.message;
   return "请求失败";
+}
+
+function previewMediaProgressPercent(progress: PreviewMediaProgress | null): number {
+  if (!progress || progress.duration <= 0) return 0;
+  return Math.min(100, Math.max(0, (progress.currentTime / progress.duration) * 100));
+}
+
+function formatMediaProgressLabel(progress: PreviewMediaProgress): string {
+  const current = formatMediaTime(progress.currentTime);
+  return progress.duration > 0 ? `${current} / ${formatMediaTime(progress.duration)}` : current;
+}
+
+function formatMediaTime(seconds: number): string {
+  const safeSeconds = Math.max(0, Math.floor(Number.isFinite(seconds) ? seconds : 0));
+  const minutes = Math.floor(safeSeconds / 60);
+  const remainingSeconds = safeSeconds % 60;
+  return `${minutes}:${remainingSeconds.toString().padStart(2, "0")}`;
 }
 
 const FILE_TYPE_OPTIONS: Array<{ value: FileTypeFilter; label: string }> = [
@@ -124,6 +141,7 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
   const [operationLabel, setOperationLabel] = useState<string | null>(null);
   const [previewFile, setPreviewFile] = useState<FileItem | null>(null);
   const [previewMinimized, setPreviewMinimized] = useState(false);
+  const [previewMediaProgress, setPreviewMediaProgress] = useState<PreviewMediaProgress | null>(null);
   const [thumbnailPreviewFile, setThumbnailPreviewFile] = useState<FileItem | null>(null);
   const [thumbnailEditingFile, setThumbnailEditingFile] = useState<FileItem | null>(null);
   const [detailFile, setDetailFile] = useState<FileItem | null>(null);
@@ -183,11 +201,13 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
   const openPreview = useCallback((file: FileItem) => {
     setPreviewFile(file);
     setPreviewMinimized(false);
+    setPreviewMediaProgress(null);
   }, []);
 
   const closePreview = useCallback(() => {
     setPreviewFile(null);
     setPreviewMinimized(false);
+    setPreviewMediaProgress(null);
   }, []);
 
   const changeFileLayoutMode = useCallback((mode: FileLayoutMode) => {
@@ -995,36 +1015,48 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
       </div>
 
       {previewFile && previewMinimized ? (
-        <div className="fixed bottom-5 right-5 z-40 flex max-w-[min(26rem,calc(100vw-2.5rem))] items-center gap-2 rounded-xl border border-border bg-background/95 px-3 py-2 shadow-dialog backdrop-blur-md">
-          <FileVisual
-            mimeType={previewFile.mime_type}
-            fileName={previewFile.file_name}
-            url={hasFileLinkAccess(previewFile) ? previewFile.file_path : undefined}
-            thumbnailUrl={previewFile.thumbnail_url}
-            size="sm"
-          />
-          <div className="min-w-0 flex-1">
-            <p className="truncate text-sm font-medium text-foreground" title={previewFile.file_name}>
-              {previewFile.file_name}
-            </p>
-            <p className="truncate text-xs text-muted">预览已最小化</p>
+        <div className="fixed bottom-5 right-5 z-40 w-[min(26rem,calc(100vw-2.5rem))] overflow-hidden rounded-xl border border-border bg-background/95 shadow-dialog backdrop-blur-md">
+          <div className="flex items-center gap-2 px-3 py-2">
+            <FileVisual
+              mimeType={previewFile.mime_type}
+              fileName={previewFile.file_name}
+              url={hasFileLinkAccess(previewFile) ? previewFile.file_path : undefined}
+              thumbnailUrl={previewFile.thumbnail_url}
+              size="sm"
+            />
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-medium text-foreground" title={previewFile.file_name}>
+                {previewFile.file_name}
+              </p>
+              <p className="truncate text-xs text-muted">
+                {previewMediaProgress
+                  ? `${previewMediaProgress.playing ? "正在播放" : "已暂停"} · ${formatMediaProgressLabel(previewMediaProgress)}`
+                  : "预览已最小化"}
+              </p>
+            </div>
+            <IconButton
+              size="sm"
+              variant="ghost"
+              label="打开预览"
+              onClick={() => setPreviewMinimized(false)}
+            >
+              <Maximize2 size={15} />
+            </IconButton>
+            <IconButton
+              size="sm"
+              variant="ghost"
+              label="关闭预览"
+              onClick={closePreview}
+            >
+              <X size={15} />
+            </IconButton>
           </div>
-          <IconButton
-            size="sm"
-            variant="ghost"
-            label="打开预览"
-            onClick={() => setPreviewMinimized(false)}
-          >
-            <Maximize2 size={15} />
-          </IconButton>
-          <IconButton
-            size="sm"
-            variant="ghost"
-            label="关闭预览"
-            onClick={closePreview}
-          >
-            <X size={15} />
-          </IconButton>
+          <div className="h-0.5 bg-primary-soft">
+            <div
+              className="h-full bg-primary transition-[width] duration-300"
+              style={{ width: `${previewMediaProgressPercent(previewMediaProgress)}%` }}
+            />
+          </div>
         </div>
       ) : null}
 
@@ -1033,6 +1065,7 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
         minimized={previewMinimized}
         onClose={closePreview}
         onMinimize={() => setPreviewMinimized(true)}
+        onMediaProgress={setPreviewMediaProgress}
         onCopy={copyText}
         onAcceleratedDownload={(file) => void onAcceleratedDownload(file)}
         videoPreviewCacheBytes={session.video_preview_cache_bytes}

@@ -62,7 +62,7 @@ export interface UploadDialogHandle {
 }
 
 export type ItemStatus = "pending" | "uploading" | "done" | "error" | "skipped";
-export type UploadMode = "file" | "url";
+export type UploadMode = "file" | "url" | "magnet";
 export type UploadChunkStatus = "queued" | "uploading" | "completed" | "failed";
 
 export interface DroppedFileEntry {

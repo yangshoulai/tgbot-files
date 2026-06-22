@@ -64,6 +64,7 @@ interface UrlUploadRowProps {
 
 interface UrlSourceEditorProps {
   sourceUrl: string;
+  mode: "url" | "magnet";
   uploadBusy: boolean;
   invalid: boolean;
   isMagnetSource: boolean;
@@ -73,6 +74,7 @@ interface UrlSourceEditorProps {
 
 export const UrlSourceEditor = memo(function UrlSourceEditor({
   sourceUrl,
+  mode,
   uploadBusy,
   invalid,
   isMagnetSource,
@@ -83,9 +85,9 @@ export const UrlSourceEditor = memo(function UrlSourceEditor({
     <div className="flex flex-col gap-1.5">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <label htmlFor="upload-source-url" className="text-xs font-medium text-muted">
-          粘贴文件 URL 或磁力链接
+          {mode === "magnet" ? "粘贴磁力链接" : "粘贴文件 URL"}
         </label>
-        {!isMagnetSource ? (
+        {mode === "url" && !isMagnetSource ? (
           <button
             type="button"
             disabled={uploadBusy}
@@ -99,7 +101,7 @@ export const UrlSourceEditor = memo(function UrlSourceEditor({
       <Input
         id="upload-source-url"
         type="text"
-        placeholder="https://example.com/report.pdf 或 magnet:?xt=urn:btih:..."
+        placeholder={mode === "magnet" ? "magnet:?xt=urn:btih:..." : "https://example.com/report.pdf"}
         value={sourceUrl}
         disabled={uploadBusy}
         invalid={invalid}
@@ -116,12 +118,15 @@ export const UrlSourceEditor = memo(function UrlSourceEditor({
         }}
       />
       <p className="text-xs leading-5 text-muted">
-        URL 导入要求远端支持 Range；磁力导入会先由 aria2 下载选中文件，再分片转存到 Telegram。
+        {mode === "magnet"
+          ? "磁力导入会先由 aria2 下载选中文件，再分片转存到 Telegram。"
+          : "URL 导入要求远端支持 Range；m3u8/HLS 链接会按片段导入。"}
       </p>
     </div>
   );
 }, (previous, next) =>
   previous.sourceUrl === next.sourceUrl &&
+  previous.mode === next.mode &&
   previous.uploadBusy === next.uploadBusy &&
   previous.invalid === next.invalid &&
   previous.isMagnetSource === next.isMagnetSource

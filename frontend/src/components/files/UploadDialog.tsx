@@ -682,7 +682,10 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   ).length, [items]);
   const normalizedSourceUrl = sourceUrl.trim();
   const urlPendingCount = normalizedSourceUrl && urlUpload.status !== "uploading" && urlUpload.status !== "done" ? 1 : 0;
-  const pendingCount = mode === "url" ? urlPendingCount : filePendingCount;
+  const isUrlMode = mode === "url";
+  const isMagnetMode = mode === "magnet";
+  const isRemoteMode = isUrlMode || isMagnetMode;
+  const pendingCount = isRemoteMode ? urlPendingCount : filePendingCount;
   const isMagnetSource = isLikelyMagnetUrl(normalizedSourceUrl);
   const magnetValidFiles = useMemo(
     () => isMagnetSource && urlUpload.magnet?.import
@@ -697,7 +700,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     )),
     [isMagnetSource, urlUpload.magnet?.fileDecisions, urlUpload.magnet?.selectedIndexes]
   );
-  const hasUnresolvedConflict = mode === "url"
+  const hasUnresolvedConflict = isRemoteMode
     ? Boolean(urlUpload.conflict) || hasUnresolvedMagnetConflict
     : items.some((item) => isLocalItemAwaitingDecision(item) && Boolean(item.conflict));
   const hasInvalidMagnetFileName = useMemo(
@@ -712,7 +715,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     })),
     [isMagnetSource, urlUpload.magnet?.fileDecisions, urlUpload.magnet?.selectedIndexes]
   );
-  const hasInvalidFileName = mode === "url"
+  const hasInvalidFileName = isRemoteMode
     ? Boolean(
         normalizedSourceUrl &&
         (urlUpload.editingFileName || urlUpload.conflict) &&
@@ -726,7 +729,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
         item.fileNameOverride.trim().length === 0
       );
   const hasDone = useMemo(() => urlUpload.status === "done" || items.some((item) => item.status === "done"), [items, urlUpload.status]);
-  const queuedUrlStartBlocked = mode === "url"
+  const queuedUrlStartBlocked = isRemoteMode
     ? Boolean(normalizedSourceUrl && urlUpload.status !== "done")
     : items.some((item) => item.status === "pending" || item.status === "uploading" || item.status === "error");
   const activeUploadRunning = Boolean(activeUploadKind);
@@ -756,7 +759,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       return;
     }
 
-    if (activeUploadKind || submitting || checkingConflicts || mode !== "url" || !normalizedSourceUrl) {
+    if (activeUploadKind || submitting || checkingConflicts || !isRemoteMode || !normalizedSourceUrl) {
       return;
     }
 
@@ -772,7 +775,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     setQueuedUrlPreparedTaskId(null);
     void submitUrlUpload(buildEngineContext());
     queuedUrlLaunchingRef.current = false;
-  }, [activeUploadKind, checkingConflicts, mode, normalizedSourceUrl, queuedUrlPreparedTaskId, submitting]);
+  }, [activeUploadKind, checkingConflicts, isRemoteMode, normalizedSourceUrl, queuedUrlPreparedTaskId, submitting]);
 
   useEffect(() => {
     if (!autoStartLocalQueueRef.current) {
@@ -796,7 +799,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   function launchQueuedUrlTask(task: QueuedUrlUploadTask) {
     queuedUrlLaunchingRef.current = true;
     setQueuedUrlTasks((current) => current.filter((item) => item.id !== task.id));
-    setMode("url");
+    setMode(isLikelyMagnetUrl(task.sourceUrl) ? "magnet" : "url");
     setUploadDirectoryPath(task.directoryPath);
     setRemark(task.remark);
     setSourceUrl(task.sourceUrl);
@@ -835,7 +838,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       return false;
     }
 
-    const duplicateCurrent = mode === "url" && normalizedSourceUrl === nextUrl && urlUpload.status !== "done";
+    const duplicateCurrent = isRemoteMode && normalizedSourceUrl === nextUrl && urlUpload.status !== "done";
     const duplicateQueued = queuedUrlTasksRef.current.some((task) => task.sourceUrl === nextUrl);
     if (duplicateCurrent || duplicateQueued) {
       options.setDraftError?.("该链接已在任务列表中");
@@ -1153,6 +1156,12 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
 
   function handleModeChange(nextMode: UploadMode) {
     if (mode === nextMode) return;
+    if (nextMode === "url" && isLikelyMagnetUrl(sourceUrl.trim())) {
+      handleSourceUrlChange("");
+    }
+    if (nextMode === "magnet" && sourceUrl.trim() && !isLikelyMagnetUrl(sourceUrl.trim())) {
+      handleSourceUrlChange("");
+    }
     setMode(nextMode);
   }
 
@@ -1629,10 +1638,14 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
     const normalized = value.trim();
 
     if (!normalized) {
-      return "请粘贴要上传的 URL";
+      return isMagnetMode ? "请粘贴要上传的磁力链接" : "请粘贴要上传的 URL";
     }
 
     if (isLikelyMagnetUrl(normalized)) {
+      if (!isMagnetMode) {
+        return "请切换到磁力链接上传方式";
+      }
+
       try {
         const url = new URL(normalized);
         if (url.protocol !== "magnet:" || !url.searchParams.get("xt")) {
@@ -1644,10 +1657,14 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       return undefined;
     }
 
+    if (isMagnetMode) {
+      return "请输入完整的磁力链接，例如 magnet:?xt=urn:btih:...";
+    }
+
     try {
       const url = new URL(normalized);
       if (url.protocol !== "http:" && url.protocol !== "https:") {
-        return "仅支持 http/https URL 或 magnet 磁力链接";
+        return "仅支持 http/https URL";
       }
     } catch {
       return "请输入完整的 URL，例如 https://example.com/file.pdf";
@@ -1685,7 +1702,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
       return;
     }
 
-    setMode("url");
+    setMode(task.kind === "magnet" ? "magnet" : "url");
     setSourceUrl(task.sourceUrl);
     setSourceHeaderRows(sourceHeaderRowsFromHeaders(task.kind === "magnet" ? undefined : task.sourceHeaders));
     setItems([]);
@@ -2300,7 +2317,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
     if (uploadBusy) return;
-    if (mode === "url") {
+    if (isRemoteMode) {
       await submitUrlUpload(buildEngineContext());
       return;
     }
@@ -2598,19 +2615,23 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
               form="upload-form"
               variant="primary"
               loading={uploadBusy}
-              leadingIcon={mode === "url" ? <Link2 size={16} /> : <FilePlus2 size={16} />}
+              leadingIcon={isRemoteMode ? <Link2 size={16} /> : <FilePlus2 size={16} />}
               disabled={pendingCount === 0 || hasInvalidFileName || hasUnresolvedConflict || magnetHasNoValidFiles}
             >
               {checkingConflicts
                 ? "检测重复项"
                 : submitting
-                ? mode === "url" ? "导入中" : "上传中"
+                ? isRemoteMode ? "导入中" : "上传中"
                 : hasInvalidFileName
                   ? "文件名不能为空"
                   : hasUnresolvedConflict
                     ? "请选择处理方式"
                   : pendingCount > 0
-                    ? mode === "url" ? (isMagnetSource && urlUpload.magnet?.import ? "导入选中文件" : isMagnetSource ? "解析磁力链接" : "上传 URL") : `开始上传 ${pendingCount} 个`
+                    ? isMagnetMode
+                      ? (urlUpload.magnet?.import ? "导入选中文件" : "解析磁力链接")
+                      : isUrlMode
+                        ? "上传 URL"
+                        : `开始上传 ${pendingCount} 个`
                     : "无待传文件"}
             </Button>
           </>
@@ -2624,7 +2645,8 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
             ariaLabel="上传方式"
             options={[
               { value: "file", label: "本地文件", icon: <UploadCloud size={15} /> },
-              { value: "url", label: "URL / 磁力", icon: <Link2 size={15} /> }
+              { value: "url", label: "URL 链接", icon: <Link2 size={15} /> },
+              { value: "magnet", label: "磁力链接", icon: <Layers3 size={15} /> }
             ]}
           />
           <span className="hidden text-xs text-muted sm:inline">统一分片上传</span>
@@ -2841,6 +2863,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
           <div className="flex flex-col gap-3 rounded-xl border border-border bg-background p-4">
             <UrlSourceEditor
               sourceUrl={visibleSourceUrl}
+              mode={isMagnetMode ? "magnet" : "url"}
               uploadBusy={false}
               invalid={editingQueuedRemoteDraft ? Boolean(queuedUrlDraftError) : urlUpload.status === "error"}
               isMagnetSource={isMagnetSource}
@@ -2853,7 +2876,7 @@ export const UploadDialog = forwardRef<UploadDialogHandle, UploadDialogProps>(fu
 
             <SourceHeadersEditor
               rows={sourceHeaderRows}
-              hidden={isMagnetSource}
+              hidden={isMagnetMode}
               uploadBusy={urlUpload.status === "uploading"}
               onAdd={addSourceHeaderRow}
               onUpdate={updateSourceHeaderRow}
