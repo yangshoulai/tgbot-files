@@ -177,6 +177,18 @@ export function normalizeTorrentRelativePath(value: string): string | null {
   return segments.length > 0 ? segments.join("/") : null;
 }
 
+export function normalizeTorrentDiskRelativePath(value: string): string | null {
+  const segments = value
+    .replace(/\\/g, "/")
+    .split("/")
+    .map((segment) => segment.trim())
+    .filter((segment) => segment && segment !== "." && segment !== "..")
+    .map((segment) => segment.replace(/[\u0000-\u001f\u007f]/g, "").replace(/[\\/]/g, "").trim())
+    .filter(Boolean);
+
+  return segments.length > 0 ? segments.join("/") : null;
+}
+
 export function sanitizeDirectorySegment(value: string | undefined): string {
   const cleaned = sanitizeFileName(value)
     .replace(/[\\/]/g, "")

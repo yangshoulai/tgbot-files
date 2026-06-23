@@ -101,6 +101,7 @@ export {
   markMagnetImportDoneIfComplete,
   cancelMagnetImportRecord,
   selectMagnetImportFiles,
+  updateMagnetImportFileMetadata,
   updateMagnetImportFileStatus
 } from "./database/magnet-imports";
 

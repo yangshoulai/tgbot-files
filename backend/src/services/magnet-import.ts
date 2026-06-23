@@ -13,6 +13,7 @@ import {
   markMagnetImportImporting,
   replaceMagnetImportFiles,
   selectMagnetImportFiles,
+  updateMagnetImportFileMetadata,
   updateMagnetImportFileStatus,
   upsertFileChunkRecord,
   type FileNameConflictAction,
@@ -65,6 +66,7 @@ import {
   isInitializedMagnetImportStatus,
   magnetInfoHash,
   mimeTypeForMagnetFileName,
+  normalizeTorrentDiskRelativePath,
   normalizeMagnetFileUploadOptions as normalizeMagnetFileUploadOptionsBase,
   normalizeTorrentRelativePath,
   parseBencode,
@@ -210,7 +212,7 @@ export async function refreshMagnetImportStatus(
     const status = await tellAria2StatusFollowing(config, importRecord.aria2_download_gid);
     aria2Status = status;
     if (status.status === "complete") {
-      const files = await listMagnetImportFileRecords(db, importRecord.id);
+      const files = await repairMagnetFileDiskPathsFromAria2Status(db, importRecord, status);
       if (await areSelectedMagnetFilesMaterialized(importRecord, files)) {
         await markMagnetImportDownloaded(db, importRecord.id, new Date().toISOString());
         importRecord = await requireMagnetImport(db, importId);
@@ -246,6 +248,44 @@ async function areSelectedMagnetFilesMaterialized(
   }
 
   return true;
+}
+
+async function repairMagnetFileDiskPathsFromAria2Status(
+  db: AppDatabase,
+  importRecord: MagnetImportRecord,
+  status: Aria2Status
+): Promise<MagnetImportFileRecord[]> {
+  let files = await listMagnetImportFileRecords(db, importRecord.id);
+  const aria2FilesByIndex = new Map(
+    magnetFilesFromAria2Status(status, importRecord.download_dir).map((file) => [file.fileIndex, file])
+  );
+
+  const now = new Date().toISOString();
+  let repaired = false;
+  for (const file of files) {
+    const aria2File = aria2FilesByIndex.get(file.file_index);
+    if (!aria2File || aria2File.relativePath === file.path) {
+      continue;
+    }
+
+    await updateMagnetImportFileMetadata({
+      db,
+      importId: importRecord.id,
+      fileIndex: file.file_index,
+      path: aria2File.relativePath,
+      fileName: aria2File.fileName,
+      relativeDirectoryPath: aria2File.relativeDirectoryPath,
+      mimeType: aria2File.mimeType,
+      updatedAt: now
+    });
+    repaired = true;
+  }
+
+  if (repaired) {
+    files = await listMagnetImportFileRecords(db, importRecord.id);
+  }
+
+  return files;
 }
 
 async function cleanupRestartableMagnetImportsBySource(
@@ -635,12 +675,14 @@ function magnetFileFromAria2File(file: Aria2File, downloadDir: string): {
 
   const sourcePath = file.path || "";
   const rawRelativePath = path.isAbsolute(sourcePath) ? path.relative(downloadDir, sourcePath) : sourcePath;
-  const relativePath = normalizeTorrentRelativePath(rawRelativePath);
+  const diskRelativePath = normalizeTorrentDiskRelativePath(rawRelativePath);
+  const displayRelativePath = normalizeTorrentRelativePath(rawRelativePath);
+  const relativePath = diskRelativePath;
   if (!relativePath || relativePath.endsWith(".torrent")) {
     return null;
   }
 
-  const segments = relativePath.split("/").filter(Boolean);
+  const segments = (displayRelativePath ?? relativePath).split("/").filter(Boolean);
   const rawFileName = segments.at(-1) ?? "";
   if (isAria2MetadataPlaceholderFile(rawFileName)) {
     return null;
@@ -653,11 +695,11 @@ function magnetFileFromAria2File(file: Aria2File, downloadDir: string): {
 
   return {
     fileIndex,
-    relativePath: relativeDirectoryPath ? `${relativeDirectoryPath}/${fileName}` : fileName,
+    relativePath,
     fileName,
     relativeDirectoryPath,
     size,
-    mimeType: mimeTypeForMagnetFileName(fileName)
+    mimeType: mimeTypeForMagnetFileName(rawFileName)
   };
 }
 
@@ -695,7 +737,8 @@ function torrentFilesFromBencodedTorrent(bytes: Uint8Array): Array<{
 }> {
   const root = parseBencode(bytes);
   const info = bencodeDictValue(root, "info");
-  const name = sanitizeDirectorySegment(bencodeStringValue(info.get("name")) || "torrent");
+  const rawName = bencodeStringValue(info.get("name")) || "torrent";
+  const displayName = sanitizeDirectorySegment(rawName);
   const files = bencodeListValue(info.get("files"));
 
   if (files) {
@@ -710,19 +753,24 @@ function torrentFilesFromBencodedTorrent(bytes: Uint8Array): Array<{
     files.forEach((item, index) => {
       if (!(item instanceof Map)) return;
       const size = bencodeNumberValue(item.get("length"));
-      const pathParts = bencodeListValue(item.get("path"))
-        ?.map((part) => sanitizeDirectorySegment(bencodeStringValue(part) || ""))
-        .filter(Boolean) ?? [];
-      if (!Number.isSafeInteger(size) || size <= 0 || pathParts.length === 0) return;
-      const fileName = sanitizeFileName(pathParts.at(-1) ?? "file");
-      const relativeDirectoryPath = [name, ...pathParts.slice(0, -1)].filter(Boolean).join("/") || null;
+      const rawPathParts = bencodeListValue(item.get("path"))
+        ?.map((part) => bencodeStringValue(part) || "")
+        .filter((part) => part.trim().length > 0) ?? [];
+      if (!Number.isSafeInteger(size) || size <= 0 || rawPathParts.length === 0) return;
+
+      const relativePath = normalizeTorrentDiskRelativePath([rawName, ...rawPathParts].join("/"));
+      if (!relativePath) return;
+
+      const displayPathParts = rawPathParts.map((part) => sanitizeDirectorySegment(part)).filter(Boolean);
+      const fileName = sanitizeFileName(rawPathParts.at(-1) ?? "file");
+      const relativeDirectoryPath = [displayName, ...displayPathParts.slice(0, -1)].filter(Boolean).join("/") || null;
       parsed.push({
         fileIndex: index + 1,
-        relativePath: relativeDirectoryPath ? `${relativeDirectoryPath}/${fileName}` : fileName,
+        relativePath,
         fileName,
         relativeDirectoryPath,
         size,
-        mimeType: mimeTypeForMagnetFileName(fileName)
+        mimeType: mimeTypeForMagnetFileName(rawPathParts.at(-1) ?? fileName)
       });
     });
     return parsed;
@@ -733,14 +781,19 @@ function torrentFilesFromBencodedTorrent(bytes: Uint8Array): Array<{
     return [];
   }
 
-  const fileName = sanitizeFileName(name || "torrent");
+  const fileName = sanitizeFileName(rawName || "torrent");
+  const relativePath = normalizeTorrentDiskRelativePath(rawName || "torrent");
+  if (!relativePath) {
+    return [];
+  }
+
   return [{
     fileIndex: 1,
-    relativePath: fileName,
+    relativePath,
     fileName,
     relativeDirectoryPath: null,
     size,
-    mimeType: mimeTypeForMagnetFileName(fileName)
+    mimeType: mimeTypeForMagnetFileName(rawName || fileName)
   }];
 }
 

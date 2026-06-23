@@ -549,6 +549,38 @@ export async function selectMagnetImportFiles(params: {
   }
 }
 
+export async function updateMagnetImportFileMetadata(params: {
+  db: AppDatabase;
+  importId: string;
+  fileIndex: number;
+  path: string;
+  fileName: string;
+  relativeDirectoryPath?: string | null;
+  mimeType: string;
+  updatedAt: string;
+}): Promise<void> {
+  await params.db
+    .prepare(
+      `UPDATE magnet_import_files
+      SET path = ?,
+        file_name = ?,
+        relative_directory_path = ?,
+        mime_type = ?,
+        updated_at = ?
+      WHERE import_id = ? AND file_index = ?`
+    )
+    .bind(
+      params.path,
+      params.fileName,
+      params.relativeDirectoryPath ?? null,
+      params.mimeType,
+      params.updatedAt,
+      params.importId,
+      params.fileIndex
+    )
+    .run();
+}
+
 export async function updateMagnetImportFileStatus(params: {
   db: AppDatabase;
   importId: string;

@@ -23,6 +23,7 @@ const EXTENSION_TO_MIME: Record<string, string> = {
   m4v: "video/mp4",
   markdown: "text/markdown",
   md: "text/markdown",
+  mkv: "video/x-matroska",
   mov: "video/quicktime",
   mp3: "audio/mpeg",
   mp4: "video/mp4",
@@ -88,6 +89,7 @@ const MIME_TO_EXTENSION: Record<string, string> = {
   "text/plain": "txt",
   "text/typescript": "ts",
   "video/mp4": "mp4",
+  "video/x-matroska": "mkv",
   "video/quicktime": "mov",
   "video/webm": "webm"
 };
