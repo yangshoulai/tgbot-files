@@ -104,6 +104,9 @@ interface MagnetImportRefreshResult {
   aria2Status?: Aria2Status;
 }
 
+const MAGNET_FILE_CHUNK_READ_ATTEMPTS = 5;
+const MAGNET_FILE_CHUNK_READ_RETRY_MS = 600;
+
 export async function cancelMagnetImportUpload(
   env: AppEnv,
   db: AppDatabase,
@@ -207,8 +210,11 @@ export async function refreshMagnetImportStatus(
     const status = await tellAria2StatusFollowing(config, importRecord.aria2_download_gid);
     aria2Status = status;
     if (status.status === "complete") {
-      await markMagnetImportDownloaded(db, importRecord.id, new Date().toISOString());
-      importRecord = await requireMagnetImport(db, importId);
+      const files = await listMagnetImportFileRecords(db, importRecord.id);
+      if (await areSelectedMagnetFilesMaterialized(importRecord, files)) {
+        await markMagnetImportDownloaded(db, importRecord.id, new Date().toISOString());
+        importRecord = await requireMagnetImport(db, importId);
+      }
     } else if (status.status === "error" || status.status === "removed") {
       await markMagnetImportFailed(db, importRecord.id, status.errorMessage || "aria2 下载磁力文件失败", new Date().toISOString());
       importRecord = await requireMagnetImport(db, importId);
@@ -220,6 +226,26 @@ export async function refreshMagnetImportStatus(
     files: await listMagnetImportFileRecords(db, importRecord.id),
     ...(aria2Status ? { aria2Status } : {})
   };
+}
+
+async function areSelectedMagnetFilesMaterialized(
+  importRecord: MagnetImportRecord,
+  files: MagnetImportFileRecord[]
+): Promise<boolean> {
+  const selectedFiles = files.filter((file) => file.selected === 1);
+  if (selectedFiles.length === 0) {
+    return false;
+  }
+
+  for (const file of selectedFiles) {
+    const absolutePath = safeMagnetFilePath(importRecord.download_dir, file.path);
+    const stats = await lstat(absolutePath).catch(() => null);
+    if (!stats?.isFile() || stats.size < file.size) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 async function cleanupRestartableMagnetImportsBySource(
@@ -783,20 +809,27 @@ async function readMagnetFileChunk(
   const expectedSize = expectedChunkSize(upload, chunkIndex);
   const start = chunkIndex * upload.chunk_size;
   const absolutePath = safeMagnetFilePath(importRecord.download_dir, file.path);
-  const handle = await open(absolutePath, "r").catch(() => {
-    throw new AppError(409, "MagnetFileNotReady", "磁力文件尚未落盘完成");
-  });
 
-  try {
-    const buffer = new Uint8Array(expectedSize);
-    const { bytesRead } = await handle.read(buffer, 0, expectedSize, start);
-    if (bytesRead !== expectedSize) {
-      throw new AppError(409, "MagnetFileNotReady", "磁力文件分片尚未下载完成");
+  for (let attempt = 1; attempt <= MAGNET_FILE_CHUNK_READ_ATTEMPTS; attempt += 1) {
+    const handle = await open(absolutePath, "r").catch(() => null);
+    if (handle) {
+      try {
+        const buffer = new Uint8Array(expectedSize);
+        const { bytesRead } = await handle.read(buffer, 0, expectedSize, start);
+        if (bytesRead === expectedSize) {
+          return new Blob([buffer], { type: upload.mime_type });
+        }
+      } finally {
+        await handle.close();
+      }
     }
-    return new Blob([buffer], { type: upload.mime_type });
-  } finally {
-    await handle.close();
+
+    if (attempt < MAGNET_FILE_CHUNK_READ_ATTEMPTS) {
+      await delay(MAGNET_FILE_CHUNK_READ_RETRY_MS);
+    }
   }
+
+  throw new AppError(409, "MagnetFileNotReady", "磁力文件分片尚未下载完成");
 }
 
 async function deleteMagnetImportDownloadDir(
