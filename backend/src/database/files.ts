@@ -261,6 +261,7 @@ export async function updateFileRecordMetadata(params: {
   db: AppDatabase;
   id: string;
   fileName: string;
+  mimeType: string;
   remark: string | null;
   filePath: string;
 }): Promise<FileRecord | null> {
@@ -273,15 +274,16 @@ export async function updateFileRecordMetadata(params: {
   await params.db
     .prepare(
       `UPDATE files
-      SET file_name = ?, remark = ?, file_path = ?
+      SET file_name = ?, mime_type = ?, remark = ?, file_path = ?
       WHERE id = ? AND deleted_at IS NULL`
     )
-    .bind(params.fileName, params.remark, params.filePath, params.id)
+    .bind(params.fileName, params.mimeType, params.remark, params.filePath, params.id)
     .run();
 
   return {
     ...existing,
     file_name: params.fileName,
+    mime_type: params.mimeType,
     remark: params.remark,
     file_path: params.filePath
   };

@@ -206,29 +206,31 @@ curl -X POST '${ctx.baseUrl}/api/admin/files' \\
               id: "admin-files-update",
               method: "PATCH",
               path: "/api/admin/files/:id",
-              title: "修改文件名和备注",
+              title: "修改文件名、类型和备注",
               auth: "Admin Cookie",
-              summary: "更新文件展示名和备注。",
-              functionality: "读取现有文件记录，校验新文件名并在需要时重新签发 file_path。",
-              useCases: ["重命名文件。", "编辑备注。"],
-              limits: ["至少提供 file_name 或 remark。", "file_name 必须 1-180 字符且同目录唯一。"],
-              specialHandling: ["remark=null 或空字符串会清空备注。", "文件名变更会生成新的签名路径，旧链接不主动失效。"],
+              summary: "更新文件展示名、MIME 类型和备注。",
+              functionality: "读取现有文件记录，校验新文件名，并在文件名或 MIME 类型变化时重新签发 file_path；MIME 类型用于列表分类、预览和缩略图识别。",
+              useCases: ["重命名文件。", "修正文件类型。", "编辑备注。"],
+              limits: ["至少提供 file_name、mime_type 或 remark。", "file_name 必须 1-180 字符且同目录唯一。"],
+              specialHandling: ["remark=null 或空字符串会清空备注。", "文件名或 MIME 类型变更会生成新的签名路径，旧链接不主动失效。", "mime_type 只更新索引，不转换已存储的文件内容。"],
               requestParams: [
                 ctx.adminCookie,
                 p("id", "Path", "是", "string", "文件 id", "文件记录 id。"),
                 p("file_name", "Body", "否", "string", "1-180 字符", "新的文件名。"),
+                p("mime_type", "Body", "否", "string", "MIME", "新的文件类型。"),
                 p("remark", "Body", "否", "string | null", "最多 1000 字符", "新的备注；null 清空。")
               ],
               responseParams: ctx.fileResponseFields,
               requestExample: `curl -X PATCH '${ctx.baseUrl}/api/admin/files/<FILE_ID>' \\
   -H 'Cookie: admin_session=...' \\
   -H 'Content-Type: application/json' \\
-  -d '{ "file_name": "new-name.txt", "remark": "新的备注" }'`,
+  -d '{ "file_name": "new-name.txt", "mime_type": "text/plain", "remark": "新的备注" }'`,
               responseExample: `{
   "ok": true,
   "file": {
     "id": "file-id",
     "file_name": "new-name.txt",
+    "mime_type": "text/plain",
     "remark": "新的备注",
     "file_path": "/f/<new-token>/new-name.txt"
   }

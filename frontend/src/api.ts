@@ -1158,7 +1158,7 @@ export function deleteFile(id: string) {
   });
 }
 
-export function updateFileMetadata(id: string, body: { file_name?: string; remark?: string | null }) {
+export function updateFileMetadata(id: string, body: { file_name?: string; mime_type?: string; remark?: string | null }) {
   return requestJson<FileUpdateResponse>(`/api/admin/files/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: {

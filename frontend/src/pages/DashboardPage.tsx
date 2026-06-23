@@ -155,6 +155,7 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
   const [detailFile, setDetailFile] = useState<FileItem | null>(null);
   const [editingFile, setEditingFile] = useState<FileItem | null>(null);
   const [editFileName, setEditFileName] = useState("");
+  const [editMimeType, setEditMimeType] = useState("");
   const [editRemark, setEditRemark] = useState("");
   const [savingFile, setSavingFile] = useState(false);
   const [selectedFileIds, setSelectedFileIds] = useState<Set<string>>(() => new Set());
@@ -588,6 +589,7 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
   function openEditDialog(file: FileItem) {
     setEditingFile(file);
     setEditFileName(file.file_name);
+    setEditMimeType(file.mime_type || "application/octet-stream");
     setEditRemark(file.remark ?? "");
   }
 
@@ -599,11 +601,17 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
       toast.danger("请输入文件名");
       return;
     }
+    const nextMimeType = editMimeType.trim().toLowerCase();
+    if (!nextMimeType) {
+      toast.danger("请选择文件类型");
+      return;
+    }
 
     setSavingFile(true);
     try {
       const response = await updateFileMetadata(editingFile.id, {
         file_name: nextName,
+        mime_type: nextMimeType,
         remark: editRemark
       });
       const updated = response.file;
@@ -1179,10 +1187,12 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
       <EditFileDialog
         editingFile={editingFile}
         editFileName={editFileName}
+        editMimeType={editMimeType}
         editRemark={editRemark}
         savingFile={savingFile}
         onClose={() => setEditingFile(null)}
         onChangeFileName={setEditFileName}
+        onChangeMimeType={setEditMimeType}
         onChangeRemark={setEditRemark}
         onSubmit={() => void onSaveFileMetadata()}
       />

@@ -32,6 +32,7 @@ import {
   normalizeFileIdList,
   normalizeFileNameUpdate,
   normalizeFileTypeFilter,
+  normalizeMimeTypeField,
   normalizeQueryIdList,
   normalizeRemarkUpdate,
   parsePositiveInteger,
@@ -315,13 +316,15 @@ export async function handleAdminFiles(request: Request, env: AppEnv, username: 
 
     const body = await readJsonObject(request);
     const hasFileName = Object.prototype.hasOwnProperty.call(body, "file_name");
+    const hasMimeType = Object.prototype.hasOwnProperty.call(body, "mime_type");
     const hasRemark = Object.prototype.hasOwnProperty.call(body, "remark");
 
-    if (!hasFileName && !hasRemark) {
-      throw new AppError(400, "InvalidBody", "file_name or remark is required");
+    if (!hasFileName && !hasMimeType && !hasRemark) {
+      throw new AppError(400, "InvalidBody", "file_name, mime_type or remark is required");
     }
 
     const nextFileName = hasFileName ? normalizeFileNameUpdate(body.file_name) : existing.file_name;
+    const nextMimeType = hasMimeType ? normalizeMimeTypeField(body.mime_type) : existing.mime_type;
     const nextRemark = hasRemark ? normalizeRemarkUpdate(body.remark) : existing.remark;
     if (nextFileName !== existing.file_name) {
       await requireFileNameAvailable({
@@ -331,13 +334,14 @@ export async function handleAdminFiles(request: Request, env: AppEnv, username: 
         excludeId: existing.id
       });
     }
-    const nextFilePath = nextFileName === existing.file_name
+    const nextFilePath = nextFileName === existing.file_name && nextMimeType === existing.mime_type
       ? existing.file_path
-      : await createFilePathForRecord(existing, nextFileName, env);
+      : await createFilePathForRecord({ ...existing, mime_type: nextMimeType }, nextFileName, env);
     const updated = await updateFileRecordMetadata({
       db,
       id,
       fileName: nextFileName,
+      mimeType: nextMimeType,
       remark: nextRemark,
       filePath: nextFilePath
     });

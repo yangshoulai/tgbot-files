@@ -441,10 +441,11 @@ class FakeDatabaseStatement {
     }
 
     if (normalizedSql.startsWith("UPDATE FILES") && normalizedSql.includes("SET FILE_NAME")) {
-      const [fileName, remark, filePath, id] = this.bindings;
+      const [fileName, mimeType, remark, filePath, id] = this.bindings;
       const file = this.db.files.find((item) => item.id === id && item.deleted_at === null);
       if (file) {
         file.file_name = String(fileName);
+        file.mime_type = String(mimeType);
         file.remark = remark === null ? null : String(remark);
         file.file_path = String(filePath);
       }
@@ -6096,18 +6097,19 @@ video.mp4
           Cookie: cookie,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ file_name: "new name.txt", remark: "" })
+        body: JSON.stringify({ file_name: "new name.txt", mime_type: "text/markdown; charset=utf-8", remark: "" })
       }),
       adminEnv
     );
     const renameBody = await renameResponse.json() as {
-      file: { file_name: string; remark: string | null; file_path: string; url: string; download_url: string };
+      file: { file_name: string; mime_type: string; remark: string | null; file_path: string; url: string; download_url: string };
     };
     const token = renameBody.file.file_path.split("/")[2] || "";
     const payload = await verifySignedToken(token, AppEnv.LINK_SIGNING_SECRET);
 
     expect(renameResponse.status).toBe(200);
     expect(renameBody.file.file_name).toBe("new name.txt");
+    expect(renameBody.file.mime_type).toBe("text/markdown");
     expect(renameBody.file.remark).toBeNull();
     expect(renameBody.file.file_path).toMatch(/^\/f\/.+\/new%20name\.txt$/);
     expect(renameBody.file.file_path).not.toBe("/f/old-token/old.txt");
@@ -6118,11 +6120,12 @@ video.mp4
       channel_id: "default",
       file_id: "tg-edit",
       name: "new name.txt",
-      mime_type: "text/plain",
+      mime_type: "text/markdown",
       size: 8
     });
     expect(db.files[0]).toMatchObject({
       file_name: "new name.txt",
+      mime_type: "text/markdown",
       remark: null,
       file_path: renameBody.file.file_path
     });
