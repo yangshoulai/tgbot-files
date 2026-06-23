@@ -189,12 +189,15 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
   const {
     cacheSummary,
     setCacheSummary,
+    cacheSummaryLoading,
+    cacheSummaryError,
+    setCacheSummaryError,
     cacheManagerOpen,
     setCacheManagerOpen,
     cacheOperation,
     setCacheOperation,
     cacheFileIndex,
-    refreshCacheSummary,
+    refreshCacheManager,
     onCacheFile,
     onPauseFileCache,
     onResumeFileCache,
@@ -1114,10 +1117,12 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
       <CacheManagerDialog
         open={cacheManagerOpen}
         summary={cacheSummary}
+        loading={cacheSummaryLoading}
+        error={cacheSummaryError}
         operation={cacheOperation}
         cacheFileIndex={cacheFileIndex}
         onClose={() => setCacheManagerOpen(false)}
-        onRefresh={() => void refreshCacheSummary()}
+        onRefresh={() => void refreshCacheManager()}
         onClearAutomatic={() => void onClearAutomaticCache()}
         onPauseFile={(entry) => {
           const file = files.find((item) => item.id === entry.fileId);
@@ -1128,6 +1133,7 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
           setCacheOperation({ fileId: entry.fileId, kind: "pause" });
           pauseFileCache(entry.fileId)
             .then(setCacheSummary)
+            .then(() => setCacheSummaryError(null))
             .then(() => toast.success("缓存已暂停"))
             .catch((error) => toast.danger(errorMessage(error)))
             .finally(() => setCacheOperation(null));
@@ -1149,6 +1155,7 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
           setCacheOperation({ fileId: entry.fileId, kind: "terminate" });
           terminateFileCache(entry.fileId)
             .then(setCacheSummary)
+            .then(() => setCacheSummaryError(null))
             .then(() => toast.success("缓存已终止"))
             .catch((error) => toast.danger(errorMessage(error)))
             .finally(() => setCacheOperation(null));
@@ -1162,6 +1169,7 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
           setCacheOperation({ fileId: entry.fileId, kind: "clear" });
           clearFileCache(entry.fileId)
             .then(setCacheSummary)
+            .then(() => setCacheSummaryError(null))
             .then(() => toast.success("缓存已清除"))
             .catch((error) => toast.danger(errorMessage(error)))
             .finally(() => setCacheOperation(null));

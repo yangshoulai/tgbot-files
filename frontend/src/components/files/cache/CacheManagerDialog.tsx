@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Play, RefreshCw, Square, Trash2 } from "lucide-react";
+import { AlertCircle, Play, RefreshCw, Square, Trash2 } from "lucide-react";
 import type { FileItem } from "../../../api";
 import { formatBytes } from "../../../utils";
 import { cn } from "../../../lib/cn";
@@ -9,12 +9,15 @@ import { Button } from "../../ui/Button";
 import { IconButton } from "../../ui/IconButton";
 import { Modal } from "../../ui/Modal";
 import { FileVisual } from "../../ui/FileVisual";
+import { Spinner } from "../../ui/Spinner";
 
 export type CacheOperation = { fileId: string; kind: "cache" | "pause" | "resume" | "terminate" | "clear" } | null;
 
 interface CacheManagerDialogProps {
   open: boolean;
   summary: FileCacheSummary | null;
+  loading?: boolean;
+  error?: string | null;
   operation: CacheOperation;
   cacheFileIndex: Map<string, FileItem>;
   onClose: () => void;
@@ -29,6 +32,8 @@ interface CacheManagerDialogProps {
 export function CacheManagerDialog({
   open,
   summary,
+  loading = false,
+  error = null,
   operation,
   cacheFileIndex,
   onClose,
@@ -61,7 +66,7 @@ export function CacheManagerDialog({
         bodyClassName="overflow-auto px-4 py-4 sm:px-5"
         footer={
           <>
-            <Button variant="secondary" leadingIcon={<RefreshCw size={15} />} onClick={onRefresh}>
+            <Button variant="secondary" leadingIcon={<RefreshCw size={15} />} loading={loading} onClick={onRefresh}>
               刷新
             </Button>
             <Button variant="secondary" leadingIcon={<Trash2 size={15} />} disabled={!hasAutomaticEntries} onClick={onClearAutomatic}>
@@ -74,13 +79,46 @@ export function CacheManagerDialog({
         }
       >
         <div className="overflow-hidden rounded-2xl border border-border bg-background">
-          {entries.length === 0 ? (
+          {loading && !summary ? (
+            <div className="grid min-h-60 place-items-center px-5 py-10 text-center">
+              <div className="flex flex-col items-center gap-3">
+                <span className="grid size-11 place-items-center rounded-full bg-primary-soft text-primary-strong">
+                  <Spinner size={20} />
+                </span>
+                <div>
+                  <p className="text-sm font-medium text-foreground">正在读取缓存索引</p>
+                  <p className="mt-1 text-xs text-muted">页面刷新后需要等待缓存 Service Worker 接管当前页面。</p>
+                </div>
+              </div>
+            </div>
+          ) : error && !summary ? (
+            <div className="grid min-h-60 place-items-center px-5 py-10 text-center">
+              <div className="flex max-w-md flex-col items-center gap-3">
+                <span className="grid size-11 place-items-center rounded-full bg-danger-soft text-danger">
+                  <AlertCircle size={20} />
+                </span>
+                <div>
+                  <p className="text-sm font-medium text-foreground">缓存索引读取失败</p>
+                  <p className="mt-1 text-xs leading-5 text-muted">{error}</p>
+                </div>
+                <Button variant="secondary" size="sm" leadingIcon={<RefreshCw size={15} />} loading={loading} onClick={onRefresh}>
+                  重新读取
+                </Button>
+              </div>
+            </div>
+          ) : entries.length === 0 ? (
             <div className="px-5 py-10 text-center">
               <p className="text-sm font-medium text-foreground">暂无缓存文件</p>
               <p className="mt-1 text-xs text-muted">预览文件会产生自动缓存，也可以在文件菜单中手动缓存。</p>
             </div>
           ) : (
             <div className="max-h-[min(70dvh,44rem)] overflow-y-auto overflow-x-hidden scroll-thin">
+              {error ? (
+                <div className="flex items-center gap-2 border-b border-warning/20 bg-warning-soft px-4 py-2 text-xs text-warning">
+                  <AlertCircle size={14} className="shrink-0" />
+                  <span className="min-w-0 truncate">缓存索引刷新失败，当前显示的是上次读取结果：{error}</span>
+                </div>
+              ) : null}
               <table className="w-full table-fixed border-collapse text-sm">
                 <colgroup>
                   <col className="w-[34%]" />

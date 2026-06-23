@@ -1,7 +1,7 @@
 import type { FileItem } from "../api";
 import { canUseAcceleratedDownload, extractSignedFileToken } from "./accelerated-download";
 import { hasFileLinkAccess } from "./file-access";
-import { getVideoPreviewServiceWorkerController } from "./video-preview-service-worker";
+import { ensureVideoPreviewServiceWorker, getVideoPreviewServiceWorkerController } from "./video-preview-service-worker";
 
 export type FileCacheSource = "auto" | "manual";
 export type FileCacheKind = "single" | "multipart" | "hls";
@@ -237,10 +237,22 @@ export function clearAutomaticFileCache(): Promise<FileCacheSummary> {
   }).then((summary) => normalizeFileCacheSummary(summary));
 }
 
-function requestFileCacheMessage<T>(message: FileCacheRequestMessage, timeoutMs = DEFAULT_CACHE_REQUEST_TIMEOUT_MS): Promise<T> {
-  const controller = getVideoPreviewServiceWorkerController();
-  if (!controller || typeof MessageChannel === "undefined") {
-    return Promise.reject(new Error("文件缓存 Service Worker 尚未接管当前页面，请刷新后重试"));
+async function requestFileCacheMessage<T>(message: FileCacheRequestMessage, timeoutMs = DEFAULT_CACHE_REQUEST_TIMEOUT_MS): Promise<T> {
+  if (typeof MessageChannel === "undefined") {
+    throw new Error("当前浏览器不支持文件缓存消息通道");
+  }
+
+  let controller = getVideoPreviewServiceWorkerController();
+  if (!controller) {
+    const result = await ensureVideoPreviewServiceWorker();
+    if (!result.controlled) {
+      throw new Error(result.error || "文件缓存 Service Worker 尚未接管当前页面，请稍后重试");
+    }
+    controller = getVideoPreviewServiceWorkerController();
+  }
+
+  if (!controller) {
+    throw new Error("文件缓存 Service Worker 尚未接管当前页面，请稍后重试");
   }
 
   const requestId = `file-cache-${Date.now()}-${Math.random().toString(36).slice(2)}`;

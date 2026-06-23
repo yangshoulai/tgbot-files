@@ -39,12 +39,18 @@ export function useFileCacheManager({ files, session, toast }: UseFileCacheManag
   const [cacheFiles, setCacheFiles] = useState<FileItem[]>([]);
   const [cacheManagerOpen, setCacheManagerOpen] = useState(false);
   const [cacheOperation, setCacheOperation] = useState<CacheOperation>(null);
+  const [cacheSummaryLoading, setCacheSummaryLoading] = useState(false);
+  const [cacheSummaryError, setCacheSummaryError] = useState<string | null>(null);
 
   const refreshCacheSummary = useCallback(async () => {
+    setCacheSummaryLoading(true);
     try {
       setCacheSummary(await getFileCacheSummary());
-    } catch {
-      setCacheSummary(null);
+      setCacheSummaryError(null);
+    } catch (error) {
+      setCacheSummaryError(errorMessage(error));
+    } finally {
+      setCacheSummaryLoading(false);
     }
   }, []);
 
@@ -91,16 +97,22 @@ export function useFileCacheManager({ files, session, toast }: UseFileCacheManag
     }
   }, []);
 
+  const refreshCacheManager = useCallback(async () => {
+    await Promise.all([
+      refreshCacheSummary(),
+      refreshCacheFileIndex()
+    ]);
+  }, [refreshCacheFileIndex, refreshCacheSummary]);
+
   useEffect(() => {
     void refreshCacheSummary();
   }, [refreshCacheSummary]);
 
   useEffect(() => {
     if (cacheManagerOpen) {
-      void refreshCacheSummary();
-      void refreshCacheFileIndex();
+      void refreshCacheManager();
     }
-  }, [cacheManagerOpen, refreshCacheFileIndex, refreshCacheSummary]);
+  }, [cacheManagerOpen, refreshCacheManager]);
 
   useEffect(() => {
     if (cacheManagerOpen) {
@@ -140,6 +152,7 @@ export function useFileCacheManager({ files, session, toast }: UseFileCacheManag
     setCacheOperation({ fileId: file.id, kind: "pause" });
     try {
       setCacheSummary(await pauseFileCache(file.id));
+      setCacheSummaryError(null);
       toast.success("缓存已暂停");
     } catch (error) {
       toast.danger(errorMessage(error));
@@ -154,6 +167,7 @@ export function useFileCacheManager({ files, session, toast }: UseFileCacheManag
       await requestPersistentFileCacheStorage();
       const metadata = buildFileCacheMetadata(file, Number.MAX_SAFE_INTEGER, "manual");
       setCacheSummary(await resumeFileCache(file.id, metadata ?? undefined));
+      setCacheSummaryError(null);
       toast.success("缓存已继续");
     } catch (error) {
       toast.danger(errorMessage(error));
@@ -166,6 +180,7 @@ export function useFileCacheManager({ files, session, toast }: UseFileCacheManag
     setCacheOperation({ fileId: file.id, kind: "terminate" });
     try {
       setCacheSummary(await terminateFileCache(file.id));
+      setCacheSummaryError(null);
       toast.success("缓存已终止");
     } catch (error) {
       toast.danger(errorMessage(error));
@@ -181,6 +196,7 @@ export function useFileCacheManager({ files, session, toast }: UseFileCacheManag
       const indexedFile = cacheFileIndex.get(fileId);
       const metadata = indexedFile ? buildFileCacheMetadata(indexedFile, Number.MAX_SAFE_INTEGER, "manual") : null;
       setCacheSummary(await resumeFileCache(fileId, metadata ?? undefined));
+      setCacheSummaryError(null);
       toast.success("缓存已继续");
     } catch (error) {
       toast.danger(errorMessage(error));
@@ -193,6 +209,7 @@ export function useFileCacheManager({ files, session, toast }: UseFileCacheManag
     setCacheOperation({ fileId: file.id, kind: "clear" });
     try {
       setCacheSummary(await clearFileCache(file.id));
+      setCacheSummaryError(null);
       toast.success("缓存已清除");
     } catch (error) {
       toast.danger(errorMessage(error));
@@ -204,6 +221,7 @@ export function useFileCacheManager({ files, session, toast }: UseFileCacheManag
   async function onClearAutomaticCache() {
     try {
       setCacheSummary(await clearAutomaticFileCache());
+      setCacheSummaryError(null);
       toast.success("自动缓存已清理");
     } catch (error) {
       toast.danger(errorMessage(error));
@@ -218,6 +236,9 @@ export function useFileCacheManager({ files, session, toast }: UseFileCacheManag
   return {
     cacheSummary,
     setCacheSummary,
+    cacheSummaryLoading,
+    cacheSummaryError,
+    setCacheSummaryError,
     cacheFiles,
     cacheManagerOpen,
     setCacheManagerOpen,
@@ -225,6 +246,7 @@ export function useFileCacheManager({ files, session, toast }: UseFileCacheManag
     setCacheOperation,
     cacheFileIndex,
     refreshCacheSummary,
+    refreshCacheManager,
     onCacheFile,
     onPauseFileCache,
     onResumeFileCache,
