@@ -1,5 +1,5 @@
 import { ChangeEvent, useEffect, useState } from "react";
-import { Check, ImageOff, ImagePlus, Link2 } from "lucide-react";
+import { Check, ImageOff, ImagePlus, Link2, Sparkles } from "lucide-react";
 import {
   ApiError,
   clearFileThumbnail,
@@ -8,12 +8,16 @@ import {
   type SourceRequestHeaders
 } from "../../api";
 import { parseCurlCommand } from "../../lib/curl";
+import { hasFileLinkAccess } from "../../lib/file-access";
 import { useToast } from "../../lib/toast";
 import {
+  generateThumbnailFromHlsPlaylist,
+  generateThumbnailFromRemoteSource,
   generateThumbnailFromFile,
   revokeThumbnail,
   type GeneratedThumbnail
 } from "../../lib/thumbnail";
+import { buildVideoPreviewMetadata, buildVideoPreviewUrl } from "../../lib/video-preview";
 import { formatBytes } from "../../utils";
 import { Button } from "../ui/Button";
 import { Modal } from "../ui/Modal";
@@ -21,7 +25,7 @@ import { Textarea } from "../ui/Textarea";
 import { Spinner } from "../ui/Spinner";
 import { Segmented } from "../ui/Segmented";
 
-type ThumbnailInputMode = "local" | "url";
+type ThumbnailInputMode = "auto" | "local" | "url";
 
 interface ThumbnailEditDialogProps {
   file: FileItem | null;
@@ -59,7 +63,7 @@ export function ThumbnailEditDialog({ file, onClose, onSaved }: ThumbnailEditDia
       return;
     }
 
-    setMode("local");
+    setMode(autoThumbnailSupported(file) ? "auto" : "local");
     setUrlText("");
     setMessage(undefined);
     setError(undefined);
@@ -98,9 +102,29 @@ export function ThumbnailEditDialog({ file, onClose, onSaved }: ThumbnailEditDia
     }
   }
 
+  async function generateAutomaticThumbnail() {
+    if (!file) return;
+
+    setMode("auto");
+    setError(undefined);
+    setMessage("正在从当前文件生成缩略图");
+    setGenerating(true);
+    try {
+      const thumbnail = await generateThumbnailFromFileItem(file);
+      updateGenerated(thumbnail);
+      setMessage(`已生成 ${thumbnail.width ?? "?"} × ${thumbnail.height ?? "?"} 缩略图，${formatBytes(thumbnail.blob.size)}`);
+    } catch (thumbnailError) {
+      updateGenerated(undefined);
+      setError(errorMessage(thumbnailError));
+      setMessage(undefined);
+    } finally {
+      setGenerating(false);
+    }
+  }
+
   async function saveLocalThumbnail() {
     if (!file || !generated) {
-      setError("请先选择本地缩略图");
+      setError(mode === "auto" ? "请先自动生成缩略图" : "请先选择本地缩略图");
       return;
     }
 
@@ -169,7 +193,8 @@ export function ThumbnailEditDialog({ file, onClose, onSaved }: ThumbnailEditDia
     }
   }
 
-  const canSave = mode === "local" ? Boolean(generated) : Boolean(urlText.trim());
+  const supportsAutoThumbnail = Boolean(file && autoThumbnailSupported(file));
+  const canSave = mode === "url" ? Boolean(urlText.trim()) : Boolean(generated);
 
   return (
     <Modal
@@ -200,7 +225,7 @@ export function ThumbnailEditDialog({ file, onClose, onSaved }: ThumbnailEditDia
             disabled={!canSave || generating}
             loading={saving}
             leadingIcon={<Check size={15} />}
-            onClick={() => void (mode === "local" ? saveLocalThumbnail() : saveUrlThumbnail())}
+            onClick={() => void (mode === "url" ? saveUrlThumbnail() : saveLocalThumbnail())}
           >
             保存缩略图
           </Button>
@@ -216,6 +241,7 @@ export function ThumbnailEditDialog({ file, onClose, onSaved }: ThumbnailEditDia
           }}
           ariaLabel="缩略图来源"
           options={[
+            { value: "auto", label: "自动生成", icon: <Sparkles size={15} /> },
             { value: "local", label: "本地图片", icon: <ImagePlus size={15} /> },
             { value: "url", label: "URL / cURL", icon: <Link2 size={15} /> }
           ]}
@@ -224,9 +250,9 @@ export function ThumbnailEditDialog({ file, onClose, onSaved }: ThumbnailEditDia
         <div className="grid gap-3 sm:grid-cols-[8rem_minmax(0,1fr)]">
           <div className="grid aspect-video place-items-center overflow-hidden rounded-xl border border-border bg-background">
             {generated ? (
-              <img src={generated.objectUrl} alt="新缩略图预览" className="h-full w-full object-cover" />
+              <img src={generated.objectUrl} alt="新缩略图预览" className="max-h-full max-w-full object-contain" />
             ) : file?.thumbnail_url ? (
-              <img src={file.thumbnail_url} alt="当前缩略图" className="h-full w-full object-cover" />
+              <img src={file.thumbnail_url} alt="当前缩略图" className="max-h-full max-w-full object-contain" />
             ) : (
               <span className="flex flex-col items-center gap-1 text-xs text-subtle">
                 {generating ? <Spinner size={18} /> : <ImagePlus size={20} />}
@@ -235,7 +261,27 @@ export function ThumbnailEditDialog({ file, onClose, onSaved }: ThumbnailEditDia
             )}
           </div>
 
-          {mode === "local" ? (
+          {mode === "auto" ? (
+            <div className="flex flex-col justify-center gap-2">
+              <Button
+                variant="secondary"
+                leadingIcon={<Sparkles size={16} />}
+                loading={generating}
+                disabled={saving || !supportsAutoThumbnail}
+                onClick={() => void generateAutomaticThumbnail()}
+              >
+                自动生成缩略图
+              </Button>
+              <p className="text-xs leading-5 text-muted">
+                图片会按原始比例生成；视频会从前几帧中截取非空白画面。HLS 会优先读取首个片段，失败后使用浏览器播放器截帧。
+              </p>
+              {!supportsAutoThumbnail ? (
+                <p className="rounded-lg border border-warning/25 bg-warning-soft px-2.5 py-2 text-xs leading-5 text-warning">
+                  当前文件类型或访问方式不支持自动生成，请选择本地图片或 URL。
+                </p>
+              ) : null}
+            </div>
+          ) : mode === "local" ? (
             <div className="flex flex-col justify-center gap-2">
               <label className="inline-flex h-10 cursor-pointer items-center justify-center gap-2 rounded-lg border border-border bg-surface px-4 text-sm font-medium text-foreground shadow-card transition-colors hover:border-border-strong hover:bg-background">
                 <ImagePlus size={16} />
@@ -290,6 +336,71 @@ export function ThumbnailEditDialog({ file, onClose, onSaved }: ThumbnailEditDia
       </div>
     </Modal>
   );
+}
+
+function autoThumbnailSupported(file: FileItem): boolean {
+  const sourceKind = thumbnailSourceKindForFile(file);
+  if (!sourceKind) return false;
+  if (sourceKind === "image") return hasFileLinkAccess(file);
+  return Boolean(buildVideoPreviewUrl(file, buildVideoPreviewMetadata(file, Number.MAX_SAFE_INTEGER, 1)));
+}
+
+async function generateThumbnailFromFileItem(file: FileItem): Promise<GeneratedThumbnail> {
+  const sourceKind = thumbnailSourceKindForFile(file);
+  if (!sourceKind) {
+    throw new Error("当前文件类型不支持自动生成缩略图");
+  }
+
+  if (file.storage_backend === "hls_package") {
+    const metadata = buildVideoPreviewMetadata(file, Number.MAX_SAFE_INTEGER, 1);
+    const previewUrl = buildVideoPreviewUrl(file, metadata);
+    if (!previewUrl) {
+      throw new Error("无法生成 HLS 预览地址");
+    }
+    return generateThumbnailFromHlsPlaylist(previewUrl, file.file_name);
+  }
+
+  if (sourceKind === "video") {
+    const metadata = buildVideoPreviewMetadata(file, Number.MAX_SAFE_INTEGER, 1);
+    const previewUrl = buildVideoPreviewUrl(file, metadata);
+    if (!previewUrl) {
+      throw new Error("无法生成视频预览地址");
+    }
+    return generateThumbnailFromRemoteSource({
+      kind: "video",
+      url: previewUrl,
+      mime_type: file.mime_type
+    }, file.file_name);
+  }
+
+  return generateThumbnailFromRemoteSource({
+    kind: "image",
+    url: file.file_path,
+    mime_type: file.mime_type
+  }, file.file_name);
+}
+
+function thumbnailSourceKindForFile(file: FileItem): "image" | "video" | null {
+  const mimeType = file.mime_type.toLowerCase();
+  const fileName = file.file_name.toLowerCase();
+
+  if (mimeType.startsWith("image/") && mimeType !== "image/svg+xml") {
+    return "image";
+  }
+
+  if (
+    file.storage_backend === "hls_package" ||
+    mimeType.startsWith("video/") ||
+    /\.(mp4|m4v|mov|webm|ogv|m3u8)$/i.test(fileName)
+  ) {
+    return "video";
+  }
+
+  if (/\.(jpg|jpeg|png|webp|gif|bmp|avif)$/i.test(fileName)) {
+    return "image";
+  }
+
+  return null;
 }
 
 function parseRemoteThumbnailInput(input: string): { url: string; headers?: SourceRequestHeaders; summary: string } {
