@@ -150,7 +150,7 @@ export function EditFileDialog({
           </p>
         ) : null}
         {editingFile && normalizedMimeType && normalizedMimeType !== editingFile.mime_type ? (
-          <p className="rounded-xl border border-border bg-muted px-3 py-2 text-xs leading-5 text-muted">
+          <p className="rounded-xl border border-border bg-background px-3 py-2 text-xs leading-5 text-muted">
             文件类型只更新索引和预览识别，不会转换已存储的文件内容。
           </p>
         ) : null}
