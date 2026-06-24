@@ -51,7 +51,7 @@ import {
 } from "./multipart-access";
 
 const HLS_PLAYLIST_MIME_TYPE = "application/vnd.apple.mpegurl";
-const HLS_PREVIEW_SEGMENT_COUNT = 4;
+const HLS_PREVIEW_SEGMENT_COUNT = 6;
 
 export async function handleAdminHlsPreviewPlaylist(request: Request, env: AppEnv, assetId: string): Promise<Response> {
   const db = requireDb(env);

@@ -23,8 +23,8 @@ const MAX_GENERATED_THUMBNAIL_BYTES = 512 * 1024;
 const JPEG_QUALITY = 0.82;
 const VIDEO_JPEG_QUALITY = 0.95;
 const VIDEO_SEEK_SECONDS = 0.75;
-const VIDEO_THUMBNAIL_CANDIDATE_LIMIT = 4;
-const HLS_THUMBNAIL_CANDIDATE_LIMIT = 6;
+const VIDEO_THUMBNAIL_CANDIDATE_LIMIT = 6;
+const THUMBNAIL_CANDIDATE_RATIOS = [0.06, 0.16, 0.3, 0.45, 0.62, 0.8, 0.9];
 const VIDEO_FRAME_WAIT_TIMEOUT_MS = 800;
 const VIDEO_FORCED_FRAME_WAIT_TIMEOUT_MS = 2500;
 const HLS_THUMBNAIL_BUFFER_TIMEOUT_MS = 18000;
@@ -38,6 +38,15 @@ const VIDEO_BLANK_BLACK_LUMA = 22;
 const AUDIO_METADATA_SCAN_BYTES = 16 * 1024 * 1024;
 const ID3_MAX_TAG_BYTES = 32 * 1024 * 1024;
 
+interface HlsThumbnailSegmentSource {
+  initUrl?: string;
+  segmentUrl: string;
+  startTime: number;
+  duration: number;
+  targetTime: number;
+  segmentTime: number;
+}
+
 interface VideoThumbnailRenderOptions {
   forceFrameDecode?: boolean;
   captureCurrentFrameFirst?: boolean;
@@ -45,6 +54,8 @@ interface VideoThumbnailRenderOptions {
   seekTimeoutMs?: number;
   readyTimeoutMs?: number;
   candidateLimit?: number;
+  targetTimes?: Array<number | null>;
+  captureTimeBaseSeconds?: number;
 }
 
 interface DrawCanvasOptions {
@@ -145,17 +156,28 @@ export async function generateThumbnailCandidatesFromHlsPlaylist(
   playlistUrl: string,
   fileName = "hls-video.m3u8"
 ): Promise<GeneratedThumbnail[]> {
+  const playlist = await fetchTextWithTimeout(playlistUrl, HLS_THUMBNAIL_BUFFER_TIMEOUT_MS);
   try {
+    const candidates = await generateThumbnailCandidatesFromHlsSegments(playlist, playlistUrl, fileName);
+    if (candidates.length >= VIDEO_THUMBNAIL_CANDIDATE_LIMIT) {
+      return candidates;
+    }
+  } catch {
+    // Fall back to player-based seeking below.
+  }
+
+  try {
+    const duration = hlsPlaylistDuration(playlist, playlistUrl);
     return await withTimeout(
-      generateThumbnailCandidatesFromHlsPlayer(playlistUrl, fileName),
+      generateThumbnailCandidatesFromHlsPlayer(playlistUrl, fileName, duration),
       HLS_PLAYER_CANDIDATE_TIMEOUT_MS,
       "HLS 候选缩略图生成超时"
     );
   } catch {
-    // Fall back to a single first-segment thumbnail instead of showing repeated candidates from one short segment.
+    // Fall back to first-segment candidates when playlist-wide capture is unavailable.
   }
 
-  return [await generateThumbnailFromHlsFirstSegment(playlistUrl, fileName)];
+  return generateThumbnailCandidatesFromHlsFirstSegment(playlistUrl, fileName);
 }
 
 async function generateThumbnailFromHlsPlayer(playlistUrl: string, fileName: string): Promise<GeneratedThumbnail> {
@@ -167,7 +189,11 @@ async function generateThumbnailFromHlsPlayer(playlistUrl: string, fileName: str
   return first;
 }
 
-async function generateThumbnailCandidatesFromHlsPlayer(playlistUrl: string, fileName: string): Promise<GeneratedThumbnail[]> {
+async function generateThumbnailCandidatesFromHlsPlayer(
+  playlistUrl: string,
+  fileName: string,
+  durationOverride?: number
+): Promise<GeneratedThumbnail[]> {
   const video = document.createElement("video");
   let hls: Hls | null = null;
   const detachVideo = attachHiddenCaptureVideo(video);
@@ -202,12 +228,11 @@ async function generateThumbnailCandidatesFromHlsPlayer(playlistUrl: string, fil
     await metadataReady;
     await bufferReady;
     await waitForVideoDimensions(video);
-    return renderLoadedVideoThumbnailCandidates(video, fileName, "auto", undefined, undefined, undefined, {
+    return renderLoadedVideoThumbnailCandidates(video, fileName, "auto", durationOverride, undefined, undefined, {
       forceFrameDecode: true,
       captureCurrentFrameFirst: false,
       seekTimeoutMs: VIDEO_SEEK_TIMEOUT_MS,
-      readyTimeoutMs: VIDEO_READY_TIMEOUT_MS,
-      candidateLimit: HLS_THUMBNAIL_CANDIDATE_LIMIT
+      readyTimeoutMs: VIDEO_READY_TIMEOUT_MS
     });
   } finally {
     hls?.destroy();
@@ -246,6 +271,59 @@ async function generateThumbnailCandidatesFromHlsFirstSegment(playlistUrl: strin
     captureCurrentFrameFirst: true,
     acceptBlankFrame: true
   });
+}
+
+async function generateThumbnailCandidatesFromHlsSegments(
+  playlistText: string,
+  playlistUrl: string,
+  fileName: string
+): Promise<GeneratedThumbnail[]> {
+  const sources = hlsThumbnailSegmentSources(playlistText, playlistUrl, VIDEO_THUMBNAIL_CANDIDATE_LIMIT);
+  const thumbnails: GeneratedThumbnail[] = [];
+
+  try {
+    for (const source of sources) {
+      const thumbnail = await generateThumbnailFromHlsSegmentSource(source, fileName);
+      thumbnails.push(thumbnail);
+    }
+  } catch (error) {
+    for (const thumbnail of thumbnails) {
+      revokeThumbnail(thumbnail);
+    }
+    throw error;
+  }
+
+  return thumbnails;
+}
+
+async function generateThumbnailFromHlsSegmentSource(
+  source: HlsThumbnailSegmentSource,
+  fileName: string
+): Promise<GeneratedThumbnail> {
+  const [segment, initSegment] = await Promise.all([
+    fetchBytesWithTimeout(source.segmentUrl, "HLS 片段读取失败"),
+    source.initUrl ? fetchBytesWithTimeout(source.initUrl, "HLS init segment 读取失败") : Promise.resolve(undefined)
+  ]);
+
+  const segmentBlob = initSegment
+    ? new Blob([arrayBufferFromBytes(initSegment.bytes), arrayBufferFromBytes(segment.bytes)], { type: "video/mp4" })
+    : isMp4Bytes(segment.bytes, segment.contentType)
+      ? new Blob([arrayBufferFromBytes(segment.bytes)], { type: segment.contentType || "video/mp4" })
+      : await transmuxTsSegmentToMp4(segment.bytes);
+  const objectUrl = URL.createObjectURL(segmentBlob);
+  const candidate = await renderVideoThumbnail(objectUrl, fileName, "auto", true, {
+    forceFrameDecode: true,
+    targetTimes: [source.segmentTime],
+    acceptBlankFrame: true,
+    seekTimeoutMs: VIDEO_SEEK_TIMEOUT_MS,
+    readyTimeoutMs: VIDEO_READY_TIMEOUT_MS,
+    captureTimeBaseSeconds: source.startTime
+  });
+
+  return {
+    ...candidate,
+    captureTimeSeconds: source.targetTime
+  };
 }
 
 async function fetchBytesWithTimeout(url: string, label: string): Promise<{ bytes: Uint8Array; contentType: string }> {
@@ -295,7 +373,10 @@ async function renderVideoThumbnail(
   revokeSourceUrl: boolean,
   options: VideoThumbnailRenderOptions = {}
 ): Promise<GeneratedThumbnail> {
-  const candidates = await renderVideoThumbnailCandidates(sourceUrl, fileName, generatedSource, revokeSourceUrl, options);
+  const candidates = await renderVideoThumbnailCandidates(sourceUrl, fileName, generatedSource, revokeSourceUrl, {
+    ...options,
+    candidateLimit: 1
+  });
   const first = candidates[0];
   if (!first) {
     throw new Error("视频截帧为空白，请手动选择缩略图");
@@ -347,7 +428,10 @@ async function renderLoadedVideoThumbnail(
   height = video.videoHeight,
   options: VideoThumbnailRenderOptions = {}
 ): Promise<GeneratedThumbnail> {
-  const candidates = await renderLoadedVideoThumbnailCandidates(video, fileName, generatedSource, duration, width, height, options);
+  const candidates = await renderLoadedVideoThumbnailCandidates(video, fileName, generatedSource, duration, width, height, {
+    ...options,
+    candidateLimit: 1
+  });
   const first = candidates[0];
   if (!first) {
     throw new Error("视频截帧为空白，请手动选择缩略图");
@@ -373,10 +457,11 @@ async function renderLoadedVideoThumbnailCandidates(
   let lastError: Error | undefined;
   let sawBlankFrame = false;
   const thumbnails: GeneratedThumbnail[] = [];
+  const blankThumbnails: GeneratedThumbnail[] = [];
   const candidateLimit = options.candidateLimit ?? VIDEO_THUMBNAIL_CANDIDATE_LIMIT;
-  const targetTimes: Array<number | null> = options.captureCurrentFrameFirst
+  const targetTimes: Array<number | null> = options.targetTimes ?? (options.captureCurrentFrameFirst
     ? [null, ...videoCaptureTimes(duration)]
-    : videoCaptureTimes(duration);
+    : videoCaptureTimes(duration));
 
   for (const targetTime of targetTimes) {
     try {
@@ -399,25 +484,40 @@ async function renderLoadedVideoThumbnailCandidates(
         }
       );
 
+      const thumbnail = await canvasToGeneratedThumbnail(canvas, fileName, generatedSource, {
+        quality: VIDEO_JPEG_QUALITY,
+        maxBytes: MAX_GENERATED_THUMBNAIL_BYTES,
+        captureTimeSeconds: targetTime === null
+          ? (options.captureTimeBaseSeconds ?? null)
+          : (options.captureTimeBaseSeconds ?? 0) + targetTime
+      });
       if (options.acceptBlankFrame || !isProbablyBlankVideoFrame(canvas)) {
-        thumbnails.push(await canvasToGeneratedThumbnail(canvas, fileName, generatedSource, {
-          quality: VIDEO_JPEG_QUALITY,
-          maxBytes: MAX_GENERATED_THUMBNAIL_BYTES,
-          captureTimeSeconds: targetTime
-        }));
+        thumbnails.push(thumbnail);
         if (thumbnails.length >= candidateLimit) {
           break;
         }
         continue;
       }
+
+      blankThumbnails.push(thumbnail);
       sawBlankFrame = true;
+      if (thumbnails.length + blankThumbnails.length >= candidateLimit) {
+        break;
+      }
     } catch (error) {
       lastError = error instanceof Error ? error : new Error("视频帧读取失败");
     }
   }
 
+  while (thumbnails.length < candidateLimit && blankThumbnails.length > 0) {
+    thumbnails.push(blankThumbnails.shift()!);
+  }
+  for (const unused of blankThumbnails) {
+    revokeThumbnail(unused);
+  }
+
   if (thumbnails.length > 0) {
-    return thumbnails;
+    return await fillThumbnailCandidates(thumbnails, candidateLimit);
   }
 
   if (sawBlankFrame) {
@@ -425,6 +525,26 @@ async function renderLoadedVideoThumbnailCandidates(
   }
 
   throw lastError ?? new Error("视频截帧为空白，请手动选择缩略图");
+}
+
+async function fillThumbnailCandidates(
+  thumbnails: GeneratedThumbnail[],
+  candidateLimit: number
+): Promise<GeneratedThumbnail[]> {
+  if (thumbnails.length === 0 || thumbnails.length >= candidateLimit) {
+    return thumbnails.slice(0, candidateLimit);
+  }
+
+  const filled = [...thumbnails];
+  for (let index = 0; filled.length < candidateLimit; index += 1) {
+    const source = thumbnails[index % thumbnails.length]!;
+    filled.push({
+      ...source,
+      objectUrl: URL.createObjectURL(source.blob)
+    });
+  }
+
+  return filled;
 }
 
 async function renderAudioCoverThumbnail(file: File, generatedSource: "auto" | "manual"): Promise<GeneratedThumbnail> {
@@ -502,6 +622,113 @@ function firstHlsMediaSource(playlistText: string, playlistUrl: string): { initU
   }
 
   throw new Error("HLS playlist 缺少可截帧片段");
+}
+
+function hlsThumbnailSegmentSources(
+  playlistText: string,
+  playlistUrl: string,
+  count: number
+): HlsThumbnailSegmentSource[] {
+  const segments = hlsMediaSegments(playlistText, playlistUrl);
+  if (segments.length === 0) {
+    throw new Error("HLS playlist 缺少可截帧片段");
+  }
+
+  const totalDuration = segments.reduce((total, segment) => total + Math.max(0, segment.duration), 0);
+  if (!Number.isFinite(totalDuration) || totalDuration <= 0) {
+    throw new Error("HLS playlist 缺少有效时长");
+  }
+
+  const selected: HlsThumbnailSegmentSource[] = [];
+  for (const ratio of THUMBNAIL_CANDIDATE_RATIOS) {
+    const targetTime = Math.max(0, Math.min(totalDuration - 0.001, totalDuration * ratio));
+    const index = hlsSegmentIndexAtTime(segments, targetTime);
+    const segment = segments[index]!;
+    selected.push({
+      ...segment,
+      targetTime,
+      segmentTime: Math.max(0, Math.min(segment.duration * 0.8, targetTime - segment.startTime))
+    });
+    if (selected.length >= count) {
+      break;
+    }
+  }
+
+  for (let index = 0; selected.length < count; index += 1) {
+    const segment = segments[index % segments.length]!;
+    const ratio = (selected.length + 1) / (count + 1);
+    const segmentTime = Math.max(0, Math.min(segment.duration * 0.8, segment.duration * ratio));
+    selected.push({
+      ...segment,
+      targetTime: segment.startTime + segmentTime,
+      segmentTime
+    });
+  }
+
+  return selected.slice(0, count);
+}
+
+function hlsPlaylistDuration(playlistText: string, playlistUrl: string): number | undefined {
+  const duration = hlsMediaSegments(playlistText, playlistUrl)
+    .reduce((total, segment) => total + Math.max(0, segment.duration), 0);
+  return Number.isFinite(duration) && duration > 0 ? duration : undefined;
+}
+
+function hlsMediaSegments(playlistText: string, playlistUrl: string): HlsThumbnailSegmentSource[] {
+  const baseUrl = absoluteUrl(playlistUrl);
+  const segments: HlsThumbnailSegmentSource[] = [];
+  let pendingDuration: number | undefined;
+  let initUrl: string | undefined;
+  let currentTime = 0;
+
+  for (const rawLine of playlistText.replace(/^\uFEFF/, "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) {
+      continue;
+    }
+
+    if (line.startsWith("#EXT-X-MAP")) {
+      const uri = hlsAttributeValue(line, "URI");
+      initUrl = uri ? new URL(uri, baseUrl).toString() : undefined;
+      continue;
+    }
+
+    if (line.startsWith("#EXTINF:")) {
+      const value = Number(line.slice("#EXTINF:".length).split(",")[0]);
+      pendingDuration = Number.isFinite(value) && value > 0 ? value : undefined;
+      continue;
+    }
+
+    if (line.startsWith("#")) {
+      continue;
+    }
+
+    if (pendingDuration !== undefined) {
+      segments.push({
+        ...(initUrl ? { initUrl } : {}),
+        segmentUrl: new URL(line, baseUrl).toString(),
+        startTime: currentTime,
+        duration: pendingDuration,
+        targetTime: currentTime,
+        segmentTime: 0
+      });
+      currentTime += pendingDuration;
+      pendingDuration = undefined;
+    }
+  }
+
+  return segments;
+}
+
+function hlsSegmentIndexAtTime(segments: HlsThumbnailSegmentSource[], targetTime: number): number {
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index]!;
+    if (targetTime < segment.startTime + segment.duration) {
+      return index;
+    }
+  }
+
+  return Math.max(0, segments.length - 1);
 }
 
 function hlsAttributeValue(line: string, key: string): string | undefined {
@@ -821,27 +1048,32 @@ function drawToCanvas(
 }
 
 function videoCaptureTimes(duration: number): number[] {
+  const maxTime = Number.isFinite(duration) && duration > 0.1 ? duration - 0.05 : VIDEO_SEEK_SECONDS;
   const rawCandidates = [
+    ...THUMBNAIL_CANDIDATE_RATIOS.slice(0, VIDEO_THUMBNAIL_CANDIDATE_LIMIT).map((ratio) => duration * ratio),
     VIDEO_SEEK_SECONDS,
     1.5,
-    3,
-    duration * 0.1,
-    duration * 0.18,
-    duration * 0.25,
-    duration * 0.38,
-    duration * 0.5,
-    duration * 0.7
+    3
   ];
-  const maxTime = Number.isFinite(duration) && duration > 0.1 ? duration - 0.05 : VIDEO_SEEK_SECONDS;
-  const unique = new Set<number>();
+  const times: number[] = [];
 
   for (const candidate of rawCandidates) {
     if (!Number.isFinite(candidate)) continue;
     const clamped = Math.max(0, Math.min(candidate, maxTime));
-    unique.add(Number(clamped.toFixed(2)));
+    const rounded = Number(clamped.toFixed(2));
+    if (!times.includes(rounded)) {
+      times.push(rounded);
+    }
   }
 
-  return Array.from(unique).sort((left, right) => left - right);
+  for (let index = 0; times.length < VIDEO_THUMBNAIL_CANDIDATE_LIMIT; index += 1) {
+    const ratio = (index + 1) / (VIDEO_THUMBNAIL_CANDIDATE_LIMIT + 1);
+    times.push(Number(Math.max(0, Math.min(maxTime, maxTime * ratio)).toFixed(2)));
+  }
+
+  return times
+    .sort((left, right) => left - right)
+    .slice(0, VIDEO_THUMBNAIL_CANDIDATE_LIMIT);
 }
 
 async function waitForVideoPaint(
