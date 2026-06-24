@@ -302,7 +302,7 @@ export function ThumbnailEditDialog({ file, onClose, onSaved }: ThumbnailEditDia
                 自动生成缩略图
               </Button>
               <p className="text-xs leading-5 text-muted">
-                图片会按原始比例生成；视频会从多个时间点截取候选画面并跳过明显空白帧。HLS 会优先读取首个片段，失败后使用浏览器播放器截帧。
+                图片会按原始比例生成；视频会从多个时间点截取候选画面并跳过明显空白帧。HLS 会优先按整段播放时间截取候选，失败时退回首个片段。
               </p>
               {!supportsAutoThumbnail ? (
                 <p className="rounded-lg border border-warning/25 bg-warning-soft px-2.5 py-2 text-xs leading-5 text-warning">

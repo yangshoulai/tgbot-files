@@ -23,11 +23,15 @@ const MAX_GENERATED_THUMBNAIL_BYTES = 512 * 1024;
 const JPEG_QUALITY = 0.82;
 const VIDEO_JPEG_QUALITY = 0.95;
 const VIDEO_SEEK_SECONDS = 0.75;
-const VIDEO_THUMBNAIL_CANDIDATE_LIMIT = 6;
+const VIDEO_THUMBNAIL_CANDIDATE_LIMIT = 4;
+const HLS_THUMBNAIL_CANDIDATE_LIMIT = 6;
 const VIDEO_FRAME_WAIT_TIMEOUT_MS = 800;
 const VIDEO_FORCED_FRAME_WAIT_TIMEOUT_MS = 2500;
 const HLS_THUMBNAIL_BUFFER_TIMEOUT_MS = 18000;
 const HLS_PLAYER_THUMBNAIL_TIMEOUT_MS = 10000;
+const HLS_PLAYER_CANDIDATE_TIMEOUT_MS = 28000;
+const VIDEO_SEEK_TIMEOUT_MS = 6000;
+const VIDEO_READY_TIMEOUT_MS = 6000;
 const VIDEO_BLANK_VARIANCE_THRESHOLD = 12;
 const VIDEO_BLANK_WHITE_LUMA = 246;
 const VIDEO_BLANK_BLACK_LUMA = 22;
@@ -38,6 +42,9 @@ interface VideoThumbnailRenderOptions {
   forceFrameDecode?: boolean;
   captureCurrentFrameFirst?: boolean;
   acceptBlankFrame?: boolean;
+  seekTimeoutMs?: number;
+  readyTimeoutMs?: number;
+  candidateLimit?: number;
 }
 
 interface DrawCanvasOptions {
@@ -139,16 +146,16 @@ export async function generateThumbnailCandidatesFromHlsPlaylist(
   fileName = "hls-video.m3u8"
 ): Promise<GeneratedThumbnail[]> {
   try {
-    return await generateThumbnailCandidatesFromHlsFirstSegment(playlistUrl, fileName);
+    return await withTimeout(
+      generateThumbnailCandidatesFromHlsPlayer(playlistUrl, fileName),
+      HLS_PLAYER_CANDIDATE_TIMEOUT_MS,
+      "HLS 候选缩略图生成超时"
+    );
   } catch {
-    // Fall back to the browser/Hls.js player path for non-TS or unusual playlists.
+    // Fall back to a single first-segment thumbnail instead of showing repeated candidates from one short segment.
   }
 
-  return withTimeout(
-    generateThumbnailCandidatesFromHlsPlayer(playlistUrl, fileName),
-    HLS_PLAYER_THUMBNAIL_TIMEOUT_MS,
-    "HLS 缩略图生成超时"
-  );
+  return [await generateThumbnailFromHlsFirstSegment(playlistUrl, fileName)];
 }
 
 async function generateThumbnailFromHlsPlayer(playlistUrl: string, fileName: string): Promise<GeneratedThumbnail> {
@@ -197,8 +204,10 @@ async function generateThumbnailCandidatesFromHlsPlayer(playlistUrl: string, fil
     await waitForVideoDimensions(video);
     return renderLoadedVideoThumbnailCandidates(video, fileName, "auto", undefined, undefined, undefined, {
       forceFrameDecode: true,
-      captureCurrentFrameFirst: true,
-      acceptBlankFrame: true
+      captureCurrentFrameFirst: false,
+      seekTimeoutMs: VIDEO_SEEK_TIMEOUT_MS,
+      readyTimeoutMs: VIDEO_READY_TIMEOUT_MS,
+      candidateLimit: HLS_THUMBNAIL_CANDIDATE_LIMIT
     });
   } finally {
     hls?.destroy();
@@ -364,6 +373,7 @@ async function renderLoadedVideoThumbnailCandidates(
   let lastError: Error | undefined;
   let sawBlankFrame = false;
   const thumbnails: GeneratedThumbnail[] = [];
+  const candidateLimit = options.candidateLimit ?? VIDEO_THUMBNAIL_CANDIDATE_LIMIT;
   const targetTimes: Array<number | null> = options.captureCurrentFrameFirst
     ? [null, ...videoCaptureTimes(duration)]
     : videoCaptureTimes(duration);
@@ -371,9 +381,9 @@ async function renderLoadedVideoThumbnailCandidates(
   for (const targetTime of targetTimes) {
     try {
       if (targetTime !== null) {
-        await seekVideo(video, targetTime);
+        await seekVideo(video, targetTime, options.seekTimeoutMs);
       }
-      await waitForVideoReadyState(video, 2, "视频帧读取超时");
+      await waitForVideoReadyState(video, 2, "视频帧读取超时", { timeoutMs: options.readyTimeoutMs });
       const dimensions = await waitForVideoDimensions(video);
       await waitForVideoPaint(video, options);
 
@@ -395,7 +405,7 @@ async function renderLoadedVideoThumbnailCandidates(
           maxBytes: MAX_GENERATED_THUMBNAIL_BYTES,
           captureTimeSeconds: targetTime
         }));
-        if (thumbnails.length >= VIDEO_THUMBNAIL_CANDIDATE_LIMIT) {
+        if (thumbnails.length >= candidateLimit) {
           break;
         }
         continue;
@@ -633,7 +643,7 @@ function waitForVideoReadyState(
   video: HTMLVideoElement,
   readyState: number,
   timeoutMessage: string,
-  options: { startMutedPlayback?: boolean } = {}
+  options: { startMutedPlayback?: boolean; timeoutMs?: number } = {}
 ): Promise<void> {
   if (video.readyState >= readyState) {
     return Promise.resolve();
@@ -644,7 +654,7 @@ function waitForVideoReadyState(
     const timeout = window.setTimeout(() => {
       cleanup();
       reject(new Error(timeoutMessage));
-    }, HLS_THUMBNAIL_BUFFER_TIMEOUT_MS);
+    }, options.timeoutMs ?? HLS_THUMBNAIL_BUFFER_TIMEOUT_MS);
     const cleanup = () => {
       window.clearTimeout(timeout);
       video.removeEventListener("loadeddata", onReady);
@@ -743,7 +753,7 @@ function waitForHlsFirstFrame(video: HTMLVideoElement, hls: Hls): Promise<void> 
   });
 }
 
-function seekVideo(video: HTMLVideoElement, time: number): Promise<void> {
+function seekVideo(video: HTMLVideoElement, time: number, timeoutMs = 12000): Promise<void> {
   return new Promise((resolve, reject) => {
     const targetTime = Math.max(0, time);
 
@@ -755,7 +765,7 @@ function seekVideo(video: HTMLVideoElement, time: number): Promise<void> {
     const timeout = window.setTimeout(() => {
       cleanup();
       reject(new Error("视频定位超时"));
-    }, 12000);
+    }, timeoutMs);
     const cleanup = () => {
       window.clearTimeout(timeout);
       video.removeEventListener("seeked", onSeeked);
