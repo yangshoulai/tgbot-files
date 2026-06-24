@@ -11,8 +11,8 @@ import { parseCurlCommand } from "../../lib/curl";
 import { hasFileLinkAccess } from "../../lib/file-access";
 import { useToast } from "../../lib/toast";
 import {
-  generateThumbnailFromHlsPlaylist,
-  generateThumbnailFromRemoteSource,
+  generateThumbnailCandidatesFromHlsPlaylist,
+  generateThumbnailCandidatesFromRemoteSource,
   generateThumbnailFromFile,
   revokeThumbnail,
   type GeneratedThumbnail
@@ -42,6 +42,7 @@ export function ThumbnailEditDialog({ file, onClose, onSaved }: ThumbnailEditDia
   const toast = useToast();
   const [mode, setMode] = useState<ThumbnailInputMode>("local");
   const [generated, setGenerated] = useState<GeneratedThumbnail>();
+  const [generatedCandidates, setGeneratedCandidates] = useState<GeneratedThumbnail[]>([]);
   const [urlText, setUrlText] = useState("");
   const [message, setMessage] = useState<string>();
   const [error, setError] = useState<string>();
@@ -60,6 +61,12 @@ export function ThumbnailEditDialog({ file, onClose, onSaved }: ThumbnailEditDia
         revokeThumbnail(current);
         return undefined;
       });
+      setGeneratedCandidates((current) => {
+        for (const candidate of current) {
+          revokeThumbnail(candidate);
+        }
+        return [];
+      });
       return;
     }
 
@@ -71,11 +78,23 @@ export function ThumbnailEditDialog({ file, onClose, onSaved }: ThumbnailEditDia
       revokeThumbnail(current);
       return undefined;
     });
+    setGeneratedCandidates((current) => {
+      for (const candidate of current) {
+        revokeThumbnail(candidate);
+      }
+      return [];
+    });
   }, [file?.id]);
 
-  function updateGenerated(next: GeneratedThumbnail | undefined) {
+  function updateGeneratedCandidates(next: GeneratedThumbnail[]) {
     setGenerated((current) => {
       revokeThumbnail(current);
+      return undefined;
+    });
+    setGeneratedCandidates((current) => {
+      for (const candidate of current) {
+        revokeThumbnail(candidate);
+      }
       return next;
     });
   }
@@ -91,10 +110,11 @@ export function ThumbnailEditDialog({ file, onClose, onSaved }: ThumbnailEditDia
     setGenerating(true);
     try {
       const thumbnail = await generateThumbnailFromFile(picked, "manual");
-      updateGenerated(thumbnail);
+      updateGeneratedCandidates([]);
+      setGenerated(thumbnail);
       setMessage(`已生成 ${thumbnail.width ?? "?"} × ${thumbnail.height ?? "?"} 缩略图，${formatBytes(thumbnail.blob.size)}`);
     } catch (thumbnailError) {
-      updateGenerated(undefined);
+      updateGeneratedCandidates([]);
       setError(errorMessage(thumbnailError));
       setMessage(undefined);
     } finally {
@@ -110,11 +130,20 @@ export function ThumbnailEditDialog({ file, onClose, onSaved }: ThumbnailEditDia
     setMessage("正在从当前文件生成缩略图");
     setGenerating(true);
     try {
-      const thumbnail = await generateThumbnailFromFileItem(file);
-      updateGenerated(thumbnail);
-      setMessage(`已生成 ${thumbnail.width ?? "?"} × ${thumbnail.height ?? "?"} 缩略图，${formatBytes(thumbnail.blob.size)}`);
+      const thumbnails = await generateThumbnailCandidatesFromFileItem(file);
+      const first = thumbnails[0];
+      if (!first) {
+        throw new Error("未生成可用缩略图候选");
+      }
+      updateGeneratedCandidates(thumbnails);
+      setGenerated(first);
+      setMessage(
+        thumbnails.length > 1
+          ? `已生成 ${thumbnails.length} 张候选缩略图，请选择一张后保存`
+          : `已生成 ${first.width ?? "?"} × ${first.height ?? "?"} 缩略图，${formatBytes(first.blob.size)}`
+      );
     } catch (thumbnailError) {
-      updateGenerated(undefined);
+      updateGeneratedCandidates([]);
       setError(errorMessage(thumbnailError));
       setMessage(undefined);
     } finally {
@@ -273,7 +302,7 @@ export function ThumbnailEditDialog({ file, onClose, onSaved }: ThumbnailEditDia
                 自动生成缩略图
               </Button>
               <p className="text-xs leading-5 text-muted">
-                图片会按原始比例生成；视频会从前几帧中截取非空白画面。HLS 会优先读取首个片段，失败后使用浏览器播放器截帧。
+                图片会按原始比例生成；视频会从多个时间点截取候选画面并跳过明显空白帧。HLS 会优先读取首个片段，失败后使用浏览器播放器截帧。
               </p>
               {!supportsAutoThumbnail ? (
                 <p className="rounded-lg border border-warning/25 bg-warning-soft px-2.5 py-2 text-xs leading-5 text-warning">
@@ -328,6 +357,36 @@ export function ThumbnailEditDialog({ file, onClose, onSaved }: ThumbnailEditDia
             {message}
           </div>
         ) : null}
+        {mode === "auto" && generatedCandidates.length > 1 ? (
+          <div className="grid gap-2 sm:grid-cols-3">
+            {generatedCandidates.map((candidate, index) => {
+              const selected = generated?.objectUrl === candidate.objectUrl;
+              return (
+                <button
+                  key={candidate.objectUrl}
+                  type="button"
+                  className={[
+                    "group overflow-hidden rounded-xl border bg-surface text-left shadow-card transition",
+                    selected ? "border-primary shadow-[0_0_0_4px_var(--color-primary-ring)]" : "border-border hover:border-primary/60"
+                  ].join(" ")}
+                  disabled={saving || generating}
+                  onClick={() => {
+                    setGenerated(candidate);
+                    setError(undefined);
+                  }}
+                >
+                  <span className="block aspect-video bg-background">
+                    <img src={candidate.objectUrl} alt={`候选缩略图 ${index + 1}`} className="h-full w-full object-contain" />
+                  </span>
+                  <span className="flex items-center justify-between gap-2 px-2.5 py-1.5 text-[11px] text-muted">
+                    <span>候选 {index + 1}</span>
+                    <span>{formatCaptureTime(candidate.captureTimeSeconds)}</span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        ) : null}
         {error ? (
           <div className="rounded-xl border border-danger/30 bg-danger-soft px-3 py-2 text-sm leading-6 text-danger">
             {error}
@@ -346,6 +405,15 @@ function autoThumbnailSupported(file: FileItem): boolean {
 }
 
 async function generateThumbnailFromFileItem(file: FileItem): Promise<GeneratedThumbnail> {
+  const candidates = await generateThumbnailCandidatesFromFileItem(file);
+  const first = candidates[0];
+  if (!first) {
+    throw new Error("未生成可用缩略图候选");
+  }
+  return first;
+}
+
+async function generateThumbnailCandidatesFromFileItem(file: FileItem): Promise<GeneratedThumbnail[]> {
   const sourceKind = thumbnailSourceKindForFile(file);
   if (!sourceKind) {
     throw new Error("当前文件类型不支持自动生成缩略图");
@@ -357,7 +425,7 @@ async function generateThumbnailFromFileItem(file: FileItem): Promise<GeneratedT
     if (!previewUrl) {
       throw new Error("无法生成 HLS 预览地址");
     }
-    return generateThumbnailFromHlsPlaylist(previewUrl, file.file_name);
+    return generateThumbnailCandidatesFromHlsPlaylist(previewUrl, file.file_name);
   }
 
   if (sourceKind === "video") {
@@ -366,14 +434,14 @@ async function generateThumbnailFromFileItem(file: FileItem): Promise<GeneratedT
     if (!previewUrl) {
       throw new Error("无法生成视频预览地址");
     }
-    return generateThumbnailFromRemoteSource({
+    return generateThumbnailCandidatesFromRemoteSource({
       kind: "video",
       url: previewUrl,
       mime_type: file.mime_type
     }, file.file_name);
   }
 
-  return generateThumbnailFromRemoteSource({
+  return generateThumbnailCandidatesFromRemoteSource({
     kind: "image",
     url: file.file_path,
     mime_type: file.mime_type
@@ -401,6 +469,15 @@ function thumbnailSourceKindForFile(file: FileItem): "image" | "video" | null {
   }
 
   return null;
+}
+
+function formatCaptureTime(value: number | null | undefined): string {
+  if (value === null) return "当前帧";
+  if (!Number.isFinite(value) || value === undefined) return "";
+  const totalSeconds = Math.max(0, Math.round(value));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
 function parseRemoteThumbnailInput(input: string): { url: string; headers?: SourceRequestHeaders; summary: string } {

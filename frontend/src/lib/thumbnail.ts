@@ -8,6 +8,7 @@ export interface GeneratedThumbnail extends ThumbnailUploadPayload {
   fileName: string;
   objectUrl: string;
   source: "auto" | "manual";
+  captureTimeSeconds?: number | null;
 }
 
 export interface RemoteThumbnailSource {
@@ -22,6 +23,7 @@ const MAX_GENERATED_THUMBNAIL_BYTES = 512 * 1024;
 const JPEG_QUALITY = 0.82;
 const VIDEO_JPEG_QUALITY = 0.95;
 const VIDEO_SEEK_SECONDS = 0.75;
+const VIDEO_THUMBNAIL_CANDIDATE_LIMIT = 6;
 const VIDEO_FRAME_WAIT_TIMEOUT_MS = 800;
 const VIDEO_FORCED_FRAME_WAIT_TIMEOUT_MS = 2500;
 const HLS_THUMBNAIL_BUFFER_TIMEOUT_MS = 18000;
@@ -107,6 +109,17 @@ export async function generateThumbnailFromRemoteSource(source: RemoteThumbnailS
   return renderVideoThumbnail(source.url, fileName, "auto", false);
 }
 
+export async function generateThumbnailCandidatesFromRemoteSource(
+  source: RemoteThumbnailSource,
+  fileName = "remote-file"
+): Promise<GeneratedThumbnail[]> {
+  if (source.kind === "image") {
+    return [await renderImageThumbnail(source.url, "auto", fileName)];
+  }
+
+  return renderVideoThumbnailCandidates(source.url, fileName, "auto", false);
+}
+
 export async function generateThumbnailFromHlsPlaylist(playlistUrl: string, fileName = "hls-video.m3u8"): Promise<GeneratedThumbnail> {
   try {
     return await generateThumbnailFromHlsFirstSegment(playlistUrl, fileName);
@@ -121,7 +134,33 @@ export async function generateThumbnailFromHlsPlaylist(playlistUrl: string, file
   );
 }
 
+export async function generateThumbnailCandidatesFromHlsPlaylist(
+  playlistUrl: string,
+  fileName = "hls-video.m3u8"
+): Promise<GeneratedThumbnail[]> {
+  try {
+    return await generateThumbnailCandidatesFromHlsFirstSegment(playlistUrl, fileName);
+  } catch {
+    // Fall back to the browser/Hls.js player path for non-TS or unusual playlists.
+  }
+
+  return withTimeout(
+    generateThumbnailCandidatesFromHlsPlayer(playlistUrl, fileName),
+    HLS_PLAYER_THUMBNAIL_TIMEOUT_MS,
+    "HLS 缩略图生成超时"
+  );
+}
+
 async function generateThumbnailFromHlsPlayer(playlistUrl: string, fileName: string): Promise<GeneratedThumbnail> {
+  const candidates = await generateThumbnailCandidatesFromHlsPlayer(playlistUrl, fileName);
+  const first = candidates[0];
+  if (!first) {
+    throw new Error("视频截帧为空白，请手动选择缩略图");
+  }
+  return first;
+}
+
+async function generateThumbnailCandidatesFromHlsPlayer(playlistUrl: string, fileName: string): Promise<GeneratedThumbnail[]> {
   const video = document.createElement("video");
   let hls: Hls | null = null;
   const detachVideo = attachHiddenCaptureVideo(video);
@@ -156,7 +195,7 @@ async function generateThumbnailFromHlsPlayer(playlistUrl: string, fileName: str
     await metadataReady;
     await bufferReady;
     await waitForVideoDimensions(video);
-    return renderLoadedVideoThumbnail(video, fileName, "auto", undefined, undefined, undefined, {
+    return renderLoadedVideoThumbnailCandidates(video, fileName, "auto", undefined, undefined, undefined, {
       forceFrameDecode: true,
       captureCurrentFrameFirst: true,
       acceptBlankFrame: true
@@ -170,6 +209,15 @@ async function generateThumbnailFromHlsPlayer(playlistUrl: string, fileName: str
 }
 
 async function generateThumbnailFromHlsFirstSegment(playlistUrl: string, fileName: string): Promise<GeneratedThumbnail> {
+  const candidates = await generateThumbnailCandidatesFromHlsFirstSegment(playlistUrl, fileName);
+  const first = candidates[0];
+  if (!first) {
+    throw new Error("视频截帧为空白，请手动选择缩略图");
+  }
+  return first;
+}
+
+async function generateThumbnailCandidatesFromHlsFirstSegment(playlistUrl: string, fileName: string): Promise<GeneratedThumbnail[]> {
   const playlist = await fetchTextWithTimeout(playlistUrl, HLS_THUMBNAIL_BUFFER_TIMEOUT_MS);
   const source = firstHlsMediaSource(playlist, playlistUrl);
   const [segment, initSegment] = await Promise.all([
@@ -184,7 +232,7 @@ async function generateThumbnailFromHlsFirstSegment(playlistUrl: string, fileNam
       : await transmuxTsSegmentToMp4(segment.bytes);
   const objectUrl = URL.createObjectURL(segmentBlob);
 
-  return renderVideoThumbnail(objectUrl, fileName, "auto", true, {
+  return renderVideoThumbnailCandidates(objectUrl, fileName, "auto", true, {
     forceFrameDecode: true,
     captureCurrentFrameFirst: true,
     acceptBlankFrame: true
@@ -238,6 +286,21 @@ async function renderVideoThumbnail(
   revokeSourceUrl: boolean,
   options: VideoThumbnailRenderOptions = {}
 ): Promise<GeneratedThumbnail> {
+  const candidates = await renderVideoThumbnailCandidates(sourceUrl, fileName, generatedSource, revokeSourceUrl, options);
+  const first = candidates[0];
+  if (!first) {
+    throw new Error("视频截帧为空白，请手动选择缩略图");
+  }
+  return first;
+}
+
+async function renderVideoThumbnailCandidates(
+  sourceUrl: string,
+  fileName: string,
+  generatedSource: "auto" | "manual",
+  revokeSourceUrl: boolean,
+  options: VideoThumbnailRenderOptions = {}
+): Promise<GeneratedThumbnail[]> {
   const video = document.createElement("video");
   video.preload = "auto";
   video.muted = true;
@@ -256,7 +319,7 @@ async function renderVideoThumbnail(
       throw new Error("无法读取视频画面尺寸");
     }
 
-    return await renderLoadedVideoThumbnail(video, fileName, generatedSource, duration, width, height, options);
+    return await renderLoadedVideoThumbnailCandidates(video, fileName, generatedSource, duration, width, height, options);
   } finally {
     video.removeAttribute("src");
     video.load();
@@ -275,6 +338,23 @@ async function renderLoadedVideoThumbnail(
   height = video.videoHeight,
   options: VideoThumbnailRenderOptions = {}
 ): Promise<GeneratedThumbnail> {
+  const candidates = await renderLoadedVideoThumbnailCandidates(video, fileName, generatedSource, duration, width, height, options);
+  const first = candidates[0];
+  if (!first) {
+    throw new Error("视频截帧为空白，请手动选择缩略图");
+  }
+  return first;
+}
+
+async function renderLoadedVideoThumbnailCandidates(
+  video: HTMLVideoElement,
+  fileName: string,
+  generatedSource: "auto" | "manual",
+  duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : VIDEO_SEEK_SECONDS,
+  width = video.videoWidth,
+  height = video.videoHeight,
+  options: VideoThumbnailRenderOptions = {}
+): Promise<GeneratedThumbnail[]> {
   if (!width || !height) {
     const dimensions = await waitForVideoDimensions(video);
     width = dimensions.width;
@@ -283,6 +363,7 @@ async function renderLoadedVideoThumbnail(
 
   let lastError: Error | undefined;
   let sawBlankFrame = false;
+  const thumbnails: GeneratedThumbnail[] = [];
   const targetTimes: Array<number | null> = options.captureCurrentFrameFirst
     ? [null, ...videoCaptureTimes(duration)]
     : videoCaptureTimes(duration);
@@ -309,15 +390,24 @@ async function renderLoadedVideoThumbnail(
       );
 
       if (options.acceptBlankFrame || !isProbablyBlankVideoFrame(canvas)) {
-        return await canvasToGeneratedThumbnail(canvas, fileName, generatedSource, {
+        thumbnails.push(await canvasToGeneratedThumbnail(canvas, fileName, generatedSource, {
           quality: VIDEO_JPEG_QUALITY,
-          maxBytes: MAX_GENERATED_THUMBNAIL_BYTES
-        });
+          maxBytes: MAX_GENERATED_THUMBNAIL_BYTES,
+          captureTimeSeconds: targetTime
+        }));
+        if (thumbnails.length >= VIDEO_THUMBNAIL_CANDIDATE_LIMIT) {
+          break;
+        }
+        continue;
       }
       sawBlankFrame = true;
     } catch (error) {
       lastError = error instanceof Error ? error : new Error("视频帧读取失败");
     }
+  }
+
+  if (thumbnails.length > 0) {
+    return thumbnails;
   }
 
   if (sawBlankFrame) {
@@ -722,12 +812,15 @@ function drawToCanvas(
 
 function videoCaptureTimes(duration: number): number[] {
   const rawCandidates = [
-    0.1,
-    0.35,
     VIDEO_SEEK_SECONDS,
-    1.25,
+    1.5,
+    3,
     duration * 0.1,
-    duration * 0.25
+    duration * 0.18,
+    duration * 0.25,
+    duration * 0.38,
+    duration * 0.5,
+    duration * 0.7
   ];
   const maxTime = Number.isFinite(duration) && duration > 0.1 ? duration - 0.05 : VIDEO_SEEK_SECONDS;
   const unique = new Set<number>();
@@ -1108,7 +1201,7 @@ async function canvasToGeneratedThumbnail(
   canvas: HTMLCanvasElement,
   sourceFileName: string,
   generatedSource: "auto" | "manual",
-  options: ThumbnailEncodeOptions = {}
+  options: ThumbnailEncodeOptions & { captureTimeSeconds?: number | null } = {}
 ): Promise<GeneratedThumbnail> {
   const output = await canvasToThumbnailBlob(canvas, options);
   const blob = output.blob;
@@ -1120,7 +1213,8 @@ async function canvasToGeneratedThumbnail(
     width: output.width,
     height: output.height,
     objectUrl,
-    source: generatedSource
+    source: generatedSource,
+    ...(options.captureTimeSeconds !== undefined ? { captureTimeSeconds: options.captureTimeSeconds } : {})
   };
 }
 
