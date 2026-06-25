@@ -2806,7 +2806,10 @@ async function readFileCacheSummary() {
 
   const normalizedEntries = Array.from(byFile.values())
     .map((entry) => {
-      const complete = entry.cachedBytes >= entry.size && entry.size > 0;
+      const cachedChunks = Array.from(entry.cachedChunkIndexes).filter((index) => Number.isSafeInteger(index) && index >= 0).length;
+      const complete = entry.kind === "hls"
+        ? cachedChunks >= entry.chunkCount && entry.chunkCount > 0
+        : entry.cachedBytes >= entry.size && entry.size > 0;
       return {
         fileId: entry.fileId,
         fileName: entry.fileName,
@@ -2818,7 +2821,7 @@ async function readFileCacheSummary() {
         chunkCount: entry.chunkCount,
         sourceUrl: entry.sourceUrl || undefined,
         token: entry.token || undefined,
-        cachedChunks: Array.from(entry.cachedChunkIndexes).filter((index) => Number.isSafeInteger(index) && index >= 0).length,
+        cachedChunks,
         cachedBytes: entry.cachedBytes,
         autoBytes: entry.autoBytes,
         cacheSource: "auto",
@@ -3063,7 +3066,9 @@ async function readFileCacheEntry(fileId) {
     autoBytes: cachedBytes,
     cacheSource: "auto",
     lastAccessed,
-    complete: cachedBytes >= size && size > 0
+    complete: kind === "hls"
+      ? cachedChunkIndexes.size >= chunkCount && chunkCount > 0
+      : cachedBytes >= size && size > 0
   };
 }
 

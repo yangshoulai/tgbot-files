@@ -221,12 +221,12 @@ export function CacheManagerDialog({
 }
 
 function fileCacheProgressPercent(entry: FileCacheEntry): number {
+  if (entry.chunkCount > 0) {
+    return Math.max(0, Math.min(100, Math.round((entry.cachedChunks / entry.chunkCount) * 100)));
+  }
   if (entry.complete) return 100;
   if (entry.size > 0) {
     return Math.max(0, Math.min(100, Math.round((entry.cachedBytes / entry.size) * 100)));
-  }
-  if (entry.chunkCount > 0) {
-    return Math.max(0, Math.min(100, Math.round((entry.cachedChunks / entry.chunkCount) * 100)));
   }
   return 0;
 }
@@ -254,6 +254,7 @@ function mergeCacheEntryWithIndexedFile(entry: FileCacheEntry, indexedFile: File
     size: indexedFile.size || entry.size,
     chunkSize,
     chunkCount,
+    complete: entry.cachedChunks >= chunkCount && chunkCount > 0,
     sourceUrl: hasFileLinkAccess(indexedFile) ? indexedFile.file_path : entry.sourceUrl
   };
 }

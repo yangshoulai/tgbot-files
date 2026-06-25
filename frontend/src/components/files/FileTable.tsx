@@ -127,12 +127,12 @@ function SortHeader({
 
 function fileCachePercent(entry: FileCacheEntry | null): number {
   if (!entry) return 0;
+  if (entry.chunkCount > 0) {
+    return Math.max(0, Math.min(100, Math.round((entry.cachedChunks / entry.chunkCount) * 100)));
+  }
   if (entry.complete) return 100;
   if (entry.size > 0) {
     return Math.max(0, Math.min(100, Math.round((entry.cachedBytes / entry.size) * 100)));
-  }
-  if (entry.chunkCount > 0) {
-    return Math.max(0, Math.min(100, Math.round((entry.cachedChunks / entry.chunkCount) * 100)));
   }
   return 0;
 }
