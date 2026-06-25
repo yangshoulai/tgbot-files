@@ -98,6 +98,20 @@ function remapDirectoryPath(path: string, oldBasePath: string, nextBasePath: str
   return path;
 }
 
+function isPathInsideDirectory(path: string, directoryPath: string): boolean {
+  return path === directoryPath || path.startsWith(`${directoryPath}/`);
+}
+
+function fallbackDirectoryAfterDelete(path: string, deletedDirectories: DirectoryItem[]): string {
+  let nextPath = path;
+  for (const directory of deletedDirectories) {
+    if (isPathInsideDirectory(nextPath, directory.path)) {
+      nextPath = parentDirectoryPath(directory.path);
+    }
+  }
+  return nextPath;
+}
+
 const FILE_TYPE_OPTIONS: Array<{ value: FileTypeFilter; label: string }> = [
   { value: "all", label: "全部类型" },
   { value: "image", label: "图片" },
@@ -395,7 +409,11 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
       setSelectedFileIds(new Set());
       setSelectedDirectoryIds(new Set());
       await clearCachesBestEffort(cacheFileIds);
-      await loadFiles();
+      const nextCurrentDirPath = fallbackDirectoryAfterDelete(currentDirPath, targetDirectories);
+      if (nextCurrentDirPath !== currentDirPath) {
+        setCurrentDirPath(nextCurrentDirPath);
+      }
+      await Promise.all([loadFiles(nextCurrentDirPath), loadDirectoryOptions()]);
     } catch (error) {
       toast.danger(errorMessage(error));
     } finally {
@@ -450,7 +468,11 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
         return next;
       });
       await clearCachesBestEffort(cacheFileIds);
-      await Promise.all([loadFiles(), loadDirectoryOptions()]);
+      const nextCurrentDirPath = fallbackDirectoryAfterDelete(currentDirPath, [directory]);
+      if (nextCurrentDirPath !== currentDirPath) {
+        setCurrentDirPath(nextCurrentDirPath);
+      }
+      await Promise.all([loadFiles(nextCurrentDirPath), loadDirectoryOptions()]);
     } catch (error) {
       toast.danger(errorMessage(error));
     } finally {
