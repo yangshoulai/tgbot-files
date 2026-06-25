@@ -3,9 +3,8 @@ import { canUseAcceleratedDownload, extractSignedFileToken } from "./accelerated
 import { hasFileLinkAccess } from "./file-access";
 import { ensureVideoPreviewServiceWorker, getVideoPreviewServiceWorkerController } from "./video-preview-service-worker";
 
-export type FileCacheSource = "auto" | "manual";
+export type FileCacheSource = "auto";
 export type FileCacheKind = "single" | "multipart" | "hls";
-export type FileManualCacheStatus = "caching" | "paused" | "waiting";
 
 const DEFAULT_FILE_CACHE_CHUNK_BYTES = 2 * 1024 * 1024;
 const DEFAULT_CACHE_REQUEST_TIMEOUT_MS = 60_000;
@@ -38,19 +37,16 @@ export interface FileCacheEntry {
   token?: string;
   cachedChunks: number;
   cachedBytes: number;
-  manualBytes: number;
   autoBytes: number;
   cacheSource: FileCacheSource;
-  manualCacheStatus?: FileManualCacheStatus;
-  manualStartedAt?: number;
   lastAccessed: number;
   complete: boolean;
 }
 
 export interface FileCacheSummary {
   entries: FileCacheEntry[];
+  entryCount?: number;
   totalBytes: number;
-  manualBytes: number;
   autoBytes: number;
 }
 
@@ -136,54 +132,6 @@ export function buildFileCacheUrl(metadata: FileCacheMetadata | null): string | 
 
 export function buildAutomaticFileCacheUrl(file: FileItem, cacheMaxBytes: number): string | null {
   return buildFileCacheUrl(buildFileCacheMetadata(file, cacheMaxBytes, "auto"));
-}
-
-export function canCacheFile(file: FileItem): boolean {
-  return Boolean(buildFileCacheMetadata(file, Number.MAX_SAFE_INTEGER, "manual"));
-}
-
-export async function requestPersistentFileCacheStorage(): Promise<boolean> {
-  if (typeof navigator === "undefined" || !navigator.storage?.persist) {
-    return false;
-  }
-
-  try {
-    return await navigator.storage.persist();
-  } catch {
-    return false;
-  }
-}
-
-export function cacheFileManually(metadata: FileCacheMetadata): Promise<FileCacheSummary> {
-  return requestFileCacheMessage<FileCacheSummary>({
-    type: "FILE_CACHE_CACHE_FILE",
-    metadata: {
-      ...metadata,
-      cacheSource: "manual"
-    }
-  }).then((summary) => normalizeFileCacheSummary(summary));
-}
-
-export function pauseFileCache(fileId: string): Promise<FileCacheSummary> {
-  return requestFileCacheMessage<FileCacheSummary>({
-    type: "FILE_CACHE_PAUSE_FILE",
-    fileId
-  }).then((summary) => normalizeFileCacheSummary(summary));
-}
-
-export function resumeFileCache(fileId: string, metadata?: FileCacheMetadata): Promise<FileCacheSummary> {
-  return requestFileCacheMessage<FileCacheSummary>({
-    type: "FILE_CACHE_RESUME_FILE",
-    fileId,
-    ...(metadata ? { metadata } : {})
-  }).then((summary) => normalizeFileCacheSummary(summary));
-}
-
-export function terminateFileCache(fileId: string): Promise<FileCacheSummary> {
-  return requestFileCacheMessage<FileCacheSummary>({
-    type: "FILE_CACHE_TERMINATE_FILE",
-    fileId
-  }).then((summary) => normalizeFileCacheSummary(summary));
 }
 
 export function startPreviewFileCache(sessionId: string, metadata: FileCacheMetadata): Promise<FileCacheSummary> {
@@ -295,19 +243,15 @@ async function requestFileCacheMessage<T>(message: FileCacheRequestMessage, time
 function normalizeFileCacheSummary(value: FileCacheSummary | null | undefined): FileCacheSummary {
   return {
     entries: Array.isArray(value?.entries) ? value.entries : [],
+    entryCount: Number(value?.entryCount) || (Array.isArray(value?.entries) ? value.entries.length : 0),
     totalBytes: Number(value?.totalBytes) || 0,
-    manualBytes: Number(value?.manualBytes) || 0,
     autoBytes: Number(value?.autoBytes) || 0
   };
 }
 
 type FileCacheRequestMessage =
-  | { type: "FILE_CACHE_CACHE_FILE"; metadata: FileCacheMetadata }
   | { type: "FILE_CACHE_START_PREVIEW"; sessionId: string; metadata: FileCacheMetadata }
   | { type: "FILE_CACHE_STOP_PREVIEW"; sessionId: string }
-  | { type: "FILE_CACHE_PAUSE_FILE"; fileId: string }
-  | { type: "FILE_CACHE_RESUME_FILE"; fileId: string; metadata?: FileCacheMetadata }
-  | { type: "FILE_CACHE_TERMINATE_FILE"; fileId: string }
   | { type: "FILE_CACHE_STATE_REQUEST"; metadata: FileCacheMetadata }
   | { type: "FILE_CACHE_LIST_REQUEST" }
   | { type: "FILE_CACHE_CLEAR_FILE"; fileId: string }

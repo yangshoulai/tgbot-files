@@ -21,9 +21,7 @@ import { useToast } from "../lib/toast";
 import { useConfirm } from "../lib/confirm";
 import {
   clearFileCache,
-  clearFilesCache,
-  pauseFileCache,
-  terminateFileCache
+  clearFilesCache
 } from "../lib/file-cache";
 import { Input } from "../components/ui/Input";
 import { IconButton } from "../components/ui/IconButton";
@@ -199,11 +197,6 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
     setCacheOperation,
     cacheFileIndex,
     refreshCacheManager,
-    onCacheFile,
-    onPauseFileCache,
-    onResumeFileCache,
-    onTerminateFileCache,
-    resumeFileCacheById,
     onClearFileCache,
     onClearAutomaticCache
   } = useFileCacheManager({ files, session, toast });
@@ -326,10 +319,10 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
       {
         label: "缓存空间",
         value: formatBytes(cacheSummary?.totalBytes ?? 0),
-        hint: `手动 ${formatBytes(cacheSummary?.manualBytes ?? 0)} · 自动 ${formatBytes(cacheSummary?.autoBytes ?? 0)}`
+        hint: `浏览器加载缓存 · 上限 ${formatBytes(session.video_preview_cache_bytes)}`
       }
     ];
-  }, [cacheSummary?.autoBytes, cacheSummary?.manualBytes, cacheSummary?.totalBytes, currentDirPath, directories.length, files, globalStats, session.config]);
+  }, [cacheSummary?.totalBytes, currentDirPath, directories.length, files, globalStats, session.config, session.video_preview_cache_bytes]);
 
   async function onDelete(file: FileItem) {
     const ok = await confirm({
@@ -1029,10 +1022,6 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
                 onCopy={onCopy}
                 onAcceleratedDownload={(file) => void onAcceleratedDownload(file)}
                 cacheSummary={cacheSummary}
-                onCacheFile={(file) => void onCacheFile(file)}
-                onPauseFileCache={(file) => void onPauseFileCache(file)}
-                onResumeFileCache={(file) => void onResumeFileCache(file)}
-                onTerminateFileCache={(file) => void onTerminateFileCache(file)}
                 onClearFileCache={(file) => void onClearFileCache(file)}
                 onDelete={onDelete}
                 layout={fileLayoutMode}
@@ -1132,42 +1121,6 @@ function DashboardPageComponent({ session, uploadVersion, copyText, onDirectoryC
         onClose={() => setCacheManagerOpen(false)}
         onRefresh={() => void refreshCacheManager()}
         onClearAutomatic={() => void onClearAutomaticCache()}
-        onPauseFile={(entry) => {
-          const file = files.find((item) => item.id === entry.fileId);
-          if (file) {
-            void onPauseFileCache(file);
-            return;
-          }
-          setCacheOperation({ fileId: entry.fileId, kind: "pause" });
-          pauseFileCache(entry.fileId)
-            .then(setCacheSummary)
-            .then(() => setCacheSummaryError(null))
-            .then(() => toast.success("缓存已暂停"))
-            .catch((error) => toast.danger(errorMessage(error)))
-            .finally(() => setCacheOperation(null));
-        }}
-        onResumeFile={(entry) => {
-          const file = files.find((item) => item.id === entry.fileId);
-          if (file) {
-            void onResumeFileCache(file);
-            return;
-          }
-          void resumeFileCacheById(entry.fileId);
-        }}
-        onTerminateFile={(entry) => {
-          const file = files.find((item) => item.id === entry.fileId);
-          if (file) {
-            void onTerminateFileCache(file);
-            return;
-          }
-          setCacheOperation({ fileId: entry.fileId, kind: "terminate" });
-          terminateFileCache(entry.fileId)
-            .then(setCacheSummary)
-            .then(() => setCacheSummaryError(null))
-            .then(() => toast.success("缓存已终止"))
-            .catch((error) => toast.danger(errorMessage(error)))
-            .finally(() => setCacheOperation(null));
-        }}
         onClearFile={(entry) => {
           const file = files.find((item) => item.id === entry.fileId);
           if (file) {

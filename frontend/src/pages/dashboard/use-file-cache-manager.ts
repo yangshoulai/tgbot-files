@@ -3,25 +3,18 @@ import {
   ApiError,
   FileItem,
   SessionResponse,
-  listDirectories,
-  listFiles,
   lookupFiles
 } from "../../api";
 import {
-  buildFileCacheMetadata,
-  cacheFileManually,
-  canCacheFile,
   clearAutomaticFileCache,
   clearFileCache,
   getFileCacheSummary,
-  pauseFileCache,
-  requestPersistentFileCacheStorage,
-  resumeFileCache,
-  terminateFileCache,
   type FileCacheSummary
 } from "../../lib/file-cache";
 import { type CacheOperation } from "../../components/files/cache/CacheManagerDialog";
 import { useToast } from "../../lib/toast";
+
+const CACHE_LOOKUP_LIMIT = 60;
 
 function errorMessage(error: unknown): string {
   if (error instanceof ApiError || error instanceof Error) return error.message;
@@ -34,25 +27,13 @@ interface UseFileCacheManagerOptions {
   toast: ReturnType<typeof useToast>;
 }
 
-export function useFileCacheManager({ files, session, toast }: UseFileCacheManagerOptions) {
+export function useFileCacheManager({ files, toast }: UseFileCacheManagerOptions) {
   const [cacheSummary, setCacheSummary] = useState<FileCacheSummary | null>(null);
   const [cacheFiles, setCacheFiles] = useState<FileItem[]>([]);
   const [cacheManagerOpen, setCacheManagerOpen] = useState(false);
   const [cacheOperation, setCacheOperation] = useState<CacheOperation>(null);
   const [cacheSummaryLoading, setCacheSummaryLoading] = useState(false);
   const [cacheSummaryError, setCacheSummaryError] = useState<string | null>(null);
-
-  const refreshCacheSummary = useCallback(async () => {
-    setCacheSummaryLoading(true);
-    try {
-      setCacheSummary(await getFileCacheSummary());
-      setCacheSummaryError(null);
-    } catch (error) {
-      setCacheSummaryError(errorMessage(error));
-    } finally {
-      setCacheSummaryLoading(false);
-    }
-  }, []);
 
   const refreshCacheFilesBySummary = useCallback(async (summary: FileCacheSummary | null) => {
     const entries = summary?.entries ?? [];
@@ -61,7 +42,7 @@ export function useFileCacheManager({ files, session, toast }: UseFileCacheManag
     const existingIds = new Set([...cacheFiles, ...files].map((file) => file.id));
     const missingIds = Array.from(new Set(entries.map((entry) => entry.fileId)))
       .filter((fileId) => fileId && !existingIds.has(fileId))
-      .slice(0, 100);
+      .slice(0, CACHE_LOOKUP_LIMIT);
     if (missingIds.length === 0) return;
 
     try {
@@ -79,30 +60,23 @@ export function useFileCacheManager({ files, session, toast }: UseFileCacheManag
     }
   }, [cacheFiles, files]);
 
-  const refreshCacheFileIndex = useCallback(async () => {
+  const refreshCacheSummary = useCallback(async () => {
+    setCacheSummaryLoading(true);
     try {
-      const directoryResponse = await listDirectories(true);
-      const directoryPaths = Array.from(new Set(["/", ...directoryResponse.directories.map((directory) => directory.path)]));
-      const responses = await Promise.all(directoryPaths.map((dir) =>
-        listFiles({
-          q: "",
-          dir,
-          all: true,
-          type: "all"
-        })
-      ));
-      setCacheFiles(responses.flatMap((response) => response.files));
-    } catch {
-      setCacheFiles([]);
+      const summary = await getFileCacheSummary();
+      setCacheSummary(summary);
+      setCacheSummaryError(null);
+      void refreshCacheFilesBySummary(summary);
+    } catch (error) {
+      setCacheSummaryError(errorMessage(error));
+    } finally {
+      setCacheSummaryLoading(false);
     }
-  }, []);
+  }, [refreshCacheFilesBySummary]);
 
   const refreshCacheManager = useCallback(async () => {
-    await Promise.all([
-      refreshCacheSummary(),
-      refreshCacheFileIndex()
-    ]);
-  }, [refreshCacheFileIndex, refreshCacheSummary]);
+    await refreshCacheSummary();
+  }, [refreshCacheSummary]);
 
   useEffect(() => {
     void refreshCacheSummary();
@@ -110,9 +84,9 @@ export function useFileCacheManager({ files, session, toast }: UseFileCacheManag
 
   useEffect(() => {
     if (cacheManagerOpen) {
-      void refreshCacheManager();
+      void refreshCacheSummary();
     }
-  }, [cacheManagerOpen, refreshCacheManager]);
+  }, [cacheManagerOpen, refreshCacheSummary]);
 
   useEffect(() => {
     if (cacheManagerOpen) {
@@ -121,89 +95,14 @@ export function useFileCacheManager({ files, session, toast }: UseFileCacheManag
   }, [cacheManagerOpen, cacheSummary, refreshCacheFilesBySummary]);
 
   useEffect(() => {
+    if (!cacheManagerOpen) return undefined;
+
     const intervalId = window.setInterval(() => {
       void refreshCacheSummary();
-    }, 2500);
+    }, 10_000);
 
     return () => window.clearInterval(intervalId);
-  }, [refreshCacheSummary]);
-
-  async function onCacheFile(file: FileItem) {
-    const metadata = buildFileCacheMetadata(file, session.video_preview_cache_bytes, "manual");
-    if (!metadata || !canCacheFile(file)) {
-      toast.danger("该文件缺少可缓存的访问链接");
-      return;
-    }
-
-    setCacheOperation({ fileId: file.id, kind: "cache" });
-    try {
-      await requestPersistentFileCacheStorage();
-      await cacheFileManually(metadata);
-      await refreshCacheSummary();
-      toast.success("文件已加入缓存队列");
-    } catch (error) {
-      toast.danger(errorMessage(error));
-    } finally {
-      setCacheOperation(null);
-    }
-  }
-
-  async function onPauseFileCache(file: FileItem) {
-    setCacheOperation({ fileId: file.id, kind: "pause" });
-    try {
-      setCacheSummary(await pauseFileCache(file.id));
-      setCacheSummaryError(null);
-      toast.success("缓存已暂停");
-    } catch (error) {
-      toast.danger(errorMessage(error));
-    } finally {
-      setCacheOperation(null);
-    }
-  }
-
-  async function onResumeFileCache(file: FileItem) {
-    setCacheOperation({ fileId: file.id, kind: "resume" });
-    try {
-      await requestPersistentFileCacheStorage();
-      const metadata = buildFileCacheMetadata(file, Number.MAX_SAFE_INTEGER, "manual");
-      setCacheSummary(await resumeFileCache(file.id, metadata ?? undefined));
-      setCacheSummaryError(null);
-      toast.success("缓存已继续");
-    } catch (error) {
-      toast.danger(errorMessage(error));
-    } finally {
-      setCacheOperation(null);
-    }
-  }
-
-  async function onTerminateFileCache(file: FileItem) {
-    setCacheOperation({ fileId: file.id, kind: "terminate" });
-    try {
-      setCacheSummary(await terminateFileCache(file.id));
-      setCacheSummaryError(null);
-      toast.success("缓存已终止");
-    } catch (error) {
-      toast.danger(errorMessage(error));
-    } finally {
-      setCacheOperation(null);
-    }
-  }
-
-  async function resumeFileCacheById(fileId: string) {
-    setCacheOperation({ fileId, kind: "resume" });
-    try {
-      await requestPersistentFileCacheStorage();
-      const indexedFile = cacheFileIndex.get(fileId);
-      const metadata = indexedFile ? buildFileCacheMetadata(indexedFile, Number.MAX_SAFE_INTEGER, "manual") : null;
-      setCacheSummary(await resumeFileCache(fileId, metadata ?? undefined));
-      setCacheSummaryError(null);
-      toast.success("缓存已继续");
-    } catch (error) {
-      toast.danger(errorMessage(error));
-    } finally {
-      setCacheOperation(null);
-    }
-  }
+  }, [cacheManagerOpen, refreshCacheSummary]);
 
   async function onClearFileCache(file: FileItem) {
     setCacheOperation({ fileId: file.id, kind: "clear" });
@@ -222,7 +121,7 @@ export function useFileCacheManager({ files, session, toast }: UseFileCacheManag
     try {
       setCacheSummary(await clearAutomaticFileCache());
       setCacheSummaryError(null);
-      toast.success("自动缓存已清理");
+      toast.success("缓存已清理");
     } catch (error) {
       toast.danger(errorMessage(error));
     }
@@ -247,11 +146,6 @@ export function useFileCacheManager({ files, session, toast }: UseFileCacheManag
     cacheFileIndex,
     refreshCacheSummary,
     refreshCacheManager,
-    onCacheFile,
-    onPauseFileCache,
-    onResumeFileCache,
-    onTerminateFileCache,
-    resumeFileCacheById,
     onClearFileCache,
     onClearAutomaticCache
   };

@@ -11,7 +11,6 @@ import {
   FolderOpen,
   Info,
   ImagePlus,
-  HardDriveDownload,
   Pencil,
   MoreVertical,
   Trash2,
@@ -23,7 +22,7 @@ import {
   hasFileLinkAccess
 } from "../../lib/file-access";
 import { cn } from "../../lib/cn";
-import { canCacheFile, type FileCacheEntry, type FileCacheSummary } from "../../lib/file-cache";
+import type { FileCacheEntry, FileCacheSummary } from "../../lib/file-cache";
 import { fileKind, formatBytes, formatDateTime } from "../../utils";
 import { IconButton } from "../ui/IconButton";
 import { FileVisual } from "../ui/FileVisual";
@@ -75,10 +74,6 @@ interface FileTableProps {
   onThumbnailPreview: (file: FileItem) => void;
   onCopy: (file: FileItem) => void;
   onAcceleratedDownload: (file: FileItem) => void;
-  onCacheFile: (file: FileItem) => void;
-  onPauseFileCache: (file: FileItem) => void;
-  onResumeFileCache: (file: FileItem) => void;
-  onTerminateFileCache: (file: FileItem) => void;
   onClearFileCache: (file: FileItem) => void;
   cacheSummary: FileCacheSummary | null;
   onDelete: (file: FileItem) => void;
@@ -145,9 +140,6 @@ function fileCachePercent(entry: FileCacheEntry | null): number {
 function fileCacheStatusText(entry: FileCacheEntry | null): string {
   if (!entry) return "未缓存";
   const percent = fileCachePercent(entry);
-  if (entry.manualCacheStatus === "caching") return `缓存中（${percent}%）`;
-  if (entry.manualCacheStatus === "waiting") return `等待中（${percent}%）`;
-  if (entry.manualCacheStatus === "paused") return `已停止（${percent}%）`;
   if (entry.cachedBytes <= 0) return "未缓存";
   if (entry.complete) return "已缓存（100%）";
   return `已缓存（${percent}%）`;
@@ -162,17 +154,11 @@ function FileCacheBadge({ entry }: { entry: FileCacheEntry | null }) {
         "inline-flex max-w-full items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium",
         !entry
           ? "bg-surface text-subtle ring-1 ring-border"
-          : entry.manualCacheStatus === "caching"
-            ? "bg-primary-soft text-primary-strong"
-            : entry.manualCacheStatus === "waiting"
-              ? "bg-surface text-muted ring-1 ring-border"
-            : entry.manualCacheStatus === "paused"
-              ? "bg-warning-soft text-warning"
-              : entry.cachedBytes <= 0
-                ? "bg-surface text-subtle ring-1 ring-border"
-              : entry.complete
-                ? "bg-success-soft text-success"
-                : "bg-primary-soft text-primary-strong"
+          : entry.cachedBytes <= 0
+            ? "bg-surface text-subtle ring-1 ring-border"
+          : entry.complete
+            ? "bg-success-soft text-success"
+            : "bg-primary-soft text-primary-strong"
       )}
       title={entry ? `已缓存 ${formatBytes(entry.cachedBytes)} / ${formatBytes(entry.size)}` : "未缓存"}
     >
@@ -210,10 +196,6 @@ export function FileTable({
   onThumbnailPreview,
   onCopy,
   onAcceleratedDownload,
-  onCacheFile,
-  onPauseFileCache,
-  onResumeFileCache,
-  onTerminateFileCache,
   onClearFileCache,
   cacheSummary,
   onDelete
@@ -372,8 +354,6 @@ export function FileTable({
     const canPreviewFile = canPreviewThroughAvailableAccess(file);
     const cacheEntry = cacheEntryMap.get(file.id) ?? null;
     const cached = Boolean(cacheEntry?.cachedBytes);
-    const cacheStatus = cacheEntry?.manualCacheStatus;
-    const cacheLabel = "缓存";
 
     return [
       {
@@ -428,38 +408,6 @@ export function FileTable({
         label: "加速下载",
         icon: <Download size={15} />,
         onSelect: () => runContextAction(() => onAcceleratedDownload(file))
-      },
-      {
-        type: "item",
-        key: "cache",
-        label: cacheLabel,
-        icon: <HardDriveDownload size={15} />,
-        disabled: !canCacheFile(file) || cacheStatus === "caching" || cacheStatus === "waiting",
-        onSelect: () => runContextAction(() => onCacheFile(file))
-      },
-      {
-        type: "item",
-        key: "pause-cache",
-        label: "停止缓存",
-        icon: <HardDriveDownload size={15} />,
-        disabled: cacheStatus !== "caching" && cacheStatus !== "waiting",
-        onSelect: () => runContextAction(() => onPauseFileCache(file))
-      },
-      {
-        type: "item",
-        key: "resume-cache",
-        label: "继续缓存",
-        icon: <HardDriveDownload size={15} />,
-        disabled: cacheStatus !== "paused",
-        onSelect: () => runContextAction(() => onResumeFileCache(file))
-      },
-      {
-        type: "item",
-        key: "terminate-cache",
-        label: "终止缓存",
-        icon: <Trash2 size={15} />,
-        disabled: !cacheStatus,
-        onSelect: () => runContextAction(() => onTerminateFileCache(file))
       },
       {
         type: "item",
