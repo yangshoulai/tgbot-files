@@ -143,8 +143,10 @@ async function handleVideoPreviewRequest(request, event) {
     const body = await createRangeStream(metadata, range);
     const firstChunk = Math.floor(range.start / metadata.chunkSize);
     const endChunk = Math.floor(range.end / metadata.chunkSize);
-    event.waitUntil(prioritizeContinuousPreviewCache(metadata, firstChunk));
-    event.waitUntil(prefetchChunks(metadata, endChunk + 1, metadata.prefetchConcurrency));
+    if (!metadata.thumbnailCapture) {
+      event.waitUntil(prioritizeContinuousPreviewCache(metadata, firstChunk));
+      event.waitUntil(prefetchChunks(metadata, endChunk + 1, metadata.prefetchConcurrency));
+    }
 
     return new Response(body, {
       status: 206,
@@ -175,7 +177,9 @@ async function handleHlsPlaylistRequest(metadata, event) {
   if (cachedText) {
     const rewritten = rewriteHlsPlaylist(cachedText, metadata);
     hlsPreviewSources.set(metadata.fileId, rewritten.sources);
-    event.waitUntil(prioritizeHlsPreviewCache(metadata.fileId, 0, metadata.cacheMaxBytes, metadata.prefetchConcurrency));
+    if (!metadata.thumbnailCapture) {
+      event.waitUntil(prioritizeHlsPreviewCache(metadata.fileId, 0, metadata.cacheMaxBytes, metadata.prefetchConcurrency));
+    }
     return new Response(rewritten.text, {
       headers: {
         "Cache-Control": "no-store",
@@ -194,7 +198,9 @@ async function handleHlsPlaylistRequest(metadata, event) {
   event.waitUntil(writeCachedHlsPlaylistText(metadata.fileId, playlistText));
   const rewritten = rewriteHlsPlaylist(playlistText, metadata);
   hlsPreviewSources.set(metadata.fileId, rewritten.sources);
-  event.waitUntil(prioritizeHlsPreviewCache(metadata.fileId, 0, metadata.cacheMaxBytes, metadata.prefetchConcurrency));
+  if (!metadata.thumbnailCapture) {
+    event.waitUntil(prioritizeHlsPreviewCache(metadata.fileId, 0, metadata.cacheMaxBytes, metadata.prefetchConcurrency));
+  }
 
   return new Response(rewritten.text, {
     headers: {
@@ -214,6 +220,7 @@ async function handleHlsPartRequest(request, event) {
   const sourceUrl = normalizeSameOriginSourceUrl(url.searchParams.get("source"));
   const cacheMaxBytes = normalizeCacheMaxBytes(url.searchParams.get("cache_max"));
   const prefetchConcurrency = normalizePreviewPrefetchConcurrency(url.searchParams.get("prefetch_concurrency"));
+  const thumbnailCapture = isTruthySearchParam(url.searchParams.get("thumbnail_capture"));
   const metadata = normalizeFileCacheMetadata({
     kind: "hls",
     fileId,
@@ -234,7 +241,7 @@ async function handleHlsPartRequest(request, event) {
 
   try {
     const response = await fetchAndCacheHlsPart({ fileId, partKind, partIndex, sourceUrl, cacheMaxBytes, metadata });
-    if (partKind === "segment") {
+    if (partKind === "segment" && !thumbnailCapture) {
       event.waitUntil(prioritizeHlsPreviewCache(fileId, partIndex, cacheMaxBytes, prefetchConcurrency));
       event.waitUntil(prefetchHlsSegments(fileId, partIndex + 1, prefetchConcurrency, cacheMaxBytes));
     }
@@ -280,7 +287,9 @@ async function handleFileCacheRequest(request, event) {
     const body = await createRangeStream(metadata, responseRange);
     const firstChunk = Math.floor(responseRange.start / metadata.chunkSize);
     const endChunk = Math.floor(responseRange.end / metadata.chunkSize);
-    event.waitUntil(prefetchChunks(metadata, endChunk + 1, Math.min(metadata.prefetchConcurrency || 1, 3)));
+    if (!metadata.thumbnailCapture) {
+      event.waitUntil(prefetchChunks(metadata, endChunk + 1, Math.min(metadata.prefetchConcurrency || 1, 3)));
+    }
 
     const headers = {
       "Accept-Ranges": "bytes",
@@ -626,6 +635,9 @@ function hlsPartPreviewUrl(metadata, partKind, index, sourceUrl) {
     chunk_count: String(metadata.chunkCount || 1),
     cache_source: metadata.cacheSource || "auto"
   });
+  if (metadata.thumbnailCapture) {
+    params.set("thumbnail_capture", "1");
+  }
   return `/__video-preview/hls-part/${encodeURIComponent(metadata.fileId)}/${partKind}/${index}?${params.toString()}`;
 }
 
@@ -1130,6 +1142,7 @@ function parsePreviewMetadata(url) {
   const mimeType = url.searchParams.get("mime") || "application/octet-stream";
   const cacheMaxBytes = normalizeCacheMaxBytes(url.searchParams.get("cache_max"));
   const prefetchConcurrency = normalizePreviewPrefetchConcurrency(url.searchParams.get("prefetch_concurrency"));
+  const thumbnailCapture = isTruthySearchParam(url.searchParams.get("thumbnail_capture"));
 
   if (!fileId || !kind) {
     return null;
@@ -1148,7 +1161,8 @@ function parsePreviewMetadata(url) {
       mimeType,
       cacheMaxBytes,
       cacheSource: "auto",
-      prefetchConcurrency
+      prefetchConcurrency,
+      thumbnailCapture
     };
   }
 
@@ -1180,7 +1194,8 @@ function parsePreviewMetadata(url) {
     mimeType,
     cacheMaxBytes,
     cacheSource: "auto",
-    prefetchConcurrency
+    prefetchConcurrency,
+    thumbnailCapture
   };
 }
 
@@ -1200,6 +1215,7 @@ function normalizePreviewMetadata(value) {
   const mimeType = typeof value.mimeType === "string" && value.mimeType ? value.mimeType : "application/octet-stream";
   const cacheMaxBytes = normalizeCacheMaxBytes(value.cacheMaxBytes);
   const prefetchConcurrency = normalizePreviewPrefetchConcurrency(value.prefetchConcurrency);
+  const thumbnailCapture = Boolean(value.thumbnailCapture);
 
   if (!fileId || !kind) {
     return null;
@@ -1218,7 +1234,8 @@ function normalizePreviewMetadata(value) {
       mimeType,
       cacheMaxBytes,
       cacheSource: "auto",
-      prefetchConcurrency
+      prefetchConcurrency,
+      thumbnailCapture
     };
   }
 
@@ -1250,8 +1267,13 @@ function normalizePreviewMetadata(value) {
     mimeType,
     cacheMaxBytes,
     cacheSource: "auto",
-    prefetchConcurrency
+    prefetchConcurrency,
+    thumbnailCapture
   };
+}
+
+function isTruthySearchParam(value) {
+  return value === "1" || value === "true" || value === "yes";
 }
 
 function normalizePreviewKind(value) {

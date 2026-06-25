@@ -421,7 +421,7 @@ async function generateThumbnailCandidatesFromFileItem(file: FileItem): Promise<
 
   if (file.storage_backend === "hls_package") {
     const metadata = buildVideoPreviewMetadata(file, Number.MAX_SAFE_INTEGER, 1);
-    const previewUrl = buildVideoPreviewUrl(file, metadata);
+    const previewUrl = buildVideoPreviewUrl(file, metadata, { thumbnailCapture: true });
     if (!previewUrl) {
       throw new Error("无法生成 HLS 预览地址");
     }
@@ -430,7 +430,7 @@ async function generateThumbnailCandidatesFromFileItem(file: FileItem): Promise<
 
   if (sourceKind === "video") {
     const metadata = buildVideoPreviewMetadata(file, Number.MAX_SAFE_INTEGER, 1);
-    const previewUrl = buildVideoPreviewUrl(file, metadata);
+    const previewUrl = buildVideoPreviewUrl(file, metadata, { thumbnailCapture: true });
     if (!previewUrl) {
       throw new Error("无法生成视频预览地址");
     }

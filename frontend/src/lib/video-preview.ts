@@ -20,6 +20,7 @@ export interface VideoPreviewMetadata {
   mimeType: string;
   cacheMaxBytes: number;
   prefetchConcurrency: number;
+  thumbnailCapture?: boolean;
 }
 
 export interface VideoPreviewPlaybackProgress {
@@ -86,7 +87,11 @@ export function buildVideoPreviewMetadata(file: FileItem, cacheMaxBytes: number,
   return null;
 }
 
-export function buildVideoPreviewUrl(file: FileItem, metadata: VideoPreviewMetadata | null): string | null {
+export function buildVideoPreviewUrl(
+  file: FileItem,
+  metadata: VideoPreviewMetadata | null,
+  options: { thumbnailCapture?: boolean } = {}
+): string | null {
   if (!metadata) {
     return null;
   }
@@ -103,6 +108,7 @@ export function buildVideoPreviewUrl(file: FileItem, metadata: VideoPreviewMetad
   if (metadata.size !== undefined) params.set("size", String(metadata.size));
   if (metadata.chunkSize !== undefined) params.set("chunk_size", String(metadata.chunkSize));
   if (metadata.chunkCount !== undefined) params.set("chunk_count", String(metadata.chunkCount));
+  if (options.thumbnailCapture || metadata.thumbnailCapture) params.set("thumbnail_capture", "1");
 
   return `/__video-preview/${metadata.kind}/${encodeURIComponent(file.id)}/${encodeURIComponent(file.file_name)}?${params.toString()}`;
 }
