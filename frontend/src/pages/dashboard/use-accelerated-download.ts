@@ -466,31 +466,18 @@ export function useAcceleratedDownload({ session, toast }: UseAcceleratedDownloa
   }
 
   function createMultipartAcceleratedParts(file: MultipartDownloadFile, token: string): AcceleratedDownloadPartTask[] {
-    const cacheUrl = isVideoPreviewServiceWorkerControlling()
-      ? buildFileCacheUrl(buildFileCacheMetadata(file, session.video_preview_cache_bytes, "auto"))
-      : null;
-
     return Array.from({ length: file.chunk_count }, (_, index) => ({
       index,
       size: expectedMultipartChunkSize(file, index),
       offset: index * file.chunk_size,
       download: (signal, onProgress) =>
-        cacheUrl
-          ? downloadAcceleratedPart({
-              url: cacheUrl,
-              expectedSize: expectedMultipartChunkSize(file, index),
-              label: `分片 ${index + 1}`,
-              signal,
-              headers: { Range: `bytes=${index * file.chunk_size}-${index * file.chunk_size + expectedMultipartChunkSize(file, index) - 1}` },
-              onProgress: (progress) => onProgress(progress.downloadedBytes)
-            })
-          : downloadMultipartChunk({
-              file,
-              token,
-              chunkIndex: index,
-              signal,
-              onProgress: (progress) => onProgress(progress.downloadedBytes)
-            })
+        downloadMultipartChunk({
+          file,
+          token,
+          chunkIndex: index,
+          signal,
+          onProgress: (progress) => onProgress(progress.downloadedBytes)
+        })
     }));
   }
 
